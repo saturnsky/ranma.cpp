@@ -1,14 +1,7 @@
 name: Check Pre-Tokenizer Hashes
 
 on:
-    push:
-        paths:
-            - 'conversion/base.py'
-            - 'convert_hf_to_gguf_update.py'
-    pull_request:
-        paths:
-            - 'conversion/base.py'
-            - 'convert_hf_to_gguf_update.py'
+  workflow_dispatch:
 
 jobs:
     pre-tokenizer-hashes:

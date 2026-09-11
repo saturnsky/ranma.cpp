@@ -1,18 +1,7 @@
 name: Python check requirements.txt
 
 on:
-  push:
-    paths:
-      - '.github/workflows/python-check-requirements.yml'
-      - 'scripts/check-requirements.sh'
-      - 'convert*.py'
-      - '**/requirements*.txt'
-  pull_request:
-    paths:
-      - '.github/workflows/python-check-requirements.yml'
-      - 'scripts/check-requirements.sh'
-      - 'convert*.py'
-      - '**/requirements*.txt'
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref && github.ref || github.run_id }}
