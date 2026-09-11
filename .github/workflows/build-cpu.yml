@@ -1,33 +1,20 @@
 name: CI (cpu)
 
+# RANMA.cpp: the only CI kept active in this fork (Linux CPU + Windows CPU builds).
+# Runs on pushes to the fork branch only; `master` is an untouched upstream mirror.
 on:
   workflow_dispatch: # allows manual triggering
   push:
     branches:
-      - master
+      - ranma
     paths: [
       '.github/workflows/build-cpu.yml',
-      '.github/workflows/build-cmake-pkg.yml',
       '**/CMakeLists.txt',
       '**/.cmake',
       '**/*.h',
       '**/*.hpp',
       '**/*.c',
       '**/*.cpp',
-    ]
-
-  pull_request:
-    types: [opened, synchronize, reopened]
-    paths: [
-      '.github/workflows/build-cpu.yml',
-      '.github/workflows/build-cmake-pkg.yml',
-      'ggml/src/ggml-rpc/**',
-      '**/CMakeLists.txt',
-      '**/.cmake',
-      '**/*.h',
-      '**/*.hpp',
-      '**/*.c',
-      '**/*.cpp'
     ]
 
 concurrency:
@@ -42,17 +29,12 @@ env:
   LLAMA_ARG_LOG_TIMESTAMPS: 1
 
 jobs:
-  build-cmake-pkg:
-    uses: ./.github/workflows/build-cmake-pkg.yml
-
   ubuntu:
     strategy:
       matrix:
         include:
           - build: 'x64'
             os: ubuntu-22.04
-          - build: 'arm64'
-            os: ubuntu-24.04-arm
 
     runs-on: ${{ matrix.os }}
 
@@ -154,9 +136,6 @@ jobs:
           - build: 'x64-openblas'
             arch: 'x64'
             defines: '-G "Ninja Multi-Config" -D CMAKE_TOOLCHAIN_FILE=cmake/x64-windows-llvm.cmake -DGGML_NATIVE=OFF -DLLAMA_BUILD_SERVER=ON -DGGML_RPC=ON -DGGML_BACKEND_DL=ON -DGGML_CPU_ALL_VARIANTS=ON -DGGML_OPENMP=OFF -DGGML_BLAS=ON -DGGML_BLAS_VENDOR=OpenBLAS -DBLAS_INCLUDE_DIRS="$env:RUNNER_TEMP/openblas/include" -DBLAS_LIBRARIES="$env:RUNNER_TEMP/openblas/lib/openblas.lib"'
-          - build: 'arm64'
-            arch: 'arm64'
-            defines: '-G "Ninja Multi-Config" -D CMAKE_TOOLCHAIN_FILE=cmake/arm64-windows-llvm.cmake -DGGML_NATIVE=OFF -DGGML_OPENMP_FETCH=ON -DLLAMA_BUILD_SERVER=ON'
 
     steps:
       - name: Clone

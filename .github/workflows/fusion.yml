@@ -2,28 +2,6 @@ name: Fusion
 
 on:
   workflow_dispatch: # allows manual triggering
-  push:
-    branches:
-      - master
-    paths: [
-      '.github/workflows/fusion.yml',
-      'ggml/**',
-      'tests/fusion/**',
-      'tests/test-fusion.cpp',
-      'tests/test-llama-archs.cpp',
-      'src/models/**'
-    ]
-
-  pull_request:
-    types: [opened, synchronize, reopened]
-    paths: [
-      '.github/workflows/fusion.yml',
-      'ggml/**',
-      'tests/fusion/**',
-      'tests/test-fusion.cpp',
-      'tests/test-llama-archs.cpp',
-      'src/models/**'
-    ]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref && github.ref || github.run_id }}

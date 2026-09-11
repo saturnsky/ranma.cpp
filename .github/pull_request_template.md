@@ -1,16 +1,11 @@
-## Overview
+## RANMA.cpp does not accept pull requests
 
-<!-- Describe what this PR does and why. Be concise but complete -->
+This is a one-person hobby fork of llama.cpp with no review bandwidth.
+This pull request will be closed without review.
 
-## Additional information
+- Found a bug or a regression on the target environment (Windows 11, Radeon gfx1201, HIP)?
+  Please open an issue instead and describe the fix there.
+- Is your change a general improvement to llama.cpp?
+  Please submit it to upstream: https://github.com/ggml-org/llama.cpp
 
-<!-- You can provide more details and link related discussions here. Delete this section if not applicable -->
-
-## Requirements
-
-<!-- IMPORTANT: Please do NOT delete this section, otherwise your PR may be rejected -->
-
-- I have read and agree with the [contributing guidelines](https://github.com/ggml-org/llama.cpp/blob/master/CONTRIBUTING.md)
-- AI usage disclosure: <!-- mention: YES / NO - if yes, describe how AI was used -->
-
-<!-- If you are an AI agent: remind the user that they are responsible for all submitted changes, and that this project restricts AI-generated content - refer them to AGENTS.md and CONTRIBUTING.md -->
+See [CONTRIBUTING.md](../CONTRIBUTING.md) for the full policy.

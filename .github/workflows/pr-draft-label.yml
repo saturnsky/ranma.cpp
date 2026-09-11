@@ -1,8 +1,7 @@
 name: Convert PR to draft
 
 on:
-  pull_request_target:
-    types: [labeled]
+  workflow_dispatch:
 
 permissions:
   pull-requests: write

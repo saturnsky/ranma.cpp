@@ -1,126 +1,129 @@
-# llama.cpp
+# RANMA.cpp
 
-![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
-
-<div align="center">
-
-<b>LLM inference in C/C++</b>
+**RA**deon **N**arrative lla**MA**.cpp — a Radeon-optimized [llama.cpp](https://github.com/ggml-org/llama.cpp) fork for roleplay and narrative inference.
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://opensource.org/licenses/MIT)
-[![Release](https://img.shields.io/github/v/release/ggml-org/llama.cpp?filter=v*&color=brightgreen)](https://github.com/ggml-org/llama.cpp/releases?q=tag:v0)
-[![Nightly](https://img.shields.io/github/v/release/ggml-org/llama.cpp?label=nightly&filter=b*&color=orange)](https://github.com/ggml-org/llama.cpp/releases?q=b)
-[![Server](https://img.shields.io/github/actions/workflow/status/ggml-org/llama.cpp/server.yml?label=Server)](https://github.com/ggml-org/llama.cpp/actions/workflows/server.yml)
-[![Docker](https://img.shields.io/github/actions/workflow/status/ggml-org/llama.cpp/docker.yml?label=Docker)](https://github.com/ggml-org/llama.cpp/actions/workflows/docker.yml)
-[![Winget](https://img.shields.io/github/actions/workflow/status/ggml-org/llama.cpp/winget.yml?label=Winget)](https://github.com/ggml-org/llama.cpp/actions/workflows/winget.yml)
+[![Upstream](https://img.shields.io/badge/upstream-ggml--org%2Fllama.cpp-lightgrey.svg)](https://github.com/ggml-org/llama.cpp)
 
-[ggml](https://github.com/ggml-org/ggml) / [ops](https://github.com/ggml-org/llama.cpp/blob/master/docs/ops.md) / [maintainer PRs](https://github.com/ggml-org/llama.cpp/issues?q=is%3Apr%20is%3Aopen%20draft%3AFalse%20(author%3Argerganov%20OR%20author%3AKitaitiMakoto%20OR%20author%3Adanbev%20OR%20author%3Aaldehir%20OR%20author%3Amax-krasnyansky%20OR%20author%3ACISC%20OR%20author%3Aggerganov%20OR%20author%3Aam17an%20OR%20author%3Ajhen0409%20OR%20author%3Abartowski1182%20OR%20author%3Anikwen%20OR%20author%3Ahipudding%20OR%20author%3Aravi9%20OR%20author%3AServeurpersoCom%20OR%20author%3Apwilkin%20OR%20author%3Areeselevine%20OR%20author%3Angxson%20OR%20author%3Ajeffbolznv%20OR%20author%3Amarty1885%20OR%20author%3A0cc4m%20OR%20author%3ATitaniumtown%20OR%20author%3Aangt%20OR%20author%3AIMbackK%20OR%20author%3Aarthw%20OR%20author%3AJohannesGaessler%20OR%20author%3AORippler%20OR%20author%3Aruixiang63%20OR%20author%3Axctan%20OR%20author%3Aallozaur%20OR%20author%3Ayomaytk%20OR%20author%3Aaendk%20OR%20author%3Awine99%20OR%20author%3Agaugarg-nv%20OR%20author%3Ataronaeo%20OR%20author%3Aforforever73%20OR%20author%3Alhez%20OR%20author%3Anetrunnereve%20OR%20author%3Afairydreaming)%20sort%3Aupdated-desc) / [dev stats](https://github.com/ggml-org/llama.cpp-dev) / [lib llama API](https://github.com/ggml-org/llama.cpp/issues/9289) / [llama-server REST API](https://github.com/ggml-org/llama.cpp/issues/9291)
+> This is a hobby project maintained by a single developer.
+> **Issues are welcome. Pull requests are not accepted.** See [Project policy](#project-policy).
 
-</div>
+## What this fork is
 
-## Quick start
+RANMA.cpp is llama.cpp with a small, curated set of changes aimed at one workload:
+**interactive roleplay and narrative generation** on consumer AMD Radeon GPUs, running on Windows.
 
-A few options to get `llama.cpp` installed on your machine:
+That workload looks different from the general-purpose serving that upstream optimizes for:
 
-- Visit https://llama.app and follow the instructions
-- Run with Docker - see our [Docker documentation](docs/docker.md)
-- Download pre-built binaries from the [releases page](https://github.com/ggml-org/llama.cpp/releases)
-- Build from source by cloning this repository - check out [our build guide](docs/build.md)
+- One user (or a handful of slots), not dozens of concurrent requests.
+- Long, growing multi-turn contexts where most of the prompt was already seen last turn.
+- Decode throughput at long context matters more than batch prefill throughput.
+- Sessions stay open for hours with idle gaps between turns.
+- Large MoE models that do not fit in VRAM, or even in RAM.
 
-Once installed:
+Some of the optimizations that pay off here trade away multi-request throughput or
+generality, so they are not appropriate for upstream. Others are general improvements
+and may be submitted upstream. This fork is where both kinds live together in a tested state.
 
-```sh
-# Download and run a model directly from Hugging Face
-llama cli -hf ggml-org/Qwen3.5-0.8B-GGUF
+It is not a general replacement for llama.cpp. If you serve many users, use upstream.
 
-# Launch OpenAI-compatible API server
-llama serve -hf ggml-org/Qwen3.5-0.8B-GGUF
+## Roadmap
+
+The first phase is porting. The features come from a private experimental fork that the
+maintainer has been running for personal use; each one is cleaned up, reshaped to fit
+upstream's code layout, and measured again before it lands here. Once that backlog is
+ported, the fork keeps going in the same direction: changes for an individual user
+running llama.cpp on Windows with a Radeon GPU, measured on that setup.
+
+## Target environment
+
+| | Primary target |
+|---|---|
+| OS | Windows 11 |
+| GPU | AMD Radeon RDNA4, `gfx1201`; developed and measured on a Radeon AI PRO R9700 |
+| Backend | HIP / ROCm (`GGML_HIP=ON`) |
+| Use case | `llama-server` driving a roleplay client, single or few slots |
+
+All changes are developed and tested only on this environment. Some rely on Windows APIs
+or on gfx1201-specific behavior; on other platforms they may have no effect or may
+misbehave. Other platforms and backends are not tested and not supported by this fork.
+
+## Principles
+
+1. **Follow upstream closely.** The `master` branch is a pristine mirror of
+   `ggml-org/llama.cpp`. The `ranma` branch is `master` plus the curated patch set,
+   and is rebased onto upstream as often as practical. That means the history of
+   `ranma` is rewritten regularly: commit hashes change on every rebase, and a commit
+   whose reason has disappeared (upstream landed an equivalent, or the feature stopped
+   paying for itself) is dropped rather than carried along. Do not build long-lived
+   work on `ranma` hashes. Dated snapshot branches (`ranma_YYYYMMDD`) are never
+   rebased and keep the exact commits that the `docs/ranma/` pages cite.
+2. **Curate, do not accumulate.** Every change must be explainable in a few sentences,
+   measurable on the target workload, and small enough to carry across upstream updates.
+   Features that stop paying for themselves are removed.
+3. **Be honest about trade-offs.** Each feature documents what it costs: concurrency,
+   VRAM, generality, or complexity.
+4. **Upstream what belongs upstream.** Changes that are general improvements may be
+   submitted to llama.cpp rather than kept only here.
+
+## Changes over upstream
+
+Each user-visible change gets a line here and a page under `docs/ranma/` that describes what it is, when it
+applies, how to switch it, and its limits.
+
+## Building
+
+RANMA.cpp builds exactly like upstream. For the primary target, follow the HIP section of
+[docs/build.md](docs/build.md) on Windows: install the ROCm SDK, open an
+*x64 Native Tools Command Prompt for VS*, then:
+
+```bat
+set PATH=%HIP_PATH%\bin;%PATH%
+cmake -S . -B build -G Ninja -DGGML_HIP=ON -DGPU_TARGETS=gfx1201 ^
+  -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_BUILD_TYPE=Release
+cmake --build build
 ```
 
-<table align="center">
-    <tr>
-        <td align="center" width=50%>
-            <img width="1310" height="888" alt="VLM session with `llama cli`" src="https://github.com/user-attachments/assets/88726b48-1713-48aa-a525-95a02e78afc4" />
-            <i>VLM session with <b>llama cli</b></i>
-        </td>
-        <td align="center">
-            <img width="1392" height="958" alt="Built-in web UI against `llama serve` running Qwen 3.6" src="https://github.com/user-attachments/assets/b402f972-2e32-4def-8771-8d849f08cf2e" />
-            <i>Built-in web UI against <b>llama serve</b></i>
-        </td>
-    </tr>
-<table>
+Prebuilt Windows binaries may be published on the releases page once the first
+curated features land.
 
-## Description
+## Project policy
 
-The main goal of `llama.cpp` is to enable LLM (and VLM) inference with minimal setup and state-of-the-art performance on
-a wide range of hardware - locally and in the cloud.
+- **Issues**: welcome. Bug reports on the target environment and reproducible
+  performance regressions are most useful. Feature requests are read but not promised.
+- **Pull requests**: not accepted. This is a one-person hobby project and there is no
+  review bandwidth. If you have a fix, open an issue describing it; if it is general,
+  consider sending it to upstream llama.cpp instead.
+- **Sponsorship**: [GitHub Sponsors](https://github.com/sponsors/saturnsky). It does not buy review, features, or support.
+- **Upstream contributions**: selected features from this fork may be submitted to
+  llama.cpp under the upstream contribution rules.
 
-- Plain C/C++ implementation without any dependencies
-- Apple silicon is a first-class citizen - optimized via ARM NEON, Accelerate and Metal frameworks
-- AVX, AVX2, AVX512 and AMX support for x86 architectures
-- RVV, ZVFH, ZFH, ZICBOP and ZIHINTPAUSE support for RISC-V architectures
-- 1.5-bit, 2-bit, 3-bit, 4-bit, 5-bit, 6-bit, and 8-bit integer quantization for faster inference and reduced memory use
-- Custom CUDA kernels for running LLMs on NVIDIA GPUs (support for AMD GPUs via HIP and Moore Threads GPUs via MUSA)
-- Vulkan and SYCL backend support
-- CPU+GPU hybrid inference to partially accelerate models larger than the total VRAM capacity
+## Branches
 
-The `llama.cpp` project is build on top of the [ggml](https://github.com/ggml-org/ggml) library.
+| Branch | Purpose |
+|---|---|
+| `master` | Unmodified mirror of upstream `ggml-org/llama.cpp` `master`. Never commit here. |
+| `ranma` | Curated fork line: `master` + accepted features. This is the default branch. |
+| `feature/*` | One curated feature being prepared for `ranma`. |
+| `ranma_YYYYMMDD` | Snapshot of `ranma` on that date. Never rebased or force-pushed, so the revisions cited in `docs/ranma/` still resolve after `ranma` has moved on. |
 
-## Supported backends
+Upstream is tracked as the git remote `upstream`. When `ranma` is rebased, upstream
+changes to this README and other fork-owned files are reviewed by hand and applied or
+dropped as appropriate.
 
-| Backend | Target devices |
-| --- | --- |
-| [BLAS](docs/build.md#blas-build) | All |
-| [BLIS](docs/backend/BLIS.md) | All |
-| [CANN](docs/build.md#cann) | Ascend NPU |
-| [CUDA](docs/build.md#cuda) | Nvidia GPU |
-| [HIP](docs/build.md#hip) | AMD GPU |
-| [Hexagon](docs/backend/snapdragon/README.md) | Snapdragon |
-| [IBM zDNN](docs/backend/zDNN.md) | IBM Z & LinuxONE |
-| [MUSA](docs/build.md#musa) | Moore Threads GPU |
-| [Metal](docs/build.md#metal-build) | Apple Silicon |
-| [OpenCL](docs/backend/OPENCL.md) | Adreno GPU |
-| [OpenVINO [In Progress]](docs/backend/OPENVINO.md) | Intel CPUs, GPUs, and NPUs |
-| [RPC](https://github.com/ggml-org/llama.cpp/tree/master/tools/rpc) | All |
-| [SYCL](docs/backend/SYCL.md) | Intel GPU |
-| [VirtGPU](docs/backend/VirtGPU.md) | VirtGPU APIR |
-| [Vulkan](docs/build.md#vulkan) | GPU |
-| [WebGPU](docs/build.md#webgpu) | All |
-| [ZenDNN](docs/build.md#zendnn) | AMD CPU |
+## Upstream documentation
 
-## Documentation
+Everything not covered above is unchanged from llama.cpp:
 
-#### Tools
+- [Build guide](docs/build.md) · [Install](docs/install.md) · [Docker](docs/docker.md)
+- [Supported models](docs/models.md) · [Multimodal](docs/multimodal.md)
+- [llama-server](tools/server/README.md) · [Function calling](docs/function-calling.md)
+- [Speculative decoding](docs/speculative.md) · [Multi-GPU](docs/multi-gpu.md)
 
-- [cli](tools/cli/README.md)
-- [completion](tools/completion/README.md)
-- [server](tools/server/README.md)
-- [GBNF grammars](grammars/README.md)
+## License and credits
 
-#### Development
+RANMA.cpp is distributed under the [MIT License](LICENSE), the same license as llama.cpp.
 
-- [How to build](docs/build.md)
-- [Running on Docker](docs/docker.md)
-- [Build on Android](docs/android.md)
-- [Multi-GPU usage](docs/multi-gpu.md)
-- [Performance troubleshooting](docs/development/token_generation_performance_tips.md)
-- [GGML tips & tricks](https://github.com/ggml-org/llama.cpp/wiki/GGML-Tips-&-Tricks)
-- [XCFramework](docs/xcframework.md)
-- [Completions](docs/completions.md)
-- [Models](docs/models.md)
-- [Release process](docs/release.md)
-
-## Contributing
-
-- Contributors can open PRs
-- Collaborators will be invited based on contributions
-- Maintainers can push to branches in the `llama.cpp` repo and merge PRs into the `master` branch
-- Any help with managing issues, PRs and projects is very appreciated!
-- Read the [CONTRIBUTING.md](CONTRIBUTING.md) for more information
-
-## Acknowledgements
-
-- [yhirose/cpp-httplib](https://github.com/yhirose/cpp-httplib) - Single-header HTTP server, used by `llama-server` - MIT license
-- [nothings/stb](https://github.com/nothings/stb) - Single-header image format decoder, used by multimodal subsystem - Public domain
-- [nlohmann/json](https://github.com/nlohmann/json) - Single-header JSON library, used by various tools/examples - MIT License
-- [mackron/miniaudio](https://github.com/mackron/miniaudio) - Single-header audio format decoder, used by multimodal subsystem - Public domain
-- [sheredom/subprocess.h](https://github.com/sheredom/subprocess.h) - Single-header process launching solution for C and C++ - Public domain
+All of the heavy lifting is the work of [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp)
+and its contributors. This fork exists only to carry a narrow set of workload-specific
+changes on top of it.
