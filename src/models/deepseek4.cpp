@@ -488,6 +488,7 @@ ggml_tensor * llama_model_deepseek4::graph::build_hca_compressed_kv_from_state(
         ggml_tensor * state_read_idxs,
         ggml_tensor * comp_pos,
         ggml_tensor * norm,
+        int64_t ratio,
         int64_t n_embd_head,
         const char * name,
         int il) const {
@@ -497,15 +498,15 @@ ggml_tensor * llama_model_deepseek4::graph::build_hca_compressed_kv_from_state(
 
     GGML_ASSERT(n_blocks > 0);
     GGML_ASSERT(state_read_idxs);
-    GGML_ASSERT(state_read_idxs->ne[0] == DSV4_HCA_RATIO*n_blocks);
+    GGML_ASSERT(state_read_idxs->ne[0] == ratio*n_blocks);
     GGML_ASSERT(n_embd_head >= n_embd_head_rope);
 
     ggml_tensor * kv = ggml_get_rows(ctx0, kv_state, state_read_idxs);
-    kv = ggml_reshape_3d(ctx0, kv, n_embd_head, DSV4_HCA_RATIO, n_blocks);
+    kv = ggml_reshape_3d(ctx0, kv, n_embd_head, ratio, n_blocks);
     cb(kv, name, il);
 
     ggml_tensor * score = ggml_get_rows(ctx0, score_state, state_read_idxs);
-    score = ggml_reshape_3d(ctx0, score, n_embd_head, DSV4_HCA_RATIO, n_blocks);
+    score = ggml_reshape_3d(ctx0, score, n_embd_head, ratio, n_blocks);
     cb(score, name, il);
 
     ggml_tensor * values = ggml_cont(ctx0, ggml_permute(ctx0, kv, 1, 0, 2, 3));
@@ -1133,6 +1134,7 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention_impl(
                 inp_dsv4->get_hca().state_read_idxs,
                 inp_dsv4->get_hca().state_write_pos,
                 layer.attn_comp_norm,
+                DSV4_HCA_RATIO,
                 n_embd_head,
                 "hca_state_compress",
                 il);
