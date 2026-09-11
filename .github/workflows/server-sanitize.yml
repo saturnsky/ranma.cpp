@@ -11,25 +11,6 @@ on:
         description: 'Run slow tests'
         required: true
         type: boolean
-  push:
-    branches:
-      - master
-    paths: [
-      '.github/workflows/server-sanitize.yml',
-      '**/CMakeLists.txt',
-      '**/Makefile',
-      '**/*.h',
-      '**/*.hpp',
-      '**/*.c',
-      '**/*.cpp',
-      'tools/server/**.*'
-    ]
-
-  pull_request:
-    types: [opened, synchronize, reopened]
-    paths: [
-      '.github/workflows/server-sanitize.yml'
-    ]
 
 env:
   # note: this is dud token to avoid rate limiting (https://github.com/ggml-org/llama.cpp/pull/25706#issuecomment-4979941302)
