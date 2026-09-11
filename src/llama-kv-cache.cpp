@@ -331,7 +331,9 @@ llama_kv_cache::llama_kv_cache(
         // always create Hadamard rotation tensors for DeepSeek lightning indexers
         if ((model.arch == LLM_ARCH_DEEPSEEK32 || model.arch == LLM_ARCH_DEEPSEEK4 || model.arch == LLM_ARCH_DEEPSEEK41 ||
                 model.arch == LLM_ARCH_GLM_DSA || model.arch == LLM_ARCH_DOTS3NOTE) &&
-                hparams.n_embd_head_k_full == hparams.indexer_head_size) {
+                hparams.n_embd_head_k_full == hparams.indexer_head_size && n_embd_head_k_all > 0) {
+            // a cache whose layer filter selected nothing (DeepSeek V4.1) has nothing to rotate, and the search for
+            // the rotation width below would never end at n_embd_head_k_all == 0
             attn_rot_k = true;
         }
 
