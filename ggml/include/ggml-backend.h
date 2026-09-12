@@ -192,6 +192,9 @@ extern "C" {
     GGML_API bool                          ggml_backend_dev_supports_op(ggml_backend_dev_t device, const struct ggml_tensor * op);
     GGML_API bool                          ggml_backend_dev_supports_buft(ggml_backend_dev_t device, ggml_backend_buffer_type_t buft);
     GGML_API bool                          ggml_backend_dev_offload_op(ggml_backend_dev_t device, const struct ggml_tensor * op);
+    // check if the device can read `src` in place from its host buffer type while executing `op`
+    // convenience wrapper around the "ggml_backend_host_direct_op" proc address, for callers outside ggml_backend_sched
+    GGML_API bool                          ggml_backend_dev_host_direct_op(ggml_backend_dev_t device, const struct ggml_tensor * op, const struct ggml_tensor * src);
 
     //
     // Backend (reg)
@@ -223,6 +226,10 @@ extern "C" {
         const char * value;
     };
     typedef struct ggml_backend_feature * (*ggml_backend_get_features_t)(ggml_backend_reg_t reg);
+    // Check if the device can execute `op` reading `src` in place from the device's host buffer type, with no copy to
+    // device memory. Only asked for `src` with buffer usage GGML_BACKEND_BUFFER_USAGE_WEIGHTS.
+    // Proc address name: "ggml_backend_host_direct_op"
+    typedef bool                          (*ggml_backend_host_direct_op_t)(ggml_backend_dev_t dev, const struct ggml_tensor * op, const struct ggml_tensor * src);
 
     //
     // Backend registry

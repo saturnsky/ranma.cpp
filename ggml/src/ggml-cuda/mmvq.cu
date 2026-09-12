@@ -1,4 +1,5 @@
 #include "mmvq.cuh"
+#include "mapped-host.cuh"
 #include "quantize.cuh"
 #include "unary.cuh"
 #include "vecdotq.cuh"
@@ -1424,6 +1425,15 @@ void ggml_cuda_mul_mat_vec_q(
 
     GGML_ASSERT(!ids || ne12 <= MMVQ_MAX_BATCH_SIZE);
 
+    const void * src0_d = src0->data;
+#if defined(GGML_USE_HIP)
+    if (ggml_backend_buffer_is_host(src0->buffer)) {
+        src0_d = ggml_hip_mapped_host_device_alias(src0);
+    }
+#else
+    ggml_cuda_assert_src0_is_device_readable(src0);
+#endif
+
     const float   * src1_d =       (const float   *) src1->data;
     const int32_t *  ids_d = ids ? (const int32_t *)  ids->data : nullptr;
     float         *  dst_d =       (float         *)  dst->data;
@@ -1447,6 +1457,11 @@ void ggml_cuda_mul_mat_vec_q(
         if (fusion->gate) {
             GGML_ASSERT(fusion->gate->type == src0->type && ggml_are_same_stride(fusion->gate, src0));
             fusion_local.gate = fusion->gate->data;
+#if defined(GGML_USE_HIP)
+            if (ggml_backend_buffer_is_host(fusion->gate->buffer)) {
+                fusion_local.gate = ggml_hip_mapped_host_device_alias(fusion->gate);
+            }
+#endif
         }
         if (fusion->gate_bias) {
             GGML_ASSERT(fusion->gate_bias->type == GGML_TYPE_F32);
@@ -1513,7 +1528,7 @@ void ggml_cuda_mul_mat_vec_q(
     const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
 
     mul_mat_vec_q_switch_type(
-        src0->data, src0->type, src1_q8_1.get(), ids_d, fusion_local, dst_d, ne00,
+        src0_d, src0->type, src1_q8_1.get(), ids_d, fusion_local, dst_d, ne00,
         ne01,              ncols_dst,     s01, stride_col_y,     stride_col_dst,
         ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
         ne03,              ne3,           s03, s13,              s3,               ids_stride, stream);
