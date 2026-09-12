@@ -110,6 +110,13 @@ applies, how to switch it, and its limits.
 - **Only the shards with lazy tensors are mapped** - with mmap loading off, the loader no longer maps model
   files that nothing reads through the mapping. Same page.
 
+### Host-resident MoE experts
+
+- **Host-direct MoE weights (HIP)** - `MUL_MAT_ID` kernels read host-resident expert weights in place over PCIe
+  instead of copying them per op or computing them on the CPU. Off by default; the recommended profile for a
+  model whose experts live in system RAM is `GGML_CUDA_HOST_DIRECT=1 GGML_CUDA_HOST_DIRECT_MAX_BATCH=512`
+  (the second value at least the ubatch size). [docs/ranma/host-direct-moe.md](docs/ranma/host-direct-moe.md)
+
 ## Building
 
 RANMA.cpp builds exactly like upstream. For the primary target, follow the HIP section of

@@ -650,6 +650,17 @@ bool ggml_backend_dev_offload_op(ggml_backend_dev_t device, const struct ggml_te
     return false;
 }
 
+// ggml_backend_sched caches this proc address per backend, this wrapper resolves it on every call and is meant for
+// the few callers outside the scheduler, such as test-backend-ops.
+bool ggml_backend_dev_host_direct_op(ggml_backend_dev_t device, const struct ggml_tensor * op, const struct ggml_tensor * src) {
+    GGML_ASSERT(device);
+
+    auto host_direct_op = (ggml_backend_host_direct_op_t)
+        ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(device), "ggml_backend_host_direct_op");
+
+    return host_direct_op != NULL && host_direct_op(device, op, src);
+}
+
 // Backend (reg)
 
 const char * ggml_backend_reg_name(ggml_backend_reg_t reg) {
@@ -791,6 +802,8 @@ struct ggml_backend_sched {
 
     ggml_backend_t backends[GGML_SCHED_MAX_BACKENDS];
     ggml_backend_buffer_type_t bufts[GGML_SCHED_MAX_BACKENDS];
+    // optional "ggml_backend_host_direct_op" proc address of each backend, NULL if it does not provide one
+    ggml_backend_host_direct_op_t host_direct_op[GGML_SCHED_MAX_BACKENDS];
     ggml_gallocr_t galloc;
 
     // hash map of the nodes in the graph
@@ -885,6 +898,37 @@ static int ggml_backend_sched_backend_id(ggml_backend_sched_t sched, ggml_backen
     return -1;
 }
 
+// Like ggml_backend_supports_buft, but a device may also accept a weight that stays in its own host buffer. The backend declares that through the
+// optional "ggml_backend_host_direct_op" proc address, resolved once per backend in ggml_backend_sched_new.
+// The decision is per op, not per graph: all MUL_MAT_ID nodes of one graph share ne[2], so a token count limit in the device callback picks the same
+// path for the whole graph. The reserve graph is built at the largest batch size, so it takes the copy path and sizes the compute buffer for it.
+static bool ggml_backend_sched_buft_supported(ggml_backend_sched_t sched, int backend_id, ggml_backend_buffer_type_t buft,
+        const struct ggml_tensor * tensor, const struct ggml_tensor * op) {
+    if (ggml_backend_supports_buft(sched->backends[backend_id], buft)) {
+        return true;
+    }
+
+    if (op == NULL || tensor == NULL) {
+        return false;
+    }
+
+    ggml_backend_buffer_t buffer = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
+    if (buffer == NULL || ggml_backend_buffer_get_usage(buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+        return false;
+    }
+
+    if (sched->host_direct_op[backend_id] == NULL) {
+        return false;
+    }
+
+    ggml_backend_dev_t dev = ggml_backend_get_device(sched->backends[backend_id]);
+    if (dev == NULL || buft != ggml_backend_dev_host_buffer_type(dev)) {
+        return false;
+    }
+
+    return sched->host_direct_op[backend_id](dev, op, tensor);
+}
+
 static int ggml_backend_sched_backend_from_buffer(ggml_backend_sched_t sched, const struct ggml_tensor * tensor, const struct ggml_tensor * op) {
     ggml_backend_buffer_t buffer = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
     if (buffer == NULL) {
@@ -893,7 +937,7 @@ static int ggml_backend_sched_backend_from_buffer(ggml_backend_sched_t sched, co
 
     // find highest prio backend that supports the buffer type and the op
     for (int i = 0; i < sched->n_backends; i++) {
-        if (ggml_backend_supports_buft(sched->backends[i], buffer->buft) &&
+        if (ggml_backend_sched_buft_supported(sched, i, buffer->buft, tensor, op) &&
             ggml_backend_supports_op(sched->backends[i], op)) {
             return i;
         }
@@ -1034,7 +1078,8 @@ static void ggml_backend_sched_print_assignments(ggml_backend_sched_t sched, str
     }
 }
 
-static bool ggml_backend_sched_buffer_supported(ggml_backend_sched_t sched, struct ggml_tensor * t, int backend_id) {
+static bool ggml_backend_sched_buffer_supported(ggml_backend_sched_t sched, struct ggml_tensor * t, int backend_id,
+        const struct ggml_tensor * op) {
     ggml_backend_buffer_t buf = t->view_src ? t->view_src->buffer : t->buffer;
     ggml_backend_buffer_type_t buft = NULL;
 
@@ -1052,7 +1097,7 @@ static bool ggml_backend_sched_buffer_supported(ggml_backend_sched_t sched, stru
         }
     }
 
-    return buft != NULL && ggml_backend_supports_buft(sched->backends[backend_id], buft);
+    return buft != NULL && ggml_backend_sched_buft_supported(sched, backend_id, buft, t, op);
 }
 
 static void ggml_backend_sched_set_if_supported(ggml_backend_sched_t sched, struct ggml_tensor * node, int cur_backend_id, int * node_backend_id) {
@@ -1226,7 +1271,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                         if (src == NULL) {
                             continue;
                         }
-                        if ((tensor_backend_id(src) != -1 || tensor_backend_id(src->view_src) != -1) && ggml_backend_sched_buffer_supported(sched, src, b)) {
+                        if ((tensor_backend_id(src) != -1 || tensor_backend_id(src->view_src) != -1) && ggml_backend_sched_buffer_supported(sched, src, b, node)) {
                             n_supported++;
                         }
                     }
@@ -1247,7 +1292,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                         if (src == NULL) {
                             continue;
                         }
-                        if (!ggml_backend_sched_buffer_supported(sched, src, b)) {
+                        if (!ggml_backend_sched_buffer_supported(sched, src, b, node)) {
                             supported = false;
                             break;
                         }
@@ -1333,7 +1378,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                     // by starting a new split, the memory of the previously offloaded weights can be reused
                     if (src->buffer != NULL && src->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
                         int src_backend_id = tensor_backend_id(src);
-                        if (src_backend_id != cur_backend_id && !ggml_backend_sched_buffer_supported(sched, src, cur_backend_id)) {
+                        if (src_backend_id != cur_backend_id && !ggml_backend_sched_buffer_supported(sched, src, cur_backend_id, node)) {
                             need_new_split = true;
                             break;
                         }
@@ -1396,7 +1441,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                     }
                 }
 
-                if (src_backend_id != cur_backend_id && !ggml_backend_sched_buffer_supported(sched, src, cur_backend_id)) {
+                if (src_backend_id != cur_backend_id && !ggml_backend_sched_buffer_supported(sched, src, cur_backend_id, node)) {
                     // create a copy of the input in the split's backend
                     if (tensor_id_copy(src_id, cur_backend_id, 0) == NULL) {
                         ggml_backend_t backend = sched->backends[cur_backend_id];
@@ -1901,6 +1946,9 @@ ggml_backend_sched_t ggml_backend_sched_new(
         sched->backends[b] = backends[b];
         sched->bufts[b] = bufts ? bufts[b] : ggml_backend_get_default_buffer_type(backends[b]);
         GGML_ASSERT(ggml_backend_supports_buft(backends[b], sched->bufts[b]));
+
+        sched->host_direct_op[b] = (ggml_backend_host_direct_op_t) ggml_backend_reg_get_proc_address(
+            ggml_backend_dev_backend_reg(ggml_backend_get_device(backends[b])), "ggml_backend_host_direct_op");
 
         if (sched->n_copies > 1) {
             for (int c = 0; c < sched->n_copies; c++) {

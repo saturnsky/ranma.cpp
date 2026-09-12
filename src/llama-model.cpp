@@ -1873,6 +1873,23 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
     }
 
+    // the weights are written, let the backend finalize its host buffers (ROCm registers them as mapped memory)
+    for (auto & [_, bufs] : pimpl->ctxs_bufs) {
+        for (auto & buf : bufs) {
+            ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(buf.get()));
+            if (dev == nullptr) {
+                continue;
+            }
+            using finalize_host_buffer_t = bool (*)(ggml_backend_buffer_t);
+            auto * finalize = (finalize_host_buffer_t) ggml_backend_reg_get_proc_address(
+                    ggml_backend_dev_backend_reg(dev), "ggml_backend_finalize_host_buffer");
+            if (finalize != nullptr && !finalize(buf.get())) {
+                throw std::runtime_error(format("failed to finalize %s model buffer",
+                        ggml_backend_buffer_name(buf.get())));
+            }
+        }
+    }
+
     if (use_mmap_buffer) {
         for (auto & mapping : ml.mappings) {
             pimpl->mappings.emplace_back(std::move(mapping));
