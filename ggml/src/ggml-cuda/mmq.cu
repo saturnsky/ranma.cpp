@@ -2,6 +2,7 @@
 #include "mmq.cuh"
 #include "quantize.cuh"
 #include "mmid.cuh"
+#include "mapped-host.cuh"
 
 #include <cstdint>
 
@@ -103,6 +104,13 @@ void ggml_cuda_mul_mat_q(
     GGML_ASSERT(!ids || ids->nb[0] == ggml_type_size(ids->type));
 
     const char  * src0_d = (const char  *) src0->data;
+#if defined(GGML_USE_HIP)
+    if (ggml_backend_buffer_is_host(src0->buffer)) {
+        src0_d = (const char *) ggml_hip_mapped_host_device_alias(src0);
+    }
+#else
+    ggml_cuda_assert_src0_is_device_readable(src0);
+#endif
     const float * src1_d = (const float *) src1->data;
     float       *  dst_d = (float       *)  dst->data;
 

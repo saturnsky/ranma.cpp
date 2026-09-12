@@ -1,6 +1,7 @@
 #include "ggml.h"
 #include "mmf.cuh"
 #include "mmid.cuh"
+#include "mapped-host.cuh"
 
 static __forceinline__ int mmf_get_rows_per_block(const int cc) {
     if (GGML_CUDA_CC_IS_CDNA(cc)) {
@@ -11,6 +12,7 @@ static __forceinline__ int mmf_get_rows_per_block(const int cc) {
 }
 
 void ggml_cuda_mul_mat_f(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst) {
+    ggml_cuda_assert_src0_is_device_readable(src0);
     GGML_ASSERT(        src1->type == GGML_TYPE_F32);
     GGML_ASSERT(!ids ||  ids->type == GGML_TYPE_I32);
     GGML_ASSERT(         dst->type == GGML_TYPE_F32);
