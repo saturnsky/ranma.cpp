@@ -68,7 +68,18 @@ misbehave. Other platforms and backends are not tested and not supported by this
 
 ## Changes over upstream
 
-None yet. The fork was just created.
+- **Host-direct MoE weights (HIP)** — `MUL_MAT_ID` kernels read host-resident expert weights in place over PCIe
+  instead of copying them per op or computing them on the CPU. Off by default. Recommended profile for a MoE model
+  whose experts live in system RAM (`-ncmoe`):
+
+  ```
+  GGML_CUDA_HOST_DIRECT=1 GGML_CUDA_HOST_DIRECT_MAX_BATCH=512
+  ```
+
+  `MAX_BATCH` should be at least the ubatch size (`-ub`, default 512). Measured on a Radeon AI PRO R9700 with
+  Qwen3.8-Flash-Next UD-Q4_K_XL: decode 45-61 % faster and prompt processing 28-51 % faster than the upstream copy
+  path, on both a 16 GiB and a 32 GiB expert placement. Details, limits and the full tables:
+  [docs/ranma/host-direct-moe.md](docs/ranma/host-direct-moe.md).
 
 Each feature that lands gets a line here and a page under `docs/ranma/` describing its
 rationale, measured effect, and trade-offs.
