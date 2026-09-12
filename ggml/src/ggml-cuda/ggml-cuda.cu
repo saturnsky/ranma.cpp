@@ -32,6 +32,7 @@
 #include "ggml-cuda/mmq.cuh"
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
+#include "ggml-cuda/mapped-host.cuh"
 #include "ggml-cuda/moe-weighted-reduction.cuh"
 #include "ggml-cuda/norm.cuh"
 #include "ggml-cuda/opt-step-adamw.cuh"
@@ -90,6 +91,13 @@
 #include <cstdlib>
 #include <string>
 #include <vector>
+
+#if defined(GGML_USE_HIP) && defined(_WIN32)
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 
 static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
 
@@ -1257,6 +1265,22 @@ static bool ggml_backend_cuda_comm_allreduce_tensor(void * comm_ctx_v, struct gg
     return comm_ctx->try_allreduce(comm_ctx, tensors);
 }
 
+// backend device context, declared here because the host buffer type needs the host-direct options
+
+struct ggml_backend_cuda_device_context {
+    int device;
+    std::string name;
+    std::string description;
+    std::string pci_bus_id;
+    int op_offload_min_batch_size;
+    // host-direct MoE: let kernels read immutable quantized weights from the host buffer type, with no copy to VRAM
+    bool    host_direct;
+    // 0: use the per-type MMVQ MUL_MAT_ID limit
+    int64_t host_direct_max_batch;
+    // 0: no coarse path, every host buffer is hipHostMalloc(Mapped)
+    size_t  host_direct_coarse_min_bytes;
+};
+
 // host buffer type
 
 static const char * ggml_backend_cuda_host_buffer_type_name(ggml_backend_buffer_type_t buft) {
@@ -1273,13 +1297,126 @@ static void ggml_backend_cuda_host_buffer_free_buffer(ggml_backend_buffer_t buff
     CUDA_CHECK(cudaFreeHost(buffer->context));
 }
 
-static void * ggml_cuda_host_malloc(size_t size) {
+#if defined(GGML_USE_HIP) && defined(_WIN32)
+// A host buffer that becomes coarse-grained mapped memory only after the model is loaded. hipHostRegister must see
+// the final contents, so the allocation starts as plain virtual memory and kernels must not read it before
+// ggml_backend_cuda_finalize_host_buffer succeeded.
+struct ggml_backend_cuda_host_coarse_context {
+    void * host_base;
+    void * device_base;
+    bool   registered; // hipHostRegister succeeded, the pages must be unregistered before they are freed
+    bool   mapped;     // device_base is valid and visible to kernels
+};
+
+static void ggml_backend_cuda_host_coarse_buffer_free_buffer(ggml_backend_buffer_t buffer) {
+    ggml_backend_cuda_host_coarse_context * ctx = (ggml_backend_cuda_host_coarse_context *) buffer->context;
+    if (ctx->registered && hipHostUnregister(ctx->host_base) != hipSuccess) {
+        (void) hipGetLastError();
+    }
+    if (!VirtualFree(ctx->host_base, 0, MEM_RELEASE)) {
+        GGML_LOG_ERROR("%s: VirtualFree failed with error %lu\n", __func__, GetLastError());
+    }
+    delete ctx;
+}
+
+static void * ggml_backend_cuda_host_coarse_buffer_get_base(ggml_backend_buffer_t buffer) {
+    return ((ggml_backend_cuda_host_coarse_context *) buffer->context)->host_base;
+}
+
+static void ggml_backend_cuda_host_coarse_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
+    memset(((ggml_backend_cuda_host_coarse_context *) buffer->context)->host_base, value, buffer->size);
+}
+
+static bool ggml_backend_cuda_host_buffer_is_coarse(ggml_backend_buffer_t buffer) {
+    return buffer->iface.free_buffer == ggml_backend_cuda_host_coarse_buffer_free_buffer;
+}
+
+static bool ggml_backend_cuda_host_buffer_is_mapped(ggml_backend_buffer_t buffer) {
+    return !ggml_backend_cuda_host_buffer_is_coarse(buffer) ||
+        ((ggml_backend_cuda_host_coarse_context *) buffer->context)->mapped;
+}
+
+// Undo a registration that cannot be used, so that the buffer is back in its plain VirtualAlloc state.
+static void ggml_backend_cuda_host_coarse_unregister(ggml_backend_cuda_host_coarse_context * ctx) {
+    if (hipHostUnregister(ctx->host_base) != hipSuccess) {
+        (void) hipGetLastError();
+    }
+    ctx->registered  = false;
+    ctx->device_base = nullptr;
+}
+
+static bool ggml_backend_cuda_finalize_host_buffer(ggml_backend_buffer_t buffer) {
+    if (!ggml_backend_cuda_host_buffer_is_coarse(buffer)) {
+        return true;
+    }
+
+    ggml_backend_cuda_host_coarse_context * ctx = (ggml_backend_cuda_host_coarse_context *) buffer->context;
+    if (ctx->mapped) {
+        return true;
+    }
+
+    const unsigned int flags = hipHostRegisterMapped | hipExtHostRegisterCoarseGrained;
+    hipError_t err = hipHostRegister(ctx->host_base, buffer->size, flags);
+    if (err != hipSuccess) {
+        (void) hipGetLastError();
+        GGML_LOG_ERROR("%s: failed to register %.2f MiB of coarse-grained mapped host memory: %s\n",
+                __func__, buffer->size / 1024.0 / 1024.0, hipGetErrorString(err));
+        return false;
+    }
+    ctx->registered = true;
+
+    err = hipHostGetDevicePointer(&ctx->device_base, ctx->host_base, 0);
+    if (err != hipSuccess) {
+        (void) hipGetLastError();
+        GGML_LOG_ERROR("%s: failed to map %.2f MiB of host memory: %s\n",
+                __func__, buffer->size / 1024.0 / 1024.0, hipGetErrorString(err));
+        ggml_backend_cuda_host_coarse_unregister(ctx);
+        return false;
+    }
+
+    // the device must see all CPU writes that came before the registration
+    err = hipDeviceSynchronize();
+    if (err != hipSuccess) {
+        GGML_LOG_ERROR("%s: post-registration synchronization failed: %s\n", __func__, hipGetErrorString(err));
+        ggml_backend_cuda_host_coarse_unregister(ctx);
+        return false;
+    }
+
+    ctx->mapped = true;
+    GGML_LOG_INFO("%s: registered %.2f MiB of coarse-grained mapped host memory, device alias %s the host address\n",
+            __func__, buffer->size / 1024.0 / 1024.0, ctx->device_base == ctx->host_base ? "matches" : "differs from");
+    return true;
+}
+#endif // GGML_USE_HIP && _WIN32
+
+const void * ggml_backend_cuda_host_buffer_device_base(ggml_backend_buffer_t buffer) {
+#if defined(GGML_USE_HIP) && defined(_WIN32)
+    if (!ggml_backend_cuda_host_buffer_is_coarse(buffer)) {
+        return nullptr;
+    }
+
+    const ggml_backend_cuda_host_coarse_context * ctx = (const ggml_backend_cuda_host_coarse_context *) buffer->context;
+    GGML_ASSERT(ctx->mapped);
+    return ctx->device_base;
+#else
+    GGML_UNUSED(buffer);
+    return nullptr;
+#endif
+}
+
+static void * ggml_cuda_host_malloc(size_t size, bool mapped) {
     if (getenv("GGML_CUDA_NO_PINNED") != nullptr) {
         return nullptr;
     }
 
     void * ptr = nullptr;
+#if defined(GGML_USE_HIP)
+    cudaError_t err = mapped ?
+        hipHostMalloc((void **) &ptr, size, hipHostMallocMapped) : cudaMallocHost((void **) &ptr, size);
+#else
+    GGML_UNUSED(mapped);
     cudaError_t err = cudaMallocHost((void **) &ptr, size);
+#endif
     if (err != cudaSuccess) {
         // clear the error
         (void)cudaGetLastError();
@@ -1291,10 +1428,71 @@ static void * ggml_cuda_host_malloc(size_t size) {
     return ptr;
 }
 
+// A weight that a kernel reads in place needs the same zeroed row padding as a device buffer gives it: MMQ loads
+// whole MMQ_ITER_K tiles of src0, so for a quantized matrix whose row length is not a multiple of the tile it reads
+// past the last row and relies on those bytes being finite. Device buffers pad and clear that region in
+// get_alloc_size/init_tensor ([TAG_ALLOC_SIZE_EXPAND]); the host buffer type does the same once host-direct is on.
+static size_t ggml_backend_cuda_host_buffer_type_get_alloc_size(ggml_backend_buffer_type_t buft, const ggml_tensor * tensor) {
+    const ggml_backend_cuda_device_context * dev_ctx = (const ggml_backend_cuda_device_context *) buft->device->context;
+
+    size_t size = ggml_nbytes(tensor);
+    if (dev_ctx->host_direct && ggml_is_quantized(tensor->type)) {
+        const int64_t ne0 = tensor->ne[0];
+        if (ne0 % MATRIX_ROW_PADDING != 0) {
+            GGML_ASSERT(tensor->nb[0] == ggml_element_size(tensor));
+            size += ggml_row_size(tensor->type, MATRIX_ROW_PADDING - ne0 % MATRIX_ROW_PADDING);
+        }
+    }
+    return size;
+}
+
+static enum ggml_status ggml_backend_cuda_host_buffer_init_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor) {
+    if (tensor->view_src != nullptr) {
+        return GGML_STATUS_SUCCESS;
+    }
+
+    if (ggml_is_quantized(tensor->type) && ggml_backend_buffer_get_usage(buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
+        // initialize padding to 0 to avoid possible NaN values
+        const size_t original_size = ggml_nbytes(tensor);
+        const size_t padded_size   = ggml_backend_buft_get_alloc_size(buffer->buft, tensor);
+
+        if (padded_size > original_size) {
+            memset((char *) tensor->data + original_size, 0, padded_size - original_size);
+        }
+    }
+    return GGML_STATUS_SUCCESS;
+}
+
 static ggml_backend_buffer_t ggml_backend_cuda_host_buffer_type_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
-    void * ptr = ggml_cuda_host_malloc(size);
+    const ggml_backend_cuda_device_context * dev_ctx = (const ggml_backend_cuda_device_context *) buft->device->context;
+
+#if defined(GGML_USE_HIP) && defined(_WIN32)
+    if (dev_ctx->host_direct && dev_ctx->host_direct_coarse_min_bytes > 0 && size >= dev_ctx->host_direct_coarse_min_bytes) {
+        void * ptr = VirtualAlloc(nullptr, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE);
+        if (ptr == nullptr) {
+            GGML_LOG_ERROR("%s: VirtualAlloc failed for %.2f MiB with error %lu\n",
+                    __func__, size / 1024.0 / 1024.0, GetLastError());
+            return nullptr;
+        }
+
+        ggml_backend_buffer_t buffer = ggml_backend_cpu_buffer_from_ptr(ptr, size);
+        buffer->buft                 = buft;
+        buffer->context              = new ggml_backend_cuda_host_coarse_context { ptr, nullptr, false, false };
+        buffer->iface.free_buffer    = ggml_backend_cuda_host_coarse_buffer_free_buffer;
+        buffer->iface.get_base       = ggml_backend_cuda_host_coarse_buffer_get_base;
+        buffer->iface.clear          = ggml_backend_cuda_host_coarse_buffer_clear;
+        buffer->iface.init_tensor    = ggml_backend_cuda_host_buffer_init_tensor;
+        return buffer;
+    }
+#endif
+
+    void * ptr = ggml_cuda_host_malloc(size, dev_ctx->host_direct);
 
     if (ptr == nullptr) {
+        if (dev_ctx->host_direct) {
+            GGML_LOG_WARN("%s: failed to allocate %.2f MiB of mapped host memory, falling back to a CPU buffer; "
+                    "host-direct will not apply to it\n", __func__, size / 1024.0 / 1024.0);
+        }
         // fallback to cpu buffer
         return ggml_backend_buft_alloc_buffer(ggml_backend_cpu_buffer_type(), size);
     }
@@ -1302,6 +1500,7 @@ static ggml_backend_buffer_t ggml_backend_cuda_host_buffer_type_alloc_buffer(ggm
     ggml_backend_buffer_t buffer = ggml_backend_cpu_buffer_from_ptr(ptr, size);
     buffer->buft = buft;
     buffer->iface.free_buffer = ggml_backend_cuda_host_buffer_free_buffer;
+    buffer->iface.init_tensor = ggml_backend_cuda_host_buffer_init_tensor;
 
     return buffer;
 }
@@ -1313,7 +1512,7 @@ ggml_backend_buffer_type_t ggml_backend_cuda_host_buffer_type() {
             /* .alloc_buffer     = */ ggml_backend_cuda_host_buffer_type_alloc_buffer,
             /* .get_alignment    = */ ggml_backend_cpu_buffer_type()->iface.get_alignment,
             /* .get_max_size     = */ NULL, // defaults to SIZE_MAX
-            /* .get_alloc_size   = */ ggml_backend_cpu_buffer_type()->iface.get_alloc_size,
+            /* .get_alloc_size   = */ ggml_backend_cuda_host_buffer_type_get_alloc_size,
             /* .is_host          = */ ggml_backend_cpu_buffer_type()->iface.is_host,
         },
         /* .device   = */ ggml_backend_reg_dev_get(ggml_backend_cuda_reg(), 0),
@@ -1326,6 +1525,57 @@ ggml_backend_buffer_type_t ggml_backend_cuda_host_buffer_type() {
 //static bool ggml_backend_buffer_is_cuda_host(ggml_backend_buffer_t buffer) {
 //    return buffer->buft->iface.get_name == ggml_backend_cuda_host_buffer_type_name;
 //}
+
+// Host-direct MoE admission: may a kernel read this weight in place from the mapped host buffer?
+// Only an immutable quantized MUL_MAT_ID weight qualifies, so the input reallocation race that corrupted integrated
+// host buffers (#15034) cannot apply here. The token count limit keeps the op on the MMVQ MUL_MAT_ID kernels, which
+// beat a copy to VRAM at this batch size.
+static bool ggml_cuda_host_direct_allowed(const ggml_backend_cuda_device_context * dev_ctx,
+        const ggml_tensor * op, const ggml_tensor * src) {
+#if defined(GGML_USE_HIP)
+    if (!dev_ctx->host_direct) {
+        return false;
+    }
+
+    if (op->op != GGML_OP_MUL_MAT_ID || src != op->src[0] || !ggml_is_quantized(src->type)) {
+        return false;
+    }
+
+    ggml_backend_buffer_t buffer = src->view_src ? src->view_src->buffer : src->buffer;
+    if (buffer == nullptr || !ggml_backend_buft_is_cuda_host(buffer->buft)) {
+        return false;
+    }
+
+#if defined(_WIN32)
+    // a coarse buffer is not mapped before it is registered, the copy path must be used until then
+    if (!ggml_backend_cuda_host_buffer_is_mapped(buffer)) {
+        return false;
+    }
+#endif
+
+    const int cc = ggml_cuda_info().devices[dev_ctx->device].cc;
+    // the token count up to which ggml_cuda_mul_mat_id dispatches to MMVQ
+    const int64_t mmvq_max = std::min<int64_t>(MMVQ_MAX_BATCH_SIZE, get_mmvq_mmid_max_batch(src->type, cc));
+
+    const int64_t max_batch = dev_ctx->host_direct_max_batch > 0 ? dev_ctx->host_direct_max_batch : mmvq_max;
+    if (op->ne[2] > max_batch) {
+        return false;
+    }
+
+    // MMVQ and MMQ are the only kernel families that resolve the mapped alias. Above the MMVQ limit, mirror the MMQ
+    // condition of ggml_cuda_mul_mat_id: without it the op reaches MMF or the sorted fallback, which reject a host src0.
+    if (op->ne[2] > mmvq_max && !ggml_cuda_should_use_mmq(src->type, cc, op->src[1]->ne[2], src->ne[2])) {
+        return false;
+    }
+
+    return true;
+#else
+    GGML_UNUSED(dev_ctx);
+    GGML_UNUSED(op);
+    GGML_UNUSED(src);
+    return false;
+#endif // GGML_USE_HIP
+}
 
 /// kernels
 
@@ -1410,6 +1660,7 @@ static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const
     using traits = batched_mul_mat_traits<compute_type>;
     using cuda_t = typename traits::cuda_type;
 
+    ggml_cuda_assert_src0_is_device_readable(src0);
     GGML_ASSERT(ggml_is_contiguous(dst));
 
     // Byte offsets and tensor dimensions are currently used in an inconsistent way for dst.
@@ -4416,7 +4667,11 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     if (node->src[j] != nullptr) {
                         assert(node->src[j]->buffer);
                         assert(node->src[j]->buffer->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) ||
-                               (integrated && ggml_backend_buft_is_cuda_host(node->src[j]->buffer->buft)));
+                               (integrated && ggml_backend_buft_is_cuda_host(node->src[j]->buffer->buft)) ||
+                               ggml_cuda_host_direct_allowed(
+                                   (const ggml_backend_cuda_device_context *)
+                                       ggml_backend_reg_dev_get(ggml_backend_cuda_reg(), cuda_ctx->device)->context,
+                                   node, node->src[j]));
                     }
                 }
 #else
@@ -4944,14 +5199,6 @@ void ggml_backend_cuda_unregister_host_buffer(void * buffer) {
 
 
 // backend device
-
-struct ggml_backend_cuda_device_context {
-    int device;
-    std::string name;
-    std::string description;
-    std::string pci_bus_id;
-    int op_offload_min_batch_size;
-};
 
 static const char * ggml_backend_cuda_device_get_name(ggml_backend_dev_t dev) {
     ggml_backend_cuda_device_context * ctx = (ggml_backend_cuda_device_context *)dev->context;
@@ -5618,6 +5865,13 @@ static bool ggml_backend_cuda_device_offload_op(ggml_backend_dev_t dev, const gg
     return get_op_batch_size(op) >= dev_ctx->op_offload_min_batch_size;
 }
 
+// "ggml_backend_host_direct_op" proc address, see ggml_backend_host_direct_op_t
+static bool ggml_backend_cuda_host_direct_op(ggml_backend_dev_t dev, const ggml_tensor * op, const ggml_tensor * src) {
+    ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
+
+    return ggml_cuda_host_direct_allowed(dev_ctx, op, src);
+}
+
 static ggml_backend_event_t ggml_backend_cuda_device_event_new(ggml_backend_dev_t dev) {
 #ifdef GGML_CUDA_NO_PEER_COPY
     GGML_UNUSED(dev);
@@ -5763,6 +6017,15 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_backend_unregister_host_buffer") == 0) {
         return (void *)ggml_backend_cuda_unregister_host_buffer;
     }
+    if (strcmp(name, "ggml_backend_host_direct_op") == 0) {
+        // host-direct weights are a HIP-only path, the predicate answers false everywhere else
+        return (void *)ggml_backend_cuda_host_direct_op;
+    }
+#if defined(GGML_USE_HIP) && defined(_WIN32)
+    if (strcmp(name, "ggml_backend_finalize_host_buffer") == 0) {
+        return (void *)ggml_backend_cuda_finalize_host_buffer;
+    }
+#endif
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_cuda_get_features;
     }
@@ -5788,6 +6051,13 @@ ggml_backend_reg_t ggml_backend_cuda_reg() {
             ggml_backend_cuda_reg_context * ctx = new ggml_backend_cuda_reg_context;
             const int min_batch_size = getenv("GGML_OP_OFFLOAD_MIN_BATCH") ? atoi(getenv("GGML_OP_OFFLOAD_MIN_BATCH")) : 32;
 
+            const char * host_direct_env = getenv("GGML_CUDA_HOST_DIRECT");
+            const bool host_direct = host_direct_env != nullptr && strcmp(host_direct_env, "0") != 0;
+            const int64_t host_direct_max_batch = getenv("GGML_CUDA_HOST_DIRECT_MAX_BATCH") ?
+                atoll(getenv("GGML_CUDA_HOST_DIRECT_MAX_BATCH")) : 0;
+            const int64_t host_direct_coarse_min_mib = getenv("GGML_CUDA_HOST_DIRECT_COARSE_MIN_MIB") ?
+                atoll(getenv("GGML_CUDA_HOST_DIRECT_COARSE_MIN_MIB")) : 1024;
+
             const ggml_cuda_device_info & info = ggml_cuda_info();
             const bool virtual_devices = info.device_count > info.physical_device_count;
 
@@ -5810,6 +6080,9 @@ ggml_backend_reg_t ggml_backend_cuda_reg() {
                     c = std::tolower(c);
                 }
                 dev_ctx->op_offload_min_batch_size = min_batch_size;
+                dev_ctx->host_direct = host_direct;
+                dev_ctx->host_direct_max_batch = host_direct_max_batch > 0 ? host_direct_max_batch : 0;
+                dev_ctx->host_direct_coarse_min_bytes = host_direct_coarse_min_mib > 0 ? (size_t) host_direct_coarse_min_mib*1024*1024 : 0;
 
                 ggml_backend_dev_t dev = new ggml_backend_device {
                     /* .iface   = */ ggml_backend_cuda_device_interface,

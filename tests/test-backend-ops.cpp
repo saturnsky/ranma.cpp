@@ -471,6 +471,63 @@ static bool ggml_is_view_op(enum ggml_op op) {
     return op == GGML_OP_VIEW || op == GGML_OP_RESHAPE || op == GGML_OP_PERMUTE || op == GGML_OP_TRANSPOSE;
 }
 
+// --host-weights allocates the weight context of a test case from the device's *host* buffer type instead of its
+// device buffer type. On ROCm this is the production mapped-host MoE placement, so the element-wise NMSE comparison
+// against the CPU backend becomes a correctness oracle for the host-direct MUL_MAT_ID path.
+static bool host_weights = false;
+
+static ggml_backend_buffer_t test_alloc_weight_tensors(ggml_context * ctx, ggml_backend_t backend, bool host) {
+    if (host) {
+        ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+        ggml_backend_buffer_type_t host_buft = dev ? ggml_backend_dev_host_buffer_type(dev) : nullptr;
+        if (host_buft != nullptr) {
+            return ggml_backend_alloc_ctx_tensors_from_buft(ctx, host_buft);
+        }
+    }
+    return ggml_backend_alloc_ctx_tensors(ctx, backend);
+}
+
+// Mirrors llama-model.cpp: once the weights are written, hand the host buffer to the backend so that it can register
+// it as mapped memory. Without this a large buffer stays unregistered and the backend keeps using the copy path.
+static bool test_finalize_host_weights(ggml_backend_buffer_t buf, ggml_backend_t backend) {
+    if (buf == nullptr) {
+        return true;
+    }
+    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+    ggml_backend_reg_t reg = dev ? ggml_backend_dev_backend_reg(dev) : nullptr;
+    if (reg == nullptr) {
+        return true;
+    }
+    using finalize_host_buffer_t = bool (*)(ggml_backend_buffer_t);
+    auto * finalize = (finalize_host_buffer_t) ggml_backend_reg_get_proc_address(reg, "ggml_backend_finalize_host_buffer");
+    return finalize == nullptr || finalize(buf);
+}
+
+// Mirror the admission rule of ggml_backend_sched. A weight may stay in a host buffer only for the ops that the
+// device accepts; the scheduler asks per op, and a test that computes a graph directly has to ask the same question.
+// Otherwise it hands a host pointer to a kernel that cannot take one.
+static bool test_host_weights_admitted(ggml_cgraph * gf, ggml_backend_buffer_t buf_weights, ggml_backend_t backend) {
+    ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+    if (dev == nullptr || buf_weights == nullptr) {
+        return true;
+    }
+
+    for (int i = 0; i < ggml_graph_n_nodes(gf); i++) {
+        ggml_tensor * node = ggml_graph_node(gf, i);
+        for (int j = 0; j < GGML_MAX_SRC; j++) {
+            ggml_tensor * src = node->src[j];
+            if (src == nullptr || src->buffer != buf_weights) {
+                continue;
+            }
+            if (!ggml_backend_dev_host_direct_op(dev, node, src)) {
+                return false;
+            }
+        }
+    }
+
+    return true;
+}
+
 static bool backend_has_feature(ggml_backend_t backend, const char * feature_name) {
     ggml_backend_dev_t dev = ggml_backend_get_device(backend);
     ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
@@ -1243,6 +1300,8 @@ struct test_case {
     virtual bool run_whole_graph() { return false; }
     virtual std::vector<ggml_tensor *> fusion_test_nodes() { return {}; }
     virtual bool use_weight_context() { return false; }
+    // when true and --host-weights is given, the weight context is allocated from the device's host buffer type
+    virtual bool use_host_weight_buffer() { return false; }
 
     ggml_cgraph * gf = nullptr;
     ggml_cgraph * gb = nullptr;
@@ -1406,7 +1465,7 @@ struct test_case {
 
         ggml_backend_buffer_ptr buf_weights(nullptr);
         if (ctx_weights) {
-            buf_weights.reset(ggml_backend_alloc_ctx_tensors(ctx_weights.get(), backend1));
+            buf_weights.reset(test_alloc_weight_tensors(ctx_weights.get(), backend1, use_host_weight_buffer()));
             if (buf_weights == NULL) {
                 printf("failed to allocate weight tensors [%s] ", ggml_backend_name(backend1));
                 return test_status_t::FAIL;
@@ -1434,6 +1493,19 @@ struct test_case {
         initialize_tensors(ctx.get());
         if (ctx_weights) {
             initialize_tensors(ctx_weights.get());
+            if (use_host_weight_buffer() && !test_finalize_host_weights(buf_weights.get(), backend1)) {
+                printf("failed to finalize host weight buffer [%s] ", ggml_backend_name(backend1));
+                return test_status_t::FAIL;
+            }
+        }
+
+        if (use_host_weight_buffer() && !test_host_weights_admitted(gf, buf_weights.get(), backend1)) {
+            test_result result(std::string(ggml_backend_name(backend1)) + " host-direct", current_op_name, vars(),
+                               "test", false, false, "not supported");
+
+            print_test_result_locked(output_printer, result);
+
+            return test_status_t::NOT_SUPPORTED;
         }
 
         // compare
@@ -1566,7 +1638,7 @@ struct test_case {
 
         ggml_backend_buffer_ptr buf_weights(nullptr);
         if (ctx_weights) {
-            buf_weights.reset(ggml_backend_alloc_ctx_tensors(ctx_weights.get(), backend));
+            buf_weights.reset(test_alloc_weight_tensors(ctx_weights.get(), backend, use_host_weight_buffer()));
             if (buf_weights == NULL) {
                 printf("failed to allocate weight tensors\n");
                 return false;
@@ -1586,11 +1658,24 @@ struct test_case {
         initialize_tensors(ctx.get());
         if (ctx_weights) {
             initialize_tensors(ctx_weights.get());
+            if (use_host_weight_buffer() && !test_finalize_host_weights(buf_weights.get(), backend)) {
+                printf("failed to finalize host weight buffer\n");
+                return false;
+            }
         }
 
         // build graph
         ggml_cgraph * gf = ggml_new_graph_custom(ctx.get(), graph_nodes, false);
         ggml_build_forward_expand(gf, out);
+
+        if (use_host_weight_buffer() && !test_host_weights_admitted(gf, buf_weights.get(), backend)) {
+            test_result result(std::string(ggml_backend_name(backend)) + " host-direct", current_op_name, vars(),
+                               "perf", false, false, "not supported");
+
+            output_printer->print_test_result(result);
+
+            return true;
+        }
 
         // warmup run
         ggml_status status = ggml_backend_graph_compute(backend, gf);
@@ -5096,9 +5181,16 @@ struct test_mul_mat_id : public test_case {
             GGML_ASSERT(n_used <= n_mats);
         }
 
+    bool use_host_weight_buffer() override { return host_weights && ggml_is_quantized(type_a); }
+    bool use_weight_context()     override { return use_host_weight_buffer(); }
+
     ggml_tensor * build_graph(ggml_context * ctx) override {
+        return build_graph(ctx, nullptr);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx, ggml_context * ctx_weights) override {
         // C^T = A * B^T: (k, m) * (k, n) => (m, n)
-        ggml_tensor * as = ggml_new_tensor_3d(ctx, type_a, k, m, n_mats);
+        ggml_tensor * as = ggml_new_tensor_3d(ctx_weights ? ctx_weights : ctx, type_a, k, m, n_mats);
         ggml_set_name(as, "as");
 
         ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_mats, n);
@@ -9951,11 +10043,22 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // 17 rows - 16 and 17 straddle the point where the upper half stops being skipped. The smaller
     // n cover the same row counts on the mat-vec path.
     for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_IQ2_XS, GGML_TYPE_F16}) {
-        for (int n : {1, 15, 16, 17, 31, 32, 33, 47, 48, 49}) {
+        // 2..8 are the token counts that the MUL_MAT_ID mat-vec kernels serve one batch at a time
+        for (int n : {1, 2, 3, 4, 5, 6, 7, 8, 15, 16, 17, 31, 32, 33, 47, 48, 49}) {
             test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 4, 4, false, 512, n, 256));
         }
         // experts that receive no rows at all
         test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 8, 1, false, 512, 1, 256));
+    }
+
+    // a real MoE expert geometry (512 experts, 10 used, n_embd 2048, n_ff_exp 800) at token counts that reach MMQ.
+    // k = 800 is not a multiple of the MMQ K tile, so the kernel reads past the last row of every expert matrix and
+    // relies on the buffer's zeroed row padding; with --host-weights this covers the host buffer type's padding
+    for (int n : {33, 128}) {
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 512, 10, false,  800, n, 2048));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q5_K, GGML_TYPE_F32, 512, 10, false,  800, n, 2048));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q5_1, GGML_TYPE_F32, 512, 10, false, 2048, n,  800));
+        test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q8_0, GGML_TYPE_F32, 512, 10, false, 2048, n,  800));
     }
 
     for (ggml_type type_a : other_types) {
@@ -11919,6 +12022,7 @@ static void usage(char ** argv) {
     printf("    --show-coverage shows test coverage\n");
     printf("    --test-file reads test operators from a test file generated by test-export-graph-ops\n");
     printf("    -j <n> runs tests using <n> parallel worker threads (default: 1, test mode only)\n");
+    printf("    --host-weights allocates quantized weight tensors from the backend device's host buffer type\n");
 }
 
 int main(int argc, char ** argv) {
@@ -11969,6 +12073,12 @@ int main(int argc, char ** argv) {
             } else {
                 usage(argv);
                 return 1;
+            }
+        } else if (strcmp(argv[i], "--host-weights") == 0) {
+            host_weights = true;
+            if (getenv("GGML_CUDA_HOST_DIRECT") == nullptr) {
+                fprintf(stderr, "warning: --host-weights without GGML_CUDA_HOST_DIRECT=1 leaves the weights in a "
+                        "buffer that the backend did not map for kernel access\n");
             }
         } else if (strcmp(argv[i], "--list-ops") == 0) {
             list_all_ops();
