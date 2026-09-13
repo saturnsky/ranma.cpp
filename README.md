@@ -96,6 +96,14 @@ misbehave. Other platforms and backends are not tested and not supported by this
   by 25 GiB while idle, and a shutdown after an idle gap takes 5.7 s instead of 11.8 s. Details and limits:
   [docs/ranma/gpu-heartbeat.md](docs/ranma/gpu-heartbeat.md).
 
+- **RDNA4 small-batch matmul (HIP)** — MMVQ computes four weight rows per block for 3..8 activation columns, and
+  dense Q4_K/Q5_K/Q6_K matmuls switch to MMQ from 5 rows instead of 9. On a Radeon AI PRO R9700 with gemma-4-31B
+  Q4_K_M one decode call with 3 / 4 / 5 / 8 rows went from 48 / 57 / 68 / 99 ms to 43 / 48 / 50 / 51 ms, so the
+  cost per call no longer drops at 9 rows; multi-slot decode with 4 and 8 sequences is 18-23 % and 76-93 % faster.
+  Single-row decode, prompt processing and MoE expert matmuls are unchanged. No switch: the entries are
+  architecture tables like upstream's Ada/Blackwell/CDNA ones. Details and the numerics discussion:
+  [docs/ranma/rdna4-small-batch.md](docs/ranma/rdna4-small-batch.md).
+
 Each feature that lands gets a line here and a page under `docs/ranma/` describing its
 rationale, measured effect, and trade-offs.
 
