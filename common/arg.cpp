@@ -3804,6 +3804,23 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--gpu-heartbeat-seconds"}, "SECONDS",
+        string_format("interval in seconds at which the server records a GPU event on every model device while idle and during model teardown, so the OS does not evict VRAM (default: %.1f; 0 = disabled)", (double) params.gpu_heartbeat_seconds),
+        [](common_params & params, const std::string & value) {
+            size_t used = 0;
+            double seconds = 0.0;
+            try {
+                seconds = std::stod(value, &used);
+            } catch (const std::exception &) {
+                used = 0;
+            }
+            if (used != value.size() || !std::isfinite(seconds) || seconds < 0.0 || seconds > 3600.0) {
+                throw std::invalid_argument("invalid value: must be a number between 0 and 3600");
+            }
+            params.gpu_heartbeat_seconds = (float) seconds;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_GPU_HEARTBEAT_SECONDS"));
+    add_opt(common_arg(
         {"--simple-io"},
         "use basic IO for better compatibility in subprocesses and limited consoles",
         [](common_params & params) {
