@@ -56,6 +56,19 @@ static std::string common_speculative_get_devices_str(const std::vector<ggml_bac
     return result.empty() ? "default" : result;
 }
 
+// format a per-draft-position threshold list for logging, e.g. "0.33,0.60,0.60,0.00"
+static std::string spec_threshold_list_str(const std::vector<float> & thresholds) {
+    if (thresholds.empty()) {
+        return "0.00";
+    }
+    std::string result;
+    for (size_t i = 0; i < thresholds.size(); i++) {
+        if (i > 0) result += ",";
+        result += string_format("%.2f", (double) thresholds[i]);
+    }
+    return result;
+}
+
 struct common_speculative_config {
     common_speculative_type type;
     common_params_speculative params;
@@ -195,7 +208,9 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
         }
 
         SPC_TRC("%s", "adding speculative implementation 'draft-simple'\n");
-        SPC_TRC("- n_max=%d, n_min=%d, p_min=%f\n", this->params.n_max, this->params.n_min, this->params.p_min);
+        SPC_TRC("- n_max=%d, n_min=%d, p_min=%s, p_continue=%s\n", this->params.n_max, this->params.n_min,
+                spec_threshold_list_str(this->params.p_min).c_str(),
+                this->params.p_continue.empty() ? "off" : spec_threshold_list_str(this->params.p_continue).c_str());
         SPC_TRC("- gpu_layers=%d, cache_k=%s, cache_v=%s, ctx_tgt=%s, ctx_dft=%s, devices=[%s]\n",
                 this->params.n_gpu_layers,
                 ggml_type_name(this->params.cache_type_k),
@@ -331,10 +346,11 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
                 }
 
                 // add drafted token for each sequence
-                const llama_token id = cur_p->data[0].id;
+                const llama_token id    = cur_p->data[0].id;
+                const float       p_top = cur_p->data[0].p;
 
                 // only collect very high-confidence draft tokens
-                if (cur_p->data[0].p < params.p_min) {
+                if (p_top < params.p_min_at(i)) {
                     drafting[seq_id] = false;
                     n_drafting--;
 
@@ -352,6 +368,14 @@ struct common_speculative_impl_draft_simple : public common_speculative_impl {
                     (dp.n_max > 0 && dp.n_max <= (int) result.size())) {
                     drafting[seq_id] = false;
                     n_drafting--;
+                    continue;
+                }
+
+                // keep the token but stop drafting below the per-position continue threshold
+                if (p_top < params.p_continue_at(i)) {
+                    drafting[seq_id] = false;
+                    n_drafting--;
+
                     continue;
                 }
 
@@ -458,7 +482,10 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
         , params(params.draft)
     {
         SPC_TRC("%s", "adding speculative implementation 'draft-eagle3'\n");
-        SPC_TRC("- n_max=%d, n_min=%d, p_min=%f, backend_sampling=%d\n", params.draft.n_max, params.draft.n_min, params.draft.p_min, (int) params.draft.backend_sampling);
+        SPC_TRC("- n_max=%d, n_min=%d, p_min=%s, p_continue=%s, backend_sampling=%d\n", params.draft.n_max, params.draft.n_min,
+                spec_threshold_list_str(params.draft.p_min).c_str(),
+                params.draft.p_continue.empty() ? "off" : spec_threshold_list_str(params.draft.p_continue).c_str(),
+                (int) params.draft.backend_sampling);
 
         auto * ctx_tgt = this->params.ctx_tgt;
         auto * ctx_dft = this->params.ctx_dft;
@@ -792,11 +819,12 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
                             common_token_to_piece(ctx_dft, cur_p->data[k].id).c_str());
                 }
 
-                const llama_token id = cur_p->data[0].id;
+                const llama_token id    = cur_p->data[0].id;
+                const float       p_top = cur_p->data[0].p;
 
                 // only collect very high-confidence draft tokens
                 // (configurable via --spec-draft-p-min, set to 0.0 to disable early-stop)
-                if (cur_p->data[0].p < params.p_min) {
+                if (p_top < params.p_min_at(i)) {
                     drafting[seq_id] = false;
                     n_drafting--;
 
@@ -813,6 +841,14 @@ struct common_speculative_impl_draft_eagle3 : public common_speculative_impl {
                 if (params.n_max <= (int) result.size()) {
                     drafting[seq_id] = false;
                     n_drafting--;
+                    continue;
+                }
+
+                // keep the token but stop drafting below the per-position continue threshold
+                if (p_top < params.p_continue_at(i)) {
+                    drafting[seq_id] = false;
+                    n_drafting--;
+
                     continue;
                 }
 
@@ -981,7 +1017,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         is_dflash2     = selector_top_k > 0;
         mask_token_id = llama_vocab_mask(llama_model_get_vocab(model_dft));
 
-        if (is_dspark && this->params.p_min > 0.0f) {
+        if (is_dspark && this->params.p_min_enabled()) {
             char buf[16] = {};
             const bool has_conf =
                 llama_model_meta_val_str(model_dft, "dflash.has_confidence_head", buf, sizeof(buf)) < 0 ||
@@ -992,7 +1028,11 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         }
 
         LOG_INF("%s: adding speculative implementation '%s'\n", __func__, common_speculative_type_to_str(type).c_str());
-        LOG_INF("%s: - n_max=%d, n_min=%d, p_min=%.2f\n", __func__, this->params.n_max, this->params.n_min, this->params.p_min);
+        LOG_INF("%s: - n_max=%d, n_min=%d, p_min=%s\n", __func__, this->params.n_max, this->params.n_min,
+                spec_threshold_list_str(this->params.p_min).c_str());
+        if (this->params.p_continue_enabled()) {
+            LOG_WRN("%s: --spec-draft-p-continue is ignored by block drafters (the whole block is drafted in one decode)\n", __func__);
+        }
         LOG_INF("%s: - block_size=%d, mask_token_id=%d, n_extract=%u, sample_from_anchor=%s\n", __func__,
                 block_size, mask_token_id, target_layer_ids_n, sample_from_anchor ? "true" : "false");
 
@@ -1244,13 +1284,13 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
                     predecessor = (int32_t) std::distance(scores,
                             std::max_element(scores, scores + selector_top_k));
-                    if (params.p_min > 0.0f) {
+                    if (params.p_min_enabled()) {
                         // softmax(scores) at the argmax, i.e. 1 / sum(exp(s_k - s_max))
                         float sum = 0.0f;
                         for (int32_t k = 0; k < selector_top_k; ++k) {
                             sum += std::exp(scores[k] - scores[predecessor]);
                         }
-                        if (1.0f / sum < params.p_min) {
+                        if (1.0f / sum < params.p_min_at(i - 1)) {
                             break;
                         }
                     }
@@ -1265,13 +1305,13 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
             if (is_dspark) {
                 // DSpark: read from the first draft slot, truncate below the confidence threshold
-                const float * conf = params.p_min > 0.0f ? llama_get_embeddings_nextn(ctx_dft) : nullptr;
+                const float * conf = params.p_min_enabled() ? llama_get_embeddings_nextn(ctx_dft) : nullptr;
                 // bonus-anchor drafts read the mask positions only, like DFlash
                 const int32_t i_draft_beg = sample_from_anchor ? 0 : 1;
                 for (int32_t i = i_draft_beg; i < n_block_tokens; ++i) {
                     const int32_t idx = beg + i;
 
-                    if (conf && conf[(size_t) idx * n_embd_dec] < params.p_min) {
+                    if (conf && conf[(size_t) idx * n_embd_dec] < params.p_min_at(i - i_draft_beg)) {
                         break;
                     }
 
@@ -1306,7 +1346,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
                     const llama_token id = cur_p->data[0].id;
 
-                    if (cur_p->data[0].p < params.p_min) {
+                    if (cur_p->data[0].p < params.p_min_at(i - 1)) {
                         break;
                     }
 
@@ -1377,7 +1417,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         n_mtp_layers = std::max(1, (int) llama_model_n_layer_nextn(llama_get_model(ctx_dft)));
 
         SPC_TRC("%s", "adding speculative implementation 'draft-mtp'\n");
-        SPC_TRC("- n_max=%d, n_min=%d, p_min=%.2f, n_embd=%d, backend_sampling=%d\n", this->params.n_max, this->params.n_min, this->params.p_min, n_embd, (int) this->params.backend_sampling);
+        SPC_TRC("- n_max=%d, n_min=%d, p_min=%s, p_continue=%s, n_embd=%d, backend_sampling=%d\n", this->params.n_max, this->params.n_min,
+                spec_threshold_list_str(this->params.p_min).c_str(),
+                this->params.p_continue.empty() ? "off" : spec_threshold_list_str(this->params.p_continue).c_str(),
+                n_embd, (int) this->params.backend_sampling);
         SPC_TRC("- gpu_layers=%d, cache_k=%s, cache_v=%s, ctx_tgt=%s, ctx_dft=%s, devices=[%s]\n",
                 this->params.n_gpu_layers,
                 ggml_type_name(this->params.cache_type_k),
@@ -1680,10 +1723,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 }
 
                 // add drafted token for each sequence
-                const llama_token id = cur_p->data[0].id;
+                const llama_token id    = cur_p->data[0].id;
+                const float       p_top = cur_p->data[0].p;
 
                 // only collect very high-confidence draft tokens
-                if (cur_p->data[0].p < params.p_min) {
+                if (p_top < params.p_min_at(i)) {
                     drafting[seq_id] = false;
                     n_drafting--;
 
@@ -1700,6 +1744,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 if (params.n_max <= (int) result.size()) {
                     drafting[seq_id] = false;
                     n_drafting--;
+                    continue;
+                }
+
+                // keep the token but stop drafting below the per-position continue threshold
+                if (p_top < params.p_continue_at(i)) {
+                    drafting[seq_id] = false;
+                    n_drafting--;
+
                     continue;
                 }
 
