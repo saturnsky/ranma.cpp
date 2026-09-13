@@ -89,6 +89,12 @@ applies, how to switch it, and its limits.
   operands to F16 with a padded row pitch and run hipBLASLt instead of MMQ. Needs `ROCBLAS_USE_HIPBLASLT=1`;
   `GGML_HIP_PREFILL_BLAS=0` turns it off. Same page.
 
+### Server and common tools
+
+- **GPU heartbeat (llama-server)** - `--gpu-heartbeat-seconds 5` records one GPU event per interval while the
+  server is idle and while the model is freed, so that Windows does not evict the VRAM of the process between
+  turns. Off by default. [docs/ranma/gpu-heartbeat.md](docs/ranma/gpu-heartbeat.md)
+
 ## Building
 
 RANMA.cpp builds exactly like upstream. For the primary target, follow the HIP section of
