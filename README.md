@@ -71,6 +71,13 @@ misbehave. Other platforms and backends are not tested and not supported by this
 Each user-visible change gets a line here and a page under `docs/ranma/` that describes what it is, when it
 applies, how to switch it, and its limits.
 
+### RDNA4 kernels (HIP)
+
+- **Small-batch matmul dispatch** - four weight rows per MMVQ block for 3..8 activation columns and a
+  per-type MMVQ/MMQ crossover, so the cost of a decode call no longer rises and then falls with the number of rows
+  in it. This is the range of a speculative verification step and of a server that batches a few slots.
+  [docs/ranma/rdna4-small-batch.md](docs/ranma/rdna4-small-batch.md)
+
 ## Building
 
 RANMA.cpp builds exactly like upstream. For the primary target, follow the HIP section of
