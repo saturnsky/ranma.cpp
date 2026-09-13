@@ -104,6 +104,20 @@ misbehave. Other platforms and backends are not tested and not supported by this
   architecture tables like upstream's Ada/Blackwell/CDNA ones. Details and the numerics discussion:
   [docs/ranma/rdna4-small-batch.md](docs/ranma/rdna4-small-batch.md).
 
+- **Per-position draft thresholds** — `--spec-draft-p-min` takes one probability per draft position and a new
+  `--spec-draft-p-continue` keeps a token in the draft but stops drafting after it. Dropping a token saves one
+  verification row, which only costs something while the batch is still in the MMVQ path; stopping saves one
+  draft-model step, which costs the same at every position. Defaults unchanged. Recommended profile for
+  gemma-4-31B with the Gemma4 MTP head on a Radeon AI PRO R9700:
+
+  ```
+  --spec-draft-p-min 0.33,0.6,0.6,0 --spec-draft-p-continue 0.9 --spec-draft-n-max 15
+  ```
+
+  Measured on 88 SPEED-Bench prompts: 74.1 t/s decode against 28.0 without speculation, 69.5 with no thresholds
+  and 72.6 with the best single `p-min`. Details, the cost curve and the reasoning behind the values:
+  [docs/ranma/spec-draft-thresholds.md](docs/ranma/spec-draft-thresholds.md).
+
 Each feature that lands gets a line here and a page under `docs/ranma/` describing its
 rationale, measured effect, and trade-offs.
 

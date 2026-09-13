@@ -327,9 +327,28 @@ struct common_params_speculative_draft {
     int32_t n_min = 0; // minimum number of draft tokens to use for speculative decoding
 
     float p_split = 0.1f; // speculative decoding split probability
-    float p_min   = 0.0f; // minimum speculative decoding probability (greedy)
+
+    // per-draft-position thresholds, a short list repeats its last value (empty = disabled)
+    std::vector<float> p_min;      // below it the draft token is dropped and drafting stops
+    std::vector<float> p_continue; // below it the draft token is kept but drafting stops
 
     bool backend_sampling = true; // offload draft sampling to the backend (default: on)
+
+    float p_min_at(int pos) const {
+        return p_min.empty() ? 0.0f : p_min[std::min<size_t>((size_t) pos, p_min.size() - 1)];
+    }
+
+    float p_continue_at(int pos) const {
+        return p_continue.empty() ? 0.0f : p_continue[std::min<size_t>((size_t) pos, p_continue.size() - 1)];
+    }
+
+    bool p_min_enabled() const {
+        return std::any_of(p_min.begin(), p_min.end(), [](float p) { return p > 0.0f; });
+    }
+
+    bool p_continue_enabled() const {
+        return std::any_of(p_continue.begin(), p_continue.end(), [](float p) { return p > 0.0f; });
+    }
 
     common_params_model mparams;
 
