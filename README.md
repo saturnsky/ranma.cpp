@@ -96,6 +96,12 @@ applies, how to switch it, and its limits.
   column count per expert, so popular experts re-read their weights less often. Bit-identical;
   `GGML_CUDA_MMQ_ID_NCOLS_OPT_SCALE=1` restores the upstream width. Same page.
 
+### Server and common tools
+
+- **GPU heartbeat (llama-server)** - `--gpu-heartbeat-seconds 5` records one GPU event per interval while the
+  server is idle and while the model is freed, so that Windows does not evict the VRAM of the process between
+  turns. Off by default. [docs/ranma/gpu-heartbeat.md](docs/ranma/gpu-heartbeat.md)
+
 ## Building
 
 RANMA.cpp builds exactly like upstream. For the primary target, follow the HIP section of
