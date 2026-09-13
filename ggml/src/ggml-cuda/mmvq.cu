@@ -381,6 +381,21 @@ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
                 return ne11 <= MMVQ_MAX_BATCH_SIZE;
         }
     }
+    if (GGML_CUDA_CC_IS_RDNA4(cc)) {
+        switch (type) { // tuned on gfx1201
+            case GGML_TYPE_Q1_0:
+                return ne11 <= 3;
+            case GGML_TYPE_Q4_K:
+            case GGML_TYPE_Q5_K:
+                return ne11 <= 4;
+            case GGML_TYPE_NVFP4:
+                return ne11 <= 6;
+            case GGML_TYPE_Q6_K:
+                return ne11 <= 7;
+            default:
+                return ne11 <= MMVQ_MAX_BATCH_SIZE;
+        }
+    }
     if (GGML_CUDA_CC_IS_CDNA(cc)) {
         if (GGML_CUDA_CC_IS_CDNA1(cc)) {
             switch (type) {
@@ -589,6 +604,21 @@ static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int 
             case 7:
             case 8:
                 return 2;
+            default:
+                return 1;
+        }
+    }
+    if (table_id == MMVQ_PARAMETERS_RDNA4) {
+        // With one row per block every block re-reads all columns of y from L2, four rows per block cut that traffic 4x.
+        // Two columns are faster with one row per block.
+        switch (ncols_dst) {
+            case 3:
+            case 4:
+            case 5:
+            case 6:
+            case 7:
+            case 8:
+                return 4;
             default:
                 return 1;
         }
