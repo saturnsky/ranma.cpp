@@ -101,6 +101,9 @@ applies, how to switch it, and its limits.
 - **GPU heartbeat (llama-server)** - `--gpu-heartbeat-seconds 5` records one GPU event per interval while the
   server is idle and while the model is freed, so that Windows does not evict the VRAM of the process between
   turns. Off by default. [docs/ranma/gpu-heartbeat.md](docs/ranma/gpu-heartbeat.md)
+- **Per-position draft thresholds** - `--spec-draft-p-min` takes one probability per draft position, and
+  `--spec-draft-p-continue` keeps a token in the draft but stops drafting after it. Defaults unchanged.
+  [docs/ranma/spec-draft-thresholds.md](docs/ranma/spec-draft-thresholds.md)
 
 ## Building
 

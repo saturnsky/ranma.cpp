@@ -250,9 +250,18 @@ Use exactly one of these options:
 --spec-draft-p-split, --draft-p-split   P
                                         speculative decoding split probability (default: 0.10)
                                         (env: LLAMA_ARG_SPEC_DRAFT_P_SPLIT)
---spec-draft-p-min, --draft-p-min       P
-                                        minimum speculative decoding probability (greedy) (default: 0.00)
+--spec-draft-p-min, --draft-p-min       P0,P1,...
+                                        minimum draft token probability per draft position, comma-separated;
+                                        a token below the value for its position is dropped and drafting stops;
+                                        a short list repeats its last value (default: 0.00)
                                         (env: LLAMA_ARG_SPEC_DRAFT_P_MIN)
+--spec-draft-p-continue                 P0,P1,...
+                                        minimum draft token probability per draft position to keep drafting
+                                        after a kept token, comma-separated; below it the token is kept but
+                                        drafting stops; applies to drafters that draft one token per step
+                                        (draft-simple, draft-eagle3, draft-mtp);
+                                        a short list repeats its last value (default: off)
+                                        (env: LLAMA_ARG_SPEC_DRAFT_P_CONTINUE)
 --spec-draft-ngl, -ngld, --gpu-layers-draft, --n-gpu-layers-draft  N
                                         max. number of draft model layers to store in VRAM, either an exact number, 'auto', or 'all' (default: auto)
                                         (env: LLAMA_ARG_N_GPU_LAYERS_DRAFT)
@@ -260,6 +269,33 @@ Use exactly one of these options:
                                         comma-separated list of devices to use for offloading the draft model
                                         (use --list-devices to see available devices)
 ```
+
+### Per-position draft thresholds
+
+`--spec-draft-p-min` and `--spec-draft-p-continue` take a comma-separated list of probabilities, one per draft
+position. Positions are 0-based and use the same numbering as the server metric
+`spec_decode_num_accepted_tokens_per_pos_total{position="i"}`: position 0 is the first drafted token. A list
+shorter than the draft length repeats its last value, so a single value applies to every position, which is what
+`--spec-draft-p-min 0.8` did before.
+
+At draft position `i`, the top-1 probability of the drafted token is compared against both gates:
+
+- below `p_min[i]` the token is dropped and drafting stops, so the token is never verified;
+- at or above `p_min[i]` but below `p_continue[i]` the token is kept in the draft, but no further draft step is
+  run after it.
+
+The two gates exist because the two costs they trade away are not the same. One extra draft token only adds a row
+to the target-model verification batch, and the marginal cost of that row depends on the batch size and on the
+kernel it lands in (for a dense model it is close to zero once the batch is large enough to use the GEMM path),
+while one extra draft step is a full draft-model decode. A token that is good enough to verify but not good
+enough to build on is therefore worth keeping and worth stopping after: `p_continue` is set higher than `p_min`
+for that position. Because the step costs differ between positions, both lists are per position. The defaults are
+unchanged; the effect was measured with `draft-mtp` only (see `docs/ranma/spec-draft-thresholds.md`).
+
+`p_continue` applies to drafters that produce one token per draft step: `draft-simple`, `draft-eagle3` and
+`draft-mtp`. Block drafters (`draft-dflash`, `draft-dflash2`, `draft-dspark`) compute the whole block in a single
+decode, so there is no later draft step to skip; they honour `p_min` per position and log a warning if
+`p_continue` is set.
 
 ### Draft Model CPU Scheduling Parameters
 

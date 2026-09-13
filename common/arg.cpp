@@ -340,6 +340,32 @@ static bool parse_bool_value(const std::string & value) {
     }
 }
 
+// parse a comma-separated list of per-draft-position probabilities in [0, 1]
+static std::vector<float> parse_spec_draft_threshold_list(const std::string & value) {
+    const auto items = string_split<std::string>(value, ',');
+    std::vector<float> thresholds;
+    thresholds.reserve(items.size());
+    for (const auto & raw : items) {
+        const std::string text = string_strip(raw);
+        if (text.empty()) {
+            throw std::invalid_argument("invalid value");
+        }
+        size_t pos = 0;
+        const double p = std::stod(text, &pos);
+        if (pos != text.size()) {
+            throw std::invalid_argument("invalid value");
+        }
+        if (!(p >= 0.0 && p <= 1.0)) {
+            throw std::invalid_argument("value must be in [0, 1]");
+        }
+        thresholds.push_back((float) p);
+    }
+    if (thresholds.empty()) {
+        throw std::invalid_argument("the list must not be empty");
+    }
+    return thresholds;
+}
+
 [[noreturn]] static void arg_removed(const std::string & msg) {
     throw std::invalid_argument("the argument has been removed. " + msg);
 }
@@ -4198,12 +4224,19 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_P_SPLIT"));
     add_opt(common_arg(
-        {"--spec-draft-p-min", "--draft-p-min"}, "P",
-        string_format("minimum speculative decoding probability (greedy) (default: %.2f)", (double)params.speculative.draft.p_min),
+        {"--spec-draft-p-min", "--draft-p-min"}, "P0,P1,...",
+        string_format("minimum draft token probability per draft position, comma-separated; a token below the value for its position is dropped and drafting stops; a short list repeats its last value (default: %.2f)", (double) params.speculative.draft.p_min_at(0)),
         [](common_params & params, const std::string & value) {
-            params.speculative.draft.p_min = std::stof(value);
+            params.speculative.draft.p_min = parse_spec_draft_threshold_list(value);
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_P_MIN"));
+    add_opt(common_arg(
+        {"--spec-draft-p-continue"}, "P0,P1,...",
+        "minimum draft token probability per draft position to keep drafting after a kept token, comma-separated; below it the token is kept but drafting stops; applies to drafters that draft one token per step (draft-simple, draft-eagle3, draft-mtp); a short list repeats its last value (default: off)",
+        [](common_params & params, const std::string & value) {
+            params.speculative.draft.p_continue = parse_spec_draft_threshold_list(value);
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_P_CONTINUE"));
     add_opt(common_arg(
         {"--spec-draft-backend-sampling"},
         {"--no-spec-draft-backend-sampling"},
