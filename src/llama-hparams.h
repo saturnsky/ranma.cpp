@@ -273,6 +273,9 @@ struct llama_hparams {
     uint32_t lilicorr_layers         = 0;
     float    lilicorr_vector_eps     = 0.0f;
     float    lilicorr_logit_scale    = 0.0f;
+    // DSV4 draft with the V4.1 rules: hyper-connection mixes lag by one sublayer, the last FFN mix
+    // collapses the copies (no output_hc_* head), and only the low-rank q is normalized
+    bool     dflash_dsv41            = false;
 
     // llama4 smallthinker
     uint32_t n_moe_layer_step        = 0;
