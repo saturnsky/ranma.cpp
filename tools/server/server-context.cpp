@@ -6,8 +6,10 @@
 #include "server-queue.h"
 #include "server-schema.h"
 #include "server-stream.h"
+#include "server-gpu-heartbeat.h"
 
 #include "build-info.h"
+#include "../../src/llama-ext.h" // staging API: llama_model_n_devices / llama_model_get_device (used by the GPU heartbeat)
 #include "common.h"
 #include "fit.h"
 #include "llama.h"
@@ -37,6 +39,19 @@
 #endif
 
 constexpr int HTTP_POLLING_SECONDS = 1;
+
+// collect the devices a model was placed on, for the GPU heartbeat
+static void server_collect_model_devices(const llama_model * model, std::vector<ggml_backend_dev_t> & devices_out) {
+    if (model == nullptr) {
+        return;
+    }
+    for (int i = 0; i < llama_model_n_devices(model); i++) {
+        ggml_backend_dev_t dev = llama_model_get_device(model, i);
+        if (dev != nullptr && std::find(devices_out.begin(), devices_out.end(), dev) == devices_out.end()) {
+            devices_out.push_back(dev);
+        }
+    }
+}
 
 static common_speculative_output_limits server_output_limits(const common_params & params) {
     if (params.embedding ||
@@ -933,9 +948,13 @@ private:
 
     bool sleeping = false;
 
+    server_gpu_heartbeat gpu_heartbeat;
+
     int64_t t_last_load_progress_ms = 0;
 
     void destroy() {
+        gpu_heartbeat.begin_shutdown();
+
         spec.reset();
         spec_init.reset();
 
@@ -949,6 +968,8 @@ private:
 
         mtmd_free(mctx);
         mctx = nullptr;
+
+        gpu_heartbeat.release();
     }
 
     void handle_sleeping_state(bool new_state) {
@@ -1382,6 +1403,16 @@ private:
 
         model_aliases = params_base.model_alias;
         model_tags    = params_base.model_tags;
+
+        // keep the model resident in VRAM while the server is idle, see docs/ranma/gpu-heartbeat.md
+        // note: this is also reached when resuming from the sleeping state, which reloads the model
+        {
+            std::vector<ggml_backend_dev_t> heartbeat_devices;
+            server_collect_model_devices(model_tgt, heartbeat_devices);
+            server_collect_model_devices(model_dft, heartbeat_devices);
+
+            gpu_heartbeat.init(heartbeat_devices, params_base.gpu_heartbeat_seconds);
+        }
 
         // propagate new defaults back to caller
         params = params_base;
@@ -2379,6 +2410,13 @@ private:
             return false;
         }
 
+        // a state-changing task must not overlap an in-flight heartbeat pulse
+        if (task.type != SERVER_TASK_TYPE_METRICS &&
+            task.type != SERVER_TASK_TYPE_SLOT_GET &&
+            task.type != SERVER_TASK_TYPE_GET_LORA) {
+            gpu_heartbeat.set_idle(false);
+        }
+
         switch (task.type) {
             case SERVER_TASK_TYPE_COMPLETION:
             case SERVER_TASK_TYPE_INFILL:
@@ -2818,11 +2856,15 @@ private:
             if (all_idle) {
                 SRV_TRC("%s", "all slots are idle\n");
 
+                gpu_heartbeat.set_idle(true);
+
                 metrics_flush_idle();
 
                 return; // skip further processing
 
             } else {
+                gpu_heartbeat.set_idle(false);
+
                 SRV_DBG("%s", "posting NEXT_RESPONSE\n");
 
                 server_task task(SERVER_TASK_TYPE_NEXT_RESPONSE);
