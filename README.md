@@ -81,6 +81,21 @@ misbehave. Other platforms and backends are not tested and not supported by this
   path, on both a 16 GiB and a 32 GiB expert placement. Details, limits and the full tables:
   [docs/ranma/host-direct-moe.md](docs/ranma/host-direct-moe.md).
 
+- **GPU heartbeat (llama-server)** — while the server is idle, and while the model is being torn down, a worker
+  thread records one GPU event on every device that holds model buffers, once per interval. On Windows the video
+  memory manager evicts a process' whole VRAM residency after about 10 s without a submission, which costs several
+  seconds of paging on the next request and parks the evicted copy in system RAM until then. Off by default.
+  Recommended value:
+
+  ```
+  --gpu-heartbeat-seconds 5
+  ```
+
+  Measured on a Radeon AI PRO R9700 with Qwen3.8-Flash-Next UD-Q4_K_XL and 26 GiB resident in VRAM: the first token
+  after a 15-60 s idle gap costs 3-16 s without the heartbeat and 0.2 s with it, available system RAM no longer drops
+  by 25 GiB while idle, and a shutdown after an idle gap takes 5.7 s instead of 11.8 s. Details and limits:
+  [docs/ranma/gpu-heartbeat.md](docs/ranma/gpu-heartbeat.md).
+
 Each feature that lands gets a line here and a page under `docs/ranma/` describing its
 rationale, measured effect, and trade-offs.
 
