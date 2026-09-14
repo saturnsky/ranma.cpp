@@ -82,8 +82,8 @@ on). `llama-bench` takes the same options plus its own `--expert-cache off|cold|
 (`benchmark.md`).
 
 Debug environment variables, read once at startup: `RANMA_EXPERT_TRACE=<mask>` turns on log lines (1
-install, 2 profile); `RANMA_EXPERT_VERIFY=1` reads every resident slice back after each install and
-compares it with its source (slow; used by the correctness checks).
+install, 2 profile, 4 prompt-processing); `RANMA_EXPERT_VERIFY=1` reads every resident slice back
+after each install and compares it with its source (slow; used by the correctness checks).
 
 The profile directory is tied to the model: a `manifest.json` per bank records the routed-expert
 geometry (layer count, expert count, per-kind bytes and types), and a store whose manifest does not
@@ -117,7 +117,8 @@ from cold. The store format is version 2; there is no reader for older layouts.
 - **`--load-mode none` is required.** With the default mmap load the experts are mapped into
   `CPU_Mapped` buffers, host-direct never engages and the cache finds no routed context (it logs
   "not available for this model"). The loader already warns about that combination.
-- **The arena is read on the in-place kernels only.** A larger batch, or host-direct off, copies the
+- **The arena is read on the in-place kernels only.** MMVQ (decode) and MMQ (prompt processing up
+  to `GGML_CUDA_HOST_DIRECT_MAX_BATCH` tokens) read it. A larger batch, or host-direct off, copies the
   whole expert weight to VRAM through the scheduler and reads the copy; that path is untouched.
 - **Startup without a profile is a random placement.** The server seeds a fixed placement from
   `--expert-seed` and evolves it at request boundaries once a profile directory is given; the first

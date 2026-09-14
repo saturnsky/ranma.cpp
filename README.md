@@ -136,6 +136,14 @@ misbehave. Other platforms and backends are not tested and not supported by this
   gains nothing, so the gain is the profile. Logits identical with the cache off and on. Details and limits:
   [docs/ranma/expert-cache.md](docs/ranma/expert-cache.md).
 
+- **Expert cache in prompt processing and delta installs (HIP)** - the in-place MMQ kernels read a resident expert
+  from the cache arena too, so a prompt batch hits the same cache decode hits, and an install moves only the experts
+  that changed between two plans. No option, both follow the expert cache being on. Measured on a Radeon AI PRO
+  R9700 with Qwen3.8-Flash-Next UD-Q4_K_XL: prompt processing 637 -> 937 t/s at depth 0 with a 20 GiB budget against
+  a random placement of the same budget, no change with 3 GiB (a prompt ubatch reads almost every expert once, so
+  only the resident fraction helps it); a delta install copies 53 to 69 of 1027 slices in 11 to 12 ms. Details:
+  [docs/ranma/expert-cache-prefill.md](docs/ranma/expert-cache-prefill.md).
+
 Each feature that lands gets a line here and a page under `docs/ranma/` describing its
 rationale, measured effect, and trade-offs.
 

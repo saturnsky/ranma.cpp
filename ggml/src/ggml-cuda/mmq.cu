@@ -3,6 +3,9 @@
 #include "quantize.cuh"
 #include "mmid.cuh"
 #include "mapped-host.cuh"
+#if defined(GGML_USE_HIP)
+#include "expert-controller.cuh"
+#endif
 
 #include <cstdint>
 
@@ -103,10 +106,21 @@ void ggml_cuda_mul_mat_q(
     GGML_ASSERT(        nb0        == ts_dst);
     GGML_ASSERT(!ids || ids->nb[0] == ggml_type_size(ids->type));
 
-    const char  * src0_d = (const char  *) src0->data;
+    const char    * src0_d        = (const char  *) src0->data;
+    const char    * x_cache       = nullptr;
+    const int32_t * x_cache_slots = nullptr;
 #if defined(GGML_USE_HIP)
-    if (ggml_backend_buffer_is_host(src0->buffer)) {
-        src0_d = (const char *) ggml_hip_mapped_host_device_alias(src0);
+    {
+        if (ggml_backend_buffer_is_host(src0->buffer)) {
+            src0_d = (const char *) ggml_hip_mapped_host_device_alias(src0);
+            if (ids) {
+                // expert cache: resident experts of this tensor are read from the VRAM arena, and in
+                // exclusive mode everything else from the host arena
+                const ggml_cuda_expert_lookup cached = ggml_cuda_expert_lookup_tensor(src0);
+                x_cache       = (const char *) cached.data;
+                x_cache_slots = cached.slots;
+            }
+        }
     }
 #else
     ggml_cuda_assert_src0_is_device_readable(src0);
@@ -129,7 +143,6 @@ void ggml_cuda_mul_mat_q(
 
     const int64_t s01 = src0->nb[1] / ts_src0;
     const int64_t s1  =  dst->nb[1] / ts_dst;
-    const int64_t s02 = src0->nb[2] / ts_src0;
     const int64_t s2  =  dst->nb[2] / ts_dst;
     const int64_t s03 = src0->nb[3] / ts_src0;
     const int64_t s3  =  dst->nb[3] / ts_dst;
@@ -176,8 +189,9 @@ void ggml_cuda_mul_mat_q(
         const mmq_args args = {
             src0_d, src0->type, (const int *) src1_q8_1.ptr, nullptr, nullptr, dst_d,
             src0->type == GGML_TYPE_NVFP4 && use_native_fp4 ? src1_scale.ptr : nullptr,
+            nullptr, nullptr,
             ne00, ne01, ne1, s01, ne11, s1,
-            ne02, ne12, s02, s12, s2,
+            ne02, ne12, (int64_t) nb02, s12, s2,
             ne03, ne13, s03, s13, s3,
             ne1, ne1};
         ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
@@ -263,8 +277,9 @@ void ggml_cuda_mul_mat_q(
     const mmq_args args = {
         src0_d, src0->type, (const int *) src1_q8_1.get(), ids_dst.get(), expert_bounds.get(), dst_d,
         src1_scale.ptr,
+        x_cache, x_cache_slots,
         ne00, ne01, ne_get_rows, s01, ne_get_rows, s1,
-        ne02, ne02, s02, s12, s2,
+        ne02, ne02, (int64_t) nb02, s12, s2,
         ne03, ne13, s03, s13, s3,
         ne12, ncols_opt};
 
