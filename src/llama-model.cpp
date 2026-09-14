@@ -1178,6 +1178,11 @@ struct llama_model::impl {
     bool has_tensor_overrides;
 
     std::vector<float> tensor_split_owned;
+
+    // ranma expert cache: the backend table that accepted this model's config, and the context that
+    // holds the routed expert weights it registered
+    const ggml_expert_iface * expert_iface = nullptr;
+    ggml_context *            expert_ctx   = nullptr;
 };
 
 llama_model::llama_model(const llama_model_params & params) : params(params), pimpl(std::make_unique<impl>()) {
@@ -1194,6 +1199,15 @@ llama_model::~llama_model() {
     for (auto * lora : loras) {
         delete lora;
     }
+    // the expert cache holds pointers into the weight contexts, release it before they go
+    if (pimpl->expert_iface && pimpl->expert_ctx) {
+        pimpl->expert_iface->release(pimpl->expert_ctx);
+        pimpl->expert_ctx = nullptr;
+    }
+}
+
+const ggml_expert_iface * llama_model::expert_iface() const {
+    return pimpl->expert_ctx ? pimpl->expert_iface : nullptr;
 }
 
 void llama_model_base::load_stats(llama_model_loader & ml) {
@@ -1413,6 +1427,25 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     const bool use_mmap_buffer = true;
 
     this->ml = &ml; // to be used by create_tensor() and load_arch_tensors()
+
+    // ranma expert cache: hand the config to the first backend that implements the cache, before
+    // any weight buffer exists. A backend that refuses (cache off, second model) leaves the model uncached.
+    if (params.expert_config != nullptr && !ml.no_alloc) {
+        for (const auto & dev : devices) {
+            auto * get_iface = (ggml_backend_expert_iface_t) ggml_backend_reg_get_proc_address(
+                    ggml_backend_dev_backend_reg(dev.dev), GGML_EXPERT_IFACE_PROC_NAME);
+            const ggml_expert_iface * iface = get_iface ? get_iface() : nullptr;
+            if (iface == nullptr || iface->abi_version != GGML_EXPERT_ABI_VERSION) {
+                continue;
+            }
+            if (iface->configure(params.expert_config)) {
+                pimpl->expert_iface = iface;
+            } else {
+                LLAMA_LOG_INFO("%s: expert cache not enabled for this model\n", __func__);
+            }
+            break;
+        }
+    }
 
     if (ml.use_mmap && params.load_mode == LLAMA_LOAD_MODE_AUTO) {
         for (const auto & dev : devices) {
@@ -1776,6 +1809,10 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 }
             } else {
                 buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft); // real buffer
+                if (buf && pimpl->expert_iface && !pimpl->expert_ctx &&
+                        pimpl->expert_iface->register_context(ctx, buf, ml.get_arch_name().c_str())) {
+                    pimpl->expert_ctx = ctx;
+                }
             }
             if (buf == nullptr) {
                 throw std::runtime_error(format("unable to allocate %s buffer", ggml_backend_buft_name(buft)));
@@ -1860,6 +1897,14 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 throw std::runtime_error(format("failed to finalize %s model buffer",
                         ggml_backend_buffer_name(buf.get())));
             }
+        }
+    }
+
+    // ranma expert cache: the weights are in place and the host buffers are registered, so the
+    // arenas can be planned, allocated and filled before the first graph is captured
+    if (pimpl->expert_iface && pimpl->expert_ctx) {
+        if (!pimpl->expert_iface->finalize()) {
+            LLAMA_LOG_WARN("%s: expert cache is not active for this model (see the backend log)\n", __func__);
         }
     }
 
@@ -2793,6 +2838,7 @@ llama_model_params llama_model_default_params() {
         /*.no_host                     =*/ false,
         /*.no_alloc                    =*/ false,
         /*.load_mtp                    =*/ false,
+        /*.expert_config               =*/ nullptr,
     };
 
     return result;

@@ -376,8 +376,25 @@ if (NOT LLAMA_USE_SYSTEM_GGML)
     llama_build_and_test(test-alloc.cpp)
 endif()
 
+# ranma: expert profile store test (no GPU)
+llama_build_and_test(test-expert-profile-store.cpp
+    ${PROJECT_SOURCE_DIR}/ggml/src/ggml-cuda/expert-profile-store.cpp
+    ${PROJECT_SOURCE_DIR}/ggml/src/ggml-cuda/expert-os-win32.cpp
+    ${PROJECT_SOURCE_DIR}/ggml/src/ggml-cuda/expert-os-posix.cpp)
+target_include_directories(test-expert-profile-store PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src/ggml-cuda ${PROJECT_SOURCE_DIR}/ggml/src)
+
+# ranma: expert cache policy tests (no GPU)
+llama_build_and_test(test-expert-geometry.cpp)
+target_include_directories(test-expert-geometry PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src/ggml-cuda)
+llama_build_and_test(test-expert-plan.cpp)
+target_include_directories(test-expert-plan PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src/ggml-cuda)
+llama_build_and_test(test-expert-score.cpp)
+target_include_directories(test-expert-score PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src/ggml-cuda)
+llama_build_and_test(test-expert-config.cpp)
+
 llama_build(test-export-graph-ops.cpp)
 if (TARGET gguf-model-data)
     target_link_libraries(test-export-graph-ops PRIVATE gguf-model-data)
     target_compile_definitions(test-export-graph-ops PRIVATE LLAMA_HF_FETCH)
 endif()
+

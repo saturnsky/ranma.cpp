@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <filesystem>
 #include <iterator>
 #include <map>
 #include <numeric>
@@ -20,6 +21,9 @@
 #include <unordered_set>
 
 #include "arg.h"
+#include "expert-policy.h"
+#include "bench-expert-profiles.h"
+#include "bench-expert-options.h"
 #include "build-info.h"
 #include "common.h"
 #include "download.h"
@@ -375,6 +379,7 @@ struct cmd_params {
     bool                             no_warmup;
     output_formats                   output_format;
     output_formats                   output_format_stderr;
+    bench_expert_options             expert;
     llama_ple_prefetch               ple_prefetch;
 };
 
@@ -421,6 +426,7 @@ static const cmd_params cmd_params_defaults = {
     /* no_warmup            */ false,
     /* output_format        */ MARKDOWN,
     /* output_format_stderr */ NONE,
+    /* expert               */ {},
     /* ple_prefetch         */ LLAMA_PLE_PREFETCH_ALWAYS,
 };
 
@@ -455,6 +461,13 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("                                                    (default: unused)\n");
     printf("  -hft, --hf-token <token>                          Hugging Face access token\n");
     printf("                                                    (default: value from HF_TOKEN environment variable)\n");
+    printf("  --expert-cache <off|cold|warm>                  explicit expert benchmark policy (omitted: original bench)\n");
+    printf("  --expert-l1-mib N                          L1 MiB; cold/warm require >0, off requires0\n");
+    printf("  --expert-profile-dir PATH                     cold output / warm immutable input profiles\n");
+    printf("  --expert-seed N                               fixed placement and benchmark input seed (default1)\n");
+    printf("  --expert-profile-archive                      retain profile records outside the score window\n");
+    printf("  --expert-profile-keep                         keep the temporary warm profile at exit\n");
+    printf("  --expert-profile-restore-each                 restore warm profile and reload placement each repetition\n");
     printf("  --ple-prefetch <off|prefill|always>           batched per-layer embedding prefetch (default: always)\n");
     printf("  --offline                                         Offline mode: forces use of cache, prevents network access\n");
     printf("                                                    (default: disabled)\n");
@@ -570,6 +583,8 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                     invalid_param = true;
                     break;
                 }
+            } else if (params.expert.parse(arg, argc, argv, i)) {
+                continue;
             } else if (arg == "-m" || arg == "--model") {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -1097,6 +1112,26 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
         exit(1);
     }
 
+    try {
+        (void) params.expert.config();
+        if (params.expert.warm() && params.expert.reset) { throw std::invalid_argument("warm cannot reset its source profile"); }
+        if (params.expert.enabled() && params.reps < 1) { throw std::invalid_argument("expert benchmarks need repetitions > 0"); }
+        if (params.expert.enabled()) {
+            if (!params.n_cpu_moe.empty() || !params.tensor_buft_overrides.empty() ||
+                    !params.fit_params_target.empty() || !params.fit_params_min_ctx.empty()) {
+                throw std::invalid_argument("expert benchmark owns expert placement; do not combine -ncmoe, -ot or fitting");
+            }
+            for (auto lm : params.load_mode) {
+                if (lm != LLAMA_LOAD_MODE_NONE) { throw std::invalid_argument("expert benchmark needs -lm none"); }
+            }
+            params.load_mode = {LLAMA_LOAD_MODE_NONE};
+            for (bool no_host : params.no_host) { if (no_host) { throw std::invalid_argument("expert benchmark needs host buffers"); } }
+        }
+    } catch (const std::exception & e) {
+        fprintf(stderr, "error: %s\n", e.what());
+        exit(1);
+    }
+
     if (!params.hf_repo.empty()) {
         for (size_t i = 0; i < params.hf_repo.size(); i++) {
             common_params p;
@@ -1506,6 +1541,9 @@ struct test {
     int                      n_depth;
     std::string              test_time;
     std::vector<uint64_t>    samples_ns;
+    bench_expert_options expert;
+    std::string expert_runs;
+    std::vector<uint64_t> expert_control_ns, expert_total_ns;
 
     test(const cmd_params_instance & inst, const llama_model * lmodel, const llama_context * ctx) :
         cpu_info(get_cpu_info()),
@@ -1601,6 +1639,9 @@ struct test {
             "embeddings",
             "no_op_offload",  "no_host",        "fit_target",    "fit_min_ctx",
             "n_prompt",       "n_gen",          "n_depth",
+            "expert_cache", "expert_l1_mib",
+            "expert_profile_dir", "expert_profile_runs", "expert_seed",
+            "expert_control_ns", "expert_total_ns",
             "test_time",      "avg_ns",         "stddev_ns",     "avg_ts",         "stddev_ts"
         };
         return fields;
@@ -1613,7 +1654,9 @@ struct test {
             field == "poll" || field == "model_size" || field == "model_n_params" || field == "n_gpu_layers" ||
             field == "main_gpu" || field == "n_prompt" || field == "n_gen" || field == "n_depth" || field == "avg_ns" ||
             field == "stddev_ns" || field == "no_op_offload" || field == "n_cpu_moe" ||
-            field == "fit_target" || field == "fit_min_ctx" || field == "flash_attn") {
+            field == "fit_target" || field == "fit_min_ctx" || field == "flash_attn" ||
+            field == "expert_l1_mib" || field == "expert_seed" ||
+            field == "expert_control_ns" || field == "expert_total_ns") {
             return INT;
         }
         if (field == "f16_kv" || field == "no_kv_offload" || field == "cpu_strict" ||
@@ -1702,6 +1745,13 @@ struct test {
                                             std::to_string(n_prompt),
                                             std::to_string(n_gen),
                                             std::to_string(n_depth),
+                                            expert.enabled() ? expert.mode : "legacy",
+                                            std::to_string(expert.l1_mib),
+                                            expert.profile,
+                                            expert_runs,
+                                            std::to_string(expert.seed),
+                                            std::to_string(expert_control_ns.empty() ? 0 : ::avg(expert_control_ns)),
+                                            std::to_string(expert_total_ns.empty() ? 0 : ::avg(expert_total_ns)),
                                             test_time,
                                             std::to_string(avg_ns()),
                                             std::to_string(stdev_ns()),
@@ -1890,6 +1940,9 @@ struct markdown_printer : public printer {
         if (field == "no_host") {
             return 4;
         }
+        if (field == "expert_ctl_ms") {
+            return 13;
+        }
 
         int width = std::max((int) field.length(), 10);
 
@@ -2026,6 +2079,12 @@ struct markdown_printer : public printer {
         if (params.fit_params_min_ctx.size() > 1 || params.fit_params_min_ctx != cmd_params_defaults.fit_params_min_ctx) {
             fields.emplace_back("fit_min_ctx");
         }
+        if (params.expert.enabled()) {
+            fields.emplace_back("expert_cache");
+            // avg_ts is compute only with the cache on; without this column a quoted row cannot be
+            // compared with a plain one.
+            fields.emplace_back("expert_ctl_ms");
+        }
         fields.emplace_back("test");
         fields.emplace_back("t/s");
 
@@ -2082,6 +2141,10 @@ struct markdown_printer : public printer {
                 value = buf;
             } else if (field == "t/s") {
                 snprintf(buf, sizeof(buf), "%.2f ± %.2f", t.avg_ts(), t.stdev_ts());
+                value = buf;
+            } else if (field == "expert_ctl_ms") {
+                const uint64_t ns = t.expert_control_ns.empty() ? 0 : ::avg(t.expert_control_ns);
+                snprintf(buf, sizeof(buf), "%.2f", ns/1e6);
                 value = buf;
             } else if (vmap.find(field) != vmap.end()) {
                 value = vmap.at(field);
@@ -2202,8 +2265,9 @@ static bool test_gen(llama_context * ctx, int n_gen, int n_threads) {
 
 static void llama_null_log_callback(enum ggml_log_level level, const char * text, void * user_data) {
     (void) level;
-    (void) text;
     (void) user_data;
+    // Expert metrics have their own trace gate and must survive the default quiet benchmark log.
+    if (strncmp(text, "expert_metrics ", 15) == 0) { fputs(text, stderr); }
 }
 
 static std::unique_ptr<printer> create_printer(output_formats format) {
@@ -2286,6 +2350,14 @@ int llama_bench(int argc, char ** argv) {
 
     std::vector<cmd_params_instance> params_instances = get_cmd_params_instances(params);
 
+    std::unique_ptr<bench_expert_profiles> profiles;
+    try { profiles.reset(new bench_expert_profiles(params.expert)); }
+    catch (const std::exception & e) { fprintf(stderr, "expert benchmark: %s\n", e.what()); return 1; }
+    common_expert expert;
+    bool expert_initialized = false;
+    const int expert_batch = *std::max_element(params.n_batch.begin(), params.n_batch.end());
+    const int expert_ubatch = *std::max_element(params.n_ubatch.begin(), params.n_ubatch.end());
+
     llama_model *               lmodel    = nullptr;
     const cmd_params_instance * prev_inst = nullptr;
 
@@ -2297,218 +2369,312 @@ int llama_bench(int argc, char ** argv) {
     auto params_count = params_instances.size();
     for (const auto & inst : params_instances) {
         params_idx++;
-        if (params.progress) {
-            fprintf(stderr, "llama-bench: benchmark %d/%zu: starting\n", params_idx, params_count);
-        }
-        auto mparams = inst.to_llama_mparams();
-        auto cparams = inst.to_llama_cparams();
-        // not a sweep dimension: one value for the whole run
-        cparams.ple_prefetch = params.ple_prefetch;
-
-        bool do_fit = inst.fit_target != cmd_params_defaults.fit_params_target[0] ||
-                      inst.fit_min_ctx != cmd_params_defaults.fit_params_min_ctx[0];
-
-        std::vector<float> fit_tensor_split(llama_max_devices(), 0.0f);
-        std::vector<llama_model_tensor_buft_override> fit_overrides(llama_max_tensor_buft_overrides(), {nullptr, nullptr});
-
-        if (do_fit) {
-            // free the previous model so fit sees full free VRAM
-            if (lmodel) {
-                llama_model_free(lmodel);
-                lmodel    = nullptr;
-                prev_inst = nullptr;
+        const int independent_reps = params.expert.restore_each ? params.reps : 1;
+        // --expert-profile-restore-each runs one independent process-like repetition per pass and
+        // reports their concatenation as one row.
+        struct rep_totals {
+            std::vector<uint64_t> samples, control, total;
+            std::string profiles;
+            void add(const test & t) {
+                samples.insert(samples.end(), t.samples_ns.begin(), t.samples_ns.end());
+                control.insert(control.end(), t.expert_control_ns.begin(), t.expert_control_ns.end());
+                total.insert(total.end(), t.expert_total_ns.begin(), t.expert_total_ns.end());
+                if (!profiles.empty()) { profiles += ";"; }
+                profiles += t.expert_runs;
+            }
+            void store(test & t) const {
+                t.samples_ns = samples; t.expert_control_ns = control; t.expert_total_ns = total;
+                t.expert_runs = profiles;
+            }
+        } reps;
+        for (int expert_rep = 0; expert_rep < independent_reps; ++expert_rep) {
+            auto run_expert = params.expert;
+            if (run_expert.enabled() && run_expert.mode != "off") { run_expert.profile = profiles->active.string(); }
+            if (run_expert.restore_each) {
+                expert.release(); expert_initialized = false;
+                if (lmodel) { llama_model_free(lmodel); lmodel = nullptr; prev_inst = nullptr; }
+                try { profiles->restore(); }
+                catch (const std::exception & e) { fprintf(stderr, "expert restore: %s\n", e.what()); return 1; }
+                cstate.depth = -1; cstate.buf.clear();
+                std::srand(1); // Restore the input stream with the independent placement.
+            }
+            if (params.progress) {
+                if (independent_reps > 1) {
+                    fprintf(stderr, "llama-bench: benchmark %d/%zu: starting independent repetition %d/%d\n",
+                        params_idx, params_count, expert_rep + 1, independent_reps);
+                } else {
+                    fprintf(stderr, "llama-bench: benchmark %d/%zu: starting\n", params_idx, params_count);
+                }
+            }
+            auto mparams = inst.to_llama_mparams();
+            auto cparams = inst.to_llama_cparams();
+            // not a sweep dimension: one value for the whole run
+            cparams.ple_prefetch = params.ple_prefetch;
+            auto expert_config = run_expert.config(expert_batch, expert_ubatch);
+            std::vector<llama_model_tensor_buft_override> expert_overrides;
+            if (run_expert.enabled()) {
+                expert_overrides = {llm_ffn_exps_cpu_override(), {nullptr, nullptr}};
+                mparams.tensor_buft_overrides = expert_overrides.data();
+                mparams.expert_config = &expert_config;
             }
 
-            // use default n_gpu_layers and n_ctx so common_fit_params can adjust them
-            mparams.n_gpu_layers          = llama_model_default_params().n_gpu_layers;
-            mparams.tensor_split          = fit_tensor_split.data();
-            mparams.tensor_buft_overrides = fit_overrides.data();
-            cparams.n_ctx                 = 0;
+            bool do_fit = inst.fit_target != cmd_params_defaults.fit_params_target[0] ||
+                          inst.fit_min_ctx != cmd_params_defaults.fit_params_min_ctx[0];
 
-            std::vector<size_t> margins(llama_max_devices(), inst.fit_target * 1024 * 1024);
+            std::vector<float> fit_tensor_split(llama_max_devices(), 0.0f);
+            std::vector<llama_model_tensor_buft_override> fit_overrides(llama_max_tensor_buft_overrides(), {nullptr, nullptr});
 
-            uint32_t n_ctx_needed = inst.n_prompt + inst.n_gen + inst.n_depth;
-            cparams.n_ctx = std::max(cparams.n_ctx, n_ctx_needed);
+            if (do_fit) {
+                // free the previous model so fit sees full free VRAM
+                if (lmodel) {
+                    llama_model_free(lmodel);
+                    lmodel    = nullptr;
+                    prev_inst = nullptr;
+                }
 
-            common_fit_params(inst.model.c_str(), &mparams, &cparams,
-                fit_tensor_split.data(),
-                fit_overrides.data(),
-                margins.data(),
-                inst.fit_min_ctx,
-                nullptr,
-                params.verbose ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
-       }
+                // use default n_gpu_layers and n_ctx so common_fit_params can adjust them
+                mparams.n_gpu_layers          = llama_model_default_params().n_gpu_layers;
+                mparams.tensor_split          = fit_tensor_split.data();
+                mparams.tensor_buft_overrides = fit_overrides.data();
+                cparams.n_ctx                 = 0;
 
-        // keep the same model between tests when possible
-        if (!lmodel || !prev_inst || !inst.equal_mparams(*prev_inst)) {
-            if (lmodel) {
-                llama_model_free(lmodel);
+                std::vector<size_t> margins(llama_max_devices(), inst.fit_target * 1024 * 1024);
+
+                uint32_t n_ctx_needed = inst.n_prompt + inst.n_gen + inst.n_depth;
+                cparams.n_ctx = std::max(cparams.n_ctx, n_ctx_needed);
+
+                common_fit_params(inst.model.c_str(), &mparams, &cparams,
+                    fit_tensor_split.data(),
+                    fit_overrides.data(),
+                    margins.data(),
+                    inst.fit_min_ctx,
+                    nullptr,
+                    params.verbose ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
             }
 
-            lmodel = llama_model_load_from_file(inst.model.c_str(), mparams);
-            if (lmodel == NULL) {
-                fprintf(stderr, "%s: error: failed to load model '%s'\n", __func__, inst.model.c_str());
+            // keep the same model between tests when possible
+            if (!lmodel || !prev_inst || !inst.equal_mparams(*prev_inst)) {
+                if (lmodel) {
+                    llama_model_free(lmodel);
+                }
+
+                cstate.depth = -1;
+                cstate.buf.clear();
+                expert.release(); expert_initialized = false;
+                lmodel = llama_model_load_from_file(inst.model.c_str(), mparams);
+                if (lmodel == NULL) {
+                    fprintf(stderr, "%s: error: failed to load model '%s'\n", __func__, inst.model.c_str());
+                    return 1;
+                }
+                prev_inst = &inst;
+            }
+
+            llama_context * ctx = llama_init_from_model(lmodel, cparams);
+            if (ctx == NULL) {
+                fprintf(stderr, "%s: error: failed to create context with model '%s'\n", __func__, inst.model.c_str());
+                llama_model_free(lmodel);
                 return 1;
             }
-            prev_inst = &inst;
-        }
 
-        llama_context * ctx = llama_init_from_model(lmodel, cparams);
-        if (ctx == NULL) {
-            fprintf(stderr, "%s: error: failed to create context with model '%s'\n", __func__, inst.model.c_str());
-            llama_model_free(lmodel);
-            return 1;
-        }
+            test t(inst, lmodel, ctx);
+            t.expert = params.expert;
+            t.expert_runs = run_expert.profile;
 
-        test t(inst, lmodel, ctx);
-
-        llama_memory_clear(llama_get_memory(ctx), false);
-
-        // cool off before the test
-        if (params.delay) {
-            std::this_thread::sleep_for(std::chrono::seconds(params.delay));
-        }
-
-        struct ggml_threadpool_params tpp = ggml_threadpool_params_default(t.n_threads);
-        if (!parse_cpu_mask(t.cpu_mask, tpp.cpumask)) {
-            fprintf(stderr, "%s: failed to parse cpu-mask: %s\n", __func__, t.cpu_mask.c_str());
-            llama_free(ctx);
-            llama_model_free(lmodel);
-            exit(1);
-        }
-        tpp.strict_cpu = t.cpu_strict;
-        tpp.poll       = t.poll;
-        tpp.prio       = params.prio;
-
-        struct ggml_threadpool * threadpool = ggml_threadpool_new_fn(&tpp);
-        if (!threadpool) {
-            fprintf(stderr, "%s: threadpool create failed : n_threads %d\n", __func__, tpp.n_threads);
-            llama_free(ctx);
-            llama_model_free(lmodel);
-            exit(1);
-        }
-
-        llama_attach_threadpool(ctx, threadpool, NULL);
-
-        // warmup run
-        if (!params.no_warmup) {
-            if (t.n_prompt > 0) {
-                if (params.progress) {
-                    fprintf(stderr, "llama-bench: benchmark %d/%zu: warmup prompt run\n", params_idx, params_count);
-                }
-                //test_prompt(ctx, std::min(t.n_batch, std::min(t.n_prompt, 32)), 0, t.n_batch, t.n_threads);
-                bool res = test_prompt(ctx, t.n_prompt, t.n_batch, t.n_threads);
-                if (!res) {
-                    fprintf(stderr, "%s: error: failed to run prompt warmup\n", __func__);
-                    llama_free(ctx);
-                    llama_model_free(lmodel);
-                    exit(1);
-                }
-            }
-            if (t.n_gen > 0) {
-                if (params.progress) {
-                    fprintf(stderr, "llama-bench: benchmark %d/%zu: warmup generation run\n", params_idx, params_count);
-                }
-                bool res = test_gen(ctx, 1, t.n_threads);
-                if (!res) {
-                    fprintf(stderr, "%s: error: failed to run gen warmup\n", __func__);
-                    llama_free(ctx);
-                    llama_model_free(lmodel);
-                    exit(1);
-                }
-            }
-        }
-
-        for (int i = 0; i < params.reps; i++) {
             llama_memory_clear(llama_get_memory(ctx), false);
 
-            if (t.n_depth > 0) {
-                bool is_cached = t.n_depth == cstate.depth;
+            // cool off before the test
+            if (params.delay) {
+                std::this_thread::sleep_for(std::chrono::seconds(params.delay));
+            }
 
-                if (is_cached) {
-                    // if previously we have computed at this depth, just restore the state
-                    const size_t ret = llama_state_seq_set_data(ctx, cstate.buf.data(), cstate.buf.size(), 0);
-                    if (ret == 0) {
-                        // if the old state is incompatible with the current context - reprocess from scratch
-                        is_cached = false;
+            struct ggml_threadpool_params tpp = ggml_threadpool_params_default(t.n_threads);
+            if (!parse_cpu_mask(t.cpu_mask, tpp.cpumask)) {
+                fprintf(stderr, "%s: failed to parse cpu-mask: %s\n", __func__, t.cpu_mask.c_str());
+                llama_free(ctx);
+                llama_model_free(lmodel);
+                return 1;
+            }
+            tpp.strict_cpu = t.cpu_strict;
+            tpp.poll       = t.poll;
+            tpp.prio       = params.prio;
+
+            struct ggml_threadpool * threadpool = ggml_threadpool_new_fn(&tpp);
+            if (!threadpool) {
+                fprintf(stderr, "%s: threadpool create failed : n_threads %d\n", __func__, tpp.n_threads);
+                llama_free(ctx);
+                llama_model_free(lmodel);
+                return 1;
+            }
+
+            llama_attach_threadpool(ctx, threadpool, NULL);
+
+            try {
+            if (run_expert.enabled()) {
+                if (!llama_expert_available(ctx)) { throw std::runtime_error("requested expert mode is unavailable; refusing uncached benchmark"); }
+                if (run_expert.mode != "off") {
+                    if (expert_initialized) { expert.rebind(ctx); }
+                    else {
+                        common_expert_params ep;
+                        ep.l1_mib = run_expert.l1_mib; ep.freeze = !run_expert.warm();
+                        expert.init(ctx, ep);
+                        if (!expert.ready()) { throw std::runtime_error("the requested profile bank is unavailable"); }
+                        expert_initialized = true;
                     }
                 }
+                fprintf(stderr, "expert benchmark: mode=%s L1=%d MiB seed=%d profile=%s\n",
+                    run_expert.mode.c_str(), run_expert.l1_mib, run_expert.seed, run_expert.profile.c_str());
+            }
 
-                if (!is_cached) {
+            // warmup run
+            if (!params.no_warmup) {
+                if (t.n_prompt > 0) {
                     if (params.progress) {
-                        fprintf(stderr, "llama-bench: benchmark %d/%zu: depth run %d/%d\n", params_idx, params_count,
-                                i + 1, params.reps);
+                        fprintf(stderr, "llama-bench: benchmark %d/%zu: warmup prompt run\n", params_idx, params_count);
                     }
-                    bool res = test_prompt(ctx, t.n_depth, t.n_batch, t.n_threads);
+                    //test_prompt(ctx, std::min(t.n_batch, std::min(t.n_prompt, 32)), 0, t.n_batch, t.n_threads);
+                    bool res = test_prompt(ctx, t.n_prompt, t.n_batch, t.n_threads);
                     if (!res) {
-                        fprintf(stderr, "%s: error: failed to run depth\n", __func__);
+                        fprintf(stderr, "%s: error: failed to run prompt warmup\n", __func__);
                         llama_free(ctx);
                         llama_model_free(lmodel);
-                        exit(1);
+                        return 1;
+                    }
+                }
+                if (t.n_gen > 0) {
+                    if (params.progress) {
+                        fprintf(stderr, "llama-bench: benchmark %d/%zu: warmup generation run\n", params_idx, params_count);
+                    }
+                    bool res = test_gen(ctx, 1, t.n_threads);
+                    if (!res) {
+                        fprintf(stderr, "%s: error: failed to run gen warmup\n", __func__);
+                        llama_free(ctx);
+                        llama_model_free(lmodel);
+                        return 1;
+                    }
+                }
+            }
+
+            expert.on_warmup_done();
+            for (int i = 0; i < (run_expert.restore_each ? 1 : params.reps); i++) {
+                llama_memory_clear(llama_get_memory(ctx), false);
+                uint64_t prompt_processed = 0;
+
+                if (t.n_depth > 0) {
+                    bool is_cached = t.n_depth == cstate.depth;
+
+                    if (is_cached) {
+                        // if previously we have computed at this depth, just restore the state
+                        const size_t ret = llama_state_seq_set_data(ctx, cstate.buf.data(), cstate.buf.size(), 0);
+                        if (ret == 0) {
+                            // if the old state is incompatible with the current context - reprocess from scratch
+                            is_cached = false;
+                        }
                     }
 
-                    // store the context state for reuse in later runs
-                    cstate.depth = t.n_depth;
-                    cstate.buf.resize(llama_state_seq_get_size(ctx, 0));
-                    llama_state_seq_get_data(ctx, cstate.buf.data(), cstate.buf.size(), 0);
-                } else {
+                    if (!is_cached) {
+                        if (params.progress) {
+                            fprintf(stderr, "llama-bench: benchmark %d/%zu: depth run %d/%d\n", params_idx, params_count,
+                                    i + 1, params.reps);
+                        }
+                        bool res = test_prompt(ctx, t.n_depth, t.n_batch, t.n_threads);
+                        if (!res) {
+                            fprintf(stderr, "%s: error: failed to run depth\n", __func__);
+                            llama_free(ctx);
+                            llama_model_free(lmodel);
+                            return 1;
+                        }
+
+                        prompt_processed += t.n_depth;
+                        // store the context state for reuse in later runs
+                        cstate.depth = t.n_depth;
+                        cstate.buf.resize(llama_state_seq_get_size(ctx, 0));
+                        llama_state_seq_get_data(ctx, cstate.buf.data(), cstate.buf.size(), 0);
+                    } else {
+                        if (params.progress) {
+                            fprintf(stderr, "llama-bench: benchmark %d/%zu: depth run %d/%d (cached)\n", params_idx, params_count,
+                                    i + 1, params.reps);
+                        }
+                    }
+                }
+
+                uint64_t t_start = get_time_ns();
+                uint64_t compute_ns = 0;
+
+                if (t.n_prompt > 0) {
                     if (params.progress) {
-                        fprintf(stderr, "llama-bench: benchmark %d/%zu: depth run %d/%d (cached)\n", params_idx, params_count,
+                        fprintf(stderr, "llama-bench: benchmark %d/%zu: prompt run %d/%d\n", params_idx, params_count,
                                 i + 1, params.reps);
                     }
+                    prompt_processed += t.n_prompt;
+                    const auto begin = get_time_ns();
+                    bool res = test_prompt(ctx, t.n_prompt, t.n_batch, t.n_threads);
+                    compute_ns += get_time_ns() - begin;
+                    if (!res) {
+                        expert.on_interrupted(0);
+                        fprintf(stderr, "%s: error: failed to run prompt\n", __func__);
+                        llama_free(ctx);
+                        llama_model_free(lmodel);
+                        return 1;
+                    }
                 }
+                if (t.n_gen > 0) {
+                    if (params.progress) {
+                        fprintf(stderr, "llama-bench: benchmark %d/%zu: generation run %d/%d\n", params_idx, params_count,
+                                i + 1, params.reps);
+                    }
+                    expert.on_generation_start(0);
+                    const auto begin = get_time_ns();
+                    bool res = test_gen(ctx, t.n_gen, t.n_threads);
+                    compute_ns += get_time_ns() - begin;
+                    if (!res) {
+                        fprintf(stderr, "%s: error: failed to run gen\n", __func__);
+                        llama_free(ctx);
+                        llama_model_free(lmodel);
+                        return 1;
+                    }
+                }
+
+                expert.on_request_end(0, prompt_processed, t.n_gen, false);
+                expert.on_all_idle();
+                uint64_t t_ns = get_time_ns() - t_start;
+                t.samples_ns.push_back(run_expert.enabled() ? compute_ns : t_ns);
+                t.expert_control_ns.push_back(run_expert.enabled() ? t_ns - compute_ns : 0);
+                t.expert_total_ns.push_back(t_ns);
             }
 
-            uint64_t t_start = get_time_ns();
-
-            if (t.n_prompt > 0) {
-                if (params.progress) {
-                    fprintf(stderr, "llama-bench: benchmark %d/%zu: prompt run %d/%d\n", params_idx, params_count,
-                            i + 1, params.reps);
-                }
-                bool res = test_prompt(ctx, t.n_prompt, t.n_batch, t.n_threads);
-                if (!res) {
-                    fprintf(stderr, "%s: error: failed to run prompt\n", __func__);
-                    llama_free(ctx);
-                    llama_model_free(lmodel);
-                    exit(1);
-                }
+            } catch (const std::exception & e) {
+                expert.on_interrupted(0);
+                fprintf(stderr, "expert benchmark failed: %s\n", e.what());
+                llama_free(ctx);
+                ggml_threadpool_free_fn(threadpool);
+                llama_model_free(lmodel);
+                return 1;
             }
-            if (t.n_gen > 0) {
-                if (params.progress) {
-                    fprintf(stderr, "llama-bench: benchmark %d/%zu: generation run %d/%d\n", params_idx, params_count,
-                            i + 1, params.reps);
-                }
-                bool res = test_gen(ctx, t.n_gen, t.n_threads);
-                if (!res) {
-                    fprintf(stderr, "%s: error: failed to run gen\n", __func__);
-                    llama_free(ctx);
-                    llama_model_free(lmodel);
-                    exit(1);
-                }
+            reps.add(t);
+            const bool last = expert_rep + 1 == independent_reps;
+            if (last) {
+                reps.store(t);
+            }
+            if (p && last) {
+                p->print_test(t);
+                fflush(p->fout);
             }
 
-            uint64_t t_ns = get_time_ns() - t_start;
-            t.samples_ns.push_back(t_ns);
+            if (p_err && last) {
+                p_err->print_test(t);
+                fflush(p_err->fout);
+            }
+
+            llama_perf_context_print(ctx);
+
+            expert.rebind(nullptr);
+            llama_free(ctx);
+
+            ggml_threadpool_free_fn(threadpool);
         }
-
-        if (p) {
-            p->print_test(t);
-            fflush(p->fout);
-        }
-
-        if (p_err) {
-            p_err->print_test(t);
-            fflush(p_err->fout);
-        }
-
-        llama_perf_context_print(ctx);
-
-        llama_free(ctx);
-
-        ggml_threadpool_free_fn(threadpool);
     }
 
+    expert.release();
     llama_model_free(lmodel);
 
     if (p) {

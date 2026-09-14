@@ -67,6 +67,10 @@ depth 8192. A configuration that leaves little free RAM, where the fault price i
 not measured with `llama-bench`; the 875 ms per ubatch above is what the gather cost there before
 this change.
 
+The published curve of the expert cache (`benchmark.md`) starts from a base revision without this
+commit. Part of the prompt-throughput difference between that base and the cache rows is this change
+and not the cache; the benchmark page separates the two.
+
 ## Status
 
 The Win32 call is resolved with `GetProcAddress`, so the link line is unchanged and an older host

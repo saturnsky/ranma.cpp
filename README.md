@@ -125,6 +125,17 @@ misbehave. Other platforms and backends are not tested and not supported by this
   memory: prompt processing 504 -> 539 t/s and decode 19.4 -> 20.0 t/s at depth 0, with ample free RAM; the fault
   price grows 50x when RAM is scarce. Details: [docs/ranma/ple-prefetch.md](docs/ranma/ple-prefetch.md).
 
+- **Expert cache (llama-server and llama-bench, HIP)** - a VRAM cache of MoE expert weights for a model whose
+  experts live in system RAM. The server profiles which experts the router selects while it generates, plans the
+  most valuable set for a byte budget and installs it at the end of a request; decode reads resident experts from
+  VRAM and the rest in place over PCIe. Off by default; `--expert-l1-mib N --expert-profile-dir DIR` with
+  `--load-mode none` and host-direct on. The budget also decides the expert placement, so it replaces `--n-cpu-moe`
+  instead of being added to it. Measured on a Radeon AI PRO R9700 with Qwen3.8-Flash-Next UD-Q4_K_XL, the same VRAM
+  given to the budget instead of to whole expert layers: decode 23.9 -> 38.9 t/s at depth 0 and 19.0 -> 26.9 t/s at
+  depth 65536 with 20 GiB, 21.4 -> 29.8 and 17.4 -> 22.9 t/s with 3 GiB; a random placement of the same budget
+  gains nothing, so the gain is the profile. Logits identical with the cache off and on. Details and limits:
+  [docs/ranma/expert-cache.md](docs/ranma/expert-cache.md).
+
 Each feature that lands gets a line here and a page under `docs/ranma/` describing its
 rationale, measured effect, and trade-offs.
 

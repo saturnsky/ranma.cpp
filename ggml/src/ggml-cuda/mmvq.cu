@@ -1,5 +1,6 @@
 #include "mmvq.cuh"
 #include "mapped-host.cuh"
+#include "expert-controller.cuh"
 #include "quantize.cuh"
 #include "unary.cuh"
 #include "vecdotq.cuh"
@@ -650,6 +651,14 @@ static __global__ void mul_mat_vec_q(
     const uint32_t sample_x    = fastdiv(sample_dst, sample_ratio);
     const uint32_t sample_y    = sample_dst;
 
+    // ranma expert cache: a resident expert is read from its arena slot instead of the tensor.
+    // Only the MUL_MAT_ID dispatch sets the table, so dense matmuls keep the plain path.
+    const ggml_cuda_expert_source x_src =
+        ggml_cuda_expert_cache_select(vx, fusion.x_cache, ids ? fusion.x_cache_slots : nullptr, channel_x);
+    const void * vx_source        = x_src.data;
+    uint32_t     source_channel_x = x_src.channel;
+    [[maybe_unused]] const int32_t cache_slot = x_src.slot;
+
     bool use_gate = false;
     bool use_bias = false;
     bool use_gate_bias = false;
@@ -677,6 +686,16 @@ static __global__ void mul_mat_vec_q(
             use_gate_scale = fusion.gate_scale != nullptr && use_gate;
             x_scale        = (const float *) fusion.x_scale;
             gate_scale     = (const float *) fusion.gate_scale;
+        }
+    }
+    [[maybe_unused]] const void * vgate_source = vgate;
+    [[maybe_unused]] uint32_t     source_channel_gate = channel_x;
+    if constexpr (has_fusion) {
+        if (use_gate && fusion.gate_cache != nullptr) {
+            if (cache_slot >= 0) {
+                vgate_source        = fusion.gate_cache;
+                source_channel_gate = (uint32_t) cache_slot;
+            }
         }
     }
 
@@ -722,12 +741,15 @@ static __global__ void mul_mat_vec_q(
 
     const block_q8_1 * y = ((const block_q8_1 *) vy) + sample_y*stride_sample_y + channel_y*stride_channel_y;
     // the last block can cover fewer than rows_per_cuda_block rows, clamp the reads to stay inside the tensor
-    const int kbx_base = sample_x*stride_sample_x + channel_x*stride_channel_x;
+    const int kbx_base = sample_x*stride_sample_x + source_channel_x*stride_channel_x;
+    [[maybe_unused]] const int gate_kbx_base = sample_x*stride_sample_x + source_channel_gate*stride_channel_x;
     int kbx_offset[rows_per_cuda_block];
+    [[maybe_unused]] int gate_kbx_offset[rows_per_cuda_block];
 #pragma unroll
     for (int i = 0; i < rows_per_cuda_block; ++i) {
         const int row_x = rows_per_cuda_block == 1 ? row0 : min(row0 + i, int(nrows_x) - 1);
-        kbx_offset[i] = kbx_base + row_x*stride_row_x;
+        kbx_offset[i]      = kbx_base + row_x*stride_row_x;
+        gate_kbx_offset[i] = gate_kbx_base + row_x*stride_row_x;
     }
 
     for (int kbx = tid / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
@@ -761,11 +783,11 @@ static __global__ void mul_mat_vec_q(
 #pragma unroll
             for (int i = 0; i < rows_per_cuda_block; ++i) {
                 tmp[j][i] += vec_dot_q_cuda(
-                    vx, &y[j*stride_col_y + kby], kbx_offset[i] + kbx, kqs);
+                    vx_source, &y[j*stride_col_y + kby], kbx_offset[i] + kbx, kqs);
                 if constexpr (has_fusion) {
                     if (use_gate) {
                         tmp_gate[j][i] += vec_dot_q_cuda(
-                            vgate, &y[j*stride_col_y + kby], kbx_offset[i] + kbx, kqs);
+                            vgate_source, &y[j*stride_col_y + kby], gate_kbx_offset[i] + kbx, kqs);
                     }
                 }
             }
@@ -925,13 +947,29 @@ static __global__ void mul_mat_vec_q_moe(
     const uint32_t channel_x = ids[channel_dst + token_idx * ids_stride];
     const uint32_t channel_y = fastmodulo(channel_dst, nchannels_y);
 
+    // ranma expert cache: a resident expert is read from its arena slot instead of the tensor.
+    const ggml_cuda_expert_source x_src =
+        ggml_cuda_expert_cache_select(vx, fusion.x_cache, fusion.x_cache_slots, channel_x);
+    const void * vx_source = x_src.data;
+    uint32_t source_channel_x = x_src.channel;
+    [[maybe_unused]] const void * vgate_source = vgate;
+    uint32_t source_channel_gate = channel_x;
+    if (use_gate && fusion.gate_cache != nullptr) {
+        if (x_src.slot >= 0) {
+            vgate_source        = fusion.gate_cache;
+            source_channel_gate = x_src.channel;
+        }
+    }
+
     const block_q8_1 * y = ((const block_q8_1 *) vy) + channel_y*stride_channel_y + token_idx*stride_col_y;
     // the last block can cover fewer than c_rows_per_block rows, clamp the reads to stay inside the tensor
     int kbx_offset[c_rows_per_block];
+    [[maybe_unused]] int gate_kbx_offset[c_rows_per_block];
 #pragma unroll
     for (int i = 0; i < c_rows_per_block; ++i) {
         const int row_x = c_rows_per_block == 1 ? row0 : min(row0 + i, int(nrows_x) - 1);
-        kbx_offset[i] = channel_x*stride_channel_x + row_x*stride_row_x;
+        kbx_offset[i]      = source_channel_x*stride_channel_x + row_x*stride_row_x;
+        gate_kbx_offset[i] = source_channel_gate*stride_channel_x + row_x*stride_row_x;
     }
 
     // partial sum for each thread
@@ -944,10 +982,10 @@ static __global__ void mul_mat_vec_q_moe(
 
 #pragma unroll
         for (int i = 0; i < c_rows_per_block; ++i) {
-            tmp[i] += vec_dot_q_cuda(vx, &y[kby], kbx_offset[i] + kbx, kqs);
+            tmp[i] += vec_dot_q_cuda(vx_source, &y[kby], kbx_offset[i] + kbx, kqs);
             if constexpr (has_fusion) {
                 if (use_gate) {
-                    tmp_gate[i] += vec_dot_q_cuda(vgate, &y[kby], kbx_offset[i] + kbx, kqs);
+                    tmp_gate[i] += vec_dot_q_cuda(vgate_source, &y[kby], gate_kbx_offset[i] + kbx, kqs);
                 }
             }
         }
@@ -1465,9 +1503,16 @@ void ggml_cuda_mul_mat_vec_q(
     GGML_ASSERT(!ids || ne12 <= MMVQ_MAX_BATCH_SIZE);
 
     const void * src0_d = src0->data;
+    ggml_cuda_mm_fusion_args_device fusion_local{};
 #if defined(GGML_USE_HIP)
     if (ggml_backend_buffer_is_host(src0->buffer)) {
         src0_d = ggml_hip_mapped_host_device_alias(src0);
+        if (ids) {
+            // expert cache: resident experts of this tensor are read from the VRAM arena
+            const ggml_cuda_expert_lookup cached = ggml_cuda_expert_lookup_tensor(src0);
+            fusion_local.x_cache       = cached.data;
+            fusion_local.x_cache_slots = cached.slots;
+        }
     }
 #else
     ggml_cuda_assert_src0_is_device_readable(src0);
@@ -1476,8 +1521,6 @@ void ggml_cuda_mul_mat_vec_q(
     const float   * src1_d =       (const float   *) src1->data;
     const int32_t *  ids_d = ids ? (const int32_t *)  ids->data : nullptr;
     float         *  dst_d =       (float         *)  dst->data;
-
-    ggml_cuda_mm_fusion_args_device fusion_local{};
 
     if (fusion) {
         const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
@@ -1499,6 +1542,15 @@ void ggml_cuda_mul_mat_vec_q(
 #if defined(GGML_USE_HIP)
             if (ggml_backend_buffer_is_host(fusion->gate->buffer)) {
                 fusion_local.gate = ggml_hip_mapped_host_device_alias(fusion->gate);
+                if (fusion_local.x_cache != nullptr) {
+                    // the fused kernel switches both matrices with the up table, so the gate arena
+                    // is only used when it shares that table (same layer); otherwise the gate reads
+                    // the mapped tensor for every expert
+                    const ggml_cuda_expert_lookup gate_cached = ggml_cuda_expert_lookup_tensor(fusion->gate);
+                    if (gate_cached.data != nullptr && gate_cached.slots == fusion_local.x_cache_slots) {
+                        fusion_local.gate_cache = gate_cached.data;
+                    }
+                }
             }
 #endif
         }
