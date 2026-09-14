@@ -171,6 +171,13 @@ bool l1_arena::read_slice(int layer, int kind, int slot, void * dst) const {
     return true;
 }
 
+bool l1_arena::verify_current_assignment(std::string & reason) const {
+    // The master of every expert stays in its original host tensor.
+    const auto tx = stage(selected_, true);
+    reason = tx.install.reason;
+    return tx.valid;
+}
+
 bool l1_arena::publish_tables(const std::vector<std::vector<int32_t>> & slots) {
     for (int l = 0; l < geo_.n_layers; ++l) {
         if (layer_slots_[l] == nullptr) {
@@ -184,32 +191,80 @@ bool l1_arena::publish_tables(const std::vector<std::vector<int32_t>> & slots) {
 }
 
 
-// Fills the arena with `selected` and publishes the slot tables. The tables are blanked first, so
-// that a kernel captured in a graph never reads a slot while the mover is rewriting it.
-bool l1_arena::install(const std::vector<std::vector<int32_t>> & selected, l1_install_stats & stats) {
-    if (!allocated() || selected.size() != size_t(geo_.n_layers)) { return false; }
-    const auto t0 = std::chrono::steady_clock::now();
-    ggml_cuda_set_device(device_);
-    std::vector<std::vector<int32_t>> slots(geo_.n_layers, std::vector<int32_t>(geo_.n_experts, -1));
-    if (!publish_tables(slots)) { return false; }
-    std::vector<int> next(capacities_.size(), 0);
+l1_transaction l1_arena::stage(const expert_slot_table & selected, bool retain) const {
+    l1_transaction tx;
+    if (!allocated() || selected.size() != size_t(geo_.n_layers)) { return tx; }
+    expert_slot_table hs(geo_.n_layers);
+    // The host master of every expert is a slice of its mapped tensor; the transaction sees that as
+    // one host slot per expert, in (layer, expert) order.
+    expert_locations homes(geo_.n_layers, std::vector<expert_location>(geo_.n_experts));
+    install_layout layout;
+    layout.gpu = capacities_; layout.host.assign(capacities_.size(), 0);
+    const std::vector<std::vector<int>> spares(capacities_.size());
     for (int l = 0; l < geo_.n_layers; ++l) {
-        const int cls = geo_.layer_class[l];
-        if (cls < 0) { continue; }
-        for (int32_t e : selected[l]) {
-            if (e < 0 || e >= geo_.n_experts || next[cls] >= capacities_[cls]) { return false; }
-            const int slot = next[cls]++;
-            for (int k = 0; k < geometry::n_kinds; ++k) {
-                if (!write_gpu_slice(cls, k, slot, host_address(l, k, e), /*src_is_device =*/ false)) { return false; }
-                stats.bytes += geo_.class_bytes[cls][k];
-            }
-            slots[l][e] = slot;
-            ++stats.copied;
-        }
+        const int c = geo_.layer_class[l];
+        if (c < 0) { continue; }
+        for (int e = 0; e < geo_.n_experts; ++e) { homes[l][e] = {expert_storage::host, layout.host[c]++}; }
     }
-    if (!sync_copies() || !publish_tables(slots)) { return false; }
-    host_slots_ = slots;
-    selected_   = selected;
+    for (int l = 0; l < geo_.n_layers; ++l) {
+        if (geo_.layer_class[l] < 0) { continue; }
+        for (int e = 0; e < geo_.n_experts; ++e) { hs[l].push_back(e); }
+    }
+    tx.install = plan_install(geo_, selected, hs, host_slots_, homes, capacities_, layout, layout, spares,
+        {true, 0}, retain);
+    tx.selected = selected;
+    tx.valid = tx.install.valid;
+    return tx;
+}
+
+// Where a slice of a move lives outside the VRAM arena: in the mapped tensor of its expert.
+void * l1_arena::slice_address(int layer, int cls, int kind, expert_location at, int expert) const {
+    GGML_UNUSED(cls); GGML_UNUSED(at);
+    return host_address(layer, kind, expert);
+}
+
+bool l1_arena::execute(const install_transaction & tx) {
+    if (!tx.valid || !allocated()) { return false; }
+    ggml_cuda_set_device(device_);
+    // Every slot the mover is about to rewrite must be invisible while it does.
+    expert_slot_table dark(geo_.n_layers, std::vector<int32_t>(geo_.n_experts, -1));
+    if (!publish_tables(dark)) { return false; }
+    for (size_t i = 0; i < tx.moves.size();) {
+        const auto & move = tx.moves[i];
+        const bool to_gpu   = move.to.storage   == expert_storage::vram;
+        const bool from_gpu = move.from.storage == expert_storage::vram;
+        for (int k = 0; k < geometry::n_kinds; ++k) {
+            void * dst = to_gpu ? nullptr : slice_address(move.layer, move.cls, k, move.to, move.expert);
+            const void * src = from_gpu ? nullptr : slice_address(move.layer, move.cls, k, move.from, move.expert);
+            bool ok = true;
+            if (from_gpu) {
+                ok = read_gpu_slice(move.cls, k, move.from.slot, dst);
+            } else if (to_gpu) {
+                ok = write_gpu_slice(move.cls, k, move.to.slot, src, false);
+            } else {
+                if (dst == nullptr || src == nullptr || !sync_copies()) { return false; }
+                memcpy(dst, src, geo_.class_bytes[move.cls][k]);
+            }
+            if (!ok) { return false; }
+        }
+        ++i;
+    }
+    return sync_copies();
+}
+
+bool l1_arena::publish(const l1_transaction & tx) {
+    if (!tx.valid || !allocated() || !publish_tables(tx.install.gpu_slots)) { return false; }
+    host_slots_ = tx.install.gpu_slots;
+    selected_ = tx.selected; gpu_spares_ = tx.install.gpu_spares;
+    return true;
+}
+
+bool l1_arena::install(const expert_slot_table & selected, bool retain, l1_install_stats & stats) {
+    const auto t0 = std::chrono::steady_clock::now();
+    const auto tx = stage(selected, retain);
+    if (!tx.valid || !execute(tx.install) || !publish(tx)) { return false; }
+    stats.retained = tx.install.retained_gpu;
+    stats.copied = tx.install.h2d_slices; stats.bytes = tx.install.h2d_bytes;
     stats.ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     return true;
 }
