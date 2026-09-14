@@ -133,6 +133,12 @@ else()
     set_source_files_properties(${GGML_SOURCES_ROCM} PROPERTIES LANGUAGE HIP)
 endif()
 
+# ranma: expert cache policy files that carry no device code; added after the LANGUAGE
+# properties above so that they are compiled as plain C++ in both branches
+target_sources(ggml-hip PRIVATE ../ggml-cuda/expert-profile-store.cpp
+                              ../ggml-cuda/expert-os-win32.cpp
+                              ../ggml-cuda/expert-os-posix.cpp)
+
 if (GGML_STATIC)
     message(FATAL_ERROR "Static linking not supported for HIP/ROCm")
 endif()

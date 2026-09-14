@@ -4,6 +4,7 @@
 #include "chat.h"
 #include "common.h"
 #include "download.h"
+#include "expert.h"
 #include "json-schema-to-grammar.h"
 #include "json.h"
 #include "llama.h"
@@ -961,6 +962,17 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
     if ((!params.server_tools.empty() || mcp_enabled) && !params.cors_origins_explicit) {
         LOG_WRN("server tools or MCP servers are enabled, using localhost as default CORS origin (change via --cors-origins)\n");
         params.cors_origins = "localhost";
+    }
+
+    // ranma expert cache: the byte budget decides the expert placement, so every routed expert goes to
+    //                     host memory here, exactly like --cpu-moe (see docs/ranma/expert-cache.md)
+    if (params.expert_l1_mib > 0) {
+        const expert_validation valid = validate_expert_params(params);
+        if (!valid.ok) {
+            throw std::invalid_argument("error: " + valid.reason + "\n");
+        }
+        params.tensor_buft_overrides.push_back(llm_ffn_exps_cpu_override());
+        LOG_INF("expert cache: %d MiB budget, every routed expert placed in host memory\n", params.expert_l1_mib);
     }
 
     // pad tensor_buft_overrides for llama_params_fit:
@@ -2798,6 +2810,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"-cmoe", "--cpu-moe"},
         "keep all Mixture of Experts (MoE) weights in the CPU",
         [](common_params & params) {
+            params.cpu_moe_explicit = true;
             params.tensor_buft_overrides.push_back(llm_ffn_exps_cpu_override());
         }
     ).set_env("LLAMA_ARG_CPU_MOE"));
@@ -2808,6 +2821,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             if (value < 0) {
                 throw std::invalid_argument("invalid value");
             }
+            params.n_cpu_moe_explicit = true;
             llm_add_n_cpu_ffn_overrides(value, LLM_FFN_EXPS_REGEX, params.tensor_buft_overrides);
         }
     ).set_env("LLAMA_ARG_N_CPU_MOE"));
@@ -2914,6 +2928,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                 throw std::runtime_error(
                     string_format("error: unknown value for --fit: '%s'\n", value.c_str()));
             }
+            params.fit_params_explicit = true;
         }
     ).set_env("LLAMA_ARG_FIT"));
     add_opt(common_arg(
@@ -3863,6 +3878,50 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_GPU_HEARTBEAT_SECONDS"));
     add_opt(common_arg(
+        {"--expert-l1-mib"}, "N",
+        string_format("VRAM budget in MiB for the cache of MoE routed-expert weights (default: %d; 0 = disabled)\n"
+                      "this budget also decides the expert placement, so it cannot be combined with\n"
+                      "--n-cpu-moe/--cpu-moe and it needs --load-mode none", params.expert_l1_mib),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("invalid value: must be 0 or more");
+            }
+            params.expert_l1_mib = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_EXPERT_L1_MIB"));
+    add_opt(common_arg(
+        {"--expert-profile-dir"}, "DIR",
+        "root directory of the expert profiles; omitted = seeded fixed placement without profiling",
+        [](common_params & params, const std::string & value) {
+            params.expert_profile_dir = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_EXPERT_PROFILE_DIR"));
+    add_opt(common_arg(
+        {"--expert-seed"}, "N", "seed for fixed random expert placement (default: 1)",
+        [](common_params & params, int value) { params.expert_seed = value; }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--expert-freeze"},
+        "keep the expert cache contents as they are and only collect the profile (default: off)",
+        [](common_params & params) {
+            params.expert_freeze = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_EXPERT_FREEZE"));
+    add_opt(common_arg(
+        {"--expert-profile-archive"},
+        "keep the profile records that leave the score window under archive/ instead of deleting them (default: off)",
+        [](common_params & params) {
+            params.expert_profile_archive = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_EXPERT_PROFILE_ARCHIVE"));
+    add_opt(common_arg(
+        {"--expert-profile-reset"},
+        "discard the stored expert profiles at startup (default: off)",
+        [](common_params & params) {
+            params.expert_profile_reset = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_EXPERT_PROFILE_RESET"));
+    add_opt(common_arg(
         {"--simple-io"},
         "use basic IO for better compatibility in subprocesses and limited consoles",
         [](common_params & params) {
@@ -4168,6 +4227,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"--spec-draft-cpu-moe", "-cmoed", "--cpu-moe-draft"},
         "keep all Mixture of Experts (MoE) weights in the CPU for the draft model",
         [](common_params & params) {
+            params.cpu_moe_explicit = true;
             params.speculative.draft.tensor_buft_overrides.push_back(llm_ffn_exps_cpu_override());
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_CPU_MOE"));
@@ -4178,6 +4238,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             if (value < 0) {
                 throw std::invalid_argument("invalid value");
             }
+            params.n_cpu_moe_explicit = true;
             llm_add_n_cpu_ffn_overrides(value, LLM_FFN_EXPS_REGEX, params.speculative.draft.tensor_buft_overrides);
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_CPU_MOE"));
