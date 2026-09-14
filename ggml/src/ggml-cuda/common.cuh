@@ -1593,6 +1593,10 @@ struct ggml_cuda_mm_fusion_args_device {
     const void    * x_cache       = nullptr;
     const void    * gate_cache    = nullptr;
     const int32_t * x_cache_slots = nullptr;
+    // exclusive mode: an expert that misses the arena lives in the host arena, whose base is vx (or
+    // fusion.gate) and whose slot for this expert is here. Null in inclusive mode, where a miss
+    // reads the mapped tensor at the expert index.
+    const int32_t * x_host_slots  = nullptr;
     ggml_glu_op glu_op;
     float glu_limit = 0.0f;
 };
@@ -1607,12 +1611,19 @@ struct ggml_cuda_expert_source {
     int32_t      slot;    // -1 on a miss
 };
 
+// `host_slots` is set by exclusive mode only: there the tensor has no bytes of its own, so
+// `tensor_data` is the base of the host arena of this kind and a miss reads the host slot of the
+// expert instead of the expert index. Inclusive mode passes null and a miss reads the mapped tensor.
 static __device__ __forceinline__ ggml_cuda_expert_source ggml_cuda_expert_cache_select(
-        const void * tensor_data, const void * arena, const int32_t * slots, const uint32_t expert) {
+        const void * tensor_data, const void * arena, const int32_t * slots, const uint32_t expert,
+        const int32_t * host_slots = nullptr) {
     if (arena != nullptr && slots != nullptr) {
         const int32_t slot = slots[expert];
         if (slot >= 0) {
             return { arena, (uint32_t) slot, slot };
+        }
+        if (host_slots != nullptr) {
+            return { tensor_data, (uint32_t) host_slots[expert], -1 };
         }
     }
     return { tensor_data, expert, -1 };

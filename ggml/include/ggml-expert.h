@@ -23,7 +23,7 @@
 extern "C" {
 #endif
 
-#define GGML_EXPERT_ABI_VERSION      2
+#define GGML_EXPERT_ABI_VERSION      3
 #define GGML_EXPERT_IFACE_PROC_NAME  "ggml_backend_expert_iface"
 
 #define GGML_EXPERT_BANK_NONE        0xFFFFFFFFu
@@ -31,6 +31,11 @@ extern "C" {
 
 typedef uint32_t ggml_expert_bank_id;
 typedef uint32_t ggml_expert_plan_id;
+
+enum ggml_expert_mode {
+    GGML_EXPERT_MODE_INCLUSIVE = 0, // cached experts are copies, the host tensor stays complete
+    GGML_EXPERT_MODE_EXCLUSIVE = 1, // one copy per expert, either in VRAM or in host memory
+};
 
 enum ggml_expert_policy {
     GGML_EXPERT_POLICY_ADAPTIVE = 0,
@@ -48,6 +53,7 @@ struct ggml_expert_config {
     uint32_t abi_version;             // GGML_EXPERT_ABI_VERSION
 
     size_t   l1_bytes;                // VRAM budget for cached expert slices and their tables; 0 = cache off
+    enum ggml_expert_mode mode;
     enum ggml_expert_policy policy;
     uint32_t random_seed;             // STATIC: deterministic per-layer expert order
 
@@ -55,6 +61,7 @@ struct ggml_expert_config {
     bool     freeze;                  // profile only: commits still score and plan, installs are refused
     bool     profile_archive;         // move records that leave the score window to archive/ instead of deleting them
     bool     profile_reset;           // discard every stored record of every bank at startup
+    int32_t  spare_slots;             // exclusive: free slots rotated per exchange batch
 
     const char * profile_dir;         // root of the profile banks; NULL or "" = no profiling, no plans
     const char * initial_bank;        // the bank whose stored records seed the plan installed at model
@@ -77,16 +84,20 @@ struct ggml_expert_status {
     bool     disabled;                // a recoverable failure turned the cache off for this model
     const char * disabled_reason;     // static string, valid while the backend is loaded
     size_t   device_bytes;            // VRAM held by the cache
+    size_t   host_bytes;              // host memory held by the cache (exclusive/L2)
     uint32_t n_banks;
 };
 
 struct ggml_expert_iface {
     uint32_t abi_version;
 
-    // Lifecycle. configure -> register_context -> finalize -> ... -> release.
+    // Lifecycle. configure -> (alloc_context | register_context) -> finalize -> ... -> release.
     bool (*configure)(const struct ggml_expert_config * config);
-    // Called after the ordinary allocation of every host weight context. Returns false when the
-    // context holds no routed experts; that is not an error.
+    // Exclusive mode owns the weight buffer of the routed-expert context. Returns NULL when the
+    // ordinary allocation must be used (inclusive mode, cache off, or the context holds no experts).
+    ggml_backend_buffer_t (*alloc_context)(struct ggml_context * ctx, ggml_backend_buffer_type_t buft, const char * identity);
+    // Inclusive mode: called after the ordinary allocation of every host weight context. Returns
+    // false when the context holds no routed experts; that is not an error.
     bool (*register_context)(struct ggml_context * ctx, ggml_backend_buffer_t buffer, const char * identity);
     // Model load end: the weights are written and the host buffers are registered. Plans from the
     // stored profile, allocates the arenas exactly once and installs. Returns false when the cache
@@ -105,6 +116,9 @@ struct ggml_expert_iface {
     // Rows [row_begin, row_end) of the next graph computed on `backend` feed `bank`; an empty range
     // or GGML_EXPERT_BANK_NONE records nothing. Cheap when unchanged.
     bool (*profile_select)(ggml_backend_t backend, int32_t row_begin, int32_t row_end, ggml_expert_bank_id bank);
+
+    // Memory accounting for buffers the cache owns (exclusive mode).
+    bool (*memory)(ggml_backend_buffer_t buffer, size_t * host_bytes, size_t * device_bytes);
 };
 
 typedef const struct ggml_expert_iface * (*ggml_backend_expert_iface_t)(void);
