@@ -36,6 +36,7 @@ ggml_expert_config expert_config_from_params(const common_params & params) {
 
     cfg.l1_bytes = (size_t) params.expert_l1_mib * 1024 * 1024;
 
+    cfg.delta_install       = true;
     cfg.freeze              = params.expert_freeze;
     cfg.profile_archive     = params.expert_profile_archive;
     cfg.profile_reset       = params.expert_profile_reset;
