@@ -23,7 +23,7 @@
 extern "C" {
 #endif
 
-#define GGML_EXPERT_ABI_VERSION      1
+#define GGML_EXPERT_ABI_VERSION      2
 #define GGML_EXPERT_IFACE_PROC_NAME  "ggml_backend_expert_iface"
 
 #define GGML_EXPERT_BANK_NONE        0xFFFFFFFFu
@@ -40,6 +40,7 @@ enum ggml_expert_policy {
 enum ggml_expert_log_flags {
     GGML_EXPERT_LOG_INSTALL = 1u << 0,
     GGML_EXPERT_LOG_PROFILE = 1u << 1,
+    GGML_EXPERT_LOG_PREFILL = 1u << 2,
 };
 
 // Passed once, before the model's weight buffers are allocated. Strings must outlive the call only.
@@ -50,6 +51,7 @@ struct ggml_expert_config {
     enum ggml_expert_policy policy;
     uint32_t random_seed;             // STATIC: deterministic per-layer expert order
 
+    bool     delta_install;           // keep slices that stay selected in place when a new plan is installed
     bool     freeze;                  // profile only: commits still score and plan, installs are refused
     bool     profile_archive;         // move records that leave the score window to archive/ instead of deleting them
     bool     profile_reset;           // discard every stored record of every bank at startup
