@@ -3911,6 +3911,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_EXPERT_PROFILE_DIR"));
     add_opt(common_arg(
+        {"--expert-prefill-swap"},
+        "keep the plan of the prompt-processing profile in the expert cache while a prompt is processed and "
+        "the plan of the generation profile while tokens are generated (default: off)\n"
+        "both profile banks are collected either way; this option only decides which plans are installed",
+        [](common_params & params) {
+            params.expert_prefill_swap = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_EXPERT_PREFILL_SWAP"));
+    add_opt(common_arg(
         {"--expert-seed"}, "N", "seed for fixed random expert placement (default: 1)",
         [](common_params & params, int value) { params.expert_seed = value; }
     ).set_examples({LLAMA_EXAMPLE_SERVER}));

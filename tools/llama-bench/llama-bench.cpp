@@ -466,6 +466,7 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  --expert-l1-mib N                                 L1 MiB; cold/warm require >0, off requires 0\n");
     printf("  --expert-cache-mode <inclusive|exclusive>         L1/L2 relation; finite L2 works with both\n");
     printf("  --expert-profile-dir PATH                         cold output / warm immutable input profiles\n");
+    printf("  --expert-prefill-swap                             warm installs the prefill plan too; both banks are always profiled\n");
     printf("  --expert-seed N                                   fixed placement and benchmark input seed (default 1)\n");
     printf("  --expert-profile-archive                          retain profile records outside the score window\n");
     printf("  --expert-profile-keep                             keep the temporary warm profile at exit\n");
@@ -1645,7 +1646,7 @@ struct test {
             "no_op_offload",  "no_host",        "fit_target",    "fit_min_ctx",
             "n_prompt",       "n_gen",          "n_depth",
             "expert_cache", "expert_cache_mode", "expert_l1_mib",
-            "expert_profile_dir", "expert_profile_runs", "expert_seed",
+            "expert_profile_dir", "expert_profile_runs", "expert_prefill_swap", "expert_seed",
             "expert_control_ns", "expert_total_ns",
             "test_time",      "avg_ns",         "stddev_ns",     "avg_ts",         "stddev_ts"
         };
@@ -1665,7 +1666,7 @@ struct test {
             return INT;
         }
         if (field == "f16_kv" || field == "no_kv_offload" || field == "cpu_strict" ||
-            field == "embeddings" || field == "no_host") {
+            field == "embeddings" || field == "no_host" || field == "expert_prefill_swap") {
             return BOOL;
         }
         if (field == "avg_ts" || field == "stddev_ts") {
@@ -1755,6 +1756,7 @@ struct test {
                                             std::to_string(expert.l1_mib),
                                             expert.profile,
                                             expert_runs,
+                                            std::to_string(expert.warm() && expert.swap),
                                             std::to_string(expert.seed),
                                             std::to_string(expert_control_ns.empty() ? 0 : ::avg(expert_control_ns)),
                                             std::to_string(expert_total_ns.empty() ? 0 : ::avg(expert_total_ns)),
@@ -2521,9 +2523,9 @@ int llama_bench(int argc, char ** argv) {
                     if (expert_initialized) { expert.rebind(ctx); }
                     else {
                         common_expert_params ep;
-                        ep.l1_mib = run_expert.l1_mib; ep.freeze = !run_expert.warm();
+                        ep.l1_mib = run_expert.l1_mib; ep.prefill_swap = run_expert.swap; ep.freeze = !run_expert.warm();
                         expert.init(ctx, ep);
-                        if (!expert.ready()) { throw std::runtime_error("the requested profile bank is unavailable"); }
+                        if (!expert.ready()) { throw std::runtime_error("requested profile banks are unavailable"); }
                         expert_initialized = true;
                     }
                 }
@@ -2565,6 +2567,7 @@ int llama_bench(int argc, char ** argv) {
             for (int i = 0; i < (run_expert.restore_each ? 1 : params.reps); i++) {
                 llama_memory_clear(llama_get_memory(ctx), false);
                 uint64_t prompt_processed = 0;
+                bool prompt_open = false;
 
                 if (t.n_depth > 0) {
                     bool is_cached = t.n_depth == cstate.depth;
@@ -2583,6 +2586,7 @@ int llama_bench(int argc, char ** argv) {
                             fprintf(stderr, "llama-bench: benchmark %d/%zu: depth run %d/%d\n", params_idx, params_count,
                                     i + 1, params.reps);
                         }
+                        expert.on_prompt_start(0); prompt_open = true;
                         bool res = test_prompt(ctx, t.n_depth, t.n_batch, t.n_threads);
                         if (!res) {
                             fprintf(stderr, "%s: error: failed to run depth\n", __func__);
@@ -2612,6 +2616,7 @@ int llama_bench(int argc, char ** argv) {
                         fprintf(stderr, "llama-bench: benchmark %d/%zu: prompt run %d/%d\n", params_idx, params_count,
                                 i + 1, params.reps);
                     }
+                    if (!prompt_open) { expert.on_prompt_start(0); prompt_open = true; }
                     prompt_processed += t.n_prompt;
                     const auto begin = get_time_ns();
                     bool res = test_prompt(ctx, t.n_prompt, t.n_batch, t.n_threads);
@@ -2629,7 +2634,7 @@ int llama_bench(int argc, char ** argv) {
                         fprintf(stderr, "llama-bench: benchmark %d/%zu: generation run %d/%d\n", params_idx, params_count,
                                 i + 1, params.reps);
                     }
-                    expert.on_generation_start(0);
+                    expert.on_generation_start(0, prompt_processed);
                     const auto begin = get_time_ns();
                     bool res = test_gen(ctx, t.n_gen, t.n_threads);
                     compute_ns += get_time_ns() - begin;
@@ -2641,7 +2646,7 @@ int llama_bench(int argc, char ** argv) {
                     }
                 }
 
-                expert.on_request_end(0, prompt_processed, t.n_gen, false);
+                expert.on_request_end(0, prompt_processed, t.n_gen, false, true);
                 expert.on_all_idle();
                 uint64_t t_ns = get_time_ns() - t_start;
                 t.samples_ns.push_back(run_expert.enabled() ? compute_ns : t_ns);

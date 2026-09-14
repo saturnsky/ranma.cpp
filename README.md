@@ -126,6 +126,9 @@ applies, how to switch it, and its limits.
 - **Exclusive mode (Windows)** - `--expert-cache-mode exclusive` gives every routed expert exactly one home, a
   VRAM slot or a host slot, so the budget is not a second copy of experts that also sit in RAM.
   [docs/ranma/expert-cache-exclusive.md](docs/ranma/expert-cache-exclusive.md)
+- **Profile banks and the prefill swap** - prompt processing and generation are profiled into separate banks;
+  `--expert-prefill-swap` additionally installs the prompt plan while a prompt is processed.
+  [docs/ranma/expert-cache-banks.md](docs/ranma/expert-cache-banks.md)
 
 ## Building
 

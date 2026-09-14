@@ -28,6 +28,13 @@ int main() {
         CHECK(cfg.random_seed == 1);
         CHECK(profile ? cfg.policy == GGML_EXPERT_POLICY_ADAPTIVE : cfg.freeze);
         CHECK(l1 && profile && std::string(mode) == "exclusive" ? cfg.spare_slots == 8 : cfg.spare_slots == 0);
+        if (l1 > 0) {
+            p.expert_prefill_swap = true;
+            CHECK(!validate_expert_params(p).ok);      // needs -np 1
+            p.n_parallel = 1;
+            CHECK(validate_expert_params(p).ok == (profile && (os || std::string(mode) == "inclusive")));
+            p.expert_prefill_swap = false;
+        }
     }
     p = common_params(); p.fit_params = false;
     p.expert_l1_mib = 3070;
