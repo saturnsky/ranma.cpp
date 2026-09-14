@@ -3,6 +3,8 @@
 #if defined(GGML_USE_HIP)
 
 #include "expert-geometry.h"
+#include "expert-host.cuh"
+#include "expert-os.h"
 #include "expert-plan.h"
 #include "expert-profiler.cuh"
 #include "expert-profile-store.h"
@@ -62,6 +64,40 @@ struct plan_state {
     placement_stats stats;
 };
 
+// Defined below the controller: the exclusive buffer type needs the controller instance.
+static ggml_backend_buffer_t exclusive_buffer_create(ggml_context * ctx, ggml_backend_buffer_type_t buft);
+// The buffer that holds the tensors of the routed context that are not routed experts, or null.
+static ggml_backend_buffer_t exclusive_delegate_buffer(ggml_backend_buffer_t buffer);
+bool is_exclusive_buft(ggml_backend_buffer_type_t buft);
+
+// 128-bit FNV-1a over 64-bit words, two lanes with different primes. Exclusive mode has no host
+// master to compare a slice against, so the digest of the bytes the loader wrote (which are the
+// bytes of the GGUF) is recorded per (layer, kind, expert) and every slot is checked against it.
+struct slice_digest {
+    uint64_t a = 0xcbf29ce484222325ull;
+    uint64_t b = 0x9e3779b97f4a7c15ull;
+
+    bool operator==(const slice_digest & other) const { return a == other.a && b == other.b; }
+    bool operator!=(const slice_digest & other) const { return !(*this == other); }
+};
+
+static slice_digest digest_of(const void * data, size_t bytes) {
+    slice_digest out;
+    const unsigned char * p = static_cast<const unsigned char *>(data);
+    size_t i = 0;
+    for (; i + sizeof(uint64_t) <= bytes; i += sizeof(uint64_t)) {
+        uint64_t word = 0;
+        memcpy(&word, p + i, sizeof(word));
+        out.a = (out.a ^ word)*0x100000001b3ull;
+        out.b = (out.b ^ word)*0xc2b2ae3d27d4eb4full;
+    }
+    for (; i < bytes; ++i) {
+        out.a = (out.a ^ (uint64_t) p[i])*0x100000001b3ull;
+        out.b = (out.b ^ (uint64_t) p[i])*0xc2b2ae3d27d4eb4full;
+    }
+    return out;
+}
+
 static uint64_t now_s() {
     return (uint64_t) std::chrono::duration_cast<std::chrono::seconds>(
         std::chrono::system_clock::now().time_since_epoch()).count();
@@ -92,6 +128,10 @@ public:
             // Nothing to do for this model; stay unconfigured so that a later model may configure.
             return false;
         }
+        if (cfg_.mode != GGML_EXPERT_MODE_INCLUSIVE && cfg_.mode != GGML_EXPERT_MODE_EXCLUSIVE) {
+            GGML_LOG_WARN("expert cache: unknown mode %d; cache off\n", (int) cfg_.mode);
+            return false;
+        }
         if (cfg_.policy < GGML_EXPERT_POLICY_ADAPTIVE || cfg_.policy > GGML_EXPERT_POLICY_STATIC) {
             GGML_LOG_ERROR("expert cache: invalid placement policy\n");
             return false;
@@ -100,6 +140,20 @@ public:
             cfg_.policy = GGML_EXPERT_POLICY_STATIC;
             cfg_.freeze = true;
             GGML_LOG_INFO("expert cache: no profile directory; seeded fixed placement, no records or installs\n");
+        }
+        if (cfg_.mode == GGML_EXPERT_MODE_INCLUSIVE || cfg_.policy != GGML_EXPERT_POLICY_ADAPTIVE || !cfg_.l1_bytes) { cfg_.spare_slots = 0; }
+        if (cfg_.mode == GGML_EXPERT_MODE_EXCLUSIVE) {
+            // validate_expert_params refuses this before the model loads; this is the backend-side
+            // guard for a caller that built the config by hand.
+            if (!expert_os::supported()) {
+                GGML_LOG_WARN("expert cache: owned host storage needs the OS address reservation, which this "
+                              "platform does not implement; cache off\n");
+                return false;
+            }
+            if (cfg_.spare_slots < 0 || (cfg_.spare_slots == 0 && cfg_.policy == GGML_EXPERT_POLICY_ADAPTIVE && cfg_.mode == GGML_EXPERT_MODE_EXCLUSIVE && cfg_.l1_bytes > 0)) {
+                GGML_LOG_WARN("expert cache: exclusive mode needs spare_slots > 0; cache off\n");
+                return false;
+            }
         }
         // Debug override: read every resident slice back after each install and compare it with
         // the host tensor. Slow (the whole arena crosses PCIe twice), meant for the verification
@@ -110,6 +164,65 @@ public:
             GGML_LOG_INFO("expert cache: RANMA_EXPERT_VERIFY set, every install is verified against the host weights\n");
         }
         state_ = state_t::configured;
+        return true;
+    }
+
+    // Owned host storage redirects loader writes for exclusive, finite inclusive and Off policies.
+    // Unlimited inclusive uses the ordinary host buffer and register_context.
+    ggml_backend_buffer_t alloc_context(ggml_context * ctx, ggml_backend_buffer_type_t buft, const char * identity) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (state_ != state_t::configured || cfg_.mode != GGML_EXPERT_MODE_EXCLUSIVE ||
+                ctx == nullptr || buft == nullptr) {
+            return nullptr;
+        }
+        if (!ggml_backend_buft_is_host(buft)) {
+            return nullptr;
+        }
+        geometry geo;
+        std::string reason;
+        if (!build_geometry(ctx, geo, reason)) {
+            disable_locked(("routed expert tensors rejected: " + reason).c_str());
+            return nullptr;
+        }
+        if (geo.n_layers == 0) {
+            return nullptr; // no routed experts in this context
+        }
+        if (!adopt_context_locked(ctx, buft, identity, geo, /*owns_host =*/ true)) {
+            return nullptr;
+        }
+        if (!prepare_exclusive_locked()) {
+            return nullptr;
+        }
+        ggml_backend_buffer_t buffer = exclusive_buffer_create(ctx, buft);
+        if (buffer == nullptr) {
+            disable_locked("exclusive address reservation failed");
+            return nullptr;
+        }
+        exclusive_buffer_ = buffer;
+        return buffer;
+    }
+
+    // Routed by the exclusive buffer type's set_tensor/get_tensor.
+    bool buffer_io(const ggml_tensor * tensor, void * data, size_t offset, size_t size, bool write) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!l1_ || !l1_->owns_host_storage()) {
+            return false;
+        }
+        const ggml_tensor * root = tensor;
+        while (root->view_src != nullptr) {
+            offset += root->view_offs;
+            root = root->view_src;
+        }
+        int layer = -1;
+        int kind  = -1;
+        if (!parse_expert_tensor_name(ggml_get_name(root), layer, kind) || layer >= geo_.n_layers ||
+                geo_.tensors[layer][kind] != root) {
+            return false;
+        }
+        if (!l1_->logical_io(layer, kind, data, offset, size, write)) { return false; }
+        if (write && digests_enabled_) {
+            record_digest_locked(layer, kind, offset, size, data);
+        }
         return true;
     }
 
@@ -134,7 +247,7 @@ public:
             GGML_LOG_DEBUG("expert cache: %d routed layers already live in device memory; not cached\n", geo.n_routed_layers());
             return false;
         }
-        return adopt_context_locked(ctx, ggml_backend_buffer_get_type(buffer), identity, geo);
+        return adopt_context_locked(ctx, ggml_backend_buffer_get_type(buffer), identity, geo, /*owns_host =*/ false);
     }
 
     bool finalize() {
@@ -144,8 +257,34 @@ public:
         }
         ggml_cuda_set_device(device_);
 
-        const size_t table_bytes = table_bytes_locked();
-        const size_t overhead = budget_overhead_locked();
+        if (l1_ && l1_->owns_host_storage()) {
+            // The delegate buffer is not in the model's buffer list, so the backend's own
+            // post-load step for host buffers has not seen it. Do it here, while the loader's
+            // writes to it are final, exactly as llama does for the buffers it knows.
+            if (!finalize_delegate_buffer_locked()) {
+                abort_locked("delegate buffer finalization failed");
+            }
+            // The loader has written every slice to its home; register the host arenas as coarse
+            // mapped memory so the kernels can read them, and the cache is live.
+            if (!host_->map()) {
+                abort_locked("host arena registration failed");
+            }
+            state_ = state_t::installed;
+            std::string reason;
+            if (!l1_->verify_current_assignment(reason)) {
+                abort_locked(("exclusive assignment is inconsistent: " + reason).c_str());
+            }
+            verify_all_locked();
+            GGML_LOG_INFO("expert cache: owned host install: %zu MiB in VRAM (%zu of %zu slices), "
+                          "%zu MiB in the host arena, %d spare slots per class\n",
+                l1_->device_bytes()/(1024*1024), resident_slices_locked(),
+                size_t(geo_.n_routed_layers())*size_t(geo_.n_experts),
+                host_->host_bytes()/(1024*1024), cfg_.spare_slots);
+            return true;
+        }
+
+        const size_t table_bytes = table_bytes_locked(false);
+        const size_t overhead = budget_overhead_locked(false);
         if (cfg_.l1_bytes <= overhead) {
             disable_locked("budget smaller than the cache tables");
             return false;
@@ -213,7 +352,12 @@ public:
         installed_plan_ = GGML_EXPERT_PLAN_NONE;
         banks_.clear();
         l1_.reset();
+        host_.reset();
         profiler_.reset();
+        exclusive_buffer_ = nullptr;
+        digests_.clear();
+        digest_known_.clear();
+        digests_enabled_ = false;
         geo_ = geometry();
         ctx_ = nullptr;
         device_ = -1;
@@ -232,7 +376,9 @@ public:
         out->installed       = state_ == state_t::installed;
         out->disabled        = state_ == state_t::disabled;
         out->disabled_reason = disabled_reason_.c_str();
-        out->device_bytes    = (l1_ ? l1_->device_bytes() : 0) + (profiler_ ? profiler_->device_bytes() : 0);
+        out->device_bytes    = (l1_ ? l1_->device_bytes() : 0) + (profiler_ ? profiler_->device_bytes() : 0) +
+                               (host_ ? host_->device_bytes() : 0);
+        out->host_bytes      = host_ ? host_->host_bytes() : 0;
         out->n_banks         = (uint32_t) banks_.size();
         return true;
     }
@@ -288,6 +434,7 @@ public:
         in.geo              = &geo_;
         in.counts           = b.store->total_selections() != 0 ? scores.data() : nullptr;
         in.budget_bytes     = SIZE_MAX;
+        in.exclusive        = l1_ && l1_->owns_host_storage();
         in.fixed_capacities = &capacities_;
         placement next = plan_placement(in);
 
@@ -348,8 +495,19 @@ public:
             disable_locked("install failed");
             return false;
         }
-        GGML_LOG_INFO("expert cache: installed plan %u of bank '%s': retained=%zu copied=%zu bytes=%zu MiB in %.1f ms\n",
-            id, banks_[plan.bank].label.c_str(), stats.retained, stats.copied, stats.bytes/(1024*1024), stats.ms);
+        if (l1_->owns_host_storage()) {
+            GGML_LOG_INFO("expert cache: installed plan %u of bank '%s': mode=%s retained=%zu exchanged=%zu "
+                          "h2d_bytes=%zu MiB d2h_bytes=%zu MiB in %.1f ms\n",
+                id, banks_[plan.bank].label.c_str(), mode_name(), stats.retained, stats.copied,
+                stats.bytes/(1024*1024), stats.d2h_bytes/(1024*1024), stats.ms);
+            std::string reason;
+            if (!l1_->verify_current_assignment(reason)) {
+                GGML_ABORT("expert cache: exclusive assignment is inconsistent after a swap: %s", reason.c_str());
+            }
+        } else {
+            GGML_LOG_INFO("expert cache: installed plan %u of bank '%s': retained=%zu copied=%zu bytes=%zu MiB in %.1f ms\n",
+                id, banks_[plan.bank].label.c_str(), stats.retained, stats.copied, stats.bytes/(1024*1024), stats.ms);
+        }
         // the plan that was installed until now is only reachable while it is a bank's newest one
         finish_plan_locked(id);
         verify_all_locked();
@@ -408,9 +566,10 @@ public:
     }
 
 private:
-    // Finds the device of the buffer type and adopts the routed-expert context.
+    // Shared tail of alloc_context and register_context: find the device of the buffer type and
+    // adopt the routed-expert context.
     bool adopt_context_locked(ggml_context * ctx, ggml_backend_buffer_type_t buft, const char * identity,
-            geometry & geo) {
+            geometry & geo, bool owns_host) {
         const int device = ggml_backend_cuda_dev_index(ggml_backend_buft_get_device(buft));
         if (device < 0) {
             GGML_LOG_INFO("expert cache: routed experts are in a CPU buffer, not the HIP host buffer type; not cached\n");
@@ -422,8 +581,9 @@ private:
         identity_  = identity ? identity : "";
         signature_ = identity_ + "\n" + geo_.signature();
         state_     = state_t::registered;
-        GGML_LOG_INFO("expert cache: registered %s: %d routed layers x %d experts, %zu size classes, device %d\n",
-            identity_.c_str(), geo_.n_routed_layers(), geo_.n_experts, geo_.class_bytes.size(), device_);
+        GGML_LOG_INFO("expert cache: registered %s%s: %d routed layers x %d experts, %zu size classes, device %d\n",
+            identity_.c_str(), owns_host ? " for owned host storage" : "", geo_.n_routed_layers(),
+            geo_.n_experts, geo_.class_bytes.size(), device_);
         return true;
     }
 
@@ -437,7 +597,18 @@ private:
         installed_plan_ = id;
     }
 
+    const char * mode_name() const { return cfg_.mode == GGML_EXPERT_MODE_INCLUSIVE ? "inclusive" : "exclusive"; }
+
+    // Once the arenas own the expert bytes there is no uncached fallback: the routed tensors hold
+    // logical addresses and no second copy exists. Every failure past that point ends the process.
+    [[noreturn]] void abort_locked(const char * reason) const {
+        GGML_ABORT("expert cache: owned host storage cannot continue: %s", reason);
+    }
+
     void disable_locked(const char * reason) {
+        if (l1_ && l1_->owns_host_storage()) {
+            abort_locked(reason);
+        }
         // Pointers stay allocated: a captured graph may hold them. Lookups miss from now on.
         GGML_LOG_WARN("expert cache: disabled: %s\n", reason);
         disabled_reason_ = reason;
@@ -449,12 +620,52 @@ private:
             return;
         }
         const auto t0 = std::chrono::steady_clock::now();
+        if (l1_->owns_host_storage()) {
+            size_t vram = 0;
+            size_t host = 0;
+            size_t skipped = 0;
+            if (!verify_exclusive_locked(vram, host, skipped)) {
+                GGML_ABORT("expert cache: an expert slice differs from the bytes the loader wrote");
+            }
+            GGML_LOG_INFO("expert cache: verified %zu VRAM and %zu host slices against the GGUF bytes "
+                          "(%zu without a digest) in %.1f ms\n", vram, host, skipped,
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+            return;
+        }
         const long checked = l1_->verify_resident(0);
         if (checked < 0) {
             GGML_ABORT("expert cache: a resident slice differs from its host tensor");
         }
         GGML_LOG_INFO("expert cache: verified %ld resident slices against the host weights in %.1f ms\n", checked,
             std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+    }
+
+    // The delegate buffer of the exclusive weight buffer may be a host buffer that the backend
+    // registers as coarse-grained mapped memory only after the model is loaded. llama runs that step
+    // for every buffer of the model, but the delegate is owned by the exclusive buffer and is not in
+    // that list, so it is run here instead. Buffers that need nothing answer true.
+    bool finalize_delegate_buffer_locked() {
+        ggml_backend_buffer_t delegate = exclusive_buffer_ != nullptr ?
+            exclusive_delegate_buffer(exclusive_buffer_) : nullptr;
+        if (delegate == nullptr) {
+            return true;
+        }
+        ggml_backend_dev_t dev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(delegate));
+        if (dev == nullptr) {
+            return true;
+        }
+        using finalize_host_buffer_t = bool (*)(ggml_backend_buffer_t);
+        finalize_host_buffer_t finalize_host = (finalize_host_buffer_t) ggml_backend_reg_get_proc_address(
+            ggml_backend_dev_backend_reg(dev), "ggml_backend_finalize_host_buffer");
+        return finalize_host == nullptr || finalize_host(delegate);
+    }
+
+    size_t resident_slices_locked() const {
+        size_t count = 0;
+        for (const std::vector<int32_t> & layer : l1_->selected()) {
+            count += layer.size();
+        }
+        return count;
     }
 
     static bool any_capacity(const std::vector<int> & capacities) {
@@ -468,13 +679,24 @@ private:
             100.0*stats.selection_hit(), 100.0*stats.byte_hit());
     }
 
-    size_t table_bytes_locked() const {
-        return geo_.n_counts()*sizeof(int32_t);
+    // Free slots that the owned-host exchange rotates through.
+    size_t spare_bytes_locked() const {
+        size_t bytes = 0;
+        for (int cls = 0; cls < (int) geo_.class_bytes.size(); ++cls) {
+            bytes += size_t(cfg_.spare_slots)*geo_.class_total_bytes(cls);
+        }
+        return bytes;
+    }
+
+    // Owned host storage keeps a second slot table, for the host arena.
+    size_t table_bytes_locked(bool owns_host) const {
+        return (owns_host ? 2 : 1)*geo_.n_counts()*sizeof(int32_t);
     }
 
     // Everything inside the budget that is not an expert slice.
-    size_t budget_overhead_locked() const {
-        return table_bytes_locked() + arena_tail_total(geo_) +
+    size_t budget_overhead_locked(bool owns_host) const {
+        return table_bytes_locked(owns_host) + arena_tail_total(geo_) +
+            (owns_host ? spare_bytes_locked() : 0) +
             (profiling_enabled() ? geo_.n_counts()*sizeof(uint32_t)*max_banks : 0);
     }
 
@@ -484,6 +706,138 @@ private:
         profiler_.reset(new profiler(geo_, max_banks));
         if (profiler_->allocate(device_)) { return true; }
         profiler_.reset(); disable_locked("profiler allocation failed"); return false;
+    }
+
+    // Exclusive: the whole budget is planned and allocated before the loader writes, so that every
+    // slice can be written straight to its final home (design section 6).
+    // Anything that fails here leaves the cache disabled and the model loading uncached.
+    bool prepare_exclusive_locked() {
+        ggml_cuda_set_device(device_);
+
+        const size_t table_bytes = table_bytes_locked(true);
+        const size_t overhead = budget_overhead_locked(true);
+        if (cfg_.l1_bytes > 0 && cfg_.l1_bytes <= overhead) {
+            disable_locked("budget smaller than the cache tables and spare slots");
+            return false;
+        }
+
+        std::vector<uint64_t> scores;
+        const uint64_t * counts = seed_counts_locked(scores);
+
+        placement_inputs in;
+        in.geo          = &geo_;
+        in.counts       = counts;
+        in.budget_bytes = cfg_.l1_bytes == 0 ? 0 : cfg_.l1_bytes - overhead;
+        in.exclusive    = true; // every VRAM slot is filled, zero-count experts included
+        placement initial = plan_placement(in);
+        if (!any_capacity(initial.capacities) && cfg_.l1_bytes > 0) {
+            disable_locked("budget holds no expert slice");
+            return false;
+        }
+        capacities_ = initial.capacities;
+
+        std::vector<int> host_capacities(geo_.class_bytes.size(), 0);
+        for (int cls = 0; cls < (int) geo_.class_bytes.size(); ++cls) {
+            host_capacities[cls] = geo_.class_layers[cls]*geo_.n_experts - capacities_[cls];
+            if (host_capacities[cls] < 0) {
+                disable_locked("more VRAM slots than experts");
+                return false;
+            }
+        }
+
+        if (!allocate_profiler_locked()) { return false; }
+        l1_.reset(new l1_arena(geo_));
+        if (!l1_->allocate(capacities_, device_, cfg_.spare_slots)) {
+            l1_.reset();
+            profiler_.reset();
+            disable_locked("arena allocation failed");
+            return false;
+        }
+        host_.reset(new host_arena(geo_));
+        if (!host_->allocate(host_capacities, cfg_.spare_slots, device_)) {
+            host_.reset();
+            l1_.reset();
+            profiler_.reset();
+            disable_locked("host arena allocation failed");
+            return false;
+        }
+        l1_->attach_host(host_.get(), cfg_.spare_slots, cfg_.mode == GGML_EXPERT_MODE_INCLUSIVE);
+        if (!l1_->assign_exclusive(initial.selected)) {
+            host_.reset();
+            l1_.reset();
+            profiler_.reset();
+            disable_locked("exclusive slot assignment failed");
+            return false;
+        }
+        if (verify_all_) {
+            digests_enabled_ = true;
+            digests_.assign(size_t(geo_.n_layers)*geometry::n_kinds*geo_.n_experts, slice_digest());
+            digest_known_.assign(digests_.size(), 0);
+        }
+        if (counts != nullptr) { log_plan_locked(initial.stats); }
+        GGML_LOG_INFO("expert cache: owned host arenas ready: VRAM %zu MiB, host %zu MiB, tables and profiler %zu KiB\n",
+            l1_->device_bytes()/(1024*1024), host_->host_bytes()/(1024*1024),
+            (table_bytes + (profiler_ ? profiler_->device_bytes() : 0))/1024);
+        return true;
+    }
+
+    size_t digest_index_locked(int layer, int kind, int expert) const {
+        return (size_t(layer)*geometry::n_kinds + size_t(kind))*size_t(geo_.n_experts) + size_t(expert);
+    }
+
+    // Records the digest of the bytes the loader writes. A write that does not cover whole expert
+    // slices leaves the touched experts without a digest, and verify reports them as skipped rather
+    // than pretending to have checked them.
+    void record_digest_locked(int layer, int kind, size_t offset, size_t size, const void * data) {
+        const int cls = geo_.layer_class[layer];
+        if (cls < 0) {
+            return;
+        }
+        const size_t stride = geo_.class_bytes[cls][kind];
+        if (stride == 0) {
+            return;
+        }
+        const bool aligned = offset % stride == 0 && size % stride == 0;
+        const int  first   = int(offset/stride);
+        const int  last    = int((offset + size + stride - 1)/stride);
+        for (int expert = first; expert < last && expert < geo_.n_experts; ++expert) {
+            const size_t index = digest_index_locked(layer, kind, expert);
+            if (!aligned) {
+                digest_known_[index] = 0;
+                continue;
+            }
+            digests_[index] = digest_of(static_cast<const char *>(data) + (size_t(expert) - first)*stride, stride);
+            digest_known_[index] = 1;
+        }
+    }
+
+    // Compares every VRAM slot and every host slot with the digest of the bytes the loader wrote.
+    bool verify_exclusive_locked(size_t & vram, size_t & host, size_t & skipped) {
+        if (digests_.empty()) { return true; }
+        std::vector<uint8_t> back;
+        for (int l = 0; l < geo_.n_layers; ++l) {
+            const int cls = geo_.layer_class[l];
+            if (cls < 0) { continue; }
+            for (int e = 0; e < geo_.n_experts; ++e) for (int k = 0; k < geometry::n_kinds; ++k) {
+                const int gpu = l1_->host_slots()[l][e];
+                const void * home = l1_->host_address(l, k, e);
+                if (gpu < 0 && !home) { skipped += k == 0; continue; }
+                if (!digest_known_[digest_index_locked(l, k, e)]) { skipped += k == 0; continue; }
+                auto check = [&](const void * data) {
+                    const size_t i = digest_index_locked(l, k, e);
+                    const auto found = digest_of(data, geo_.class_bytes[cls][k]);
+                    if (digests_[i] == found) { return true; }
+                    GGML_LOG_ERROR("expert cache: layer %d kind %d expert %d differs from GGUF bytes\n", l, k, e); return false;
+                };
+                if (gpu >= 0) {
+                    back.resize(geo_.class_bytes[cls][k]);
+                    if (!l1_->read_slice(l, k, gpu, back.data()) || !check(back.data())) { return false; }
+                    vram += k == 0;
+                }
+                if (home) { if (!check(home)) { return false; } host += k == 0; }
+            }
+        }
+        return true;
     }
 
     bool bank_ok_locked(ggml_expert_bank_id bank) const {
@@ -578,6 +932,11 @@ private:
     std::vector<int> capacities_;
     std::unique_ptr<profiler> profiler_;
     std::unique_ptr<l1_arena> l1_;
+    std::unique_ptr<host_arena> host_;
+    ggml_backend_buffer_t exclusive_buffer_ = nullptr; // owned by the model, not by the controller
+    bool digests_enabled_ = false;
+    std::vector<slice_digest> digests_;      // [(layer*n_kinds + kind)*n_experts + expert]
+    std::vector<uint8_t>      digest_known_;
     std::vector<bank_state> banks_;
     std::map<ggml_expert_plan_id, plan_state> plans_;
     ggml_expert_plan_id next_plan_id_  = 0;
@@ -587,6 +946,197 @@ private:
 static controller & instance() {
     static controller c;
     return c;
+}
+
+// ---- the exclusive buffer type ---------------------------------------------------------------
+//
+// Address-only storage: the buffer's base is an expert_os reservation with no pages behind it, so
+// every routed expert tensor gets a distinct, stable logical address while its bytes live in the
+// VRAM arena or in the host arena. Everything that touches tensor data goes through logical_io.
+
+namespace {
+
+struct exclusive_buffer_context {
+    expert_os::reservation res;
+    ggml_context * tensors = nullptr;
+    // The weight context of the HIP host buffer type is not routed experts only: the token
+    // embedding of a fully offloaded model lands in the same buffer type. Those tensors keep real
+    // storage of that same buffer type, in a delegate buffer this one owns, so the cache does not
+    // move them and the graph is the one a run without the cache builds.
+    ggml_backend_buffer_t delegate_buffer = nullptr;
+};
+
+const char * exclusive_buft_name(ggml_backend_buffer_type_t) {
+    return "ROCm_ExpertExclusive";
+}
+
+size_t exclusive_buft_alignment(ggml_backend_buffer_type_t) {
+    return 128;
+}
+
+ggml_backend_buffer_t exclusive_buft_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
+    // Anything allocated on this buffer type that is not a routed expert weight needs real device
+    // storage. A LoRA adapter tensor takes the buffer type of its base tensor (src/llama-adapter.cpp),
+    // so a base tensor that lives here would otherwise hand the adapter a null allocator.
+    return ggml_backend_buft_alloc_buffer(ggml_backend_dev_buffer_type(buft->device), size);
+}
+
+void * exclusive_get_base(ggml_backend_buffer_t buffer) {
+    return static_cast<exclusive_buffer_context *>(buffer->context)->res.base;
+}
+
+void exclusive_free_buffer(ggml_backend_buffer_t buffer) {
+    exclusive_buffer_context * ctx = static_cast<exclusive_buffer_context *>(buffer->context);
+    if (ctx->delegate_buffer != nullptr) {
+        ggml_backend_buffer_free(ctx->delegate_buffer);
+    }
+    expert_os::release(ctx->res);
+    delete ctx;
+}
+
+void exclusive_set_tensor(ggml_backend_buffer_t, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+    if (!instance().buffer_io(tensor, const_cast<void *>(data), offset, size, /*write =*/ true)) {
+        GGML_ABORT("expert cache: exclusive write to '%s' failed", ggml_get_name(tensor));
+    }
+}
+
+void exclusive_get_tensor(ggml_backend_buffer_t, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
+    if (!instance().buffer_io(tensor, data, offset, size, /*write =*/ false)) {
+        GGML_ABORT("expert cache: exclusive read of '%s' failed", ggml_get_name(tensor));
+    }
+}
+
+void exclusive_memset_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, uint8_t value,
+        size_t offset, size_t size) {
+    std::vector<uint8_t> chunk(std::min<size_t>(size, 8*1024*1024), value);
+    while (size != 0) {
+        const size_t n = std::min(size, chunk.size());
+        exclusive_set_tensor(buffer, tensor, chunk.data(), offset, n);
+        offset += n;
+        size   -= n;
+    }
+}
+
+bool exclusive_cpy_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * src, ggml_tensor * dst) {
+    if (!ggml_are_same_layout(src, dst)) {
+        return false;
+    }
+    const size_t total = ggml_nbytes(src);
+    std::vector<uint8_t> chunk(std::min<size_t>(total, 8*1024*1024));
+    for (size_t offset = 0; offset < total; offset += chunk.size()) {
+        const size_t n = std::min(chunk.size(), total - offset);
+        ggml_backend_tensor_get(src, chunk.data(), offset, n);
+        exclusive_set_tensor(buffer, dst, chunk.data(), offset, n);
+    }
+    return true;
+}
+
+void exclusive_clear(ggml_backend_buffer_t buffer, uint8_t value) {
+    exclusive_buffer_context * ctx = static_cast<exclusive_buffer_context *>(buffer->context);
+    for (ggml_tensor * t = ggml_get_first_tensor(ctx->tensors); t != nullptr;
+            t = ggml_get_next_tensor(ctx->tensors, t)) {
+        if (t->buffer == buffer) { // the delegated tensors belong to the delegate buffer
+            exclusive_memset_tensor(buffer, t, value, 0, ggml_nbytes(t));
+        }
+    }
+}
+
+ggml_backend_buffer_type g_exclusive_buft = {
+    /* .iface   = */ { exclusive_buft_name, exclusive_buft_alloc_buffer, exclusive_buft_alignment,
+                       nullptr, nullptr, nullptr },
+    /* .device  = */ nullptr,
+    /* .context = */ nullptr,
+};
+
+} // namespace
+
+static bool is_routed_expert(const ggml_tensor * tensor) {
+    int layer = -1;
+    int kind  = -1;
+    return parse_expert_tensor_name(ggml_get_name(tensor), layer, kind);
+}
+
+static ggml_backend_buffer_t exclusive_buffer_create(ggml_context * ctx, ggml_backend_buffer_type_t buft) {
+    // The tensors of this context that are not routed experts are delegated to a buffer of `buft`,
+    // the buffer type the context was going to use anyway, so they keep the storage, alloc size,
+    // alignment and row padding of that type and stay exactly where inclusive mode and a run
+    // without the cache put them. Only the routed experts get logical addresses.
+    const size_t delegate_align = ggml_backend_buft_get_alignment(buft);
+    size_t logical_bytes  = 0;
+    size_t delegate_bytes = 0;
+    int    delegated      = 0;
+    for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+        if (is_routed_expert(t)) {
+            logical_bytes += GGML_PAD(ggml_nbytes(t), 128);
+        } else {
+            delegate_bytes += GGML_PAD(ggml_backend_buft_get_alloc_size(buft, t), delegate_align);
+            ++delegated;
+        }
+    }
+    std::optional<expert_os::reservation> res = expert_os::reserve(logical_bytes);
+    if (!res) {
+        return nullptr;
+    }
+    exclusive_buffer_context * context = new exclusive_buffer_context();
+    context->res     = *res;
+    context->tensors = ctx;
+    if (delegate_bytes != 0) {
+        context->delegate_buffer = ggml_backend_buft_alloc_buffer(buft, delegate_bytes);
+        if (context->delegate_buffer == nullptr) {
+            GGML_LOG_ERROR("expert cache: could not allocate %.2f MiB of %s for the %d non-expert tensors of the "
+                           "routed expert context\n", delegate_bytes/1024.0/1024.0,
+                           ggml_backend_buft_name(buft), delegated);
+            expert_os::release(context->res);
+            delete context;
+            return nullptr;
+        }
+        ggml_backend_buffer_set_usage(context->delegate_buffer, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    }
+
+    g_exclusive_buft.device = buft->device;
+    ggml_backend_buffer_i iface = {};
+    iface.free_buffer    = exclusive_free_buffer;
+    iface.get_base       = exclusive_get_base;
+    iface.memset_tensor  = exclusive_memset_tensor;
+    iface.set_tensor     = exclusive_set_tensor;
+    iface.get_tensor     = exclusive_get_tensor;
+    iface.cpy_tensor     = exclusive_cpy_tensor;
+    iface.clear          = exclusive_clear;
+
+    ggml_backend_buffer_t buffer = ggml_backend_buffer_init(&g_exclusive_buft, iface, context, logical_bytes);
+    char * delegate_base = context->delegate_buffer != nullptr ?
+        static_cast<char *>(ggml_backend_buffer_get_base(context->delegate_buffer)) : nullptr;
+    size_t offset          = 0;
+    size_t delegate_offset = 0;
+    for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+        const bool expert = is_routed_expert(t);
+        ggml_backend_buffer_t owner = expert ? buffer : context->delegate_buffer;
+        char * address = expert ? static_cast<char *>(context->res.base) + offset : delegate_base + delegate_offset;
+        if (ggml_backend_tensor_alloc(owner, t, address) != GGML_STATUS_SUCCESS) {
+            ggml_backend_buffer_free(buffer);
+            return nullptr;
+        }
+        if (expert) {
+            offset += GGML_PAD(ggml_nbytes(t), 128);
+        } else {
+            delegate_offset += GGML_PAD(ggml_backend_buft_get_alloc_size(buft, t), delegate_align);
+        }
+    }
+    GGML_LOG_INFO("expert cache: owned host buffer: %.2f MiB of address space for the routed experts, "
+                  "%.2f MiB of %s for %d other tensors of the same context\n",
+        logical_bytes/1024.0/1024.0, delegate_bytes/1024.0/1024.0, ggml_backend_buft_name(buft), delegated);
+    return buffer;
+}
+
+static ggml_backend_buffer_t exclusive_delegate_buffer(ggml_backend_buffer_t buffer) {
+    if (buffer == nullptr || !is_exclusive_buft(buffer->buft)) {
+        return nullptr;
+    }
+    return static_cast<exclusive_buffer_context *>(buffer->context)->delegate_buffer;
+}
+
+bool is_exclusive_buft(ggml_backend_buffer_type_t buft) {
+    return buft != nullptr && buft->iface.get_name == exclusive_buft_name;
 }
 
 } // namespace ggml_cuda_expert
@@ -601,7 +1151,14 @@ void ggml_cuda_expert_profile_ids(ggml_backend_cuda_context & ctx, const ggml_te
     instance().profile_ids(ctx, ids);
 }
 
+bool ggml_cuda_expert_is_exclusive_buffer_type(ggml_backend_buffer_type_t buft) {
+    return ggml_cuda_expert::is_exclusive_buft(buft);
+}
+
 static bool iface_configure(const ggml_expert_config * config) { return instance().configure(config); }
+static ggml_backend_buffer_t iface_alloc_context(ggml_context * ctx, ggml_backend_buffer_type_t buft, const char * identity) {
+    return instance().alloc_context(ctx, buft, identity);
+}
 static bool iface_register_context(ggml_context * ctx, ggml_backend_buffer_t buffer, const char * identity) {
     return instance().register_context(ctx, buffer, identity);
 }
@@ -618,9 +1175,27 @@ static bool iface_plan_install(ggml_expert_plan_id plan) { return instance().pla
 static bool iface_profile_select(ggml_backend_t backend, int32_t row_begin, int32_t row_end, ggml_expert_bank_id bank) {
     return instance().profile_select(backend, row_begin, row_end, bank);
 }
+static bool iface_memory(ggml_backend_buffer_t buffer, size_t * host_bytes, size_t * device_bytes) {
+    if (buffer == nullptr || !ggml_cuda_expert::is_exclusive_buft(buffer->buft)) {
+        return false;
+    }
+    ggml_expert_status status = {};
+    if (!instance().status(&status)) {
+        return false;
+    }
+    if (host_bytes != nullptr) {
+        *host_bytes = status.host_bytes;
+    }
+    if (device_bytes != nullptr) {
+        *device_bytes = status.device_bytes;
+    }
+    return true;
+}
+
 static const ggml_expert_iface g_expert_iface = {
     /* .abi_version      = */ GGML_EXPERT_ABI_VERSION,
     /* .configure        = */ iface_configure,
+    /* .alloc_context    = */ iface_alloc_context,
     /* .register_context = */ iface_register_context,
     /* .finalize         = */ iface_finalize,
     /* .release          = */ iface_release,
@@ -631,6 +1206,7 @@ static const ggml_expert_iface g_expert_iface = {
     /* .bank_discard     = */ iface_bank_discard,
     /* .plan_install     = */ iface_plan_install,
     /* .profile_select   = */ iface_profile_select,
+    /* .memory           = */ iface_memory,
 };
 
 const ggml_expert_iface * ggml_backend_cuda_expert_iface(void) {

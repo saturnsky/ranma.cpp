@@ -109,17 +109,30 @@ void ggml_cuda_mul_mat_q(
     const char    * src0_d        = (const char  *) src0->data;
     const char    * x_cache       = nullptr;
     const int32_t * x_cache_slots = nullptr;
+    const int32_t * x_host_slots  = nullptr;
 #if defined(GGML_USE_HIP)
     {
-        if (ggml_backend_buffer_is_host(src0->buffer)) {
-            src0_d = (const char *) ggml_hip_mapped_host_device_alias(src0);
+        const bool src0_is_host_mapped = ggml_backend_buffer_is_host(src0->buffer);
+        // exclusive mode: the tensor has no bytes of its own, both arenas come from the lookup
+        const bool src0_is_exclusive =
+            ggml_cuda_expert_is_exclusive_buffer_type(ggml_backend_buffer_get_type(src0->buffer));
+        GGML_ASSERT(!src0_is_exclusive || ids);
+        if (src0_is_host_mapped || src0_is_exclusive) {
+            if (src0_is_host_mapped) {
+                src0_d = (const char *) ggml_hip_mapped_host_device_alias(src0);
+            }
             if (ids) {
                 // expert cache: resident experts of this tensor are read from the VRAM arena, and in
                 // exclusive mode everything else from the host arena
                 const ggml_cuda_expert_lookup cached = ggml_cuda_expert_lookup_tensor(src0);
                 x_cache       = (const char *) cached.data;
                 x_cache_slots = cached.slots;
+                x_host_slots  = cached.host_slots;
+                if (cached.host_data != nullptr) {
+                    src0_d = (const char *) cached.host_data;
+                }
             }
+            GGML_ASSERT(!src0_is_exclusive || x_host_slots != nullptr);
         }
     }
 #else
@@ -189,7 +202,7 @@ void ggml_cuda_mul_mat_q(
         const mmq_args args = {
             src0_d, src0->type, (const int *) src1_q8_1.ptr, nullptr, nullptr, dst_d,
             src0->type == GGML_TYPE_NVFP4 && use_native_fp4 ? src1_scale.ptr : nullptr,
-            nullptr, nullptr,
+            nullptr, nullptr, nullptr,
             ne00, ne01, ne1, s01, ne11, s1,
             ne02, ne12, (int64_t) nb02, s12, s2,
             ne03, ne13, s03, s13, s3,
@@ -277,7 +290,7 @@ void ggml_cuda_mul_mat_q(
     const mmq_args args = {
         src0_d, src0->type, (const int *) src1_q8_1.get(), ids_dst.get(), expert_bounds.get(), dst_d,
         src1_scale.ptr,
-        x_cache, x_cache_slots,
+        x_cache, x_cache_slots, x_host_slots,
         ne00, ne01, ne_get_rows, s01, ne_get_rows, s1,
         ne02, ne02, (int64_t) nb02, s12, s2,
         ne03, ne13, s03, s13, s3,

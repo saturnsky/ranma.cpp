@@ -25,6 +25,10 @@ Three parts, in the order the data flows:
    moves, because captured HIP graphs hold its address; only slot contents and tables change, and
    only while nothing computes.
 
+The cache is inclusive by default: each VRAM resident also keeps its host copy, and the host tensor
+stays complete. `--expert-cache-mode exclusive` gives every routed expert exactly one home instead
+and takes the budget back out of host memory (`expert-cache-exclusive.md`).
+
 This is a fork feature of the HIP build. It is not compiled into the CUDA backend; the options are
 accepted there and do nothing.
 
@@ -72,6 +76,7 @@ would serve generation badly.
 |---|---|---|
 | `--expert-l1-mib N` | 0 (off) | VRAM budget in MiB for expert payload and cache overhead. The budget also decides the expert placement (every routed expert goes to host memory), so `--n-cpu-moe`/`--cpu-moe` are refused together with it. `--expert-cache-mib` is accepted as an alias. |
 | `--expert-profile-dir DIR` | none | Without it the placement is seeded and fixed: no records, no installs. |
+| `--expert-cache-mode MODE` | `inclusive` | `inclusive` keeps a host copy of each VRAM resident; `exclusive` keeps one home per expert (`expert-cache-exclusive.md`). |
 | `--expert-seed N` | 1 | Seed of the fixed random placement used when no profile is available. |
 | `--expert-freeze` | off | Profile and plan, never change the cache contents (for collecting a profile without disturbing a measurement). |
 | `--expert-profile-archive` | off | Records that leave the ten-record score window move to `DIR/<bank>/archive/` instead of being deleted. |

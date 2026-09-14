@@ -680,6 +680,7 @@ struct common_params {
 
     // ranma expert cache (docs/ranma/expert-cache.md)
     int32_t     expert_l1_mib          = 0;     // VRAM budget for cached MoE expert weights; 0 = off
+    std::string expert_cache_mode         = "inclusive";
     std::string expert_profile_dir;                // root directory of the selection profiles; required when the cache is on
     bool        expert_freeze             = false; // profile only, never change the cache contents
     bool        expert_profile_archive    = false; // keep records that leave the score window under archive/

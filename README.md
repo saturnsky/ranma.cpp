@@ -144,6 +144,13 @@ misbehave. Other platforms and backends are not tested and not supported by this
   only the resident fraction helps it); a delta install copies 53 to 69 of 1027 slices in 11 to 12 ms. Details:
   [docs/ranma/expert-cache-prefill.md](docs/ranma/expert-cache-prefill.md).
 
+- **Expert cache, exclusive mode (HIP, Windows)** - `--expert-cache-mode exclusive` gives every routed expert
+  exactly one home, a VRAM slot or a host slot, instead of caching copies of experts that also stay in host memory.
+  Off by default. Measured on a Radeon AI PRO R9700 with Qwen3.8-Flash-Next UD-Q4_K_XL and a 20000 MiB budget:
+  peak process private memory 97.6 -> 78.2 GiB, 2.6 GiB below running with no cache at all, at the same decode
+  throughput and identical logits. Details and the exchange that keeps the single copy safe:
+  [docs/ranma/expert-cache-exclusive.md](docs/ranma/expert-cache-exclusive.md).
+
 Each feature that lands gets a line here and a page under `docs/ranma/` describing its
 rationale, measured effect, and trade-offs.
 
