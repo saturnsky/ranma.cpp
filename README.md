@@ -116,6 +116,10 @@ applies, how to switch it, and its limits.
   instead of copying them per op or computing them on the CPU. Off by default; the recommended profile for a
   model whose experts live in system RAM is `GGML_CUDA_HOST_DIRECT=1 GGML_CUDA_HOST_DIRECT_MAX_BATCH=512`
   (the second value at least the ubatch size). [docs/ranma/host-direct-moe.md](docs/ranma/host-direct-moe.md)
+- **Expert cache** - `--expert-l1-mib N --expert-profile-dir DIR` gives the routed experts a VRAM budget: the
+  server profiles which experts the router selects, plans the most valuable set for the budget and installs it
+  at a request boundary. The budget decides the expert placement, so it replaces `--n-cpu-moe`. Needs host-direct
+  and `--load-mode none`. [docs/ranma/expert-cache.md](docs/ranma/expert-cache.md)
 
 ## Building
 

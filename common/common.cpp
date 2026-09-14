@@ -3,6 +3,7 @@
 
 #include "build-info.h"
 #include "common.h"
+#include "expert.h"
 #include "fit.h"
 #include "log.h"
 #include "llama.h"
@@ -1324,6 +1325,18 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
             params.fit_params_min_ctx,
             has_draft || spec_mtp ? &extra : nullptr,
             params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
+    }
+
+    // ranma expert cache: the config must live until the model is loaded, see docs/ranma/expert-cache.md
+    ggml_expert_config expert_cfg = {};
+    if (params.expert_l1_mib > 0) {
+        const expert_validation valid = validate_expert_params(params);
+        if (!valid.ok) {
+            throw std::runtime_error(valid.reason);
+        }
+
+        expert_cfg = expert_config_from_params(params);
+        mparams.expert_config = &expert_cfg;
     }
 
     llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mparams);

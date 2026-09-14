@@ -103,6 +103,8 @@ if (CUDAToolkit_FOUND)
     list(APPEND GGML_HEADERS_CUDA "../../include/ggml-cuda.h")
 
     file(GLOB   GGML_SOURCES_CUDA "*.cu")
+    # ranma: expert cache policy files that carry no device code
+    list(APPEND GGML_SOURCES_CUDA "expert-profile-store.cpp" "expert-os-win32.cpp" "expert-os-posix.cpp")
     file(GLOB   SRCS "template-instances/fattn-tile*.cu")
     list(APPEND GGML_SOURCES_CUDA ${SRCS})
     file(GLOB   SRCS "template-instances/fattn-mma*.cu")

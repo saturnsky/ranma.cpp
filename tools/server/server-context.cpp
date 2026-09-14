@@ -7,6 +7,7 @@
 #include "server-schema.h"
 #include "server-stream.h"
 #include "server-gpu-heartbeat.h"
+#include "expert-policy.h"
 
 #include "build-info.h"
 #include "../../src/llama-ext.h" // staging API: llama_model_n_devices / llama_model_get_device (used by the GPU heartbeat)
@@ -962,6 +963,7 @@ private:
     bool sleeping = false;
 
     server_gpu_heartbeat gpu_heartbeat;
+    common_expert        expert;
 
     int64_t t_last_load_progress_ms = 0;
 
@@ -982,6 +984,7 @@ private:
         mtmd_free(mctx);
         mctx = nullptr;
 
+        expert.release();
         gpu_heartbeat.release();
     }
 
@@ -1342,6 +1345,17 @@ private:
                 if (slot.stats.n_gen > 0) {
                     metrics_on_prediction(slot);
                 }
+
+                // an install may not run while another slot computes; the policy defers it
+                bool other_slots_busy = false;
+                for (const auto & other : slots) {
+                    if (other.id != slot.id && other.is_processing()) {
+                        other_slots_busy = true;
+                        break;
+                    }
+                }
+
+                expert.on_request_end(slot.id, slot.stats.n_prompt_processed, slot.stats.n_gen, other_slots_busy);
             };
 
             slot.reset();
@@ -1434,6 +1448,15 @@ private:
             gpu_heartbeat.init(heartbeat_devices, params_base.gpu_heartbeat_seconds);
         }
 
+        // ranma expert cache policy, see docs/ranma/expert-cache.md
+        {
+            common_expert_params ep;
+            ep.l1_mib = params_base.expert_l1_mib;
+            ep.freeze = params_base.expert_freeze;
+
+            expert.init(ctx_tgt, ep);
+        }
+
         // propagate new defaults back to caller
         params = params_base;
 
@@ -1461,6 +1484,10 @@ private:
         });
         queue_tasks.on_update_slots([this]() {
             update_slots();
+        });
+        queue_tasks.on_idle_tick([this]() {
+            // the expert cache retries a deferred install once every slot is idle
+            expert.on_all_idle();
         });
         queue_tasks.on_sleeping_state([this](bool sleeping) {
             handle_sleeping_state(sleeping);
@@ -2921,6 +2948,8 @@ private:
 
                 gpu_heartbeat.set_idle(true);
 
+                expert.on_all_idle();
+
                 metrics_flush_idle();
 
                 return; // skip further processing
@@ -3251,6 +3280,7 @@ private:
                         slot.ckpt_restored_id_task = -1;
 
                         slot.state = SLOT_STATE_PROCESSING_PROMPT;
+
 
                         SLT_TRC(slot, "new prompt, n_ctx_slot = %d, n_keep = %d, task.n_tokens = %d\n",
                                 slot.n_ctx, slot.task->params.n_keep, slot.task->n_tokens());
@@ -3830,6 +3860,10 @@ private:
                     for (auto & slot : slots) {
                         if (slot.is_processing()) {
                             send_error(slot, err);
+
+                            // the interval of this request is incomplete: it must not become a record
+                            expert.on_interrupted(slot.id);
+
                             slot.release();
 
                             // note: it's complicated to keep track of how much of the current batch has been
@@ -3953,6 +3987,9 @@ private:
 
                 // prompt evaluated for next-token prediction
                 slot.state = SLOT_STATE_GENERATING;
+
+                expert.on_generation_start(slot.id);
+
 
                 if (slot.can_speculate()) {
                     common_speculative_begin(spec.get(), slot.id, slot.prompt.tokens.get_text_tokens());

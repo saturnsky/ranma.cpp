@@ -1587,9 +1587,36 @@ struct ggml_cuda_mm_fusion_args_device {
     const void * gate_bias = nullptr;
     const void * x_scale = nullptr;
     const void * gate_scale = nullptr;
+    // ranma expert cache (expert-l1.cuh): cached expert slices packed by slot with the tensor's
+    // nb[2] stride; x_cache_slots maps a routed expert id to its slot, or -1 for "read the tensor".
+    // The fused up/gate kernel uses the same table for both arenas.
+    const void    * x_cache       = nullptr;
+    const void    * gate_cache    = nullptr;
+    const int32_t * x_cache_slots = nullptr;
     ggml_glu_op glu_op;
     float glu_limit = 0.0f;
 };
+
+// ranma expert cache: where one routed expert matrix is read from. The arena packs resident slices
+// by slot with the tensor's nb[2] stride, so a hit only replaces the base pointer and the channel
+// index; a miss reads the mapped host tensor exactly as before. Shared by the MMVQ and MMQ
+// MUL_MAT_ID paths so both follow the same rule.
+struct ggml_cuda_expert_source {
+    const void * data;    // arena base on a hit, the tensor base on a miss
+    uint32_t     channel; // slot on a hit, the expert id on a miss
+    int32_t      slot;    // -1 on a miss
+};
+
+static __device__ __forceinline__ ggml_cuda_expert_source ggml_cuda_expert_cache_select(
+        const void * tensor_data, const void * arena, const int32_t * slots, const uint32_t expert) {
+    if (arena != nullptr && slots != nullptr) {
+        const int32_t slot = slots[expert];
+        if (slot >= 0) {
+            return { arena, (uint32_t) slot, slot };
+        }
+    }
+    return { tensor_data, expert, -1 };
+}
 
 struct ggml_cuda_kernel_launch_params {
     dim3 block_nums;

@@ -360,6 +360,19 @@ llama_context::llama_context(
         }
         backends.emplace_back(backend_cpu);
 
+        // ranma expert cache: the first GPU backend whose registry answers the cache table is the
+        // one that runs the routed experts (one model, one device by design)
+        expert_iface = model.expert_iface();
+        if (expert_iface) {
+            for (auto & backend : backends) {
+                ggml_backend_dev_t dev = ggml_backend_get_device(backend.get());
+                if (dev && ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(dev), GGML_EXPERT_IFACE_PROC_NAME)) {
+                    expert_backend = backend.get();
+                    break;
+                }
+            }
+        }
+
         // create a list of the set_n_threads functions in the backends
         for (auto & backend : backends) {
             ggml_backend_dev_t dev = ggml_backend_get_device(backend.get());
@@ -1454,6 +1467,27 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
+    // ranma expert cache: tell the profiler which rows of this ubatch belong to the profiled
+    // sequence. The rows of one sequence are contiguous in the ubatches the model builds.
+    if (expert_iface && expert_backend) {
+        int32_t row_begin = -1;
+        int32_t row_end   = -1;
+        if (expert_profiled_seq >= 0 && expert_profiled_bank != GGML_EXPERT_BANK_NONE) {
+            for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+                for (int32_t s = 0; s < ubatch.n_seq_id[i]; ++s) {
+                    if (ubatch.seq_id[i][s] == expert_profiled_seq) {
+                        if (row_begin < 0) {
+                            row_begin = (int32_t) i;
+                        }
+                        row_end = (int32_t) i + 1;
+                        break;
+                    }
+                }
+            }
+        }
+        expert_iface->profile_select(expert_backend, row_begin, row_end, expert_profiled_bank);
+    }
+
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
@@ -1467,6 +1501,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 }
 
 int llama_context::encode(const llama_batch & batch_inp) {
+    // ranma expert cache: an install may not run while this is on the stack
+    expert_compute_guard expert_guard(expert_n_compute_in_flight);
+
     // MTP hook batches carry both token (next-token id) and embd (h_nextn row),
     // so accept either present rather than requiring exactly one.
     GGML_ASSERT(batch_inp.token || batch_inp.embd);
@@ -1705,6 +1742,9 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
 }
 
 int llama_context::decode(const llama_batch & batch_inp) {
+    // ranma expert cache: an install may not run while this is on the stack
+    expert_compute_guard expert_guard(expert_n_compute_in_flight);
+
     // MTP hook batches carry both token (next-token id) and embd (h_nextn row),
     // so accept either present rather than requiring exactly one.
     GGML_ASSERT(batch_inp.token || batch_inp.embd);
@@ -3931,6 +3971,55 @@ void llama_set_warmup(llama_context * ctx, bool warmup) {
 
 void llama_synchronize(llama_context * ctx) {
     ctx->synchronize();
+}
+
+// ranma expert cache
+
+bool llama_expert_available(const llama_context * ctx) {
+    return ctx->expert_iface != nullptr && ctx->expert_backend != nullptr;
+}
+
+bool llama_expert_bank_open(llama_context * ctx, const char * label, ggml_expert_bank_id * out_bank) {
+    return llama_expert_available(ctx) && ctx->expert_iface->bank_open(label, out_bank);
+}
+
+bool llama_expert_bank_mark(llama_context * ctx, ggml_expert_bank_id bank) {
+    return llama_expert_available(ctx) && ctx->expert_iface->bank_mark(bank);
+}
+
+bool llama_expert_bank_commit(llama_context * ctx, ggml_expert_bank_id bank, const ggml_expert_record * record, ggml_expert_plan_id * out_plan) {
+    if (!llama_expert_available(ctx)) {
+        return false;
+    }
+    ctx->synchronize();
+    return ctx->expert_iface->bank_commit(bank, record, out_plan);
+}
+
+bool llama_expert_bank_discard(llama_context * ctx, ggml_expert_bank_id bank) {
+    return llama_expert_available(ctx) && ctx->expert_iface->bank_discard(bank);
+}
+
+bool llama_expert_plan_install(llama_context * ctx, ggml_expert_plan_id plan) {
+    if (!llama_expert_available(ctx)) {
+        return false;
+    }
+    // Step 1 of the drain: no encode/decode of this context may be on the stack. The server's
+    // update_slots is single threaded, so with n_parallel == 1 this never trips; it makes the
+    // caller's "no compute in flight" precondition a checked condition instead of an assumption.
+    const int in_flight = ctx->expert_n_compute_in_flight.load(std::memory_order_acquire);
+    if (in_flight != 0) {
+        LLAMA_LOG_DEBUG("%s: plan %u not installed: %d compute calls in flight\n", __func__, (unsigned) plan, in_flight);
+        return false;
+    }
+    // nothing of this context may still read the arenas: drain before the tables change. This also
+    // resolves the outputs of the last compute, so none are pending when the tables move.
+    ctx->synchronize();
+    return ctx->expert_iface->plan_install(plan);
+}
+
+void llama_expert_set_profiled_seq(llama_context * ctx, llama_seq_id seq_id, ggml_expert_bank_id bank) {
+    ctx->expert_profiled_seq  = seq_id;
+    ctx->expert_profiled_bank = bank;
 }
 
 float * llama_get_logits(llama_context * ctx) {

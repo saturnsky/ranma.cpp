@@ -33,6 +33,7 @@
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
 #include "ggml-cuda/mapped-host.cuh"
+#include "ggml-cuda/expert-controller.cuh"
 #include "ggml-cuda/moe-weighted-reduction.cuh"
 #include "ggml-cuda/norm.cuh"
 #include "ggml-cuda/opt-step-adamw.cuh"
@@ -1281,6 +1282,15 @@ struct ggml_backend_cuda_device_context {
     size_t  host_direct_coarse_min_bytes;
 };
 
+#if defined(GGML_USE_HIP)
+int ggml_backend_cuda_dev_index(ggml_backend_dev_t dev) {
+    if (dev == nullptr || ggml_backend_dev_backend_reg(dev) != ggml_backend_cuda_reg()) {
+        return -1;
+    }
+    return ((const ggml_backend_cuda_device_context *) dev->context)->device;
+}
+#endif
+
 // host buffer type
 
 static const char * ggml_backend_cuda_host_buffer_type_name(ggml_backend_buffer_type_t buft) {
@@ -2407,6 +2417,13 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_GET_ROWS:
             ggml_cuda_op_get_rows(ctx, dst);
+#if defined(GGML_USE_HIP)
+            // ranma expert cache: when the router is not fused into TOPK_MOE (scheduler splits keep
+            // prompt batches out of the fused path), the weights gather still sees the selected ids
+            if (strncmp(dst->name, "ffn_moe_weights-", 16) == 0) {
+                ggml_cuda_expert_profile_ids(ctx, dst->src[1]);
+            }
+#endif
             break;
         case GGML_OP_GET_ROWS_BACK:
             ggml_cuda_op_get_rows_back(ctx, dst);
@@ -6028,6 +6045,12 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
 #if defined(GGML_USE_HIP) && defined(_WIN32)
     if (strcmp(name, "ggml_backend_finalize_host_buffer") == 0) {
         return (void *)ggml_backend_cuda_finalize_host_buffer;
+    }
+#endif
+#if defined(GGML_USE_HIP)
+    if (strcmp(name, GGML_EXPERT_IFACE_PROC_NAME) == 0) {
+        // ranma expert cache, see ggml-expert.h
+        return (void *)ggml_backend_cuda_expert_iface;
     }
 #endif
     if (strcmp(name, "ggml_backend_get_features") == 0) {
