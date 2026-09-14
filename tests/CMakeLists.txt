@@ -391,6 +391,7 @@ target_include_directories(test-expert-exclusive PRIVATE ${PROJECT_SOURCE_DIR}/g
 llama_build_and_test(test-expert-score.cpp)
 target_include_directories(test-expert-score PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src/ggml-cuda)
 llama_build_and_test(test-expert-config.cpp)
+llama_build_and_test(test-server-expert.cpp)
 
 llama_build(test-export-graph-ops.cpp)
 if (TARGET gguf-model-data)
