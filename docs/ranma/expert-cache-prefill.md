@@ -91,6 +91,9 @@ ubatch does not reach the in-place path at all.
   `GGML_CUDA_HOST_DIRECT_MAX_BATCH`. A larger batch, or host-direct off, still copies the whole
   expert weight to VRAM through the scheduler and reads the copy; that path is untouched. Trimming
   that copy with the resident set is a possible later addition, not done here.
+- **The plan is the decode plan by default.** Prompt processing is profiled into its own bank, but
+  the plan installed while a prompt is processed is the one chosen for generation unless
+  `--expert-prefill-swap` is on (`expert-cache-banks.md`).
 - **The gain needs a large resident fraction.** At a budget that holds a few percent of the expert
   bytes the prompt-processing rate does not move. The feature is free, but it is not a reason to
   raise the budget by itself; the decode gain is.

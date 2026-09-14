@@ -1047,7 +1047,7 @@ extern "C" {
     // caller names the banks and decides when to mark, commit and install. Every call returns false
     // when the model has no such cache.
     LLAMA_API bool llama_expert_available(const struct llama_context * ctx);
-    LLAMA_API bool llama_expert_bank_open(struct llama_context * ctx, const char * label, ggml_expert_bank_id * out_bank);
+    LLAMA_API bool llama_expert_bank_open(struct llama_context * ctx, const char * label, bool prompt_bank, ggml_expert_bank_id * out_bank);
     // begin an interval: the bank histogram is zeroed
     LLAMA_API bool llama_expert_bank_mark(struct llama_context * ctx, ggml_expert_bank_id bank);
     // store the interval as one profile record, rescore and plan; nothing is installed

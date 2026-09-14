@@ -48,6 +48,7 @@ static const char * state_name(state_t s) {
 
 struct bank_state {
     std::string label;
+    bool prompt = false;                    // the caller's policy says this bank counts prompt processing
     std::unique_ptr<profile_store> store;   // null when profiling is off for this bank
     bool store_usable = false;              // open() returned ok/missing/corrupt, not incompatible
     ggml_expert_plan_id latest_plan = GGML_EXPERT_PLAN_NONE;
@@ -385,12 +386,12 @@ public:
 
     // ---- banks and plans ------------------------------------------------------------------
 
-    bool bank_open(const char * label, ggml_expert_bank_id * out) {
+    bool bank_open(const char * label, bool prompt_bank, ggml_expert_bank_id * out) {
         std::lock_guard<std::mutex> lock(mutex_);
         if (!profiling_enabled() || state_ != state_t::installed || label == nullptr || label[0] == '\0' || out == nullptr) {
             return false;
         }
-        return open_bank_locked(label, out);
+        return open_bank_locked(label, prompt_bank, out);
     }
 
     // Mark and discard both drop what the bank counted so far.
@@ -864,7 +865,8 @@ private:
                 continue;
             }
             ggml_expert_bank_id bank = GGML_EXPERT_BANK_NONE;
-            if (open_bank_locked(label.c_str(), &bank) && banks_[bank].store_usable &&
+            // A seed bank is opened before the caller names its phase; init reopens it by label.
+            if (open_bank_locked(label.c_str(), false, &bank) && banks_[bank].store_usable &&
                     banks_[bank].store->total_selections() != 0) {
                 scores = banks_[bank].store->scores();
                 GGML_LOG_INFO("expert cache: bank '%s' seeds the plan from %zu stored records\n",
@@ -877,7 +879,7 @@ private:
         return nullptr;
     }
 
-    bool open_bank_locked(const char * label, ggml_expert_bank_id * out) {
+    bool open_bank_locked(const char * label, bool prompt_bank, ggml_expert_bank_id * out) {
         for (size_t i = 0; i < banks_.size(); ++i) {
             if (banks_[i].label == label) {
                 *out = (ggml_expert_bank_id) i;
@@ -890,6 +892,7 @@ private:
         }
         bank_state b;
         b.label  = label;
+        b.prompt = prompt_bank;
         if (!profile_dir_.empty()) {
             profile_store_params p;
             p.bank_dir  = std::filesystem::path(profile_dir_)/label;
@@ -1165,7 +1168,7 @@ static bool iface_register_context(ggml_context * ctx, ggml_backend_buffer_t buf
 static bool iface_finalize(void) { return instance().finalize(); }
 static void iface_release(ggml_context * ctx) { instance().release(ctx); }
 static bool iface_status(ggml_expert_status * out) { return instance().status(out); }
-static bool iface_bank_open(const char * label, ggml_expert_bank_id * out) { return instance().bank_open(label, out); }
+static bool iface_bank_open(const char * label, bool prompt_bank, ggml_expert_bank_id * out) { return instance().bank_open(label, prompt_bank, out); }
 static bool iface_bank_mark(ggml_expert_bank_id bank) { return instance().bank_zero(bank); }
 static bool iface_bank_commit(ggml_expert_bank_id bank, const ggml_expert_record * record, ggml_expert_plan_id * out) {
     return instance().bank_commit(bank, record, out);
