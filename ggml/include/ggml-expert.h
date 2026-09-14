@@ -23,7 +23,7 @@
 extern "C" {
 #endif
 
-#define GGML_EXPERT_ABI_VERSION      3
+#define GGML_EXPERT_ABI_VERSION      4
 #define GGML_EXPERT_IFACE_PROC_NAME  "ggml_backend_expert_iface"
 
 #define GGML_EXPERT_BANK_NONE        0xFFFFFFFFu
@@ -64,8 +64,10 @@ struct ggml_expert_config {
     int32_t  spare_slots;             // exclusive: free slots rotated per exchange batch
 
     const char * profile_dir;         // root of the profile banks; NULL or "" = no profiling, no plans
-    const char * initial_bank;        // the bank whose stored records seed the plan installed at model
-                                      // load; NULL or "" = start with empty arenas
+    const char * initial_bank;        // bank labels separated by commas, most wanted first: the first one
+                                      // with stored records seeds the plan installed at model load.
+                                      // NULL or "" = start with empty arenas (ABI 4: the list replaces
+                                      // the single label of ABI 3)
     uint32_t log_mask;                // ggml_expert_log_flags
 };
 
@@ -107,7 +109,8 @@ struct ggml_expert_iface {
     bool (*status)(struct ggml_expert_status * out);
 
     // Profile banks and plans.
-    bool (*bank_open)(const char * label, ggml_expert_bank_id * out_bank);
+    // `prompt_bank` says the bank counts prompt processing. The backend knows no phase names.
+    bool (*bank_open)(const char * label, bool prompt_bank, ggml_expert_bank_id * out_bank);
     bool (*bank_mark)(ggml_expert_bank_id bank);      // begin an interval: the bank histogram is zeroed
     bool (*bank_commit)(ggml_expert_bank_id bank, const struct ggml_expert_record * record, ggml_expert_plan_id * out_plan);
                                                        // store the interval, rescore, plan; nothing is installed
