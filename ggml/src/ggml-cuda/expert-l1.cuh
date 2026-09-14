@@ -8,7 +8,7 @@
 
 #include "common.cuh"
 #include "expert-geometry.h"
-#include "expert-location.h"
+#include "expert-host.cuh"
 #include "expert-plan.h"
 
 #include <cstdint>
@@ -16,10 +16,13 @@
 #include <string>
 #include <vector>
 
-// Frozen kernel-facing lookup.
+// Frozen kernel-facing lookup. host_* are used by exclusive mode; they stay null while only the
+// inclusive VRAM tier exists.
 struct ggml_cuda_expert_lookup {
-    const void    * data  = nullptr; // arena base of this kind, slot-major with the tensor's nb[2] stride
-    const int32_t * slots = nullptr; // device table of the layer, shared by all kinds
+    const void    * data       = nullptr; // arena base of this kind, slot-major with the tensor's nb[2] stride
+    const int32_t * slots      = nullptr; // device table of the layer, shared by all kinds
+    const void    * host_data  = nullptr;
+    const int32_t * host_slots = nullptr;
 };
 
 namespace ggml_cuda_expert {
@@ -28,6 +31,7 @@ struct l1_install_stats {
     size_t retained = 0;
     size_t copied   = 0;   // slices (layer, expert) copied, all kinds
     size_t bytes    = 0;   // bytes written into the VRAM arena
+    size_t d2h_bytes = 0;  // exclusive only: bytes written back to the host arena
     double ms       = 0.0;
 };
 
@@ -60,10 +64,21 @@ public:
     l1_arena(const l1_arena &) = delete;
     l1_arena & operator=(const l1_arena &) = delete;
 
-    // Exactly once. capacities[class] slots per class; the tables start empty (-1).
-    bool allocate(const std::vector<int> & capacities, int device);
+    // Exactly once. capacities[class] slots per class, plus `spare_slots` free slots per class that
+    // the exclusive exchange rotates through (0 for inclusive mode); the tables start empty (-1).
+    bool allocate(const std::vector<int> & capacities, int device, int spare_slots = 0);
     bool allocated() const { return !layer_slots_.empty(); }
 
+    // Exclusive mode and every finite tier: this arena and `host` together own the routed expert
+    // bytes. Must be called after allocate() and before the first assignment.
+    void attach_host(host_arena * host, int spare_slots, bool host_master = false);
+    bool owns_host_storage() const { return host_ != nullptr; }
+
+    const std::vector<std::vector<int>> & gpu_spares() const { return gpu_spares_; }
+    const expert_locations & locations() const { return homes_; }
+    const install_layout & layout() const { return layout_; }
+    using location_resolver = std::function<void *(int, int, expert_location)>;
+    void attach_locations(location_resolver resolver) { resolve_ = std::move(resolver); }
     void * host_address(int layer, int kind, int expert) const;
 
     bool write_gpu_slice(int cls, int kind, int slot, const void * src, bool src_is_device);
@@ -72,10 +87,22 @@ public:
     char * gpu_slice_address(int cls, int kind, int slot) const { return gpu_slice(cls, kind, slot); }
     bool   sync_copies();
 
+    // Exclusive mode, once: gives every routed expert a home. `selected` gets the VRAM slots in
+    // (layer, expert) order, everything else gets a host slot in the same order, and the slots past
+    // the capacities become the spares. Publishes both tables.
+    bool assign_exclusive(const std::vector<std::vector<int32_t>> & selected);
+
+    // Exclusive mode: reads or writes `size` bytes at `offset` of the routed expert tensor
+    // (layer, kind) through whichever home owns each expert slice it touches. This is what the
+    // exclusive buffer type's set_tensor and get_tensor are.
+    bool logical_io(int layer, int kind, void * data, size_t offset, size_t size, bool write);
+
     size_t device_bytes() const { return allocated_bytes_; }
     const std::vector<int> & capacities() const { return capacities_; }
     // Mirror of the device table that maps an expert to its VRAM slot, or -1.
     const std::vector<std::vector<int32_t>> & host_slots() const { return host_slots_; }
+    // Exclusive mode: mirror of the device table that maps an expert to its host arena slot.
+    const std::vector<std::vector<int32_t>> & arena_slots() const { return arena_slots_; }
     const std::vector<std::vector<int32_t>> & selected() const { return selected_; }
 
     // Slot-table publish helpers used by install(); public for the tests and for the transaction
@@ -98,7 +125,8 @@ public:
     bool install(const std::vector<std::vector<int32_t>> & selected, bool retain, l1_install_stats & stats);
 
     // Reads one cached slice back and compares it with the host tensor. False means the arena holds
-    // wrong bytes, which is a fatal stride/source assumption failure.
+    // wrong bytes, which is a fatal stride/source assumption failure. Inclusive mode only: exclusive
+    // mode has no host master to compare against, it uses the load-time digests below.
     bool verify_slice(int layer, int kind, int expert) const;
     // Verifies up to `max_slices` resident slices (all when 0). Returns the number checked, or -1 on a mismatch.
     long verify_resident(size_t max_slices) const;
@@ -125,7 +153,16 @@ private:
     std::vector<std::vector<int32_t>> selected_;       // [layer] sorted resident expert ids
     size_t allocated_bytes_ = 0;
 
+    // exclusive mode
+    host_arena * host_ = nullptr;
+    int          spare_slots_ = 0;
+    std::vector<std::vector<int32_t>> arena_slots_;    // [layer][expert] host arena slot or -1
+    std::vector<int>                  host_capacities_;
     std::vector<std::vector<int>>     gpu_spares_;     // [class] free VRAM slots
+    expert_locations homes_;
+    install_layout layout_;
+    bool host_master_ = true;
+    location_resolver resolve_;
 };
 
 } // namespace ggml_cuda_expert
