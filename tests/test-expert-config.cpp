@@ -1,6 +1,7 @@
 // Expert option contracts before model geometry is available.
 #include "common.h"
 #include "expert.h"
+#include "../ggml/src/ggml-cuda/expert-os.h"
 
 #include <cstdio>
 #include <fstream>
@@ -12,21 +13,25 @@ int main() {
     common_params p;
     CHECK(validate_expert_params(p).ok);
     p.expert_l1_mib = -1; CHECK(!validate_expert_params(p).ok); p.expert_l1_mib = 0;
+    p.expert_cache_mode = "invalid"; CHECK(!validate_expert_params(p).ok); p.expert_cache_mode = "inclusive";
     p.expert_seed = -1; CHECK(!validate_expert_params(p).ok); p.expert_seed = 1;
     p.expert_profile_dir = "profile"; CHECK(!validate_expert_params(p).ok); p.expert_profile_dir.clear();
-    for (int l1 : {0, 3070}) for (bool profile : {false, true}) {
+    const bool os = ggml_cuda_expert::expert_os::supported();
+    for (const char * mode : {"inclusive", "exclusive"}) for (int l1 : {0, 3070}) for (bool profile : {false, true}) {
         p = common_params(); p.fit_params = false;
-        p.expert_l1_mib = l1; p.n_parallel = 4;
+        p.expert_cache_mode = mode; p.expert_l1_mib = l1; p.n_parallel = 4;
         p.expert_profile_dir = profile ? "profile" : "";
-        CHECK(validate_expert_params(p).ok == (l1 > 0 || !profile));
+        const bool mode_ok = os || std::string(mode) == "inclusive";
+        CHECK(validate_expert_params(p).ok == (l1 > 0 ? mode_ok : !profile));
         const auto cfg = expert_config_from_params(p);
         CHECK(cfg.l1_bytes == size_t(l1)*1024*1024);
         CHECK(cfg.random_seed == 1);
         CHECK(profile ? cfg.policy == GGML_EXPERT_POLICY_ADAPTIVE : cfg.freeze);
+        CHECK(l1 && profile && std::string(mode) == "exclusive" ? cfg.spare_slots == 8 : cfg.spare_slots == 0);
     }
     p = common_params(); p.fit_params = false;
     p.expert_l1_mib = 3070;
-    CHECK(validate_expert_params(p).ok); // The profile directory is optional.
+    CHECK(validate_expert_params(p).ok); // Profile is optional even without finite L2.
     p.expert_l1_mib = 20000;
     CHECK(validate_expert_params(p).ok);
     p.n_cpu_moe_explicit = true; CHECK(!validate_expert_params(p).ok); p.n_cpu_moe_explicit = false;
@@ -34,12 +39,12 @@ int main() {
     CHECK(expert_config_from_params(p).random_seed == 73);
     bench_expert_options o; o.supplied = true;
     auto off = o.config();
-    CHECK(off.l1_bytes == 0 && off.profile_dir[0] == 0);
+    CHECK(off.l1_bytes == 0 && off.profile_dir[0] == 0 && off.spare_slots == 0);
     o.mode = "cold"; o.l1_mib = 3070; o.profile = "fixture";
     auto cold = o.config(1024, 128);
     CHECK(cold.policy == GGML_EXPERT_POLICY_STATIC && cold.freeze);
-    o.mode = "warm";
-    { auto warm = o.config(); CHECK(warm.policy == GGML_EXPERT_POLICY_ADAPTIVE && !warm.freeze); }
+    o.mode = "warm"; o.storage = "exclusive";
+    if (os) { auto warm = o.config(); CHECK(warm.policy == GGML_EXPERT_POLICY_ADAPTIVE && !warm.freeze && warm.spare_slots == 8); }
     const auto temporary = std::filesystem::temp_directory_path() /
         ("bench-profile-fixture-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
     CHECK(std::filesystem::create_directory(temporary));
@@ -66,6 +71,6 @@ int main() {
     CHECK(std::filesystem::exists(source / "record"));
     std::filesystem::remove_all(temporary);
     printf("PASS: bench modes, source-preserving process snapshot, restore and owned cleanup\n");
-    printf("PASS: cache modes, zero L1 and the optional profile directory\n");
+    printf("PASS: cache modes, zero L1, optional profile and phase restrictions\n");
     return 0;
 }
