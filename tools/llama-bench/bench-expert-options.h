@@ -13,6 +13,7 @@ struct bench_expert_options {
     std::string profile;
     int l1_mib = 0;
     int seed = 1;
+    bool swap = false;
     bool archive = false;
     bool reset = false;
     bool supplied = false, keep = false, restore_each = false;
@@ -23,6 +24,7 @@ struct bench_expert_options {
     bool parse(const std::string & arg, int argc, char ** argv, int & i) {
         if (arg.compare(0, 9, "--expert-") != 0) { return false; }
         supplied = true;
+        if (arg == "--expert-prefill-swap") { swap = true; return true; }
         if (arg == "--expert-profile-archive") { archive = true; return true; }
         if (arg == "--expert-profile-reset") { reset = true; return true; }
         if (arg == "--expert-profile-keep") { keep = true; return true; }
@@ -54,13 +56,15 @@ struct bench_expert_options {
         if (mode != "off" && (profile.empty() || l1_mib == 0)) {
             throw std::invalid_argument("cold/warm need --expert-profile-dir and --expert-l1-mib > 0");
         }
-        if (mode == "off" && (!profile.empty() || archive || reset)) { throw std::invalid_argument("off has no profile"); }
+        if (mode == "off" && (!profile.empty() || archive || reset || swap)) { throw std::invalid_argument("off has no profile or phase swap"); }
         if (!warm() && (keep || restore_each)) { throw std::invalid_argument("profile keep/restore-each requires warm"); }
+        if (!warm() && swap) { throw std::invalid_argument("cold/off placement is frozen; prefill swap requires warm"); }
         if (reset) { throw std::invalid_argument("cold requires an empty directory; profile reset is not supported by bench"); }
         common_params p;
         p.expert_l1_mib = l1_mib;
         p.expert_cache_mode = storage;
         p.expert_profile_dir = profile;
+        p.expert_prefill_swap = warm() && swap;
         p.expert_profile_archive = archive;
         p.expert_profile_reset = reset;
         p.n_parallel = 1; p.n_batch = batch; p.n_ubatch = ubatch;
