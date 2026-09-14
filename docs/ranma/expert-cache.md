@@ -25,6 +25,11 @@ Three parts, in the order the data flows:
    moves, because captured HIP graphs hold its address; only slot contents and tables change, and
    only while nothing computes.
 
+Both `MUL_MAT_ID` kernel families read the arena through one device helper: MMVQ during generation
+and MMQ while a prompt is processed, as long as the prompt ubatch is within the host-direct batch
+limit (`expert-cache-prefill.md`). An install is a delta transaction over the previous plan, not a
+refill.
+
 This is a fork feature of the HIP build. It is not compiled into the CUDA backend; the options are
 accepted there and do nothing.
 
@@ -106,7 +111,7 @@ written earlier, and reports a `ctl ms` column that separates policy and install
 
 | Environment switch | Default | Effect |
 |---|---|---|
-| `RANMA_EXPERT_TRACE=<mask>` | 0 | Bit mask of log lines: 1 install, 2 profile. |
+| `RANMA_EXPERT_TRACE=<mask>` | 0 | Bit mask of log lines: 1 install, 2 profile, 4 prompt processing. |
 | `RANMA_EXPERT_VERIFY=1` | off | After every install, read every resident slice back and compare it with its source. Slow; for correctness checks, not for serving. |
 
 Both are read once at startup.
@@ -136,10 +141,10 @@ requests rebuild a profile from cold.
   profile.
 - **A manual `-ot` on `_exps` tensors is left alone** and is the user's responsibility; if the
   experts end up in VRAM anyway there is nothing to cache and the option is ignored with a log line.
-- **The arena is read on the in-place kernels only.** A batch above
-  `GGML_CUDA_HOST_DIRECT_MAX_BATCH`, or host-direct off, copies the whole expert weight to VRAM
-  through the scheduler and reads the copy; that path is untouched. A prompt batch goes through MMQ
-  and therefore reads the host tensor.
+- **The arena is read on the in-place kernels only.** MMVQ (generation) and MMQ (prompt processing
+  up to `GGML_CUDA_HOST_DIRECT_MAX_BATCH` tokens) read it. A larger batch, or host-direct off,
+  copies the whole expert weight to VRAM through the scheduler and reads the copy; that path is
+  untouched.
 - **Startup without a profile is a random placement.** The server seeds a fixed placement from
   `--expert-seed` and evolves it at request boundaries once a profile directory is given; the first
   requests run at about the no-cache speed.

@@ -177,7 +177,7 @@ public:
             return false;
         }
         l1_install_stats stats;
-        if (!l1_->install(initial.selected, stats)) {
+        if (!l1_->install(initial.selected, /*retain=*/false, stats)) {
             disable_locked("initial install failed");
             return false;
         }
@@ -344,12 +344,12 @@ public:
         // still read the arena or the tables.
         CUDA_CHECK(cudaDeviceSynchronize());
         l1_install_stats stats;
-        if (!l1_->install(plan.selected, stats)) {
+        if (!l1_->install(plan.selected, cfg_.delta_install, stats)) {
             disable_locked("install failed");
             return false;
         }
-        GGML_LOG_INFO("expert cache: installed plan %u of bank '%s': copied=%zu bytes=%zu MiB in %.1f ms\n",
-            id, banks_[plan.bank].label.c_str(), stats.copied, stats.bytes/(1024*1024), stats.ms);
+        GGML_LOG_INFO("expert cache: installed plan %u of bank '%s': retained=%zu copied=%zu bytes=%zu MiB in %.1f ms\n",
+            id, banks_[plan.bank].label.c_str(), stats.retained, stats.copied, stats.bytes/(1024*1024), stats.ms);
         // the plan that was installed until now is only reachable while it is a bank's newest one
         finish_plan_locked(id);
         verify_all_locked();

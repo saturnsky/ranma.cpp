@@ -120,6 +120,9 @@ applies, how to switch it, and its limits.
   server profiles which experts the router selects, plans the most valuable set for the budget and installs it
   at a request boundary. The budget decides the expert placement, so it replaces `--n-cpu-moe`. Needs host-direct
   and `--load-mode none`. [docs/ranma/expert-cache.md](docs/ranma/expert-cache.md)
+- **The cache serves prompt processing, and installs are deltas** - MMQ reads the cache arena through the same
+  slot tables as MMVQ, and an install moves only what changed between two plans.
+  [docs/ranma/expert-cache-prefill.md](docs/ranma/expert-cache-prefill.md)
 
 ## Building
 
