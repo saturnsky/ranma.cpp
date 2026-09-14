@@ -3902,8 +3902,8 @@ bool llama_expert_available(const llama_context * ctx) {
     return ctx->expert_iface != nullptr && ctx->expert_backend != nullptr;
 }
 
-bool llama_expert_bank_open(llama_context * ctx, const char * label, ggml_expert_bank_id * out_bank) {
-    return llama_expert_available(ctx) && ctx->expert_iface->bank_open(label, out_bank);
+bool llama_expert_bank_open(llama_context * ctx, const char * label, bool prompt_bank, ggml_expert_bank_id * out_bank) {
+    return llama_expert_available(ctx) && ctx->expert_iface->bank_open(label, prompt_bank, out_bank);
 }
 
 bool llama_expert_bank_mark(llama_context * ctx, ggml_expert_bank_id bank) {

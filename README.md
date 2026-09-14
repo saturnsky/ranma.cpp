@@ -151,6 +151,14 @@ misbehave. Other platforms and backends are not tested and not supported by this
   throughput and identical logits. Details and the exchange that keeps the single copy safe:
   [docs/ranma/expert-cache-exclusive.md](docs/ranma/expert-cache-exclusive.md).
 
+- **Expert cache profile banks and the prefill swap (HIP)** - prompt processing and generation each get their own
+  profile bank, always; the plan that serves the cache comes from the generation bank alone, because a mixed
+  histogram would serve generation badly. `--expert-prefill-swap` (off by default) additionally holds the
+  prompt-processing plan while a prompt is processed. Measured on a Radeon AI PRO R9700 with Qwen3.8-Flash-Next
+  UD-Q4_K_XL: with the whole model resident the swap is worth 1 to 9 % of prompt throughput; with a 40 GiB host tier
+  it is worth +15 % (20 GiB budget) and +13 % (3 GiB budget) at every depth, at a boundary install of 2.5 to 3.3 s
+  per request. Details: [docs/ranma/expert-cache-banks.md](docs/ranma/expert-cache-banks.md).
+
 Each feature that lands gets a line here and a page under `docs/ranma/` describing its
 rationale, measured effect, and trade-offs.
 

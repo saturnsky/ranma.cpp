@@ -12,7 +12,9 @@ Three parts, in the order the data flows:
 
 1. **Profiler** (`ggml/src/ggml-cuda/expert-profiler.cu`). A small kernel runs after the top-k
    kernel of every routed layer and adds the selected expert ids of the profiled rows to a histogram
-   in VRAM. Nothing is read back on the hot path.
+   in VRAM. Nothing is read back on the hot path. The rows and the histogram ("bank") are chosen by
+   the caller before each decode; the server profiles the generation phase of slot 0 into a bank
+   called `decode` and its prompt phase into a bank called `prefill` (`expert-cache-banks.md`).
 2. **Profile store and plan** (`expert-profile-store.cpp`, `expert-score.h`, `expert-plan.h`). When
    a request ends the server commits the bank: the histogram since the last commit is stored as one
    record under `<profile-dir>/<bank>/records/`, the newest ten records are scored with a half-life
@@ -52,7 +54,8 @@ be seen), and the plan is installed only while no compute is in flight.
 The plan comes from the generation phase only, never from a histogram that mixes prompt and
 generation selections. Prompt processing and generation select different experts, and a prompt
 ubatch of hundreds of tokens outweighs single-token generation in any mixed count, so a mixed plan
-would serve generation badly.
+would serve generation badly. Generation throughput is what this cache is for; how prompt
+processing is served is the subject of `expert-cache-banks.md`.
 
 ## How it is layered
 
@@ -75,8 +78,9 @@ would serve generation badly.
 | Option | Default | Meaning |
 |---|---|---|
 | `--expert-l1-mib N` | 0 (off) | VRAM budget in MiB for expert payload and cache overhead. The budget also decides the expert placement (every routed expert goes to host memory), so `--n-cpu-moe`/`--cpu-moe` are refused together with it. `--expert-cache-mib` is accepted as an alias. |
-| `--expert-profile-dir DIR` | none | Without it the placement is seeded and fixed: no records, no installs. |
+| `--expert-profile-dir DIR` | none | Root of the profile banks, `DIR/decode/` and `DIR/prefill/`. Without it the placement is seeded and fixed: no records, no installs. |
 | `--expert-cache-mode MODE` | `inclusive` | `inclusive` keeps a host copy of each VRAM resident; `exclusive` keeps one home per expert (`expert-cache-exclusive.md`). |
+| `--expert-prefill-swap` | off | Hold the prompt-processing plan while a prompt is processed (`expert-cache-banks.md`). |
 | `--expert-seed N` | 1 | Seed of the fixed random placement used when no profile is available. |
 | `--expert-freeze` | off | Profile and plan, never change the cache contents (for collecting a profile without disturbing a measurement). |
 | `--expert-profile-archive` | off | Records that leave the ten-record score window move to `DIR/<bank>/archive/` instead of being deleted. |

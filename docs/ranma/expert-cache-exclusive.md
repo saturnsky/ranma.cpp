@@ -96,8 +96,10 @@ The option validator checks before the model loads:
   so when it was not given the CLI turns it off itself, logs one line, and the context size has to
   be set explicitly.
 
-`RANMA_EXPERT_VERIFY=1` checks every VRAM and every host slot after each install (see "Design notes"
-for what it compares against).
+The newest plan is installed at the end of every request, and with `--expert-prefill-swap` also at
+the boundary between prompt processing and generation (`expert-cache-banks.md`); the install is the
+exchange above. `RANMA_EXPERT_VERIFY=1` checks every VRAM and every host slot after each install
+(see "Design notes" for what it compares against).
 
 ## What it costs
 

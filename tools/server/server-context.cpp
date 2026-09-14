@@ -1428,11 +1428,12 @@ private:
             gpu_heartbeat.init(heartbeat_devices, params_base.gpu_heartbeat_seconds);
         }
 
-        // ranma expert cache policy, see docs/ranma/expert-cache.md
+        // ranma expert cache policy, see docs/ranma/expert-cache-banks.md
         {
             common_expert_params ep;
-            ep.l1_mib = params_base.expert_l1_mib;
-            ep.freeze = params_base.expert_freeze;
+            ep.l1_mib    = params_base.expert_l1_mib;
+            ep.prefill_swap = params_base.expert_prefill_swap;
+            ep.freeze       = params_base.expert_freeze;
 
             expert.init(ctx_tgt, ep);
         }
@@ -3215,6 +3216,7 @@ private:
 
                         slot.state = SLOT_STATE_PROCESSING_PROMPT;
 
+                        expert.on_prompt_start(slot.id);
 
                         SLT_TRC(slot, "new prompt, n_ctx_slot = %d, n_keep = %d, task.n_tokens = %d\n",
                                 slot.n_ctx, slot.task->params.n_keep, slot.task->n_tokens());
@@ -3912,8 +3914,7 @@ private:
                 // prompt evaluated for next-token prediction
                 slot.state = SLOT_STATE_GENERATING;
 
-                expert.on_generation_start(slot.id);
-
+                expert.on_generation_start(slot.id, slot.stats.n_prompt_processed);
 
                 if (slot.can_speculate()) {
                     common_speculative_begin(spec.get(), slot.id, slot.prompt.tokens.get_text_tokens());

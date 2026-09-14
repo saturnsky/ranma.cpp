@@ -30,9 +30,12 @@ it reloads the model and costs more.
 
 ## Records and timing
 
-The warm-up decode is excluded from records. The model-load seed serves until the policy has
-produced the required plan, so the first test of a process may not run on the same placement as the
-later ones.
+The warm-up decode is excluded from records. Depth fill is prompt processing and enters the
+`prefill` record; a PP test commits its `prefill` record when it completes, a TG test its `decode`
+record. The benchmark drives prompt start before depth fill and PP, generation start before TG,
+request end after each test, and all-idle between repetitions, exactly the server's moments
+(`expert-cache-banks.md`). The model-load seed serves until the policy has produced the required
+plan, so the first test of a process may not run on the same placement as the later ones.
 
 Markdown output keeps the normal `llama-bench` table and adds the cache mode column and a `ctl ms`
 column. With the cache on, `t/s` is compute-only time; the policy and install cost sits in

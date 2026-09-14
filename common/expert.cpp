@@ -29,6 +29,15 @@ expert_validation validate_expert_params(const common_params & params) {
         if (!ggml_cuda_expert::expert_os::supported()) { return expert_reject("exclusive storage needs Windows address reservation"); }
         if (params.fit_params && params.fit_params_explicit) { return expert_reject("--expert-cache-mode exclusive cannot be combined with -fit on"); }
     }
+    const bool speculative = params.speculative.has_dft() || params.speculative.has_synth() ||
+        std::any_of(params.speculative.types.begin(), params.speculative.types.end(),
+            [](common_speculative_type t) { return t != COMMON_SPECULATIVE_TYPE_NONE; });
+    if (params.expert_prefill_swap) {
+        if (!active) { return expert_reject("--expert-prefill-swap needs an expert cache budget"); }
+        if (params.expert_profile_dir.empty()) { return expert_reject("--expert-prefill-swap needs --expert-profile-dir"); }
+        if (params.n_parallel != 1) { return expert_reject("--expert-prefill-swap needs -np 1"); }
+        if (!params.mmproj.path.empty() || speculative) { return expert_reject("--expert-prefill-swap with mmproj/speculative decoding has no gate yet"); }
+    }
     if (!active && (!params.expert_profile_dir.empty() || params.expert_freeze || params.expert_profile_archive || params.expert_profile_reset)) {
         return expert_reject("expert profile options need an expert cache budget");
     }
@@ -56,7 +65,10 @@ ggml_expert_config expert_config_from_params(const common_params & params) {
     cfg.spare_slots = cfg.mode == GGML_EXPERT_MODE_EXCLUSIVE && cfg.policy == GGML_EXPERT_POLICY_ADAPTIVE && cfg.l1_bytes > 0 ? 8 : 0;
 
     cfg.profile_dir = params.expert_profile_dir.c_str();
-    cfg.initial_bank = "decode";
+    // The plan installed at load is the plan of the phase the next compute will be in: with the
+    // swap on that is prompt processing, otherwise generation. The other bank is the fallback for
+    // a profile directory that has only ever seen one of them.
+    cfg.initial_bank = params.expert_prefill_swap ? "prefill,decode" : "decode";
     cfg.log_mask     = 0;
 
     const char * trace = getenv("RANMA_EXPERT_TRACE");

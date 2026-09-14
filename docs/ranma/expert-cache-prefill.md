@@ -115,6 +115,9 @@ configuration of the cache (`expert-cache.md`). `test-backend-ops -b ROCm0 -o MU
   `GGML_CUDA_HOST_DIRECT_MAX_BATCH`. A larger batch, or host-direct off, still copies the whole
   expert weight to VRAM through the scheduler and reads the copy; that path is untouched. Trimming
   that copy with the resident set is a possible later addition, not done here.
+- **The plan is the decode plan by default.** Prompt processing is profiled into its own bank, but
+  the plan installed while a prompt is processed is the one chosen for generation unless
+  `--expert-prefill-swap` is on (`expert-cache-banks.md`).
 - **The gain needs a large resident fraction.** At a 3 GiB budget the prefill rate does not move.
   The feature is free, but it is not a reason to raise the budget by itself; the decode gain is.
 - **No fused gate/up on this path.** MMQ has no gate fusion, so the table-sharing rule the MMVQ hook
