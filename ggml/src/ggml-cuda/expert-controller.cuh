@@ -26,10 +26,23 @@ ggml_cuda_expert_lookup ggml_cuda_expert_lookup_tensor(const ggml_tensor * src0)
 // selected for this compute. No-op unless the cache is installed.
 void ggml_cuda_expert_profile_ids(ggml_backend_cuda_context & ctx, const ggml_tensor * ids);
 
+// True for the buffer type that exclusive mode allocates the routed expert weights on. Its tensors
+// carry logical addresses only: their bytes live in the VRAM arena or in the host arena, so every
+// kernel that reads them must resolve them through ggml_cuda_expert_lookup_tensor.
+bool ggml_cuda_expert_is_exclusive_buffer_type(ggml_backend_buffer_type_t buft);
+
 // The versioned function table answered for GGML_EXPERT_IFACE_PROC_NAME.
 const ggml_expert_iface * ggml_backend_cuda_expert_iface(void);
 
 // Index of a CUDA/HIP device object, -1 for devices of other backends (defined in ggml-cuda.cu).
 int ggml_backend_cuda_dev_index(ggml_backend_dev_t dev);
+
+#else
+
+// The cache is a HIP-only feature, but ggml-cuda.cu asks this question outside the HIP guards.
+static inline bool ggml_cuda_expert_is_exclusive_buffer_type(ggml_backend_buffer_type_t buft) {
+    GGML_UNUSED(buft);
+    return false;
+}
 
 #endif // GGML_USE_HIP

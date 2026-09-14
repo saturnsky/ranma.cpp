@@ -9,6 +9,7 @@
 
 struct bench_expert_options {
     std::string mode = "off";
+    std::string storage = "inclusive";
     std::string profile;
     int l1_mib = 0;
     int seed = 1;
@@ -29,6 +30,7 @@ struct bench_expert_options {
         if (++i >= argc) { throw std::invalid_argument("missing expert option value"); }
         const std::string value = argv[i];
         if (arg == "--expert-cache") { mode = value; }
+        else if (arg == "--expert-cache-mode") { storage = value; }
         else if (arg == "--expert-profile-dir") { profile = value; }
         else {
             size_t end = 0;
@@ -57,6 +59,7 @@ struct bench_expert_options {
         if (reset) { throw std::invalid_argument("cold requires an empty directory; profile reset is not supported by bench"); }
         common_params p;
         p.expert_l1_mib = l1_mib;
+        p.expert_cache_mode = storage;
         p.expert_profile_dir = profile;
         p.expert_profile_archive = archive;
         p.expert_profile_reset = reset;
@@ -71,6 +74,7 @@ struct bench_expert_options {
         cfg.policy = warm() ? GGML_EXPERT_POLICY_ADAPTIVE : GGML_EXPERT_POLICY_STATIC;
         cfg.random_seed = (uint32_t) seed;
         cfg.freeze = !warm();
+        if (!warm()) { cfg.spare_slots = 0; }
         if (mode == "off") { cfg.initial_bank = ""; }
         cfg.log_mask |= GGML_EXPERT_LOG_PROFILE | GGML_EXPERT_LOG_INSTALL;
         return cfg;
