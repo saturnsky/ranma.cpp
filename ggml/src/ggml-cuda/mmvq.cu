@@ -679,7 +679,8 @@ static __global__ void mul_mat_vec_q(
     // ranma expert cache: a resident expert is read from its arena slot instead of the tensor.
     // Only the MUL_MAT_ID dispatch sets the table, so dense matmuls keep the plain path.
     const ggml_cuda_expert_source x_src =
-        ggml_cuda_expert_cache_select(vx, fusion.x_cache, ids ? fusion.x_cache_slots : nullptr, channel_x);
+        ggml_cuda_expert_cache_select(vx, fusion.x_cache, ids ? fusion.x_cache_slots : nullptr, channel_x,
+            ids ? fusion.x_host_slots : nullptr);
     const void * vx_source        = x_src.data;
     uint32_t     source_channel_x = x_src.channel;
     [[maybe_unused]] const int32_t cache_slot = x_src.slot;
@@ -720,6 +721,9 @@ static __global__ void mul_mat_vec_q(
             if (cache_slot >= 0) {
                 vgate_source        = fusion.gate_cache;
                 source_channel_gate = (uint32_t) cache_slot;
+            } else if (ids && fusion.x_host_slots != nullptr) {
+                // exclusive miss: vgate is the gate host arena and both kinds share the slot table
+                source_channel_gate = x_src.channel;
             }
         }
     }
@@ -974,7 +978,7 @@ static __global__ void mul_mat_vec_q_moe(
 
     // ranma expert cache: a resident expert is read from its arena slot instead of the tensor.
     const ggml_cuda_expert_source x_src =
-        ggml_cuda_expert_cache_select(vx, fusion.x_cache, fusion.x_cache_slots, channel_x);
+        ggml_cuda_expert_cache_select(vx, fusion.x_cache, fusion.x_cache_slots, channel_x, fusion.x_host_slots);
     const void * vx_source = x_src.data;
     uint32_t source_channel_x = x_src.channel;
     [[maybe_unused]] const void * vgate_source = vgate;
@@ -982,6 +986,9 @@ static __global__ void mul_mat_vec_q_moe(
     if (use_gate && fusion.gate_cache != nullptr) {
         if (x_src.slot >= 0) {
             vgate_source        = fusion.gate_cache;
+            source_channel_gate = x_src.channel;
+        } else if (fusion.x_host_slots != nullptr) {
+            // exclusive miss: vgate is the gate host arena and both kinds share the slot table
             source_channel_gate = x_src.channel;
         }
     }
@@ -1538,14 +1545,28 @@ void ggml_cuda_mul_mat_vec_q(
     const void * src0_d = src0->data;
     ggml_cuda_mm_fusion_args_device fusion_local{};
 #if defined(GGML_USE_HIP)
-    if (ggml_backend_buffer_is_host(src0->buffer)) {
-        src0_d = ggml_hip_mapped_host_device_alias(src0);
+    const bool src0_is_host_mapped = ggml_backend_buffer_is_host(src0->buffer);
+    // exclusive mode: the tensor itself has no bytes, its data pointer is a logical address, so the
+    // lookup must supply both arenas
+    const bool src0_is_exclusive =
+        ggml_cuda_expert_is_exclusive_buffer_type(ggml_backend_buffer_get_type(src0->buffer));
+    GGML_ASSERT(!src0_is_exclusive || ids);
+    if (src0_is_host_mapped || src0_is_exclusive) {
+        if (src0_is_host_mapped) {
+            src0_d = ggml_hip_mapped_host_device_alias(src0);
+        }
         if (ids) {
-            // expert cache: resident experts of this tensor are read from the VRAM arena
+            // expert cache: resident experts of this tensor are read from the VRAM arena, and in
+            // exclusive mode everything else from the host arena
             const ggml_cuda_expert_lookup cached = ggml_cuda_expert_lookup_tensor(src0);
             fusion_local.x_cache       = cached.data;
             fusion_local.x_cache_slots = cached.slots;
+            fusion_local.x_host_slots  = cached.host_slots;
+            if (cached.host_data != nullptr) {
+                src0_d = cached.host_data;
+            }
         }
+        GGML_ASSERT(!src0_is_exclusive || fusion_local.x_host_slots != nullptr);
     }
 #else
     ggml_cuda_assert_src0_is_device_readable(src0);
@@ -1573,8 +1594,10 @@ void ggml_cuda_mul_mat_vec_q(
             GGML_ASSERT(fusion->gate->type == src0->type && ggml_are_same_stride(fusion->gate, src0));
             fusion_local.gate = fusion->gate->data;
 #if defined(GGML_USE_HIP)
-            if (ggml_backend_buffer_is_host(fusion->gate->buffer)) {
-                fusion_local.gate = ggml_hip_mapped_host_device_alias(fusion->gate);
+            if (ggml_backend_buffer_is_host(fusion->gate->buffer) || src0_is_exclusive) {
+                if (ggml_backend_buffer_is_host(fusion->gate->buffer)) {
+                    fusion_local.gate = ggml_hip_mapped_host_device_alias(fusion->gate);
+                }
                 if (fusion_local.x_cache != nullptr) {
                     // the fused kernel switches both matrices with the up table, so the gate arena
                     // is only used when it shares that table (same layer); otherwise the gate reads
@@ -1582,6 +1605,14 @@ void ggml_cuda_mul_mat_vec_q(
                     const ggml_cuda_expert_lookup gate_cached = ggml_cuda_expert_lookup_tensor(fusion->gate);
                     if (gate_cached.data != nullptr && gate_cached.slots == fusion_local.x_cache_slots) {
                         fusion_local.gate_cache = gate_cached.data;
+                        if (gate_cached.host_data != nullptr) {
+                            GGML_ASSERT(gate_cached.host_slots == fusion_local.x_host_slots);
+                            fusion_local.gate = gate_cached.host_data;
+                        }
+                    } else {
+                        // inclusive mode falls back to the mapped gate tensor for every expert;
+                        // exclusive mode has no such fallback, the gate must share the table
+                        GGML_ASSERT(!src0_is_exclusive);
                     }
                 }
             }

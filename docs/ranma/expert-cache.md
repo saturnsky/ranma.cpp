@@ -30,6 +30,10 @@ and MMQ while a prompt is processed, as long as the prompt ubatch is within the 
 limit (`expert-cache-prefill.md`). An install is a delta transaction over the previous plan, not a
 refill.
 
+The cache is inclusive by default: each VRAM resident also keeps its host copy, and the host tensor
+stays complete. `--expert-cache-mode exclusive` gives every routed expert exactly one home instead
+and takes the budget back out of host memory (`expert-cache-exclusive.md`).
+
 This is a fork feature of the HIP build. It is not compiled into the CUDA backend; the options are
 accepted there and do nothing.
 
@@ -98,6 +102,7 @@ with `GGML_CUDA_HOST_DIRECT=1` and `GGML_CUDA_HOST_DIRECT_MAX_BATCH=512` in the 
 |---|---|---|
 | `--expert-l1-mib N` | 0 (off) | VRAM budget in MiB for expert payload and cache overhead. The budget also decides the expert placement (every routed expert goes to host memory), so `--n-cpu-moe`/`--cpu-moe` are refused together with it. |
 | `--expert-profile-dir DIR` | none | Root directory of the profile. Without it the placement is seeded and fixed: no records, no installs. |
+| `--expert-cache-mode MODE` | `inclusive` | `inclusive` keeps a host copy of each VRAM resident; `exclusive` keeps one home per expert (`expert-cache-exclusive.md`). |
 | `--expert-seed N` | 1 | Seed of the fixed random placement used when no profile is available. |
 | `--expert-freeze` | off | Profile and plan, never change the cache contents (for collecting a profile without disturbing a measurement). |
 | `--expert-profile-archive` | off | Records that leave the ten-record score window move to `DIR/<bank>/archive/` instead of being deleted. |
@@ -127,7 +132,8 @@ requests rebuild a profile from cold.
   for the profiler banks and a zeroed tail per size class and kind for the MMQ read-ahead
   (`ggml_row_size(type, MATRIX_ROW_PADDING - ne0 % MATRIX_ROW_PADDING)`, at least 512 bytes), all
   inside the budget.
-- Host memory: every expert stays on the host, so the VRAM residents are a second copy.
+- Host memory: in inclusive mode every expert stays on the host, so the VRAM residents are a second
+  copy; in exclusive mode the residents are host memory the model does not need.
 - Per decode token: one 128-thread kernel per routed layer (the histogram add) and one table read
   per expert in the kernel prologue. Nothing is synchronized.
 - At request end: one device synchronize, one histogram read-back, one record write.

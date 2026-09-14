@@ -1835,10 +1835,20 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                     t->buffer = buf; // set dummy buffer for weights so that the backend scheduler won't try to allocate them
                 }
             } else {
-                buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft); // real buffer
-                if (buf && pimpl->expert_iface && !pimpl->expert_ctx &&
-                        pimpl->expert_iface->register_context(ctx, buf, ml.get_arch_name().c_str())) {
-                    pimpl->expert_ctx = ctx;
+                buf = nullptr;
+                if (pimpl->expert_iface && !pimpl->expert_ctx) {
+                    // exclusive mode owns the routed expert buffer
+                    buf = pimpl->expert_iface->alloc_context(ctx, buft, ml.get_arch_name().c_str());
+                    if (buf) {
+                        pimpl->expert_ctx = ctx;
+                    }
+                }
+                if (buf == nullptr) {
+                    buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx, buft); // real buffer
+                    if (buf && pimpl->expert_iface && !pimpl->expert_ctx &&
+                            pimpl->expert_iface->register_context(ctx, buf, ml.get_arch_name().c_str())) {
+                        pimpl->expert_ctx = ctx;
+                    }
                 }
             }
             if (buf == nullptr) {

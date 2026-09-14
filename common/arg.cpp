@@ -967,6 +967,13 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
     // ranma expert cache: the byte budget decides the expert placement, so every routed expert goes to
     //                     host memory here, exactly like --cpu-moe (see docs/ranma/expert-cache.md)
     if (params.expert_l1_mib > 0) {
+        // exclusive mode spends the budget on VRAM slices that cannot move back, so the fitter would
+        // measure free memory that is already gone; it is turned off here unless the user insisted,
+        // and validate_expert_params rejects the combination when they did
+        if (params.expert_cache_mode == "exclusive" && params.fit_params && !params.fit_params_explicit) {
+            params.fit_params = false;
+            LOG_INF("expert cache: exclusive mode turns -fit off; set the context size explicitly\n");
+        }
         const expert_validation valid = validate_expert_params(params);
         if (!valid.ok) {
             throw std::invalid_argument("error: " + valid.reason + "\n");
@@ -3889,6 +3896,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.expert_l1_mib = value;
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_EXPERT_L1_MIB"));
+    add_opt(common_arg(
+        {"--expert-cache-mode"}, "MODE",
+        string_format("how the expert cache holds the weights: inclusive or exclusive (default: %s)", params.expert_cache_mode.c_str()),
+        [](common_params & params, const std::string & value) {
+            params.expert_cache_mode = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_EXPERT_CACHE_MODE"));
     add_opt(common_arg(
         {"--expert-profile-dir"}, "DIR",
         "root directory of the expert profiles; omitted = seeded fixed placement without profiling",

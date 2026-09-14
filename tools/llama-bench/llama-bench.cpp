@@ -464,6 +464,7 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("                                                    (default: value from HF_TOKEN environment variable)\n");
     printf("  --expert-cache <off|cold|warm>                    explicit expert benchmark policy (omitted: original bench)\n");
     printf("  --expert-l1-mib N                                 L1 MiB; cold/warm require >0, off requires 0\n");
+    printf("  --expert-cache-mode <inclusive|exclusive>         L1/L2 relation; finite L2 works with both\n");
     printf("  --expert-profile-dir PATH                         cold output / warm immutable input profiles\n");
     printf("  --expert-seed N                                   fixed placement and benchmark input seed (default 1)\n");
     printf("  --expert-profile-archive                          retain profile records outside the score window\n");
@@ -1643,7 +1644,7 @@ struct test {
             "embeddings",
             "no_op_offload",  "no_host",        "fit_target",    "fit_min_ctx",
             "n_prompt",       "n_gen",          "n_depth",
-            "expert_cache", "expert_l1_mib",
+            "expert_cache", "expert_cache_mode", "expert_l1_mib",
             "expert_profile_dir", "expert_profile_runs", "expert_seed",
             "expert_control_ns", "expert_total_ns",
             "test_time",      "avg_ns",         "stddev_ns",     "avg_ts",         "stddev_ts"
@@ -1750,6 +1751,7 @@ struct test {
                                             std::to_string(n_gen),
                                             std::to_string(n_depth),
                                             expert.enabled() ? expert.mode : "legacy",
+                                            expert.storage,
                                             std::to_string(expert.l1_mib),
                                             expert.profile,
                                             expert_runs,
@@ -2525,8 +2527,9 @@ int llama_bench(int argc, char ** argv) {
                         expert_initialized = true;
                     }
                 }
-                fprintf(stderr, "expert benchmark: mode=%s L1=%d MiB seed=%d profile=%s\n",
-                    run_expert.mode.c_str(), run_expert.l1_mib, run_expert.seed, run_expert.profile.c_str());
+                fprintf(stderr, "expert benchmark: mode=%s storage=%s L1=%d MiB seed=%d profile=%s\n",
+                    run_expert.mode.c_str(), run_expert.storage.c_str(), run_expert.l1_mib,
+                    run_expert.seed, run_expert.profile.c_str());
             }
 
             // warmup run
