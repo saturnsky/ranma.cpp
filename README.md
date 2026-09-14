@@ -123,6 +123,9 @@ applies, how to switch it, and its limits.
 - **The cache serves prompt processing, and installs are deltas** - MMQ reads the cache arena through the same
   slot tables as MMVQ, and an install moves only what changed between two plans.
   [docs/ranma/expert-cache-prefill.md](docs/ranma/expert-cache-prefill.md)
+- **Exclusive mode (Windows)** - `--expert-cache-mode exclusive` gives every routed expert exactly one home, a
+  VRAM slot or a host slot, so the budget is not a second copy of experts that also sit in RAM.
+  [docs/ranma/expert-cache-exclusive.md](docs/ranma/expert-cache-exclusive.md)
 
 ## Building
 

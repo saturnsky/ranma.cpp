@@ -2285,6 +2285,11 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         }
     }
 
+    // Exclusive expert cache: src0 carries logical addresses only, so MMVQ and MMQ (which resolve
+    // the cache lookup) are the only kernels that may run it. Everything below dereferences src0.
+    GGML_ASSERT(!ggml_cuda_expert_is_exclusive_buffer_type(ggml_backend_buffer_get_type(src0->buffer)) &&
+                "exclusive expert weights reached a kernel that reads src0 directly");
+
     // note: this path should not be reached when recording CUDA graphs, because it requires stream synchronization
     GGML_ASSERT(ggml_cuda_mul_mat_id_needs_sync(dst, cc));
     cudaStream_t stream = ctx.stream();
@@ -5862,7 +5867,11 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
 static bool ggml_backend_cuda_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
     ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
     const bool integrated = ggml_cuda_info().devices[dev_ctx->device].integrated;
-    return (ggml_backend_buft_is_cuda(buft) && buft->device == dev) || (integrated && ggml_backend_buft_is_cuda_host(buft));
+    // the exclusive expert cache owns a buffer type of its own; its tensors are read by the HIP
+    // MUL_MAT_ID kernels through the cache lookup, and the cache is a process singleton bound to
+    // the device it was registered on, so only that device supports them
+    return (ggml_backend_buft_is_cuda(buft) && buft->device == dev) || (integrated && ggml_backend_buft_is_cuda_host(buft)) ||
+           (ggml_cuda_expert_is_exclusive_buffer_type(buft) && buft->device == dev);
 }
 
 static int64_t get_op_batch_size(const ggml_tensor * op) {
