@@ -6,12 +6,12 @@
 
 namespace ggml_cuda_expert {
 
-enum class expert_storage { none, vram, host };
+enum class expert_storage { file, vram, host, lent };
 
 struct expert_location {
-    expert_storage storage = expert_storage::none;
+    expert_storage storage = expert_storage::file;
     int slot = -1;
-    bool resident() const { return storage == expert_storage::host; }
+    bool resident() const { return storage == expert_storage::host || storage == expert_storage::lent; }
     bool operator==(const expert_location & other) const { return storage == other.storage && slot == other.slot; }
     bool operator!=(const expert_location & other) const { return !(*this == other); }
 };
@@ -21,10 +21,13 @@ using expert_slot_table = std::vector<std::vector<int32_t>>;
 
 struct install_layout {
     std::vector<int> gpu, host; // Physical slot counts, including spares.
+    std::vector<int> lent_begin, lent_count;
 
     bool contains(int cls, expert_location at) const {
         if (cls < 0 || size_t(cls) >= host.size()) { return false; }
-        return at.storage == expert_storage::host && at.slot >= 0 && at.slot < host[cls];
+        if (at.storage == expert_storage::host) { return at.slot >= 0 && at.slot < host[cls]; }
+        return at.storage == expert_storage::lent && size_t(cls) < lent_count.size() &&
+            size_t(cls) < lent_begin.size() && at.slot >= lent_begin[cls] && at.slot - lent_begin[cls] < lent_count[cls];
     }
 };
 

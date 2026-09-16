@@ -9,6 +9,7 @@
 #include "common.cuh"
 #include "expert-geometry.h"
 #include "expert-host.cuh"
+#include "expert-l2-ledger.h"
 #include "expert-plan.h"
 
 #include <cstdint>
@@ -16,13 +17,14 @@
 #include <string>
 #include <vector>
 
-// Frozen kernel-facing lookup. host_* are used by exclusive mode; they stay null while only the
-// inclusive VRAM tier exists.
+// Frozen kernel-facing lookup. host_* are used by exclusive mode and the host tier; they stay null
+// while only the inclusive VRAM tier exists.
 struct ggml_cuda_expert_lookup {
-    const void    * data       = nullptr; // arena base of this kind, slot-major with the tensor's nb[2] stride
-    const int32_t * slots      = nullptr; // device table of the layer, shared by all kinds
-    const void    * host_data  = nullptr;
-    const int32_t * host_slots = nullptr;
+    const void    * data           = nullptr; // arena base of this kind, slot-major with the tensor's nb[2] stride
+    const int32_t * slots          = nullptr; // device table of the layer, shared by all kinds
+    const void    * host_data      = nullptr;
+    const int32_t * host_slots     = nullptr;
+    const uint64_t * host_addresses = nullptr;
 };
 
 namespace ggml_cuda_expert {
@@ -74,12 +76,32 @@ public:
     void attach_host(host_arena * host, int spare_slots, bool host_master = false);
     bool owns_host_storage() const { return host_ != nullptr; }
 
+    // With a finite host tier the file owns the experts that are in neither table, so this
+    // adopts the two tables as they are instead of demanding that every expert have an arena home.
+    bool assign_tier(const std::vector<std::vector<int32_t>> & gpu_slots,
+                     const expert_locations & homes, const install_layout & layout,
+                     const std::vector<std::vector<int32_t>> & selected,
+                     const std::vector<std::vector<int>> & gpu_spares);
     const std::vector<std::vector<int>> & gpu_spares() const { return gpu_spares_; }
     const expert_locations & locations() const { return homes_; }
     const install_layout & layout() const { return layout_; }
     using location_resolver = std::function<void *(int, int, expert_location)>;
     void attach_locations(location_resolver resolver) { resolve_ = std::move(resolver); }
     void * host_address(int layer, int kind, int expert) const;
+
+    // What the mover needs from the SSD tier to move a slice whose source is the file. Empty
+    // without a tier, and then a transaction may not contain such a move.
+    struct tier_reader {
+        std::function<bool(const std::vector<l2_read> &, std::string &)> read;
+        std::function<const void *(const l2_read &)> address;
+        int slots = 0;   // ring slots one batch may use
+    };
+    void attach_tier_reader(tier_reader reader) { tier_ = std::move(reader); }
+
+    // Three-tier mode: the per (layer, kind) device address table of the SSD tier, which the kernels
+    // take before the host slot table. Null without a tier.
+    using address_source = std::function<const uint64_t * (int layer, int kind)>;
+    void attach_addresses(address_source addresses) { addresses_ = std::move(addresses); }
 
     bool write_gpu_slice(int cls, int kind, int slot, const void * src, bool src_is_device);
     bool read_gpu_slice(int cls, int kind, int slot, void * dst);
@@ -113,6 +135,7 @@ public:
 
     // Pure: no device memory is read or written, no state changes.
     void * slice_address(int layer, int cls, int kind, expert_location at, int expert) const;
+    size_t move_from_file(const install_transaction & tx, size_t first);
     l1_transaction stage(const std::vector<std::vector<int32_t>> & selected, bool retain) const;
     // The one mover: invalidates the tables when this arena has no host master, then moves every
     // slice the transaction lists, whatever tier each end of a move is in.
@@ -132,6 +155,8 @@ public:
     long verify_resident(size_t max_slices) const;
 
     // Debug invariants of the current assignment, shared by both movers.
+    // With the SSD tier an expert may live in neither arena, so the "exactly one home" half of the
+    // check is dropped; the "never two homes, never a slot twice" half stays.
     bool verify_current_assignment(std::string & reason) const;
 
     // Reads one VRAM slot back into `dst`, which must hold the class/kind stride. Verification only.
@@ -155,6 +180,8 @@ private:
 
     // exclusive mode
     host_arena * host_ = nullptr;
+    address_source addresses_;
+    tier_reader    tier_;
     int          spare_slots_ = 0;
     std::vector<std::vector<int32_t>> arena_slots_;    // [layer][expert] host arena slot or -1
     std::vector<int>                  host_capacities_;
