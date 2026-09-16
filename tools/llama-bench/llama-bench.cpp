@@ -375,6 +375,7 @@ struct cmd_params {
     bool                             no_warmup;
     output_formats                   output_format;
     output_formats                   output_format_stderr;
+    llama_ple_prefetch               ple_prefetch;
 };
 
 static const cmd_params cmd_params_defaults = {
@@ -420,6 +421,7 @@ static const cmd_params cmd_params_defaults = {
     /* no_warmup            */ false,
     /* output_format        */ MARKDOWN,
     /* output_format_stderr */ NONE,
+    /* ple_prefetch         */ LLAMA_PLE_PREFETCH_ALWAYS,
 };
 
 static void print_usage(int /* argc */, char ** argv) {
@@ -454,6 +456,7 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("                                                    (default: unused)\n");
     printf("  -hft, --hf-token <token>                          Hugging Face access token\n");
     printf("                                                    (default: value from HF_TOKEN environment variable)\n");
+    printf("  --ple-prefetch <off|prefill|always>               batched per-layer embedding prefetch (default: always)\n");
     printf("  --offline                                         Offline mode: forces use of cache, prevents network access\n");
     printf("                                                    (default: disabled)\n");
     printf("  -p, --n-prompt <n>                                (default: %s)\n", join(cmd_params_defaults.n_prompt, ",").c_str());
@@ -536,6 +539,7 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
     params.progress             = cmd_params_defaults.progress;
     params.no_warmup            = cmd_params_defaults.no_warmup;
     params.offline              = cmd_params_defaults.offline;
+    params.ple_prefetch         = cmd_params_defaults.ple_prefetch;
 
     if (const char * env = getenv("HF_TOKEN")) {
         params.hf_token = env;
@@ -554,6 +558,22 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
             } else if (arg == "--version") {
                 llama_print_build_info(llama_version());
                 exit(0);
+            } else if (arg == "--ple-prefetch") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                const std::string value = argv[i];
+                if (value == "off") {
+                    params.ple_prefetch = LLAMA_PLE_PREFETCH_OFF;
+                } else if (value == "prefill") {
+                    params.ple_prefetch = LLAMA_PLE_PREFETCH_PREFILL;
+                } else if (value == "always") {
+                    params.ple_prefetch = LLAMA_PLE_PREFETCH_ALWAYS;
+                } else {
+                    invalid_param = true;
+                    break;
+                }
             } else if (arg == "-m" || arg == "--model") {
                 if (++i >= argc) {
                     invalid_param = true;
@@ -2286,6 +2306,8 @@ int llama_bench(int argc, char ** argv) {
         }
         auto mparams = inst.to_llama_mparams();
         auto cparams = inst.to_llama_cparams();
+        // not a sweep dimension: one value for the whole run
+        cparams.ple_prefetch = params.ple_prefetch;
 
         bool do_fit = inst.fit_target != cmd_params_defaults.fit_params_target[0] ||
                       inst.fit_min_ctx != cmd_params_defaults.fit_params_min_ctx[0];

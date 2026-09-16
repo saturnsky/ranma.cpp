@@ -1789,6 +1789,22 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                                    string_format("error: unknown value for --flash-attn: '%s'\n", value.c_str()));
                            }
                        }).set_env("LLAMA_ARG_FLASH_ATTN"));
+    add_opt(common_arg({ "--ple-prefetch" }, "{off,prefill,always}",
+                       string_format("batched prefetch of per-layer embedding rows; 'prefill' covers prompt ubatches, "
+                                     "'always' also covers decode (default: '%s')",
+                                     llama_ple_prefetch_name(params.ple_prefetch)),
+                       [](common_params & params, const std::string & value) {
+                           if (value == "off") {
+                               params.ple_prefetch = LLAMA_PLE_PREFETCH_OFF;
+                           } else if (value == "prefill") {
+                               params.ple_prefetch = LLAMA_PLE_PREFETCH_PREFILL;
+                           } else if (value == "always") {
+                               params.ple_prefetch = LLAMA_PLE_PREFETCH_ALWAYS;
+                           } else {
+                               throw std::runtime_error(
+                                   string_format("error: unknown value for --ple-prefetch: '%s'\n", value.c_str()));
+                           }
+                       }).set_env("LLAMA_ARG_PLE_PREFETCH"));
     add_opt(common_arg(
         {"-p", "--prompt"}, "PROMPT",
         "prompt to start generation with; for system message, use -sys",
