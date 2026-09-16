@@ -100,6 +100,8 @@ applies, how to switch it, and its limits.
 - **Per-layer embedding prefetch** - `--ple-prefetch {off,prefill,always}` (default `always`) hands the rows of
   a lazily mapped per-layer embedding table to the operating system before the gather, and the gather of that
   tensor runs on the threadpool. [docs/ranma/ple-prefetch.md](docs/ranma/ple-prefetch.md)
+- **Only the shards with lazy tensors are mapped** - with mmap loading off, the loader no longer maps model
+  files that nothing reads through the mapping. Same page.
 
 ## Building
 
