@@ -1412,8 +1412,19 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
     if (use_mmap || lazy.any()) {
         mappings.reserve(files.size());
         mmaps_used.reserve(files.size());
+        size_t mapped_files = 0;
         for (uint32_t idx = 0; idx < files.size(); idx++) {
+            // Keep file indices stable. A lazy tensor does not need mappings of the other shards.
+            if (!use_mmap && lazy.for_file(idx).empty()) {
+                mappings.emplace_back(nullptr);
+                mmaps_used.emplace_back(0, 0);
+                if (mlock_mmaps) {
+                    mlock_mmaps->emplace_back(nullptr);
+                }
+                continue;
+            }
             const auto & file = files[idx];
+            ++mapped_files;
 
             bool is_numa = false;
 
@@ -1438,6 +1449,9 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
             }
             mappings.emplace_back(std::move(mapping));
         }
+        if (!use_mmap) {
+            LLAMA_LOG_INFO("%s: lazy-read mapping uses %zu of %zu model files\n", __func__, mapped_files, files.size());
+        }
     }
 
     // compute the total size of all tensors for progress reporting
@@ -1449,6 +1463,12 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
 void llama_model_loader::get_mapping_range(size_t * first, size_t * last, void ** addr, int idx, ggml_context * ctx) const {
     GGML_ASSERT(!mappings.empty());
     const auto & mapping = mappings.at(idx);
+    if (!mapping) {
+        // this file is not mapped: report an empty range, like the mapped path does when it finds no tensor
+        *first = *last = 0;
+        *addr = nullptr;
+        return;
+    }
 
     *first = mapping->size();
     *last  = 0;
