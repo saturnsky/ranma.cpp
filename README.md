@@ -97,6 +97,9 @@ applies, how to switch it, and its limits.
 - **Per-position draft thresholds** - `--spec-draft-p-min` takes one probability per draft position, and
   `--spec-draft-p-continue` keeps a token in the draft but stops drafting after it. Defaults unchanged.
   [docs/ranma/spec-draft-thresholds.md](docs/ranma/spec-draft-thresholds.md)
+- **Per-layer embedding prefetch** - `--ple-prefetch {off,prefill,always}` (default `always`) hands the rows of
+  a lazily mapped per-layer embedding table to the operating system before the gather, and the gather of that
+  tensor runs on the threadpool. [docs/ranma/ple-prefetch.md](docs/ranma/ple-prefetch.md)
 
 ## Building
 
