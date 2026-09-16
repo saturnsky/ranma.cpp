@@ -577,6 +577,7 @@ llama_model_loader::llama_model_loader(
         llm_kv = LLM_KV(llm_arch_from_string(arch_name));
 
         files.emplace_back(new llama_file(fname.c_str(), "rb", use_direct_io));
+        file_paths.emplace_back(fname);
         contexts.emplace_back(ctx);
 
         // Save tensors data offset of the main file.
@@ -645,6 +646,7 @@ llama_model_loader::llama_model_loader(
                 }
 
                 files.emplace_back(new llama_file(fname_split, "rb", use_direct_io));
+                file_paths.emplace_back(fname_split);
                 contexts.emplace_back(ctx);
 
                 // Save tensors data offset info of the shard.
@@ -689,6 +691,7 @@ llama_model_loader::llama_model_loader(
         llm_kv = LLM_KV(llm_arch_from_string(arch_name));
 
         files.emplace_back(new llama_file(file));
+        file_paths.emplace_back();
         contexts.emplace_back(ctx);
 
         // Save tensors data offset info of the main file.
@@ -1684,7 +1687,31 @@ bool llama_model_loader::load_all_data(
         } else {
             const auto & file = files.at(weight->idx);
 
-            if (ggml_backend_buffer_is_host(cur->buffer)) {
+            // ranma expert cache: the SSD tier keeps part of a routed expert tensor in the file, so
+            // the loader reads it expert by expert and skips the ones the tier will stream.
+            const bool tier = expert_iface != nullptr && expert_iface->set_backing != nullptr &&
+                weight->idx < file_paths.size() && !file_paths[weight->idx].empty() &&
+                expert_iface->set_backing(cur, (int32_t) weight->idx, file_paths[weight->idx].c_str(), weight->offs);
+            if (tier) {
+                const size_t unit = cur->nb[2];
+                GGML_ASSERT(unit != 0 && n_size % unit == 0);
+                std::vector<no_init<uint8_t>> read_buf(unit);
+                size_t read = 0;
+                for (size_t base = 0; base < n_size; base += unit) {
+                    if (!expert_iface->load_wanted(cur, (int32_t) (base/unit))) {
+                        continue;
+                    }
+                    file->seek(weight->offs + base, SEEK_SET);
+                    file->read_raw(read_buf.data(), unit);
+                    if (check_tensors && !ggml_validate_row_data(cur->type, read_buf.data(), unit)) {
+                        throw std::runtime_error(format("tensor '%s' has invalid data", ggml_get_name(cur)));
+                    }
+                    ggml_backend_tensor_set(cur, read_buf.data(), base, unit);
+                    read += unit;
+                }
+                LLAMA_LOG_DEBUG("%s: expert cache read %zu of %zu bytes of '%s'\n", __func__,
+                    read, n_size, ggml_get_name(cur));
+            } else if (ggml_backend_buffer_is_host(cur->buffer)) {
                 file->seek(weight->offs, SEEK_SET);
                 file->read_raw(cur->data, n_size);
                 if (check_tensors) {

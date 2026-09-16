@@ -686,7 +686,13 @@ struct common_params {
     bool        expert_freeze             = false; // profile only, never change the cache contents
     bool        expert_profile_archive    = false; // keep records that leave the score window under archive/
     bool        expert_profile_reset      = false; // discard the stored profiles at startup
-    int32_t     expert_seed               = 1;
+    // the host tier and the SSD tier (docs/ranma/expert-cache-l2.md)
+    int32_t     expert_l2_mib             = -1;    // -1 = unlimited host arena, 0 is rejected
+    int32_t     expert_l2_staging_mib     = 0;     // 0 = automatic; sets both rings unless overridden
+    int32_t     expert_l2_prefill_ring_mib = -1;   // -1 = inherit the staging value, 0 = automatic
+    int32_t     expert_l2_decode_ring_mib  = -1;
+    int32_t     expert_seed                = 1;
+    int32_t     expert_l2_worker_cpu       = -1;
 
     std::vector<std::string> api_keys;
 

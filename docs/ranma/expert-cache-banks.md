@@ -95,8 +95,9 @@ reads back anyway, against the plan that was installed while the interval ran, s
 on the hot path. This is the only direct measurement of what a plan is worth during prompt
 processing.
 
-**Which bank is the prompt bank.** `bank_open` takes a `prompt_bank` flag. The policy opens `decode`
-with the flag clear and `prefill` with it set.
+**Which bank is the prompt bank.** `bank_open` takes a `prompt_bank` flag. The backend stores it and
+compares no label string: the flag decides which ring an install carries with a finite host tier
+(`expert-cache-l2.md`). The policy opens `decode` with the flag clear and `prefill` with it set.
 
 **Freeze refuses installs in the policy.** `--expert-freeze` returns from the policy's install before
 it reaches the backend, so a frozen run never installs a plan; banks are still marked, committed and
@@ -139,6 +140,10 @@ first pair discarded, both rows Warm from one Cold seed that carries both banks:
 |---|---:|---:|---|
 | off | 557.02 | 30.28 | 8.6 / 24.5 |
 | on | 575.41 | 29.81 | 17.9 / 46.3 |
+
+**Correctness.** Eight prompts x 48 greedy tokens with top-3 logprobs, exclusive 3072 MiB, finite
+8192 MiB host tier, swap on, against the cache off on the same binary: identical
+(`expert-cache.md`).
 
 ## What it costs
 

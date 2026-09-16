@@ -159,6 +159,14 @@ misbehave. Other platforms and backends are not tested and not supported by this
   it is worth +15 % (20 GiB budget) and +13 % (3 GiB budget) at every depth, at a boundary install of 2.5 to 3.3 s
   per request. Details: [docs/ranma/expert-cache-banks.md](docs/ranma/expert-cache-banks.md).
 
+- **Expert cache host tier with file backing (HIP, Windows)** - `--expert-l2-mib N` bounds the host memory the cache
+  may hold; what fits in neither VRAM nor that budget stays in the GGUF and is read on demand into a ring of host
+  slots the kernels address directly. Default -1 (unlimited). Measured on a Radeon AI PRO R9700 with
+  Qwen3.8-Flash-Next UD-Q4_K_XL (73 GB of experts) and a 20 GiB budget, emulating a 64 GB machine with a 40 GiB
+  tier: decode 37.9 t/s at depth 0 and 26.5 t/s at depth 65536 against 38.2 and 26.8 with unlimited host memory,
+  prompt processing 917 against 948 t/s; with an 8 GiB tier (a 32 GB machine) decode 32.0 and 25.3 t/s. Details,
+  the demand path and the known limits: [docs/ranma/expert-cache-l2.md](docs/ranma/expert-cache-l2.md).
+
 Each feature that lands gets a line here and a page under `docs/ranma/` describing its
 rationale, measured effect, and trade-offs.
 

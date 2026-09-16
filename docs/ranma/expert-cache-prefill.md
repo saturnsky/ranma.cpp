@@ -47,6 +47,8 @@ refill of a 20 GiB budget moves 20 GiB at every request boundary; a delta moves 
   read src0 and is unchanged.
 - `expert-plan.h::plan_install` is the single place that knows where every expert lives, which is
   what lets one mover serve both the promotion of a new resident and the retention of an old one.
+  The transaction later gained host, ring and file locations (`expert-cache-l2.md`) without a second
+  planner.
 
 Two details of the MMQ path are worth naming.
 

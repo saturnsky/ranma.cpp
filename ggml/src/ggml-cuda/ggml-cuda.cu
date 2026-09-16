@@ -2168,6 +2168,14 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
     return true;
 }
 
+#if defined(GGML_USE_HIP)
+struct expert_done_guard {
+    ggml_backend_cuda_context * ctx;
+    const ggml_tensor * src0;
+    ~expert_done_guard() { ggml_cuda_expert_layer_done(*ctx, src0); }
+};
+#endif
+
 static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     const ggml_tensor * src1 = dst->src[1];
@@ -2183,6 +2191,10 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
     if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
         static_assert(MMVQ_MAX_BATCH_SIZE == MMVF_MAX_BATCH_SIZE);
+#if defined(GGML_USE_HIP)
+        // Release the layer's pins after the last weight-reading kernel on every return path.
+        expert_done_guard done_guard{&ctx, src0};
+#endif
         if (ne2 <= MMVQ_MAX_BATCH_SIZE) {
             if (ggml_is_quantized(src0->type)) {
                 const int mmvq_mmid_max = get_mmvq_mmid_max_batch(src0->type, cc);
@@ -4330,6 +4342,9 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
             if (ggml_cuda_should_fuse_mul_mat_vec_q(mm_node)) {
                 ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, out_node, &fusion_data);
+#if defined(GGML_USE_HIP)
+                ggml_cuda_expert_layer_done(*cuda_ctx, src0);
+#endif
                 fused_mul_mat_vec = true;
                 fused_node_count  = n_ops;
                 break;
@@ -4395,6 +4410,9 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
         if (ggml_cuda_should_fuse_mul_mat_vec_q(mm_node)) {
             ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, bias_node, &fusion_data);
+#if defined(GGML_USE_HIP)
+            ggml_cuda_expert_layer_done(*cuda_ctx, src0);
+#endif
             fused_mul_mat_vec = true;
             fused_node_count  = 2;
             break;

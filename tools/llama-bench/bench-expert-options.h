@@ -12,7 +12,11 @@ struct bench_expert_options {
     std::string storage = "inclusive";
     std::string profile;
     int l1_mib = 0;
-    int seed = 1;
+    int l2_mib = -1;  // -1 = unlimited host tier; 0 is rejected
+    int staging_mib = 0;
+    int prefill_ring_mib = -1;
+    int decode_ring_mib = -1;
+    int seed = 1, worker_cpu = -1;
     bool swap = false;
     bool archive = false;
     bool reset = false;
@@ -37,11 +41,17 @@ struct bench_expert_options {
         else {
             size_t end = 0;
             const long long n = std::stoll(value, &end);
-            if (end != value.size() || n < 0 || n > std::numeric_limits<int>::max()) {
+            const bool minus_one_ok = arg == "--expert-l2-worker-cpu" || arg == "--expert-l2-mib";
+            if (end != value.size() || (n < 0 && !(minus_one_ok && n == -1)) || n > std::numeric_limits<int>::max()) {
                 throw std::invalid_argument("expert sizes and seed must be nonnegative integers");
             }
             if (arg == "--expert-l1-mib") { l1_mib = (int) n; }
+            else if (arg == "--expert-l2-mib") { l2_mib = (int) n; }
+            else if (arg == "--expert-l2-staging-mib") { staging_mib = (int) n; }
+            else if (arg == "--expert-l2-prefill-ring-mib") { prefill_ring_mib = (int) n; }
+            else if (arg == "--expert-l2-decode-ring-mib") { decode_ring_mib = (int) n; }
             else if (arg == "--expert-seed") { seed = (int) n; }
+            else if (arg == "--expert-l2-worker-cpu") { worker_cpu = (int) n; }
             else { throw std::invalid_argument("unknown expert option: " + arg); }
         }
         return true;
@@ -64,18 +74,23 @@ struct bench_expert_options {
         p.expert_l1_mib = l1_mib;
         p.expert_cache_mode = storage;
         p.expert_profile_dir = profile;
+        p.expert_l2_mib = l2_mib;
+        p.expert_l2_staging_mib = staging_mib;
+        p.expert_l2_prefill_ring_mib = prefill_ring_mib;
+        p.expert_l2_decode_ring_mib = decode_ring_mib;
         p.expert_prefill_swap = warm() && swap;
         p.expert_profile_archive = archive;
         p.expert_profile_reset = reset;
         p.n_parallel = 1; p.n_batch = batch; p.n_ubatch = ubatch;
-        p.expert_seed = seed;
+        p.expert_seed = seed; p.expert_l2_worker_cpu = worker_cpu;
         p.fit_params = false;
         const auto valid = validate_expert_params(p);
         if (!valid.ok) { throw std::invalid_argument(valid.reason); }
         auto cfg = expert_config_from_params(p);
         cfg.profile_dir = mode == "off" ? "" : profile.c_str();
         cfg.l1_bytes = size_t(l1_mib)*1024*1024;
-        cfg.policy = warm() ? GGML_EXPERT_POLICY_ADAPTIVE : GGML_EXPERT_POLICY_STATIC;
+        cfg.policy = mode == "off" ? GGML_EXPERT_POLICY_OFF :
+            warm() ? GGML_EXPERT_POLICY_ADAPTIVE : GGML_EXPERT_POLICY_STATIC;
         cfg.random_seed = (uint32_t) seed;
         cfg.freeze = !warm();
         if (!warm()) { cfg.spare_slots = 0; }

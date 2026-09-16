@@ -8,6 +8,10 @@ second copy of those experts. Exclusive mode takes that memory back: a 20 GiB bu
 of host memory less than inclusive mode, and less than running with no cache at all, because the
 experts that live in VRAM are not in RAM either.
 
+With unlimited host memory every expert has one of the two homes. With a finite `--expert-l2-mib`
+the experts outside both resident sets stay in the GGUF file and are read on demand
+(`expert-cache-l2.md`). The file is never modified in either mode.
+
 ## Why it exists
 
 Inclusive mode is simple because the host tensor is complete. An install copies whatever the plan
@@ -133,6 +137,9 @@ exchange above. `RANMA_EXPERT_VERIFY=1` checks every VRAM and every host slot af
 
 ## Design notes
 
+- **`host_addresses` is null without a finite host tier.** A host slot is addressed by its slot
+  index. The finite tier supplies an address table for streamed and lent ring slices; the kernels
+  take a nonzero address before the host-slot path.
 - **Non-expert tensors of the routed context are kept, not refused.** Refusing them would mean
   exclusive mode never runs on the reference model, whose token embedding shares the context. The
   delegate buffer has the context's own buffer type; because that buffer is not in the model's
@@ -142,16 +149,19 @@ exchange above. `RANMA_EXPERT_VERIFY=1` checks every VRAM and every host slot af
   its base tensor (`src/llama-adapter.cpp`), and a base tensor in the exclusive buffer would
   otherwise hand it a null allocator.
 - **`RANMA_EXPERT_VERIFY` compares against a digest of the loader's bytes.** Inclusive mode verifies
-  an arena slice against the host master. Exclusive mode has no master and the backend does not know
-  the model's file handles, so a 128-bit digest is recorded per (layer, kind, expert) while the
+  an arena slice against the host master. Exclusive mode has no master and the backend does not
+  know the model's file handles, so a 128-bit digest is recorded per (layer, kind, expert) while the
   loader writes, and every slot is compared against it after every install. A write that does not
-  cover whole slices leaves experts without a digest and the log counts them.
+  cover whole slices leaves experts without a digest and the log counts them. With a finite host
+  tier a slice promoted from the file is compared with the file payload before a digest is retained
+  for it.
 - **No dark step in an exclusive install.** The inclusive mover publishes -1 for a slot before it
   overwrites it, so the slot is never visible as resident while it changes. In exclusive mode -1
   would mean "read the tensor", which has no bytes, so the tables stay valid throughout and the
   ordering on the copy stream is what protects a slot until it is reused.
 - **The fused `MUL_MAT_ID` path** (models with a quantized expert down bias or scale) reads the
-  arenas too.
+  arenas too. It notifies the host tier after the fused kernel has finished reading the down weights;
+  the controller checks kind 2, so gate and up fusions do not release the layer's slots.
 
 ## Revision
 

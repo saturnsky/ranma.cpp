@@ -957,7 +957,7 @@ static __global__ void mul_mat_q(
         const int32_t * __restrict__ expert_bounds, float * __restrict__ dst, float * __restrict__ tmp_fixup,
         const float * __restrict__ y_scale,
         const char * __restrict__ x_cache, const int32_t * __restrict__ x_cache_slots,
-        const int32_t * __restrict__ x_host_slots,
+        const int32_t * __restrict__ x_host_slots, const uint64_t * __restrict__ x_host_addresses,
         const uint3 blocks_per_ne00, const int nrows_x, const int ncols_dst, const int stride_row_x, const int ncols_y, const int stride_col_dst,
         const uint3 channel_ratio, const uint3 nchannels_y, const int64_t stride_channel_x_bytes, const int stride_channel_y, const int stride_channel_dst,
         const uint3 sample_ratio, const uint3 nsamples_y, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
@@ -1054,7 +1054,7 @@ static __global__ void mul_mat_q(
 
         // ranma expert cache: a resident expert is read from its arena slot instead of the tensor.
         // The channel base is a 64-bit byte offset: a multi-GiB arena overflows a block index.
-        const ggml_cuda_expert_source x_src = ggml_cuda_expert_cache_select(x, x_cache, x_cache_slots, fastdiv(zt, channel_ratio), x_host_slots);
+        const ggml_cuda_expert_source x_src = ggml_cuda_expert_cache_select(x, x_cache, x_cache_slots, fastdiv(zt, channel_ratio), x_host_slots, x_host_addresses);
         const char * x_channel = (const char *) x_src.data + (int64_t) x_src.channel*stride_channel_x_bytes;
         const int offset_x = fastdiv(wt, sample_ratio)*stride_sample_x + it*I*stride_row_x;
 
@@ -1152,7 +1152,7 @@ static __global__ void mul_mat_q(
 
         // ranma expert cache: a resident expert is read from its arena slot instead of the tensor.
         // The channel base is a 64-bit byte offset: a multi-GiB arena overflows a block index.
-        const ggml_cuda_expert_source x_src = ggml_cuda_expert_cache_select(x, x_cache, x_cache_slots, fastdiv(zt, channel_ratio), x_host_slots);
+        const ggml_cuda_expert_source x_src = ggml_cuda_expert_cache_select(x, x_cache, x_cache_slots, fastdiv(zt, channel_ratio), x_host_slots, x_host_addresses);
         const char * x_channel = (const char *) x_src.data + (int64_t) x_src.channel*stride_channel_x_bytes;
         const int offset_x = fastdiv(wt, sample_ratio)*stride_sample_x + it*I*stride_row_x;
 
@@ -1240,7 +1240,7 @@ static __global__ void mul_mat_q(
 
     // ranma expert cache: a resident expert is read from its arena slot instead of the tensor.
     // The channel base is a 64-bit byte offset: a multi-GiB arena overflows a block index.
-    const ggml_cuda_expert_source x_src = ggml_cuda_expert_cache_select(x, x_cache, x_cache_slots, fastdiv(zt, channel_ratio), x_host_slots);
+    const ggml_cuda_expert_source x_src = ggml_cuda_expert_cache_select(x, x_cache, x_cache_slots, fastdiv(zt, channel_ratio), x_host_slots, x_host_addresses);
     const char * x_channel = (const char *) x_src.data + (int64_t) x_src.channel*stride_channel_x_bytes;
     const int offset_x = fastdiv(wt, sample_ratio)*stride_sample_x + it*I*stride_row_x;
 
@@ -1395,7 +1395,7 @@ struct mmq_args {
     // ranma expert cache: arena base and slot table of this src0 tensor, both null when it is not cached
     const char * x_cache; const int32_t * x_cache_slots;
     // exclusive mode: x is the host arena base and this maps an expert to its host slot; null otherwise
-    const int32_t * x_host_slots;
+    const int32_t * x_host_slots; const uint64_t * x_host_addresses;
     int64_t ncols_x; int64_t nrows_x; int64_t ncols_dst; int64_t stride_row_x; int64_t ncols_y; int64_t nrows_dst;
     int64_t nchannels_x; int64_t nchannels_y; int64_t stride_channel_x_bytes; int64_t stride_channel_y; int64_t stride_channel_dst;
     int64_t nsamples_x; int64_t nsamples_y; int64_t stride_sample_x; int64_t stride_sample_y; int64_t stride_sample_dst;
@@ -1447,7 +1447,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     if (!ggml_cuda_mmq_get_stream_k(type, J, fallback, cc)) {
         mul_mat_q<type, J, fallback><<<block_nums_xy_tiling, block_dims, nbytes_shared, stream>>>
             (args.x, args.y, args.ids_dst, args.expert_bounds, args.dst, nullptr, args.y_scale,
-             args.x_cache, args.x_cache_slots, args.x_host_slots,
+             args.x_cache, args.x_cache_slots, args.x_host_slots, args.x_host_addresses,
              blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
              channel_ratio_fd, nchannels_y_fd, args.stride_channel_x_bytes, args.stride_channel_y, args.stride_channel_dst,
              sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
@@ -1477,7 +1477,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
 
     mul_mat_q<type, J, fallback><<<block_nums_stream_k, block_dims, nbytes_shared, stream>>>
         (args.x, args.y, args.ids_dst, args.expert_bounds, args.dst, tmp_fixup.ptr, args.y_scale,
-         args.x_cache, args.x_cache_slots, args.x_host_slots,
+         args.x_cache, args.x_cache_slots, args.x_host_slots, args.x_host_addresses,
          blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
          channel_ratio_fd, nchannels_y_fd, args.stride_channel_x_bytes, args.stride_channel_y, args.stride_channel_dst,
          sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,

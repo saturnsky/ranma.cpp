@@ -29,7 +29,9 @@ Three parts, in the order the data flows:
 
 The cache is inclusive by default: each VRAM resident also keeps its host copy, and the host tensor
 stays complete. `--expert-cache-mode exclusive` gives every routed expert exactly one home instead
-and takes the budget back out of host memory (`expert-cache-exclusive.md`).
+and takes the budget back out of host memory (`expert-cache-exclusive.md`). `--expert-l2-mib`
+bounds the host memory the cache may use in either mode and leaves the rest of the experts in the
+GGUF file, read on demand (`expert-cache-l2.md`).
 
 This is a fork feature of the HIP build. It is not compiled into the CUDA backend; the options are
 accepted there and do nothing.
@@ -77,9 +79,10 @@ processing is served is the subject of `expert-cache-banks.md`.
 
 | Option | Default | Meaning |
 |---|---|---|
-| `--expert-l1-mib N` | 0 (off) | VRAM budget in MiB for expert payload and cache overhead. The budget also decides the expert placement (every routed expert goes to host memory), so `--n-cpu-moe`/`--cpu-moe` are refused together with it. `--expert-cache-mib` is accepted as an alias. |
+| `--expert-l1-mib N` | 0 (off) | VRAM budget in MiB for expert payload and cache overhead. The budget also decides the expert placement (every routed expert goes to host memory), so `--n-cpu-moe`/`--cpu-moe` are refused together with it. `--expert-cache-mib` is accepted as an alias. Zero is valid together with a finite `--expert-l2-mib`. |
 | `--expert-profile-dir DIR` | none | Root of the profile banks, `DIR/decode/` and `DIR/prefill/`. Without it the placement is seeded and fixed: no records, no installs. |
 | `--expert-cache-mode MODE` | `inclusive` | `inclusive` keeps a host copy of each VRAM resident; `exclusive` keeps one home per expert (`expert-cache-exclusive.md`). |
+| `--expert-l2-mib N` | -1 (unlimited) | Host memory budget in MiB; what fits in neither tier stays in the file (`expert-cache-l2.md`). 0 is refused. |
 | `--expert-prefill-swap` | off | Hold the prompt-processing plan while a prompt is processed (`expert-cache-banks.md`). |
 | `--expert-seed N` | 1 | Seed of the fixed random placement used when no profile is available. |
 | `--expert-freeze` | off | Profile and plan, never change the cache contents (for collecting a profile without disturbing a measurement). |
@@ -90,9 +93,10 @@ Most options are also environment variables of the usual form (`LLAMA_ARG_EXPERT
 on). `llama-bench` takes the same options plus its own `--expert-cache off|cold|warm`
 (`benchmark.md`).
 
-Debug environment variables, read once at startup: `RANMA_EXPERT_TRACE=<mask>` turns on log lines (1
-install, 2 profile, 4 prompt-processing); `RANMA_EXPERT_VERIFY=1` reads every resident slice back
-after each install and compares it with its source (slow; used by the correctness checks).
+Debug environment variables, read once at startup: `RANMA_EXPERT_TRACE=<mask>` turns on log lines
+(1 install, 2 profile, 4 prompt-processing, 8 host tier and per-commit round lines);
+`RANMA_EXPERT_VERIFY=1` reads every resident slice back after each install and compares it with its
+source (slow; used by the correctness checks).
 
 The profile directory is tied to the model: a `manifest.json` per bank records the routed-expert
 geometry (layer count, expert count, per-kind bytes and types), and a store whose manifest does not

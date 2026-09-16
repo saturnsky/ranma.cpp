@@ -392,6 +392,12 @@ llama_build_and_test(test-expert-exclusive.cpp)
 target_include_directories(test-expert-exclusive PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src/ggml-cuda)
 llama_build_and_test(test-expert-score.cpp)
 target_include_directories(test-expert-score PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src/ggml-cuda)
+llama_build_and_test(test-expert-l2.cpp)
+target_include_directories(test-expert-l2 PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src/ggml-cuda)
+llama_build_and_test(test-expert-os.cpp
+    ${PROJECT_SOURCE_DIR}/ggml/src/ggml-cuda/expert-os-win32.cpp
+    ${PROJECT_SOURCE_DIR}/ggml/src/ggml-cuda/expert-os-posix.cpp)
+target_include_directories(test-expert-os PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src/ggml-cuda ${PROJECT_SOURCE_DIR}/ggml/src)
 llama_build_and_test(test-expert-config.cpp)
 llama_build_and_test(test-server-expert.cpp)
 
@@ -401,3 +407,13 @@ if (TARGET gguf-model-data)
     target_compile_definitions(test-export-graph-ops PRIVATE LLAMA_HF_FETCH)
 endif()
 
+# Standalone fixture; run explicitly with a writable scratch directory and a GPU guard.
+if (WIN32 AND GGML_HIP)
+    find_package(hip REQUIRED)
+    add_executable(test-expert-l2-gpu EXCLUDE_FROM_ALL test-expert-l2-gpu.cu)
+    set_source_files_properties(test-expert-l2-gpu.cu PROPERTIES LANGUAGE CXX)
+    target_compile_features(test-expert-l2-gpu PRIVATE cxx_std_17)
+    target_compile_definitions(test-expert-l2-gpu PRIVATE GGML_USE_HIP GGML_HIP_NO_VMM)
+    target_include_directories(test-expert-l2-gpu PRIVATE ../ggml/src ../ggml/src/ggml-cuda)
+    target_link_libraries(test-expert-l2-gpu PRIVATE ggml-base hip::device hip::host)
+endif()
