@@ -1940,6 +1940,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                 //     from disk, MoE tensors kept on the CPU, etc) are left out and stay out of RAM
                 // this also allows using partial offloading when the model size exceeds the metal buffer
                 //     size, but not the RAM size
+                if (!ml.mappings.at(idx)) {
+                    continue; // a file that is not mapped (lazy-only) holds nothing of this context
+                }
                 void * addr = ml.mappings.at(idx)->addr();
 
                 for (const auto & range : ml.get_mapping_ranges(idx, ctx)) {

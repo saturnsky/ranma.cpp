@@ -1414,8 +1414,19 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
     if (use_mmap || lazy.any()) {
         mappings.reserve(files.size());
         mmaps_used.reserve(files.size());
+        size_t mapped_files = 0;
         for (uint32_t idx = 0; idx < files.size(); idx++) {
+            // Keep file indices stable. A lazy tensor does not need mappings of the other shards.
+            if (!use_mmap && lazy.for_file(idx).empty()) {
+                mappings.emplace_back(nullptr);
+                mmaps_used.emplace_back(0, 0);
+                if (mlock_mmaps) {
+                    mlock_mmaps->emplace_back(nullptr);
+                }
+                continue;
+            }
             const auto & file = files[idx];
+            ++mapped_files;
 
             bool is_numa = false;
 
@@ -1439,6 +1450,9 @@ void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps
                 mlock_mmaps->emplace_back(std::move(mlock_mmap));
             }
             mappings.emplace_back(std::move(mapping));
+        }
+        if (!use_mmap) {
+            LLAMA_LOG_INFO("%s: lazy-read mapping uses %zu of %zu model files\n", __func__, mapped_files, files.size());
         }
     }
 
@@ -1491,6 +1505,11 @@ static mapping_ranges sub_ranges(const mapping_ranges & a, const mapping_ranges 
 
 std::vector<llama_model_loader::mapping_range> llama_model_loader::get_mapping_ranges(uint32_t idx, ggml_context * ctx) const {
     GGML_ASSERT(idx < mappings.size());
+
+    if (!mappings.at(idx)) {
+        // this file is not mapped (lazy-only mapping keeps a null placeholder): no range to take from it
+        return {};
+    }
 
     // data of this context, and data of the other contexts that share the same file
     // a weight that is mapped in several contexts (e.g. the token embedding) is not foreign data
