@@ -195,6 +195,17 @@ extern "C" {
 
     LLAMA_API const char * llama_flash_attn_type_name(enum llama_flash_attn_type flash_attn_type);
 
+    // Batched prefetch of the rows a per-layer-embedding gather is about to read.
+    // Only architectures with a lazily mapped per-layer embedding table act on it; everywhere else
+    // it is inert. See docs/ranma/ple-prefetch.md.
+    enum llama_ple_prefetch {
+        LLAMA_PLE_PREFETCH_OFF     = 0, // never prefetch
+        LLAMA_PLE_PREFETCH_PREFILL = 1, // prefetch gathers of 256 rows or more (prompt ubatches)
+        LLAMA_PLE_PREFETCH_ALWAYS  = 2, // also prefetch the single-token gathers of decode
+    };
+
+    LLAMA_API const char * llama_ple_prefetch_name(enum llama_ple_prefetch ple_prefetch);
+
     enum llama_split_mode {
         LLAMA_SPLIT_MODE_NONE   = 0, // single GPU
         LLAMA_SPLIT_MODE_LAYER  = 1, // split layers and KV across GPUs
@@ -372,6 +383,7 @@ extern "C" {
         enum llama_pooling_type      pooling_type;      // whether to pool (sum) embedding results by sequence id
         enum llama_attention_type    attention_type;    // attention type to use for embeddings
         enum llama_flash_attn_type   flash_attn_type;   // when to enable Flash Attention
+        enum llama_ple_prefetch      ple_prefetch;      // batched prefetch of per-layer embedding rows
 
         // ref: https://github.com/ggml-org/llama.cpp/pull/2054
         float    rope_freq_base;   // RoPE base frequency, 0 = from model

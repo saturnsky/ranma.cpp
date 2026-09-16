@@ -2,9 +2,61 @@
 #include "llama-impl.h"
 #include "llama-memory-hybrid-idx.h"
 #include "llama-memory-recurrent.h"
+#include "llama-prefetch.h"
 
 #include <algorithm>
 #include <cinttypes>
+
+// Batched prefetch of the per-layer embedding rows of one ubatch.
+//
+// per_layer_token_embd.weight is a multi-GiB table that the loader maps lazily, so every gathered row
+// is a demand page fault. A 512-token prompt ubatch gathers thousands of ~110 byte rows: that is
+// thousands of serialized 4 KiB reads when the pages are not in the page cache. One call with the
+// merged ranges lets the OS read them together. It is a hint; the gather reads the same bytes.
+//
+// Thresholds are the measured ones, see docs/ranma/ple-prefetch.md.
+static const size_t PLE_PREFETCH_MIN_ROWS_PREFILL = 256;
+static const size_t PLE_PREFETCH_MIN_ROWS_DECODE  = 16;
+
+static void prefetch_ple_rows(const ggml_tensor * table, const std::vector<int32_t> & rows,
+                              enum llama_ple_prefetch mode) {
+    if (mode == LLAMA_PLE_PREFETCH_OFF || table == nullptr || table->data == nullptr) {
+        return;
+    }
+
+    const size_t min_rows = mode == LLAMA_PLE_PREFETCH_ALWAYS
+        ? PLE_PREFETCH_MIN_ROWS_DECODE
+        : PLE_PREFETCH_MIN_ROWS_PREFILL;
+    if (rows.size() < min_rows) {
+        return;
+    }
+
+    // A table that is not in host memory is not page-faulted by the CPU; prefetching a device
+    // pointer would be meaningless. This is also what keeps the option inert for other placements.
+    if (table->buffer == nullptr || !ggml_backend_buffer_is_host(table->buffer)) {
+        return;
+    }
+
+    std::vector<int32_t> sorted = rows;
+    std::sort(sorted.begin(), sorted.end());
+    sorted.erase(std::unique(sorted.begin(), sorted.end()), sorted.end());
+
+    // Merge consecutive rows so that neighbouring tokens become one range rather than many.
+    std::vector<llama_prefetch_range> ranges;
+    for (size_t first = 0; first < sorted.size();) {
+        size_t last = first + 1;
+        while (last < sorted.size() && sorted[last] == sorted[last - 1] + 1) {
+            ++last;
+        }
+        llama_prefetch_range range;
+        range.addr = (const char *) table->data + (size_t) sorted[first] * table->nb[1];
+        range.size = (size_t) (sorted[last - 1] - sorted[first] + 1) * table->nb[1];
+        ranges.push_back(range);
+        first = last;
+    }
+
+    llama_prefetch_ranges(ranges.data(), ranges.size());
+}
 
 // bad metadata must be catchable: GGML_ASSERT aborts the whole process
 static void qwen4exp_require_nonzero(const llama_model_loader & ml, llm_kv kid, uint32_t value) {
@@ -1028,7 +1080,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_ffn(ggml_tensor * cur, co
 class llm_graph_input_ple : public llm_graph_input_i {
 public:
     llm_graph_input_ple(const llama_model_qwen4exp & pmodel,
-                        const llama_kv_cache_context * mctx) : pmodel(pmodel), mctx(mctx) {}
+                        const llama_kv_cache_context * mctx,
+                        enum llama_ple_prefetch ple_prefetch) :
+        pmodel(pmodel), mctx(mctx), ple_prefetch(ple_prefetch) {}
     virtual ~llm_graph_input_ple() = default;
 
     void set_input(const llama_ubatch * ubatch) override;
@@ -1044,6 +1098,9 @@ public:
 
     // the predecessor tokens live in the attention KV cells (ext.tok)
     const llama_kv_cache_context * mctx;
+
+    // when to hand the gathered rows to the OS ahead of GET_ROWS
+    const enum llama_ple_prefetch ple_prefetch;
 
     // scratch, reused across set_input() calls
     std::vector<llama_token> prev;
@@ -1108,6 +1165,8 @@ void llm_graph_input_ple::set_input(const llama_ubatch * ubatch) {
             }
         }
     }
+
+    prefetch_ple_rows(pmodel.per_layer_tok_embd, idx, ple_prefetch);
 
     ggml_backend_tensor_set(rows, idx.data(), 0, idx.size()*ggml_element_size(rows));
 }
@@ -1174,7 +1233,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_inp_ple(
 
     // the attention cells see every ubatch regardless of the layer types
     auto ple_inp = std::make_unique<llm_graph_input_ple>(
-            static_cast<const llama_model_qwen4exp &>(model), mctx_hyb->get_attn());
+            static_cast<const llama_model_qwen4exp &>(model), mctx_hyb->get_attn(), cparams.ple_prefetch);
 
     ple_inp->rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_heads * n_tokens);
     ggml_set_input(ple_inp->rows);

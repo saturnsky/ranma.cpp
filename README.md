@@ -118,6 +118,13 @@ misbehave. Other platforms and backends are not tested and not supported by this
   and 72.6 with the best single `p-min`. Details, the cost curve and the reasoning behind the values:
   [docs/ranma/spec-draft-thresholds.md](docs/ranma/spec-draft-thresholds.md).
 
+- **Per-layer embedding prefetch and gather** - `--ple-prefetch {off,prefill,always}` (default `always`) hands the
+  rows a per-layer-embedding gather is about to read to the operating system before the gather runs, and the gather
+  of that one tensor runs on the threadpool. The table is mapped lazily, so without this every gathered row is a
+  page fault on one thread. Measured on a Radeon AI PRO R9700 with Qwen3.8-Flash-Next UD-Q4_K_XL, experts in host
+  memory: prompt processing 504 -> 539 t/s and decode 19.4 -> 20.0 t/s at depth 0, with ample free RAM; the fault
+  price grows 50x when RAM is scarce. Details: [docs/ranma/ple-prefetch.md](docs/ranma/ple-prefetch.md).
+
 Each feature that lands gets a line here and a page under `docs/ranma/` describing its
 rationale, measured effect, and trade-offs.
 

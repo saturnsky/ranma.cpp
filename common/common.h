@@ -516,6 +516,7 @@ struct common_params {
     enum llama_pooling_type      pooling_type      = LLAMA_POOLING_TYPE_UNSPECIFIED; // pooling type for embeddings
     enum llama_attention_type    attention_type    = LLAMA_ATTENTION_TYPE_UNSPECIFIED; // attention type for embeddings
     enum llama_flash_attn_type   flash_attn_type   = LLAMA_FLASH_ATTN_TYPE_AUTO; // whether to use Flash Attention
+    enum llama_ple_prefetch      ple_prefetch      = LLAMA_PLE_PREFETCH_ALWAYS; // batched prefetch of per-layer embedding rows
 
     struct common_params_sampling    sampling;
     struct common_params_speculative speculative;

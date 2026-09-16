@@ -47,6 +47,18 @@ const char * llama_flash_attn_type_name(enum llama_flash_attn_type flash_attn_ty
     GGML_ABORT("fatal error");
 }
 
+const char * llama_ple_prefetch_name(enum llama_ple_prefetch ple_prefetch) {
+    switch (ple_prefetch) {
+        case LLAMA_PLE_PREFETCH_OFF:
+            return "off";
+        case LLAMA_PLE_PREFETCH_PREFILL:
+            return "prefill";
+        case LLAMA_PLE_PREFETCH_ALWAYS:
+            return "always";
+    }
+    GGML_ABORT("fatal error");
+}
+
 const char * llama_load_mode_name(enum llama_load_mode load_mode) {
     switch (load_mode) {
         case LLAMA_LOAD_MODE_AUTO:
