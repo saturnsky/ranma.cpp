@@ -123,9 +123,13 @@ ggml_cuda_expert_lookup l1_arena::lookup(int layer, int kind) const noexcept {
     out.data  = class_data_[cls][kind] ? class_data_[cls][kind] :
         (host_ && host_->mapped() ? host_->device_data(cls, kind) : nullptr);
     out.slots = layer_slots_[layer];
+    if (addresses_) {
+        out.host_addresses = addresses_(layer, kind);
+    }
     if (host_ != nullptr && host_->mapped()) {
         // Owned host storage: an expert that misses the VRAM arena is read from the host arena,
-        // not from the tensor, which has no bytes of its own.
+        // not from the tensor, which has no bytes of its own. The kernels take the host slot table
+        // first; host_addresses, when a tier attached one, answers the experts it does not hold.
         out.host_data  = host_->device_data(cls, kind);
         out.host_slots = host_->device_slots(layer);
     }
@@ -186,9 +190,21 @@ bool l1_arena::assign_exclusive(const std::vector<std::vector<int32_t>> & select
     }
     homes_ = host_locations(arena_slots_);
     layout_.gpu = capacities_; layout_.host = host_capacities_;
+    layout_.lent_begin.assign(classes, 0); layout_.lent_count.assign(classes, 0);
     for (size_t c = 0; c < classes; ++c) { layout_.gpu[c] += spare_slots_; layout_.host[c] += spare_slots_; }
     host_slots_ = std::move(gpu);
     selected_   = selected;
+    return publish_tables(host_slots_) && host_->publish_tables(arena_slots_);
+}
+
+bool l1_arena::assign_tier(const expert_slot_table & gpu_slots, const expert_locations & homes,
+        const install_layout & layout, const expert_slot_table & selected,
+        const std::vector<std::vector<int>> & spares) {
+    if (!allocated() || !host_ || gpu_slots.size() != size_t(geo_.n_layers) || homes.size() != gpu_slots.size()) { return false; }
+    host_slots_ = gpu_slots; homes_ = homes; layout_ = layout;
+    arena_slots_ = host_slot_table(homes);
+    host_capacities_ = layout.host;
+    selected_ = selected; gpu_spares_ = spares;
     return publish_tables(host_slots_) && host_->publish_tables(arena_slots_);
 }
 
@@ -282,7 +298,7 @@ bool l1_arena::read_slice(int layer, int kind, int slot, void * dst) const {
 bool l1_arena::verify_current_assignment(std::string & reason) const {
     if (host_) {
         return verify_assignment(host_slots_, homes_, geo_.layer_class, layout_, gpu_spares_, geo_.n_experts,
-            {host_master_, spare_slots_}, reason);
+            {host_master_, spare_slots_}, bool(addresses_), reason);
     }
     // The unlimited inclusive path keeps its master in each original host tensor.
     const auto tx = stage(selected_, true);
@@ -313,6 +329,7 @@ l1_transaction l1_arena::stage(const expert_slot_table & selected, bool retain) 
     if (!host_) {
         homes.assign(geo_.n_layers, std::vector<expert_location>(geo_.n_experts));
         layout.gpu = capacities_; layout.host.assign(capacities_.size(), 0);
+        layout.lent_begin.assign(capacities_.size(), 0); layout.lent_count.assign(capacities_.size(), 0);
         spares.assign(capacities_.size(), {});
         for (int l = 0; l < geo_.n_layers; ++l) {
             const int c = geo_.layer_class[l];
@@ -327,18 +344,49 @@ l1_transaction l1_arena::stage(const expert_slot_table & selected, bool retain) 
         }
     }
     tx.install = plan_install(geo_, selected, hs, host_slots_, homes, capacities_, layout, layout, spares,
-        {host_master_, spare_slots_}, retain);
+        {host_master_, spare_slots_}, false, retain);
     tx.selected = selected;
     tx.valid = tx.install.valid;
     return tx;
 }
 
-// Where a slice of a move lives outside the VRAM arena. A two-tier arena reads its own host
-// arena; without a host arena the tensor still owns the bytes.
+// Where a slice of a move lives outside the VRAM arena. A tier resolves host and lent slots; a
+// two-tier arena reads its own host arena; without a host arena the tensor still owns the bytes.
 void * l1_arena::slice_address(int layer, int cls, int kind, expert_location at, int expert) const {
     if (resolve_) { return resolve_(cls, kind, at); }
     if (host_)    { return host_->slice(cls, kind, at.slot); }
     return host_address(layer, kind, expert);
+}
+
+// Reads a batch of file-resident experts into ring slots and copies them to their destinations.
+// Returns the number of moves consumed, or 0 on a refusal.
+size_t l1_arena::move_from_file(const install_transaction & tx, size_t first) {
+    if (!tier_.read || !tier_.address || tier_.slots <= 0 || !sync_copies()) { return 0; }
+    std::vector<l2_read> reads;
+    size_t count = 0;
+    while (first + count < tx.moves.size() && count < size_t(tier_.slots) &&
+            tx.moves[first + count].from.storage == expert_storage::file) {
+        const auto & item = tx.moves[first + count];
+        for (int k = 0; k < geometry::n_kinds; ++k) { reads.push_back({item.layer, k, item.expert, int(count)}); }
+        ++count;
+    }
+    std::string reason;
+    if (!tier_.read(reads, reason)) {
+        GGML_ABORT("expert cache: install read failed: %s", reason.c_str());
+    }
+    for (const l2_read & read : reads) {
+        const auto & item = tx.moves[first + read.slot];
+        const void * src = tier_.address(read);
+        if (item.to.storage == expert_storage::vram) {
+            if (!write_gpu_slice(item.cls, read.kind, item.to.slot, src, false)) { return 0; }
+        } else {
+            void * dst = slice_address(item.layer, item.cls, read.kind, item.to, item.expert);
+            if (dst == nullptr) { return 0; }
+            memcpy(dst, src, geo_.class_bytes[item.cls][read.kind]);
+        }
+    }
+    // A ring slot may be refilled by the next batch, so every copy out of it completes first.
+    return sync_copies() ? count : 0;
 }
 
 bool l1_arena::execute(const install_transaction & tx) {
@@ -350,6 +398,12 @@ bool l1_arena::execute(const install_transaction & tx) {
     }
     for (size_t i = 0; i < tx.moves.size();) {
         const auto & move = tx.moves[i];
+        if (move.from.storage == expert_storage::file) {
+            const size_t done = move_from_file(tx, i);
+            if (done == 0) { return false; }
+            i += done;
+            continue;
+        }
         const bool to_gpu   = move.to.storage   == expert_storage::vram;
         const bool from_gpu = move.from.storage == expert_storage::vram;
         for (int k = 0; k < geometry::n_kinds; ++k) {

@@ -48,6 +48,8 @@ plans, which on a running conversation is a small part of it.
   read src0 and is unchanged.
 - `expert-plan.h::plan_install` is the single place that knows where every expert lives, which is
   what lets one mover serve both the promotion of a new resident and the retention of an old one.
+  With a finite host tier the same transaction also covers host, ring and file locations
+  (`expert-cache-l2.md`), with no second planner.
 
 Two details of the MMQ path are worth naming.
 

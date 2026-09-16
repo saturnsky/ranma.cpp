@@ -680,7 +680,7 @@ static __global__ void mul_mat_vec_q(
     // Only the MUL_MAT_ID dispatch sets the table, so dense matmuls keep the plain path.
     const ggml_cuda_expert_source x_src =
         ggml_cuda_expert_cache_select(vx, fusion.x_cache, ids ? fusion.x_cache_slots : nullptr, channel_x,
-            ids ? fusion.x_host_slots : nullptr);
+            ids ? fusion.x_host_slots : nullptr, ids ? fusion.x_host_addresses : nullptr);
     const void * vx_source        = x_src.data;
     uint32_t     source_channel_x = x_src.channel;
     [[maybe_unused]] const int32_t cache_slot = x_src.slot;
@@ -721,6 +721,10 @@ static __global__ void mul_mat_vec_q(
             if (cache_slot >= 0) {
                 vgate_source        = fusion.gate_cache;
                 source_channel_gate = (uint32_t) cache_slot;
+            } else if (ids && fusion.gate_host_addresses != nullptr && fusion.gate_host_addresses[channel_x] != 0) {
+                // SSD tier: the gate slice of this expert has an address of its own
+                vgate_source        = (const void *) (uintptr_t) fusion.gate_host_addresses[channel_x];
+                source_channel_gate = 0;
             } else if (ids && fusion.x_host_slots != nullptr) {
                 // exclusive miss: vgate is the gate host arena and both kinds share the slot table
                 source_channel_gate = x_src.channel;
@@ -978,7 +982,8 @@ static __global__ void mul_mat_vec_q_moe(
 
     // ranma expert cache: a resident expert is read from its arena slot instead of the tensor.
     const ggml_cuda_expert_source x_src =
-        ggml_cuda_expert_cache_select(vx, fusion.x_cache, fusion.x_cache_slots, channel_x, fusion.x_host_slots);
+        ggml_cuda_expert_cache_select(vx, fusion.x_cache, fusion.x_cache_slots, channel_x, fusion.x_host_slots,
+            fusion.x_host_addresses);
     const void * vx_source = x_src.data;
     uint32_t source_channel_x = x_src.channel;
     [[maybe_unused]] const void * vgate_source = vgate;
@@ -987,6 +992,10 @@ static __global__ void mul_mat_vec_q_moe(
         if (x_src.slot >= 0) {
             vgate_source        = fusion.gate_cache;
             source_channel_gate = x_src.channel;
+        } else if (fusion.gate_host_addresses != nullptr && fusion.gate_host_addresses[channel_x] != 0) {
+            // SSD tier: the gate slice of this expert has an address of its own
+            vgate_source        = (const void *) (uintptr_t) fusion.gate_host_addresses[channel_x];
+            source_channel_gate = 0;
         } else if (fusion.x_host_slots != nullptr) {
             // exclusive miss: vgate is the gate host arena and both kinds share the slot table
             source_channel_gate = x_src.channel;
@@ -1562,6 +1571,7 @@ void ggml_cuda_mul_mat_vec_q(
             fusion_local.x_cache       = cached.data;
             fusion_local.x_cache_slots = cached.slots;
             fusion_local.x_host_slots  = cached.host_slots;
+            fusion_local.x_host_addresses = cached.host_addresses;
             if (cached.host_data != nullptr) {
                 src0_d = cached.host_data;
             }
@@ -1605,6 +1615,7 @@ void ggml_cuda_mul_mat_vec_q(
                     const ggml_cuda_expert_lookup gate_cached = ggml_cuda_expert_lookup_tensor(fusion->gate);
                     if (gate_cached.data != nullptr && gate_cached.slots == fusion_local.x_cache_slots) {
                         fusion_local.gate_cache = gate_cached.data;
+                        fusion_local.gate_host_addresses = gate_cached.host_addresses;
                         if (gate_cached.host_data != nullptr) {
                             GGML_ASSERT(gate_cached.host_slots == fusion_local.x_host_slots);
                             fusion_local.gate = gate_cached.host_data;

@@ -966,7 +966,7 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
 
     // ranma expert cache: the byte budget decides the expert placement, so every routed expert goes to
     //                     host memory here, exactly like --cpu-moe (see docs/ranma/expert-cache.md)
-    if (params.expert_l1_mib > 0) {
+    if (params.expert_l1_mib > 0 || params.expert_l2_mib > 0) {
         // exclusive mode spends the budget on VRAM slices that cannot move back, so the fitter would
         // measure free memory that is already gone; it is turned off here unless the user insisted,
         // and validate_expert_params rejects the combination when they did
@@ -3887,8 +3887,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"--expert-l1-mib"}, "N",
         string_format("VRAM budget in MiB for the cache of MoE routed-expert weights (default: %d; 0 = disabled)\n"
-                      "this budget also decides the expert placement, so it cannot be combined with\n"
-                      "--n-cpu-moe/--cpu-moe and it needs --load-mode none", params.expert_l1_mib),
+                      "this budget also decides the expert placement; a finite L2 leaves nonresidents in the GGUF file,\n"
+                      "so it cannot be combined with --n-cpu-moe/--cpu-moe and it needs --load-mode none", params.expert_l1_mib),
         [](common_params & params, int value) {
             if (value < 0) {
                 throw std::invalid_argument("invalid value: must be 0 or more");
@@ -3920,8 +3920,49 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_EXPERT_PREFILL_SWAP"));
     add_opt(common_arg(
+        {"--expert-l2-mib"}, "N",
+        string_format("host memory budget in MiB for the expert cache (default: %d; -1 = unlimited)\n"
+                      "the routed experts that fit in neither VRAM nor this budget stay in the GGUF file and are\n"
+                      "read from it on demand; supports both modes on Windows",
+                      params.expert_l2_mib),
+        [](common_params & params, int value) {
+            if (value < -1) {
+                throw std::invalid_argument("invalid value: must be -1 or more");
+            }
+            params.expert_l2_mib = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--expert-l2-staging-mib"}, "N",
+        "size in MiB of the staging ring the SSD tier reads into (default: 0 = automatic); sets both ring sizes "
+        "unless one of the two options below overrides it",
+        [](common_params & params, int value) {
+            params.expert_l2_staging_mib = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--expert-l2-prefill-ring-mib"}, "N",
+        "staging ring size in MiB while a prompt is processed (default: the staging value; 0 = automatic)",
+        [](common_params & params, int value) {
+            params.expert_l2_prefill_ring_mib = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--expert-l2-decode-ring-mib"}, "N",
+        "staging ring size in MiB while tokens are generated (default: the staging value; 0 = automatic); the "
+        "slots it gives up hold more resident experts, and it only differs from the prompt ring with "
+        "--expert-prefill-swap",
+        [](common_params & params, int value) {
+            params.expert_l2_decode_ring_mib = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--expert-seed"}, "N", "seed for fixed random expert placement (default: 1)",
         [](common_params & params, int value) { params.expert_seed = value; }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--expert-l2-worker-cpu"}, "N", "logical CPU for the L2 worker (-1 = last active logical CPU; default: -1)",
+        [](common_params & params, int value) { params.expert_l2_worker_cpu = value; }
     ).set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"--expert-freeze"},

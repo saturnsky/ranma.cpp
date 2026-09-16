@@ -465,12 +465,17 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  --expert-cache <off|cold|warm>                    explicit expert benchmark policy (omitted: original bench)\n");
     printf("  --expert-l1-mib N                                 L1 MiB; cold/warm require >0, off requires 0\n");
     printf("  --expert-cache-mode <inclusive|exclusive>         L1/L2 relation; finite L2 works with both\n");
+    printf("  --expert-l2-mib N                                 host budget MiB, -1=unlimited; applies in all three modes\n");
     printf("  --expert-profile-dir PATH                         cold output / warm immutable input profiles\n");
     printf("  --expert-prefill-swap                             warm installs the prefill plan too; both banks are always profiled\n");
+    printf("  --expert-l2-staging-mib N                         host ring MiB; 0=automatic\n");
+    printf("  --expert-l2-prefill-ring-mib N                    prefill ring override\n");
+    printf("  --expert-l2-decode-ring-mib N                     decode ring override (warm swap only)\n");
     printf("  --expert-seed N                                   fixed placement and benchmark input seed (default 1)\n");
     printf("  --expert-profile-archive                          retain profile records outside the score window\n");
     printf("  --expert-profile-keep                             keep the temporary warm profile at exit\n");
     printf("  --expert-profile-restore-each                     restore warm profile and reload placement each repetition\n");
+    printf("  --expert-l2-worker-cpu N                          worker logical CPU; -1 selects the last (default)\n");
     printf("  --ple-prefetch <off|prefill|always>               batched per-layer embedding prefetch (default: always)\n");
     printf("  --offline                                         Offline mode: forces use of cache, prevents network access\n");
     printf("                                                    (default: disabled)\n");
@@ -1645,7 +1650,7 @@ struct test {
             "embeddings",
             "no_op_offload",  "no_host",        "fit_target",    "fit_min_ctx",
             "n_prompt",       "n_gen",          "n_depth",
-            "expert_cache", "expert_cache_mode", "expert_l1_mib",
+            "expert_cache", "expert_cache_mode", "expert_l1_mib", "expert_l2_mib",
             "expert_profile_dir", "expert_profile_runs", "expert_prefill_swap", "expert_seed",
             "expert_control_ns", "expert_total_ns",
             "test_time",      "avg_ns",         "stddev_ns",     "avg_ts",         "stddev_ts"
@@ -1661,7 +1666,7 @@ struct test {
             field == "main_gpu" || field == "n_prompt" || field == "n_gen" || field == "n_depth" || field == "avg_ns" ||
             field == "stddev_ns" || field == "no_op_offload" || field == "n_cpu_moe" ||
             field == "fit_target" || field == "fit_min_ctx" || field == "flash_attn" ||
-            field == "expert_l1_mib" || field == "expert_seed" ||
+            field == "expert_l1_mib" || field == "expert_l2_mib" || field == "expert_seed" ||
             field == "expert_control_ns" || field == "expert_total_ns") {
             return INT;
         }
@@ -1754,6 +1759,7 @@ struct test {
                                             expert.enabled() ? expert.mode : "legacy",
                                             expert.storage,
                                             std::to_string(expert.l1_mib),
+                                            std::to_string(expert.l2_mib),
                                             expert.profile,
                                             expert_runs,
                                             std::to_string(expert.warm() && expert.swap),
@@ -2529,9 +2535,9 @@ int llama_bench(int argc, char ** argv) {
                         expert_initialized = true;
                     }
                 }
-                fprintf(stderr, "expert benchmark: mode=%s storage=%s L1=%d MiB seed=%d profile=%s\n",
+                fprintf(stderr, "expert benchmark: mode=%s storage=%s L1=%d MiB L2=%d MiB seed=%d profile=%s\n",
                     run_expert.mode.c_str(), run_expert.storage.c_str(), run_expert.l1_mib,
-                    run_expert.seed, run_expert.profile.c_str());
+                    run_expert.l2_mib, run_expert.seed, run_expert.profile.c_str());
             }
 
             // warmup run

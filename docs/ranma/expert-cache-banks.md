@@ -88,14 +88,16 @@ arena's current one before it drains the device, so a boundary that does not cha
 one log line and no synchronize.
 
 **What an interval read.** Under `RANMA_EXPERT_TRACE` bit 3 every commit reports a round line: the
-bytes its interval selected, split into the ones that came from the VRAM arena and the ones that
-came from host memory, and the profile-save time. It is computed from the bank histogram that the
+bytes its interval selected, split into the ones that came from the VRAM arena, from host memory and
+from the file, and the profile-save time. It is computed from the bank histogram that the
 commit reads back anyway, against the plan that was installed while the interval ran, so it costs
 nothing on the hot path. This is the only direct measurement of what a plan is worth during prompt
 processing.
 
-**Which bank is the prompt bank.** `bank_open` takes a `prompt_bank` flag. The policy opens `decode`
-with the flag clear and `prefill` with it set.
+**Which bank is the prompt bank.** `bank_open` takes a `prompt_bank` flag. The backend stores it and
+compares no label string: the flag decides which staging ring an install carries with a finite host
+tier (`expert-cache-l2.md`). The policy opens `decode` with the flag clear and `prefill` with it
+set.
 
 **Freeze refuses installs in the policy.** `--expert-freeze` returns from the policy's install before
 it reaches the backend, so a frozen run never installs a plan; banks are still marked, committed and
@@ -150,6 +152,8 @@ and its generation test the decode bank, and `--expert-prefill-swap` is an optio
   bank more and is not done here.
 - **A request that generates nothing produces no decode record**, and only the profiled slot feeds
   the banks.
+- **With a finite host tier the boundary install reads from the SSD**, which makes the swap
+  noticeably more expensive per request than it is with everything resident (`expert-cache-l2.md`).
 - **On short requests the swap costs more than it returns**, because the two installs are paid per
   request while the better plan only pays over the length of the prompt. That is why it is an option
   and not the default.

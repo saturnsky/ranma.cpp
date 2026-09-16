@@ -34,7 +34,9 @@ refill.
 
 The cache is inclusive by default: each VRAM resident also keeps its host copy, and the host tensor
 stays complete. `--expert-cache-mode exclusive` gives every routed expert exactly one home instead
-and takes the budget back out of host memory (`expert-cache-exclusive.md`).
+and takes the budget back out of host memory (`expert-cache-exclusive.md`). `--expert-l2-mib` bounds
+the host memory the cache may use in either mode and leaves the rest of the experts in the GGUF
+file, read on demand (`expert-cache-l2.md`).
 
 This is a fork feature of the HIP build. It is not compiled into the CUDA backend; the options are
 accepted there and do nothing.
@@ -103,9 +105,10 @@ with `GGML_CUDA_HOST_DIRECT=1` and `GGML_CUDA_HOST_DIRECT_MAX_BATCH=512` in the 
 
 | Option | Default | Meaning |
 |---|---|---|
-| `--expert-l1-mib N` | 0 (off) | VRAM budget in MiB for expert payload and cache overhead. The budget also decides the expert placement (every routed expert goes to host memory), so `--n-cpu-moe`/`--cpu-moe` are refused together with it. |
+| `--expert-l1-mib N` | 0 (off) | VRAM budget in MiB for expert payload and cache overhead. The budget also decides the expert placement (every routed expert goes to host memory), so `--n-cpu-moe`/`--cpu-moe` are refused together with it. Zero is valid together with a finite `--expert-l2-mib`. |
 | `--expert-profile-dir DIR` | none | Root of the profile banks, `DIR/decode/` and `DIR/prefill/`. Without it the placement is seeded and fixed: no records, no installs. |
 | `--expert-cache-mode MODE` | `inclusive` | `inclusive` keeps a host copy of each VRAM resident; `exclusive` keeps one home per expert (`expert-cache-exclusive.md`). |
+| `--expert-l2-mib N` | -1 (unlimited) | Host memory budget in MiB; what fits in neither tier stays in the file and is read on demand (`expert-cache-l2.md`). 0 is refused. |
 | `--expert-prefill-swap` | off | Hold the prompt-processing plan while a prompt is processed (`expert-cache-banks.md`). |
 | `--expert-seed N` | 1 | Seed of the fixed random placement used when no profile is available. |
 | `--expert-freeze` | off | Profile and plan, never change the cache contents (for collecting a profile without disturbing a measurement). |
@@ -114,13 +117,16 @@ with `GGML_CUDA_HOST_DIRECT=1` and `GGML_CUDA_HOST_DIRECT_MAX_BATCH=512` in the 
 
 Most options are also environment variables of the usual form (`LLAMA_ARG_EXPERT_L1_MIB` and so on).
 
+The host tier has four more options of its own, for the staging ring and the worker thread; they are
+described in `expert-cache-l2.md`.
+
 `llama-bench` takes the same options plus its own `--expert-cache off|cold|warm`, which selects a
 run with no cache, a run from the seeded placement that writes a profile, or a run from a profile
 written earlier, and reports a `ctl ms` column that separates policy and install time from compute.
 
 | Environment switch | Default | Effect |
 |---|---|---|
-| `RANMA_EXPERT_TRACE=<mask>` | 0 | Bit mask of log lines: 1 install, 2 profile, 4 prompt processing. |
+| `RANMA_EXPERT_TRACE=<mask>` | 0 | Bit mask of log lines: 1 install, 2 profile, 4 prompt processing, 8 host tier and per-commit round lines. |
 | `RANMA_EXPERT_VERIFY=1` | off | After every install, read every resident slice back and compare it with its source. Slow; for correctness checks, not for serving. |
 
 Both are read once at startup.
@@ -137,7 +143,8 @@ requests rebuild a profile from cold.
   (`ggml_row_size(type, MATRIX_ROW_PADDING - ne0 % MATRIX_ROW_PADDING)`, at least 512 bytes), all
   inside the budget.
 - Host memory: in inclusive mode every expert stays on the host, so the VRAM residents are a second
-  copy; in exclusive mode the residents are host memory the model does not need.
+  copy; in exclusive mode the residents are host memory the model does not need. With a finite
+  `--expert-l2-mib` the host tier is bounded and the rest of the experts stay in the file.
 - Per decode token: one 128-thread kernel per routed layer (the histogram add) and one table read
   per expert in the kernel prologue. Nothing is synchronized.
 - At request end: one device synchronize, one histogram read-back and one record write per bank.

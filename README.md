@@ -122,6 +122,9 @@ applies, how to switch it, and its limits.
 - **Profile banks and the prefill swap** - prompt processing and generation are profiled into separate banks;
   `--expert-prefill-swap` additionally installs the prompt plan while a prompt is processed.
   [docs/ranma/expert-cache-banks.md](docs/ranma/expert-cache-banks.md)
+- **Finite host tier with file backing (Windows)** - `--expert-l2-mib N` bounds the host memory of the cache;
+  what fits in neither VRAM nor that budget stays in the GGUF file and is read on demand into a ring of host
+  slots that the kernels address directly. [docs/ranma/expert-cache-l2.md](docs/ranma/expert-cache-l2.md)
 
 ## Building
 
