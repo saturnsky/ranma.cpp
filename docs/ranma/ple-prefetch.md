@@ -72,12 +72,32 @@ current choice is that the CPU backend knows one model tensor name.
 256 rows is where the prompt measurement settled. 16 rows is one decoded token; it is the default
 because it helps decode and costs nothing on prompt processing.
 
+## Shard mapping
+
+A lazily mapped tensor needs a mapping of its own shard, but not of the other shards of the model.
+With ordinary mmap loading off, the loader used to map every shard as soon as one of them held a
+lazy tensor. Those extra mappings are never read - every other shard is loaded through the ordinary
+read path - and they are not free: the mere presence of read-only mappings of the model files, not
+the mapped byte range, slows down unbuffered reads of those same files on a Windows host.
+
+The loader therefore maps only the files that actually contain lazy tensors and keeps a null
+placeholder for the others, so file indices and the per-file mmap and mlock lists stay aligned and
+no other loader code has to change. An unmapped file reports an empty mapping range, which every
+caller already treats as "take nothing from the mapping". The load log prints how many of the model
+files were mapped, which is the quickest way to check the behaviour.
+
+Ordinary mmap loading is unchanged: it still maps every shard. Lazy per-layer embedding paging keeps
+working, because the shard that holds the table is one of the mapped ones. A shard that holds both a
+lazy tensor and other tensors is still mapped whole.
+
 ## Limits
 
 - Measured on Windows only; the POSIX path is written but not measured.
 - The gather parallelization is gated on one tensor name, so a model without a per-layer embedding
   table sees no change at all.
 - A table that is not in host memory is skipped.
+- The shard-mapping change applies only when ordinary mmap loading is off, and only reduces the
+  mapping count for a model whose lazy tensor does not share its shard with everything else.
 - The benefit depends on how much free RAM the machine has: with an ample page cache the faults are
   cheap and there is little to save.
 
