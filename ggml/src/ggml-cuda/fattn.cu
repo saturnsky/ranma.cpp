@@ -681,6 +681,18 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         }
     }
 
+#ifdef GGML_USE_HIP
+    static const bool prefill_wmma = [] {
+        const char * value = getenv("GGML_HIP_PREFILL_WMMA");
+        return !value || atoi(value) != 0;
+    }();
+    // The 16-row bound is a conservative policy choice, not a kernel requirement: 2..15 rows were not measured.
+    if (prefill_wmma && GGML_CUDA_CC_IS_RDNA4(cc) && amd_wmma_available(cc) &&
+        Q->ne[0] == 512 && V->ne[0] == 512 && Q->ne[1] >= 16 &&
+        gqa_ratio == 8 && gqa_opt_applies && K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16) {
+        return BEST_FATTN_KERNEL_MMA_F16;
+    }
+#endif
     // AMD WMMA is faster than the tile kernel if the wide tiles with high arithmetic intensity can be utilized.
     if ((amd_wmma_available(cc) && gqa_opt_applies && Q->ne[0] <= 256) && Q->ne[0] != 40 && Q->ne[0] != 72 &&
             Q->ne[1] * gqa_ratio_eff > (Q->ne[0] <= 128 ? 8 : 16)) {
