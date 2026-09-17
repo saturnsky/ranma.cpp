@@ -82,6 +82,9 @@ applies, how to switch it, and its limits.
 - **12-column tile attention for GQA-12 groups** - token generation on a model whose head group is a multiple
   of twelve reads each K/V head once instead of three times. `GGML_HIP_FATTN_GQA12=0` restores the upstream
   dispatch. Same page.
+- **WMMA attention for 512-wide heads** - prompt processing of a 512/512 head at GQA 8 with an F16 KV cache
+  takes the wide-tile MMA kernel. `GGML_HIP_PREFILL_WMMA=0` restores the upstream dispatch.
+  [docs/ranma/rdna4-prefill.md](docs/ranma/rdna4-prefill.md)
 
 ## Building
 
