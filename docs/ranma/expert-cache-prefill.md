@@ -27,9 +27,11 @@ slot tables are blanked while the mover runs so that no captured graph reads a s
 
 A resident expert costs nothing extra to read from the arena, so any kernel that reads a routed
 expert should read it there. The gain is not the same as for decode. A decode step reads a whole
-expert matrix for one token, so it is bound by the PCIe read and a hit removes the read entirely. A
-prompt ubatch reads almost every expert of a layer once and reuses each for many tokens, so the read
-is already amortized and only a high resident fraction shows up in the prefill rate.
+expert matrix for one token, so it is bound by the PCIe read and a hit removes the read entirely.
+A prompt ubatch reads almost every expert of a layer once and reuses each for many tokens, so the
+read is already amortized and only a high resident fraction shows up in the prefill rate. The
+measurement below shows exactly that: at a 3 GiB budget prefill does not move, at a 20 GiB budget
+it is about half again as fast.
 
 The delta install exists because two consecutive plans of one conversation differ by little. A full
 refill of a 20 GiB budget moves 20 GiB at every request boundary; a delta moves a few hundred MiB.
@@ -92,6 +94,19 @@ At a 3 GiB budget the resident fraction is 4 % of the expert bytes, and prompt p
 2 %. The delta path is what the install log shows: a first install of the 3072 MiB budget writes
 1027 slices in 70.3 ms, and the installs that follow retain 958 to 974 of those 1027 slices and copy
 53 to 69 (159 to 207 MiB) in 10.8 to 12.3 ms.
+
+**With a large budget.** From the published curve (`benchmark.md`), PP512 at depths 0 / 4096 /
+8192 / 32768 / 65536 after a discarded 65536 pass, unlimited host memory:
+
+| budget | Cold (seeded random placement) | Warm, exclusive | Warm / Cold at depth 0 |
+|---:|---|---|---:|
+| 20000 MiB | 636.56, 656.79, 634.96, 573.21, 493.20 | 937.43, 927.21, 898.39, 771.49, 631.95 | +47 % |
+| 3072 MiB | 621.97, 607.97, 587.09, 536.59, 465.16 | 615.13, 602.39, 577.88, 529.72, 459.98 | -1 % |
+
+The Cold row is the comparison because it has the same binary, the same placement of all experts in
+host memory and a random arena of the same size; the difference to Warm is what the profiled plan is
+worth to a prompt ubatch. It follows the resident fraction (27 % of the expert bytes at 20000 MiB)
+and not the decode hit rate (98 % of the selected bytes in the same run).
 
 **Correctness.** Cache off and on must produce the same logits. Eight prompts of 18 to 197 tokens,
 so every prefill goes through MMQ, greedy, 48 tokens, top-3 logprobs: identical with the cache off

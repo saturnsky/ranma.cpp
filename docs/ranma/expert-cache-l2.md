@@ -173,6 +173,28 @@ Warm from a Cold seed of the same budget. Byte split = selected bytes served fro
 | 40960 MiB | 402.77 | 29.61 | 435.29 | 28.77 | 71.0 / 28.4 / 0.6 % |
 | 24576 MiB | 268.87 | 28.50 | 287.23 | 27.61 | 71.0 / 27.6 / 1.4 % |
 
+**The published curve.** Depths 0 / 4096 / 8192 / 32768 / 65536 after a discarded 65536 pass. The
+host tier emulates a smaller machine as "installed RAM minus 24 GB" (`benchmark.md`); the base
+revision with no cache does not fit on those machines at all (it needs 80.7 GB and 96.4 GB of host
+memory for the two placements). Exclusive + swap is the mode the 64 GB comparison selected:
+
+| device row | emulated RAM | host tier | PP512 | TG128 | byte split |
+|---|---:|---:|---|---|---|
+| R9700, 20000 MiB | 128 GB | unlimited | 947.95, 953.39, 916.02, 786.23, 643.71 | 38.20, 37.78, 37.36, 31.90, 26.75 | 98.4 / 1.6 / 0.0 % |
+| R9700, 20000 MiB | 64 GB | 40960 MiB | 916.86, 915.62, 878.40, 765.02, 626.96 | 37.85, 37.58, 36.77, 31.39, 26.50 | 98.4 / 1.6 / 0.0 % |
+| R9700, 20000 MiB | 32 GB | 8192 MiB | 488.33, 479.72, 458.96, 448.33, 386.25 | 32.00, 34.33, 34.99, 29.50, 25.25 | 98.4 / 1.0 / 0.6 % |
+| RX 9070 XT emulation, 3072 MiB | 128 GB | unlimited | 659.75, 635.08, 612.71, 557.87, 482.24 | 29.74, 30.76, 30.27, 26.54, 22.91 | 71.8 / 28.2 / 0.0 % |
+| RX 9070 XT emulation, 3072 MiB | 64 GB | 40960 MiB | 589.51, 570.30, 564.62, 524.99, 453.37 | 29.12, 29.40, 29.19, 26.09, 22.51 | 71.8 / 28.2 / 0.0 % |
+| RX 9070 XT emulation, 3072 MiB | 32 GB | 8192 MiB | 152.76, 140.23, 133.92, 136.15, 127.58 | 16.22, 17.79, 19.24, 17.00, 14.11 | 71.8 / 19.9 / 8.3 % |
+
+The 32 GB rows are the mean of two repeats; their spread is up to 10 % on prompt throughput and 11 %
+on decode, wider than the 1 to 7 % drift of the other rows, and the file tier is where the variation
+comes from. Decode is monotone in the host budget and loses little until the budget is a small
+fraction of the model: the decode plan's residents carry 98 % of the selected bytes at 40 GiB and
+still 99 % (0.6 % from the file) at 8 GiB on the R9700 row. Prompt processing pays earlier and more,
+for the reason below. The byte splits are dominated by decode traffic; a prompt ubatch reads a far
+larger share from the file.
+
 **Where the prompt-processing cost of a finite tier goes.** On this binary, R9700 row, 3072 MiB
 budget, one 512-token prompt ubatch at depth 0 takes 883.5 ms with the unlimited tier and 1271.2 ms
 with a 40960 MiB tier. The difference was decomposed with per-op timing:
@@ -226,6 +248,10 @@ per-layer embedding table and routed experts still pays that cost.
   the next steps; both change nothing until the ring is at least as large as that set.
 - **The prompt swap's boundary install reads from the SSD** with a finite tier: 2.5 to 3.3 s per
   request on this machine at 40960 MiB (`expert-cache-banks.md`).
+- **Emulation caveat.** The 64 GB and 32 GB rows above are the same 128 GB machine with a bounded
+  host tier. The page-cache behaviour of a smaller machine is not emulated: those rows' file reads
+  may be served by a page cache that a real 64 GB or 32 GB machine would not have, so their
+  file-tier cost is a lower bound.
 - **No correctness check yet** for a finite tier with a multimodal projector or speculative
   decoding; the validator refuses both.
 - **`llama-server` of this tree can hang at shutdown** after every request has been answered, with

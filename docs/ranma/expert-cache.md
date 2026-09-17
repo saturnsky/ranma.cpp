@@ -103,6 +103,64 @@ geometry (layer count, expert count, per-kind bytes and types), and a store whos
 match the loaded model is ignored with a warning, not overwritten. Ten requests rebuild a profile
 from cold. The store format is version 2; there is no reader for older layouts.
 
+## Measured effect
+
+Development machine: Radeon AI PRO R9700 (32 GiB, gfx1201) on PCIe 5.0 x16, headless, power limit
+-30 %, voltage offset 0 mV; Ryzen 9 7950X3D, 128 GiB DDR5-5600, Windows 11, ROCm 10. Model:
+Qwen3.8-Flash-Next UD-Q4_K_XL (48 routed layers x 512 experts, 10 used, 73450 MiB of routed expert
+weights). Protocol of `benchmark.md`: `llama-bench` PP512 / TG128, one repetition, depths 0, 4096,
+8192, 32768 and 65536 in one model load after a discarded 65536 pass, host-direct on, `--load-mode
+none`, unlimited host memory.
+
+**Correctness.** The cache only changes where a resident expert's bytes are read from, so the same
+binary must produce the same logits with the cache off and on. Eight prompts x 48 greedy tokens with
+their top-3 logprobs were compared between the cache off and the cache on (exclusive, 3072 MiB, a
+finite 8192 MiB host tier, prompt swap on, so every tier and both kernels are exercised): every token
+and every logprob identical, and `RANMA_EXPERT_VERIFY` found no slice that differed from its source.
+This machine produces one of two deterministic results per process for this prompt set with the
+cache off, for a reason that is not the cache (the two diverge on one of the eight prompts from its
+first token on); the cache run reproduces one of the two exactly.
+
+**Decode.** TG128 in t/s at depth 0 / 4096 / 8192 / 32768 / 65536, Warm rows from a profile that a
+Cold row of the same budget wrote:
+
+| device row | budget | no cache (`-ncmoe`, base) | Cold, seeded random placement | Warm, exclusive |
+|---|---:|---|---|---|
+| R9700 | 20000 MiB | 23.90, 23.43, 23.10, 21.14, 18.95 | 24.37, 23.96, 23.57, 21.46, 19.10 | 38.90, 38.52, 37.62, 32.01, 26.89 |
+| RX 9070 XT emulation | 3072 MiB | 21.36, 21.00, 20.74, 19.12, 17.37 | 21.60, 21.23, 20.93, 19.25, 17.40 | 29.77, 30.73, 30.42, 26.59, 22.92 |
+
+The "no cache" row is the published base revision with `-ncmoe 35` (13 expert layers in VRAM, the
+same VRAM as the 20000 MiB budget) and `-ncmoe 45` (3 layers, close to the 3072 MiB budget). The
+RX 9070 XT row is not a measurement on that card: it is the same R9700 with the placement a 16 GiB
+card would use, device buffers under 15 GiB at depth 65536.
+
+Three things the table says. The same VRAM is worth far more as a profiled budget than as whole
+layers: +63 % at depth 0 and +42 % at depth 65536 with 20 GiB, +39 % and +32 % with 3 GiB. A random
+placement of the same budget (the Cold row) is worth nothing on decode, so the gain is the profile,
+not the VRAM. And the gain persists at long context, where attention takes a growing share of the
+step: the cache removes expert reads, and those are a smaller part of a 64K-context step.
+
+**Prompt processing.** PP512 at the same depths:
+
+| device row | budget | no cache (base) | Cold | Warm, exclusive |
+|---|---:|---|---|---|
+| R9700 | 20000 MiB | 349.89, 343.86, 338.34, 331.30, 322.30 | 636.56, 656.79, 634.96, 573.21, 493.20 | 937.43, 927.21, 898.39, 771.49, 631.95 |
+| RX 9070 XT emulation | 3072 MiB | 337.97, 325.27, 325.18, 321.26, 314.78 | 621.97, 607.97, 587.09, 536.59, 465.16 | 615.13, 602.39, 577.88, 529.72, 459.98 |
+
+Here the attribution matters. The difference between the base and the Cold row is not the cache:
+the base revision predates the per-layer embedding prefetch and parallel gather (`ple-prefetch.md`),
+and with 50 to 70 GB of experts in host memory its embedding gather pays the expensive page faults
+that page describes. The cache's own effect on prompt processing is Cold against Warm: +47 % with a
+20 GiB budget, nothing with a 3 GiB budget. A prompt ubatch reads almost every expert of a layer
+once, so what helps it is the resident fraction, not the hit rate on generation
+(`expert-cache-prefill.md`).
+
+**Install cost.** From the install log of an inclusive 3072 MiB run of the same binary: a first
+install writes 1027 slices in about 70 ms, and the installs that follow retain 958 to 974 of those slices and copy
+53 to 69 (159 to 207 MiB) in 11 to 12 ms. A first install of a 20000 MiB budget is a few hundred
+milliseconds. With `llama-bench` this time is reported in its own column (`ctl ms`) and is not part
+of the throughput above; on the server it lands between two requests.
+
 ## What it costs
 
 - VRAM: the budget, plus 4 bytes per (layer, expert) for the tables, 16 bytes per (layer, expert)
@@ -110,7 +168,8 @@ from cold. The store format is version 2; there is no reader for older layouts.
   (`ggml_row_size(type, MATRIX_ROW_PADDING - ne0 % MATRIX_ROW_PADDING)`, at least 512 bytes), all
   inside the budget.
 - Host memory: inclusive mode keeps every expert on the host, so the VRAM residents are a second
-  copy.
+  copy. Process private memory peaks in the runs above: 80.7 GiB with no cache, 97.6 GiB inclusive at
+  20000 MiB, 78.2 GiB exclusive at 20000 MiB.
 - Per decode token: one 128-thread kernel per routed layer (the histogram add) and one table read
   per expert in the kernel prologue. Nothing is synchronized.
 - At request end: one device synchronize, a 200 KiB device-to-host copy per bank, one record write.

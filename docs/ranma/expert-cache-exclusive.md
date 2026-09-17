@@ -105,6 +105,57 @@ the boundary between prompt processing and generation (`expert-cache-banks.md`);
 exchange above. `RANMA_EXPERT_VERIFY=1` checks every VRAM and every host slot after each install
 (see "Design notes" for what it compares against).
 
+## Measured effect
+
+Development machine: Radeon AI PRO R9700 (32 GiB, gfx1201) on PCIe 5.0 x16, headless, power limit
+-30 %, voltage offset 0 mV; Ryzen 9 7950X3D, 128 GiB DDR5-5600, Windows 11, ROCm 10. Model:
+Qwen3.8-Flash-Next UD-Q4_K_XL (73450 MiB of routed expert weights, 24576 (layer, expert) slices).
+Protocol of `benchmark.md`: `llama-bench` PP512 / TG128, one repetition, depths 0, 4096, 8192, 32768
+and 65536 after a discarded 65536 pass, unlimited host memory, Warm from one Cold seed per device
+row.
+
+**Host memory.** Peak process private bytes of each run:
+
+| device row | budget | no cache (base) | inclusive Warm | exclusive Warm |
+|---|---:|---:|---:|---:|
+| R9700 | 20000 MiB | 80.74 GiB | 97.59 GiB | 78.15 GiB |
+| RX 9070 XT emulation | 3072 MiB | 80.74 GiB | 80.65 GiB | 77.82 GiB |
+
+The difference between the modes is the VRAM arena: 19.4 GiB at the 20000 MiB budget, 2.8 GiB at
+3072 MiB. Exclusive mode with a 20 GiB budget uses 2.6 GiB less host memory than running with no
+cache at all.
+
+**Throughput.** PP512 / TG128 in t/s at depths 0 / 4096 / 8192 / 32768 / 65536:
+
+| device row | budget | mode | PP512 | TG128 |
+|---|---:|---|---|---|
+| R9700 | 20000 MiB | inclusive | 864.89, 863.78, 842.60, 733.35, 609.81 | 38.00, 37.71, 37.02, 32.04, 26.89 |
+| R9700 | 20000 MiB | exclusive | 937.43, 927.21, 898.39, 771.49, 631.95 | 38.90, 38.52, 37.62, 32.01, 26.89 |
+| RX 9070 XT emulation | 3072 MiB | inclusive | 662.87, 638.14, 611.07, 558.11, 481.22 | 29.89, 30.80, 30.45, 26.66, 22.95 |
+| RX 9070 XT emulation | 3072 MiB | exclusive | 615.13, 602.39, 577.88, 529.72, 459.98 | 29.77, 30.73, 30.42, 26.59, 22.92 |
+
+Decode is the same in both modes within the run-to-run drift of this protocol (up to 0.9 % on TG128
+between two base runs on the R9700 row, 2.4 % on the other row), as it should be: the same bytes
+are read by the same kernels from the same kind of memory. Prompt processing differs by up to 8 % in
+either direction between the two rows; the base-to-base drift of prompt throughput is 4 to 7 % under
+this protocol, so no direction is claimed.
+
+**Install and exchange.** The load-time install has no timing of its own; it is the loader's writes.
+At a request boundary an exchange moves every byte twice (the promoted slice up, the demoted slice
+down), so it costs about 1.4x an inclusive copy per slice: in the same runs the control time of a
+TG128 test at the 20000 MiB budget, which is one commit and one delta install, is 33 to 45 ms
+inclusive and 54 to 74 ms exclusive on the R9700 row (the `ctl ms` column of `benchmark.md`).
+
+**Correctness.** Eight prompts x 48 greedy tokens with top-3 logprobs, exclusive 3072 MiB with a
+finite 8192 MiB host tier and the prompt swap on, against the cache off on the same binary: every
+token and every logprob identical (`expert-cache.md`). Exclusive mode builds the same graph as a run
+without the cache (2 splits, the same `ROCm0` model buffer and the same `ROCm_Host` compute buffer),
+because the non-expert tensors of the routed context keep their buffer type.
+
+**Model load.** About 1.6x the load time of inclusive mode or the cache off on a warm page cache
+(59 to 67 s against 37 to 41 s here). The host arena is committed and touched, and every slice goes
+through the buffer's `set_tensor` instead of one read into a host buffer.
+
 ## What it costs
 
 - VRAM: the same as inclusive mode (budget, tables, profiler banks, arena tails). The spare slots

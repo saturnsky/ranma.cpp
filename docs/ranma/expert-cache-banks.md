@@ -141,14 +141,66 @@ first pair discarded, both rows Warm from one Cold seed that carries both banks:
 | off | 557.02 | 30.28 | 8.6 / 24.5 |
 | on | 575.41 | 29.81 | 17.9 / 46.3 |
 
+**With a large budget and unlimited host memory.** From the published curve, depths 0 / 4096 /
+8192 / 32768 / 65536 after a discarded 65536 pass, R9700 row, 20000 MiB budget:
+
+| mode | swap | PP512 | TG128 | ctl ms TG @ 0 |
+|---|---|---|---|---:|
+| inclusive | off | 864.89, 863.78, 842.60, 733.35, 609.81 | 38.00, 37.71, 37.02, 32.04, 26.89 | 45 |
+| inclusive | on | 942.85, 943.39, 897.43, 762.83, 616.78 | 38.49, 38.16, 37.46, 31.75, 26.71 | 103 |
+| exclusive | off | 937.43, 927.21, 898.39, 771.49, 631.95 | 38.90, 38.52, 37.62, 32.01, 26.89 | 74 |
+| exclusive | on | 947.95, 953.39, 916.02, 786.23, 643.71 | 38.20, 37.78, 37.36, 31.90, 26.75 | 183 |
+
+The RX 9070 XT emulation row (3072 MiB budget) shows the same picture with smaller numbers: the four
+Warm modes are within the base-to-base drift of each other on both axes.
+
+With every expert resident in VRAM or host memory the swap buys 1 to 9 % of prompt throughput and
+costs 1 to 2 % of decode, plus a boundary install of about 0.1 to 0.2 s per request. The reason is
+that a prompt ubatch reads an expert once whether one or a hundred of its tokens selected it, so
+what the arena saves is decided by whether an expert is selected at all in the ubatch. At 512
+tokens the experts at the top of either bank are selected in nearly every ubatch, so exchanging the
+top of the decode bank for the top of the prefill bank changes little; the two banks differ in their
+tails, and the tails are not in the arena.
+
+**With a finite host tier.** Same protocol, `--expert-l2-mib 40960` (the placement of a 64 GB
+machine, `benchmark.md`):
+
+| device row | mode | PP512 | TG128 | ctl ms TG @ 0 |
+|---|---|---|---|---:|
+| R9700, 20000 MiB | exclusive | 756.18, 772.05, 759.96, 692.15, 576.16 | 37.92, 37.63, 36.76, 31.44, 26.44 | 76 |
+| R9700, 20000 MiB | exclusive + swap | 916.86, 915.62, 878.40, 765.02, 626.96 | 37.85, 37.58, 36.77, 31.39, 26.50 | 2510 |
+| RX 9070 XT emulation, 3072 MiB | exclusive | 517.19, 501.77, 486.27, 484.53, 401.05 | 29.20, 30.10, 29.75, 25.84, 22.40 | 28 |
+| RX 9070 XT emulation, 3072 MiB | exclusive + swap | 589.51, 570.30, 564.62, 524.99, 453.37 | 29.12, 29.40, 29.19, 26.09, 22.51 | 3327 |
+
+Here the swap is worth +15 % (R9700) and +13 % (emulated 16 GiB card) of prompt throughput at every
+depth, at the same decode throughput. The tails now matter: the plan also decides which experts stay
+in host memory and which stay in the file, and a file read costs an SSD access instead of a PCIe
+read. The prefill plan chooses that boundary by prompt-processing demand, so a prompt ubatch reads
+fewer bytes from the file.
+
+The price is in the last column. With a finite tier the install at the prompt-to-generation
+boundary has to bring back the decode residents that the prefill plan pushed to the file, and that
+is a read from the SSD: 2.5 s on the R9700 row and 3.3 s on the emulated card per request, against
+0.1 to 0.2 s with unlimited host memory. `llama-bench` reports it separately; a server pays it as
+time to the first token of every request. On a request with a short prompt that install costs more
+than the better prompt plan returns.
+
+So the honest answer is that the swap is a long-prompt feature for a host tier that does not hold
+the whole model. On a server that prefills thousands of tokens per request with a finite host tier
+it is worth double-digit percent of the prefill rate; with the whole model resident it is worth a
+few percent; on short requests it is a per-request cost with nothing to show for it. That is why it
+is an option and why it is off.
+
 **Correctness.** Eight prompts x 48 greedy tokens with top-3 logprobs, exclusive 3072 MiB, finite
 8192 MiB host tier, swap on, against the cache off on the same binary: identical
 (`expert-cache.md`).
 
 ## What it costs
 
-- **Two installs per request instead of one**, when the swap is on. The prompt-to-generation install
-  is inside the request, so it is added to the time to the first token.
+- **Two installs per request instead of one**, when the swap is on. With unlimited host memory the
+  extra install is a delta of the arena, 0.1 to 0.2 s at a 20000 MiB budget; with a finite host
+  tier it includes SSD reads and is seconds, see above. The prompt-to-generation install is inside
+  the request, so it is added to the time to the first token.
 - **A second histogram in VRAM.** Four banks are allocated at model load (`n_counts * 4` bytes each,
   96 KiB per bank here); the second one is simply used.
 - **A second directory of records** under the profile directory, the same size as the first.

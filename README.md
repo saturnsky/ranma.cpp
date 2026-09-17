@@ -167,6 +167,10 @@ misbehave. Other platforms and backends are not tested and not supported by this
   prompt processing 917 against 948 t/s; with an 8 GiB tier (a 32 GB machine) decode 32.0 and 25.3 t/s. Details,
   the demand path and the known limits: [docs/ranma/expert-cache-l2.md](docs/ranma/expert-cache-l2.md).
 
+- **Benchmark** - the protocol and the full result tables of the expert cache series against the published
+  snapshot `ranma_20260914`, on the R9700 and on an emulated 16 GiB placement, with 128, 64 and 32 GB of host
+  memory: [docs/ranma/benchmark.md](docs/ranma/benchmark.md).
+
 Each feature that lands gets a line here and a page under `docs/ranma/` describing its
 rationale, measured effect, and trade-offs.
 
