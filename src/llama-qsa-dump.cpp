@@ -120,6 +120,7 @@ struct qsa_dump_state {
 
     std::vector<int32_t> buf;
     std::vector<int32_t> blocks;
+    std::vector<llama_qsa_dump_block> valid_blocks;
 };
 
 qsa_dump_state & qsa_dump_get() {
@@ -169,12 +170,24 @@ void llama_qsa_dump_set_cell_blk(const int32_t * cell_blk, int64_t n_kv, int64_t
     state.cell_blk_n_stream = n_stream;
 }
 
+void llama_qsa_dump_set_blocks(const std::vector<llama_qsa_dump_block> & blocks) {
+    auto & state = qsa_dump_get();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    state.valid_blocks = blocks;
+    std::sort(state.valid_blocks.begin(), state.valid_blocks.end(),
+            [](const llama_qsa_dump_block & a, const llama_qsa_dump_block & b) {
+                return a.seq != b.seq ? a.seq < b.seq : a.start < b.start;
+            });
+}
+
 bool llama_qsa_dump_eval_callback(ggml_tensor * t, bool ask, void * user_data) {
     GGML_UNUSED(user_data);
 
     const bool is_dbg = strncmp(t->name, "indexer_dbg_", 12) == 0;
 
-    if (!is_dbg && strncmp(t->name, LLAMA_QSA_DUMP_PREFIX, strlen(LLAMA_QSA_DUMP_PREFIX)) != 0) {
+    const bool is_trans = strncmp(t->name, "indexer_ktrans_dump-", 20) == 0;
+
+    if (!is_trans && !is_dbg && strncmp(t->name, LLAMA_QSA_DUMP_PREFIX, strlen(LLAMA_QSA_DUMP_PREFIX)) != 0) {
         return false;
     }
 
@@ -187,6 +200,26 @@ bool llama_qsa_dump_eval_callback(ggml_tensor * t, bool ask, void * user_data) {
     std::lock_guard<std::mutex> lock(state.mutex);
 
     if (state.file == nullptr) {
+        return true;
+    }
+
+    if (is_trans) {
+        const int il = atoi(t->name + 20);
+        GGML_ASSERT(t->type == GGML_TYPE_F32 && ggml_is_contiguous(t));
+        std::vector<uint8_t> raw(ggml_nbytes(t));
+        ggml_backend_tensor_get(t, raw.data(), 0, raw.size());
+        qsa_sha1 meta, values;
+        const size_t row_bytes = t->ne[0]*sizeof(float);
+        for (const auto & block : state.valid_blocks) {
+            GGML_ASSERT((block.row + 1)*row_bytes <= raw.size());
+            const int32_t key[] = {block.seq, block.start, block.pos[0], block.pos[1], block.pos[2], block.pos[3]};
+            meta.update(key, sizeof(key));
+            values.update(raw.data() + block.row*row_bytes, row_bytes);
+        }
+        const int64_t step = state.step + (il <= state.last_il ? 1 : 0);
+        fprintf(state.file, "# ktrans %" PRId64 " %d %zu %s %s\n", step, il, state.valid_blocks.size(),
+                meta.final_hex().c_str(), values.final_hex().c_str());
+        fflush(state.file);
         return true;
     }
 

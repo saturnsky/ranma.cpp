@@ -23,6 +23,7 @@ for equivalence checks, or a diagnostic.
 | `GGML_CUDA_TOP_K_STABLE_TIES` | off | `1` makes the top-k pick the smallest columns among tied values, so selections and outputs can be compared between runs. Test switch. |
 | `LLAMA_QSA_DUMP` | unset | a path: write one line per indexer layer and graph evaluation there. Diagnostic; it changes the graph. |
 | `LLAMA_QSA_LEGACY` | off | `1` selects the per-token indexer cache instead of pooled block keys. Reference path. |
+| `LLAMA_QSA_CACHE_NORM_ROPE` | on | `0` stores the pooled keys untransformed and applies norm and rotation in every graph. Reference path. |
 
 ## Tie-breaking in the top-k
 
@@ -126,3 +127,35 @@ split cache and `LLAMA_QSA_LEGACY=1` are not affected.
 The layout of the indexer cache is part of the sequence state. Each layout
 writes its own version into the state file, and a file written by another
 layout is refused instead of being read as keys that do not match it.
+
+## Cached norm and rotation
+
+A block key is normalized and rotated before it is scored. Both are applied
+once, when the block is completed, and the indexer cache holds the finished
+key, so a graph reads it and scores it directly. Only the rope section
+positions of the blocks a ubatch completes are uploaded; the positions of the
+whole context are no longer a graph input. The host still scans the block
+positions, because the bookkeeping of the completed blocks comes out of that
+scan.
+
+A stored key depends on the rope parameters and on the normalization epsilon,
+so those are recorded when the first indexer graph is built. A later graph
+that would use different ones is rejected, and the pair is written into the
+state file under a state version of its own: a file produced with a different
+transform is refused rather than scored against keys that do not match it.
+
+`LLAMA_QSA_CACHE_NORM_ROPE=0` goes back to storing the pooled keys
+untransformed and transforming the whole context in every graph. It is the
+in-binary reference for "what the cache holds equals what a recompute
+produces". It applies to the pooled cache only; with the per-token indexer
+cache selected, the transform always happens in the graph.
+
+The dump gains a line for the transformed cache:
+
+```
+# ktrans <step> <layer> <valid blocks> <sha1 of the block descriptions> <sha1 of the block keys>
+```
+
+It hashes the valid blocks together with their sequence, their first position
+and their section positions, so a cached block can be compared with a
+recomputed one even when the two paths hold it in different cache rows.

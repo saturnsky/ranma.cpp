@@ -83,6 +83,9 @@ public:
     // selects the previous per-token cache, which pools the whole context every step.
     llama_dsv4_comp_state * get_idx_state() const;   // members of the block still being filled
 
+    bool      get_idx_norm_rope() const;
+    void bind_idx_transform(const ggml_tensor * rope, float norm_eps) const;
+
     bool      get_idx_pooled()    const;
     uint32_t  get_idx_ratio()     const;
     uint32_t  get_idx_n_seq_max() const;
@@ -99,7 +102,8 @@ public:
     // the caller then adds the attention mask, the only part of the bias that varies within a block
     void set_input_qsa(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
                        ggml_tensor * bias, const llama_ubatch * ubatch, uint32_t ratio,
-                       bool blk_bias) const;
+                       bool blk_bias, ggml_tensor * completed_pos = nullptr,
+                       const std::vector<int64_t> * write_idxs = nullptr) const;
 
 private:
     // forget seq_id (all of it if seq_id < 0) in every cache at once, so a failed restore cannot leave the caches out of step
@@ -111,6 +115,8 @@ private:
     llama_hparams hparams_idx;
 
     const bool      idx_pooled;
+    const bool      idx_norm_rope;
+    mutable std::vector<uint8_t> idx_transform;
     const uint32_t  idx_ratio;
     const uint32_t  idx_n_seq_max;
     const ggml_type idx_raw_type;
@@ -187,6 +193,9 @@ public:
 
     const idx_pool_plan & get_idx_pool_plan(const llama_ubatch & ubatch) const;
 
+    bool      get_idx_norm_rope() const;
+    void bind_idx_transform(const ggml_tensor * rope, float norm_eps) const;
+
     bool      get_idx_pooled()   const;
     ggml_type get_idx_raw_type() const;
 
@@ -195,7 +204,7 @@ public:
 
     void set_input_qsa(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
                        ggml_tensor * bias, const llama_ubatch * ubatch, uint32_t ratio,
-                       bool blk_bias) const;
+                       bool blk_bias, ggml_tensor * completed_pos = nullptr) const;
 
     void set_input_idx_pool_plan(
             ggml_tensor * state_persist_src_idxs,
