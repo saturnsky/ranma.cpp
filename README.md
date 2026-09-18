@@ -85,6 +85,9 @@ applies, how to switch it, and its limits.
 - **WMMA attention for 512-wide heads** - prompt processing of a 512/512 head at GQA 8 with an F16 KV cache
   takes the wide-tile MMA kernel. `GGML_HIP_PREFILL_WMMA=0` restores the upstream dispatch.
   [docs/ranma/rdna4-prefill.md](docs/ranma/rdna4-prefill.md)
+- **Padded F16 BLAS for wide dense Q2_K/Q6_K/IQ2 matmuls** - wide prompt matmuls of those types convert both
+  operands to F16 with a padded row pitch and run hipBLASLt instead of MMQ. Needs `ROCBLAS_USE_HIPBLASLT=1`;
+  `GGML_HIP_PREFILL_BLAS=0` turns it off. Same page.
 
 ## Building
 
