@@ -77,6 +77,8 @@ applies, how to switch it, and its limits.
   per-type MMVQ/MMQ crossover, so the cost of a decode call no longer rises and then falls with the number of rows
   in it. This is the range of a speculative verification step and of a server that batches a few slots.
   [docs/ranma/rdna4-small-batch.md](docs/ranma/rdna4-small-batch.md)
+- **Four rows per block at one column** - single-token decode of a wide matrix reads the activation once per
+  four weight rows; chosen per call from the matrix size. Same page.
 
 ## Building
 
