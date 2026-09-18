@@ -159,6 +159,8 @@ applies, how to switch it, and its limits.
   default. [docs/ranma/qwen-sparse-attention.md](docs/ranma/qwen-sparse-attention.md)
 - **Indexer dump** - `LLAMA_QSA_DUMP=<path>` records hashes of what every indexer layer selects, which is how a
   change to the indexer is shown not to change its selection. Same page.
+- **Pooled block keys in the indexer cache** - a step pools only the block it completes instead of the whole
+  context. Same page.
 
 ## Building
 
