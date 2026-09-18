@@ -735,3 +735,70 @@ to_fp32_nc_cuda_t ggml_get_to_fp32_nc_cuda(ggml_type type) {
             return nullptr;
     }
 }
+
+// Conversion into a destination with a padded row pitch. Only the row stride changes, the values are
+// the same as the contiguous converters produce; the padding columns are left uninitialized because
+// no consumer reads them.
+
+template<typename dst_t>
+using dequantize_k_block_t = void (*)(const void * vx, const int64_t ib, dst_t * yy, const int tid);
+
+template<typename dst_t, dequantize_k_block_t<dst_t> dequantize_k_block>
+static __global__ void dequantize_block_k_pitched(const void * __restrict__ vx, dst_t * __restrict__ yy,
+        const uint3 blocks_per_row, const int64_t dst_pitch) {
+    const int64_t ib = blockIdx.x;
+    const uint2   rc = fast_div_modulo((uint32_t) ib, blocks_per_row);
+
+    dequantize_k_block(vx, ib, yy + rc.x*dst_pitch + rc.y*QK_K, threadIdx.x);
+}
+
+template<typename dst_t, dequantize_k_block_t<dst_t> dequantize_k_block, int block_size>
+static void dequantize_row_k_pitched_cuda(const void * vx, dst_t * y,
+        const int64_t ne00, const int64_t ne01, const int64_t dst_pitch, cudaStream_t stream) {
+    GGML_ASSERT(ne00 % QK_K == 0);
+    const int64_t blocks_per_row = ne00 / QK_K;
+    dequantize_block_k_pitched<dst_t, dequantize_k_block><<<blocks_per_row*ne01, block_size, 0, stream>>>
+        (vx, y, init_fastdiv_values(blocks_per_row), dst_pitch);
+}
+
+template <typename src_t, typename dst_t>
+static __global__ void convert_unary_pitched(const void * __restrict__ vx, dst_t * __restrict__ y,
+        const int64_t ne00, const int64_t ne01, const int64_t dst_pitch) {
+    const int64_t i00 = (int64_t)blockDim.x*blockIdx.x + threadIdx.x;
+
+    if (i00 >= ne00) {
+        return;
+    }
+
+    const src_t * x = (const src_t *) vx;
+
+    for (int64_t i01 = blockIdx.y; i01 < ne01; i01 += gridDim.y) {
+        y[i01*dst_pitch + i00] = ggml_cuda_cast<dst_t>(x[i01*ne00 + i00]);
+    }
+}
+
+template <typename src_t, typename dst_t>
+static void convert_unary_pitched_cuda(const void * vx, dst_t * y,
+        const int64_t ne00, const int64_t ne01, const int64_t dst_pitch, cudaStream_t stream) {
+    const dim3 num_blocks((ne00 + CUDA_DEQUANTIZE_BLOCK_SIZE - 1) / CUDA_DEQUANTIZE_BLOCK_SIZE,
+        (unsigned int) std::min(ne01, (int64_t)65535), 1);
+    convert_unary_pitched<src_t, dst_t><<<num_blocks, CUDA_DEQUANTIZE_BLOCK_SIZE, 0, stream>>>
+        (vx, y, ne00, ne01, dst_pitch);
+}
+
+to_fp16_pitched_cuda_t ggml_get_to_fp16_pitched_cuda(ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_Q2_K:
+            return dequantize_row_k_pitched_cuda<half, dequantize_q2_K<half>, 64>;
+        case GGML_TYPE_Q6_K:
+            return dequantize_row_k_pitched_cuda<half, dequantize_q6_K<half>, 64>;
+        case GGML_TYPE_IQ2_XS:
+            return dequantize_row_k_pitched_cuda<half, dequantize_iq2_xs<half>, 32>;
+        case GGML_TYPE_IQ2_S:
+            return dequantize_row_k_pitched_cuda<half, dequantize_iq2_s<half>, 32>;
+        case GGML_TYPE_F32:
+            return convert_unary_pitched_cuda<float, half>;
+        default:
+            return nullptr;
+    }
+}
