@@ -12,6 +12,14 @@ typedef to_t_cuda_t<nv_bfloat16> to_bf16_cuda_t;
 
 to_fp16_cuda_t ggml_get_to_fp16_cuda(ggml_type type);
 
+// Conversion to F16 that writes rows with a destination pitch instead of contiguously, so that a
+// following GEMM can be given a padded leading dimension. Returns nullptr for types without such a
+// converter.
+typedef void (*to_fp16_pitched_cuda_t)(const void * x, half * y,
+    int64_t ne00, int64_t ne01, int64_t dst_pitch, cudaStream_t stream);
+
+to_fp16_pitched_cuda_t ggml_get_to_fp16_pitched_cuda(ggml_type type);
+
 to_bf16_cuda_t ggml_get_to_bf16_cuda(ggml_type type);
 
 to_fp32_cuda_t ggml_get_to_fp32_cuda(ggml_type type);
