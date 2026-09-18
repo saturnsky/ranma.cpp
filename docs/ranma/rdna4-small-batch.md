@@ -9,6 +9,8 @@ backend (`ggml/src/ggml-cuda/mmvq.cu`), both keyed on RDNA4:
    columns. One and two columns keep one row per block.
 2. `ggml_cuda_should_use_mmvq` gets an RDNA4 arm that lowers the MMVQ/MMQ crossover per weight
    type.
+3. At one activation column, the eight-warp RDNA4 weight types take four rows per block as well,
+   but only for a matrix that is wide enough; the host chooses the variant per call.
 
 | Weight type | First activation-column count routed to MMQ |
 | --- | ---: |
@@ -27,7 +29,8 @@ existing Ada Lovelace, Blackwell, Orin and CDNA entries in the same two function
 A dense `MUL_MAT` with a quantized weight, on a HIP build running on an RDNA4 device, with an
 activation matrix of 1..8 columns. In practice that is a speculative-decoding verification step, a
 server batching a few slots, or any other decode call with more than one row. Single-column decode
-and prompt batches of hundreds of columns are outside the range that changes.
+changes only through the one-column rule below; prompt batches of hundreds of columns are outside
+the range that changes at all.
 
 ## Why it exists
 
@@ -47,12 +50,36 @@ MMVQ range, and the lowered crossover hands the remaining widths to the flat MMQ
 two entries make the cost of a call non-decreasing in the column count. Two columns keep one row per
 block because four rows per block measured as a loss there.
 
+## One column: four rows for a wide matrix
+
+At one output column the block computes a single weight row, so a large matrix is covered by as many
+blocks as it has rows and each of them re-reads the one activation column. Four rows per block
+amortize that read there too, but they also divide the number of blocks by four, and a narrow matrix
+then no longer fills the compute units.
+
+The rule is therefore conditional and is evaluated on the host for every call
+(`mmvq_rdna4_alt_rows`):
+
+- the RDNA4 parameter table is in use, and
+- the call has exactly one activation column, and
+- the weight type is one of the RDNA4 eight-warp types (Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K, Q4_K,
+  Q5_K, Q6_K, IQ4_NL, IQ4_XS), and
+- the weight has at least `MMVQ_RDNA4_ALT_ROWS_MIN_NROWS` = 768 rows, the narrowest matrix for which
+  the four-row block measured faster than the one-row block.
+
+The decision is passed to the kernel as a template flag, so the row count stays a compile-time
+constant. The flag is combined with a constant that is only true for HIP builds and with the
+eight-warp condition, so no other backend and no other type compiles the extra kernel. The existing
+small-k and halved-iteration one-column variants take precedence over it.
+
 ## What it does not touch
 
 - `MUL_MAT_ID` (MoE experts): multi-token expert matmuls use their own kernel with its own fixed
   rows per block, and the MoE MMVQ/MMQ limit is a separate one.
 - Fused gate/up MMVQ, which requires a single activation column.
-- Single-row decode (one row per block) and prompt processing (already MMQ).
+- One-column calls on a weight with fewer than 768 rows, on a type that is not an eight-warp
+  type, or on a non-HIP build: they keep one row per block.
+- Prompt processing, which is already on MMQ.
 - Every non-RDNA4 device and every non-HIP build.
 
 ## Selection rule and limits
@@ -70,7 +97,9 @@ Blackwell and CDNA entries of the same function behave the same way.
 ## Numerics
 
 Four rows per block keep the per-row accumulation order, so a call that stays on MMVQ produces the
-same values as before.
+same values as before, at one column as well as at 3..8 columns. A weight whose row count is not a
+multiple of four is safe because the kernel clamps the row reads of the last, partial block to the
+last valid row; the duplicated row contributes a partial sum that is never stored.
 
 Moving 5..8-column calls to MMQ is a real numerical change and not only an accumulation-order
 effect: MMVQ and MMQ quantize the activations separately, and they approximate the constant term of
@@ -83,7 +112,9 @@ differ from the MMVQ ones in the same way outputs at nine columns and above alwa
 ## How to verify
 
 - `test-backend-ops -o MUL_MAT` covers the affected widths, including K-quant weights at 1..8
-  columns with a row count that is not a multiple of four.
+  columns with a row count that is neither a multiple of four nor below the 768-row bound.
+- The one-column rule is visible as a decode-throughput difference (`llama-bench -n 128`) on a model
+  whose projections have at least 768 rows and an eight-warp weight type.
 - The cost curve over the column count is visible in
   `llama-bench -ngl 999 -fa on -b 16 -ub 16 -n 0 -p 1,2,3,4,5,6,7,8,9,16 -d 0,8192`: milliseconds
   per call is the column count divided by the reported tokens per second. With these tables the
