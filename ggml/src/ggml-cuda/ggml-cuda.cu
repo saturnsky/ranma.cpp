@@ -1820,6 +1820,50 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     return use_mul_mat_vec_q;
 }
 
+#if defined(GGML_USE_HIP) && !defined(GGML_CUDA_FORCE_MMQ)
+// Padding added to the row pitch of both F16 GEMM operands of the dense prefill BLAS path. hipBLASLt
+// on RDNA4 slows down when the leading dimension in bytes is a multiple of 16 KiB (K = 8192, 16384,
+// ...); 64 extra elements break that alignment and cost nothing at other K. The padding columns
+// are never read by the GEMM, so they are left uninitialized.
+static constexpr int64_t CUDA_PREFILL_BLAS_PAD = 64;
+
+// F16 BLAS for a single dense matmul, converting both operands straight into padded-pitch scratch.
+static void ggml_cuda_mul_mat_f16_blas_padded(ggml_backend_cuda_context & ctx, const ggml_tensor * src0,
+        const ggml_tensor * src1, ggml_tensor * dst) {
+    GGML_TENSOR_BINARY_OP_LOCALS
+
+    GGML_ASSERT(ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1);
+    GGML_ASSERT(ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(dst));
+    GGML_ASSERT(ne00 == ne10);
+
+    const to_fp16_pitched_cuda_t convert_src0 = ggml_get_to_fp16_pitched_cuda(src0->type);
+    const to_fp16_pitched_cuda_t convert_src1 = ggml_get_to_fp16_pitched_cuda(src1->type);
+    GGML_ASSERT(convert_src0 != nullptr && convert_src1 != nullptr);
+
+    const int64_t lda = ne00 + CUDA_PREFILL_BLAS_PAD;
+    const int64_t ldb = ne10 + CUDA_PREFILL_BLAS_PAD;
+
+    cudaStream_t main_stream = ctx.stream();
+
+    ggml_cuda_pool_alloc<half> src0_f16(ctx.pool(), lda*ne01);
+    ggml_cuda_pool_alloc<half> src1_f16(ctx.pool(), ldb*ne11);
+
+    convert_src0(src0->data, src0_f16.get(), ne00, ne01, lda, main_stream);
+    convert_src1(src1->data, src1_f16.get(), ne10, ne11, ldb, main_stream);
+
+    CUBLAS_CHECK(
+        cublasGemmEx(ctx.cublas_handle(), CUBLAS_OP_T, CUBLAS_OP_N,
+                ne01, ne11, ne10,
+                batched_mul_mat_traits<GGML_TYPE_F32>::get_alpha(),
+                src0_f16.get(), CUDA_R_16F, lda,
+                src1_f16.get(), CUDA_R_16F, ldb,
+                batched_mul_mat_traits<GGML_TYPE_F32>::get_beta(),
+                dst->data,      CUDA_R_32F, ne0,
+                batched_mul_mat_traits<GGML_TYPE_F32>::compute_type,
+                CUBLAS_GEMM_DEFAULT_TENSOR_OP));
+}
+#endif // defined(GGML_USE_HIP) && !defined(GGML_CUDA_FORCE_MMQ)
+
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     GGML_TENSOR_BINARY_OP_LOCALS
 
@@ -1840,6 +1884,34 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
 
     const int cc        = ggml_cuda_info().devices[ctx.device].cc;
     const int warp_size = ggml_cuda_info().devices[ctx.device].warp_size;
+
+#if defined(GGML_USE_HIP) && !defined(GGML_CUDA_FORCE_MMQ)
+    static const bool prefill_blas = [] {
+        const char * value = getenv("GGML_HIP_PREFILL_BLAS");
+        const char * use_lt = getenv("ROCBLAS_USE_HIPBLASLT");
+        return (!value || atoi(value) != 0) && use_lt && atoi(use_lt) == 1 &&
+            !getenv("GGML_CUDA_CUBLAS_COMPUTE_TYPE");
+    }();
+    int64_t min_blas_ncols = 0;
+    switch (src0->type) {
+        case GGML_TYPE_Q2_K:   min_blas_ncols = 64;   break;
+        case GGML_TYPE_Q6_K:   min_blas_ncols = 256;  break;
+        case GGML_TYPE_IQ2_S:
+        case GGML_TYPE_IQ2_XS: min_blas_ncols = 512;  break;
+        default: break;
+    }
+    constexpr int64_t max_f16_elements = (512LL << 20) / sizeof(half);
+    if (prefill_blas && dst->op == GGML_OP_MUL_MAT && GGML_CUDA_CC_IS_RDNA4(cc) &&
+        min_blas_ncols && ne11 >= min_blas_ncols &&
+        ggml_get_op_params_i32(dst, 0) == GGML_PREC_DEFAULT &&
+        ne02 == 1 && ne03 == 1 && ne12 == 1 && ne13 == 1 && ggml_is_contiguous(src0) &&
+        ggml_is_contiguous(src1) && ggml_is_contiguous(dst) && src0->buffer &&
+        ggml_backend_buffer_get_type(src0->buffer) == ggml_backend_cuda_buffer_type(ctx.device) &&
+        (ne00 + CUDA_PREFILL_BLAS_PAD)*ne01 + (ne10 + CUDA_PREFILL_BLAS_PAD)*ne11 <= max_f16_elements) {
+        ggml_cuda_mul_mat_f16_blas_padded(ctx, src0, src1, dst);
+        return;
+    }
+#endif
 
     if (ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, ne11)) {
         // The custom F16 vector kernel can be used over batched cuBLAS GEMM.
