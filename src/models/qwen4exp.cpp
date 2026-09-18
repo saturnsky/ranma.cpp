@@ -2,6 +2,7 @@
 #include "llama-impl.h"
 #include "llama-memory-hybrid-idx.h"
 #include "llama-memory-recurrent.h"
+#include "llama-qsa-dump.h"
 #include "llama-prefetch.h"
 
 #include <algorithm>
@@ -651,6 +652,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     ggml_tensor * k_raw = build_lora_mm(model.layers[il].index_k_proj, cur);
     k_raw = ggml_reshape_3d(ctx0, k_raw, idx_dim, 1, n_tokens);
     cb(k_raw, "indexer_k_raw", il);
+    if (llama_qsa_dump_enabled()) { ggml_format_name(k_raw, "indexer_dbg_kraw-%d", il); }
 
     ggml_build_forward_expand(gf, mctx_idx->cpy_k(ctx0, k_raw, inp->k_idxs, il));
 
@@ -672,6 +674,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     }
     pooled = ggml_scale(ctx0, pooled, 1.0f/(float) r);
     cb(pooled, "indexer_k_pooled", il);
+    if (llama_qsa_dump_enabled()) {
+        pooled = ggml_cont(ctx0, pooled);
+        ggml_format_name(pooled, "indexer_dbg_kpool-%d", il);
+    }
 
     // count blocks along ne1: rms_norm launches gridDim.y = ne2, capped at 65535, and 262144/4 = 65536
     pooled = ggml_reshape_3d(ctx0, pooled, idx_dim, n_blocks*n_stream, 1);
@@ -734,6 +740,12 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
     const int64_t width = std::min<int64_t>(n_kv, (int64_t) hparams.indexer_top_k + r - 1);
 
     ggml_tensor * top_k = ggml_cont(ctx0, ggml_top_k(ctx0, expanded, width));
+
+    if (llama_qsa_dump_enabled()) {
+        // name the computed node, not the view below: the dump reads it back after compute
+        ggml_format_name(top_k, "indexer_top_k_dump-%d", il);
+        llama_qsa_dump_set_n_kv(il, n_kv);
+    }
 
     // build_attn_qsa reads [n_top_k, n_batch, 1, n_stream], matching the KQ mask.
     top_k = ggml_reshape_4d(ctx0, top_k, width, n_tps, 1, n_stream);
