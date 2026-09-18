@@ -157,6 +157,8 @@ applies, how to switch it, and its limits.
 - **Test switch for a stable top-k tie selection** - `GGML_CUDA_TOP_K_STABLE_TIES=1` makes the radix top-k select
   the smallest columns among exactly tied values, so selections and outputs can be compared between runs. Off by
   default. [docs/ranma/qwen-sparse-attention.md](docs/ranma/qwen-sparse-attention.md)
+- **Indexer dump** - `LLAMA_QSA_DUMP=<path>` records hashes of what every indexer layer selects, which is how a
+  change to the indexer is shown not to change its selection. Same page.
 
 ## Building
 

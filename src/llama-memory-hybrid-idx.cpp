@@ -4,6 +4,7 @@
 #include "llama-batch.h"
 #include "llama-io.h"
 #include "llama-model.h"
+#include "llama-qsa-dump.h"
 
 
 #include <algorithm>
@@ -585,6 +586,10 @@ void llama_memory_hybrid_idx::set_input_qsa(
                 cur_bias[j] = v;
             }
         }
+    }
+
+    if (llama_qsa_dump_enabled()) {
+        llama_qsa_dump_set_cell_blk(dst_cell_blk, n_kv, n_ns);
     }
 }
 

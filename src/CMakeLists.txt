@@ -37,6 +37,7 @@ set(LLAMA_CORE_SOURCES
     llama-model-saver.cpp
     llama-model.cpp
     llama-prefetch.cpp
+    llama-qsa-dump.cpp
     llama-quant.cpp
     llama-sampler.cpp
     llama-vocab.cpp
