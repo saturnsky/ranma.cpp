@@ -1,5 +1,7 @@
 #include "llama-memory-hybrid-idx.h"
 
+#include "llama-kv-cache-dsv4.h"
+
 #include "llama-impl.h"
 #include "llama-batch.h"
 #include "llama-io.h"
@@ -10,8 +12,343 @@
 #include <algorithm>
 #include <cassert>
 #include <cmath>
+#include <cstdlib>
 #include <iterator>
+#include <map>
 #include <stdexcept>
+
+// the indexer cache layout is part of the sequence state, so a file written by another
+// layout must be refused instead of read as garbage
+static constexpr uint32_t LLAMA_HYBRID_IDX_STATE_MAGIC          = 0x58444951; // QIDX
+static constexpr uint32_t LLAMA_HYBRID_IDX_STATE_VERSION_RAW    = 1;   // one key per token
+static constexpr uint32_t LLAMA_HYBRID_IDX_STATE_VERSION_POOLED = 2;   // one pooled key per block
+
+// [TAG_QSA_POOLED] the pooled indexer is the default; the per-token cache stays available
+static bool qwen_idx_pooled_enabled() {
+    const char * env = std::getenv("LLAMA_QSA_LEGACY");
+    return env == nullptr || std::atoi(env) == 0;
+}
+
+// pooled keys the cache can be asked for, one per block of `ratio` tokens
+static uint32_t qwen_idx_comp_rows(uint32_t kv_size, uint32_t ratio, uint32_t n_pad) {
+    return GGML_PAD(std::max<uint32_t>(1, (kv_size + ratio - 1)/ratio), n_pad);
+}
+
+static int64_t qwen_idx_stream_offset(uint32_t n_stream, llama_seq_id seq_id, uint32_t size) {
+    if (seq_id < 0 || (uint32_t) seq_id >= n_stream) {
+        throw std::runtime_error("Qwen pooled indexer sequence id out of stream range");
+    }
+    return (int64_t) seq_id*size;
+}
+
+static bool qwen_idx_token_has_seq(const llama_ubatch & ubatch, uint32_t i, llama_seq_id seq_id) {
+    for (int32_t s = 0; s < ubatch.n_seq_id[i]; ++s) {
+        if (ubatch.seq_id[i][s] == seq_id) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Plans one ubatch: which raw keys stay as the open block's members, which blocks the
+// ubatch completes, and where their pooled keys go. Decode completes 0 or 1 block.
+//
+// A reservation ubatch carries no real positions - every token sits at 0 - so it is planned
+// as if its tokens were consecutive, and at the full block count, which is the worst case
+// a later graph can ask for.
+static llama_memory_hybrid_idx_context::idx_pool_plan qwen_idx_build_pool_plan(
+        const llama_ubatch & ubatch,
+        uint32_t ratio,
+        uint32_t kv_size,
+        uint32_t n_rows,
+        uint32_t n_stream,
+        bool reserve) {
+    llama_memory_hybrid_idx_context::idx_pool_plan plan;
+    plan.n_visible.resize(ubatch.n_tokens);
+    plan.n_stream = ubatch.n_seqs_unq;
+
+    if (plan.n_stream <= 0) {
+        plan.n_stream = 1;
+    }
+
+    const uint32_t n_tps = std::max<uint32_t>(1, ubatch.n_seq_tokens);
+
+    std::vector<llama_pos> pos_of(ubatch.n_tokens);
+    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+        pos_of[i] = reserve ? (llama_pos) (i%n_tps) : ubatch.pos[i];
+    }
+
+    struct persist_row {
+        int32_t dst;
+        int32_t src;
+        llama_pos pos;
+    };
+
+    const int64_t state_rows = (int64_t) ratio*n_stream;
+    std::vector<persist_row> persist_rows;
+    std::map<std::pair<llama_seq_id, llama_pos>, int32_t> current;
+    std::map<llama_seq_id, uint32_t> write_counts;
+
+    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+        for (int32_t s = 0; s < ubatch.n_seq_id[i]; ++s) {
+            current[{ ubatch.seq_id[i][s], pos_of[i] }] = (int32_t) i;
+        }
+    }
+
+    // a member either arrives in this ubatch or was persisted by an earlier one
+    const auto source_idx = [&](llama_seq_id seq_id, llama_pos pos) -> int32_t {
+        const auto it = current.find({ seq_id, pos });
+        if (it != current.end()) {
+            return (int32_t) (state_rows + it->second);
+        }
+        return (int32_t) (qwen_idx_stream_offset(n_stream, seq_id, ratio) + pos%ratio);
+    };
+
+    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+        const llama_pos pos = pos_of[i];
+        if (pos < 0) {
+            continue;
+        }
+
+        plan.n_visible[i] = (int32_t) ((pos + 1)/ratio);
+        plan.n_kv = std::max<int64_t>(plan.n_kv, plan.n_visible[i]);
+
+        for (int32_t s = 0; s < ubatch.n_seq_id[i]; ++s) {
+            const llama_seq_id seq_id = ubatch.seq_id[i][s];
+            const int32_t dst = (int32_t) (qwen_idx_stream_offset(n_stream, seq_id, ratio) + pos%ratio);
+            const auto it = std::find_if(persist_rows.begin(), persist_rows.end(),
+                    [dst](const persist_row & row) { return row.dst == dst; });
+            if (it == persist_rows.end()) {
+                persist_rows.push_back({ dst, (int32_t) i, pos });
+            } else if (pos > it->pos) {
+                it->src = (int32_t) i;
+                it->pos = pos;
+            }
+
+            if ((pos + 1)%ratio != 0) {
+                continue;
+            }
+
+            const llama_pos start = pos + 1 - ratio;
+            const int64_t cache_off = qwen_idx_stream_offset(n_stream, seq_id, kv_size);
+            plan.state_write_idxs.push_back(cache_off + pos/ratio);
+            for (uint32_t j = 0; j < ratio; ++j) {
+                plan.state_read_idxs.push_back(source_idx(seq_id, start + j));
+            }
+            ++write_counts[seq_id];
+        }
+    }
+
+    // Keep the graph shape stable for decode and equal-size ubatches. A step that does not
+    // seal a real block writes a scratch row instead; the cache reserves its tail for that,
+    // so the write can never land on a block the graph reads.
+    for (uint32_t s = 0; s < ubatch.n_seqs_unq; ++s) {
+        const llama_seq_id seq_id = ubatch.seq_id_unq[s];
+        uint32_t n_tokens = 0;
+        uint32_t i_first = ubatch.n_tokens;
+        for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+            if (pos_of[i] >= 0 && qwen_idx_token_has_seq(ubatch, i, seq_id)) {
+                ++n_tokens;
+                i_first = std::min(i_first, i);
+            }
+        }
+        if (n_tokens == 0) {
+            continue;
+        }
+
+        const uint32_t n_writes = (n_tokens + ratio - 1)/ratio;
+        if (write_counts[seq_id] < n_writes) {
+            if (write_counts[seq_id] + 1 != n_writes || i_first >= ubatch.n_tokens) {
+                throw std::runtime_error("Qwen pooled indexer positions are not contiguous");
+            }
+            const int64_t cache_off = qwen_idx_stream_offset(n_stream, seq_id, kv_size);
+            plan.state_write_idxs.push_back(cache_off + kv_size - 1);
+            const int32_t src = (int32_t) (state_rows + i_first);
+            for (uint32_t j = 0; j < ratio; ++j) {
+                plan.state_read_idxs.push_back(src);
+            }
+        }
+    }
+
+    std::sort(persist_rows.begin(), persist_rows.end(),
+            [](const persist_row & a, const persist_row & b) { return a.dst < b.dst; });
+    for (const auto & row : persist_rows) {
+        plan.state_persist_src_idxs.push_back(row.src);
+        plan.state_persist_dst_idxs.push_back(row.dst);
+    }
+
+    plan.n_kv = reserve ? (int64_t) n_rows : std::max<int64_t>(256, GGML_PAD(plan.n_kv, 256));
+    if (plan.n_kv > n_rows) {
+        plan.n_kv = n_rows;
+    }
+
+    return plan;
+}
+
+// the pooled cache is addressed by block row, not by slot, so every stream reads from its own base
+static llama_kv_cache::slot_info_vec_t qwen_idx_build_comp_sinfos(
+        const std::vector<llama_ubatch> & ubatches,
+        uint32_t n_stream) {
+    llama_kv_cache::slot_info_vec_t sinfos;
+    sinfos.reserve(ubatches.size());
+
+    for (const auto & ubatch : ubatches) {
+        llama_kv_cache::slot_info sinfo;
+        sinfo.s0 = n_stream;
+        sinfo.s1 = 0;
+        sinfo.resize(ubatch.n_seqs_unq);
+
+        for (uint32_t s = 0; s < ubatch.n_seqs_unq; ++s) {
+            const uint32_t stream = (uint32_t) ubatch.seq_id_unq[s];
+            if (stream >= n_stream) {
+                throw std::runtime_error("Qwen pooled indexer stream out of range");
+            }
+            sinfo.s0 = std::min(sinfo.s0, stream);
+            sinfo.s1 = std::max(sinfo.s1, stream);
+            sinfo.strm[s] = stream;
+            sinfo.idxs[s].resize(1, 0);
+        }
+
+        if (sinfo.s1 - sinfo.s0 + 1 != ubatch.n_seqs_unq) {
+            throw std::runtime_error("Qwen pooled indexer streams are not contiguous");
+        }
+        sinfos.push_back(std::move(sinfo));
+    }
+    return sinfos;
+}
+
+static std::vector<llama_memory_hybrid_idx_context::idx_pool_plan> qwen_idx_build_pool_plans(
+        const std::vector<llama_ubatch> & ubatches,
+        uint32_t ratio,
+        uint32_t kv_size,
+        uint32_t n_rows,
+        uint32_t n_stream) {
+    std::vector<llama_memory_hybrid_idx_context::idx_pool_plan> plans;
+    plans.reserve(ubatches.size());
+    for (const auto & ubatch : ubatches) {
+        plans.push_back(qwen_idx_build_pool_plan(ubatch, ratio, kv_size, n_rows, n_stream, false));
+    }
+    return plans;
+}
+
+static std::vector<uint32_t> qwen_idx_pool_ns(const std::vector<llama_ubatch> & ubatches) {
+    std::vector<uint32_t> res;
+    res.reserve(ubatches.size());
+    for (const auto & ubatch : ubatches) {
+        res.push_back(std::max<uint32_t>(1, ubatch.n_seqs_unq));
+    }
+    return res;
+}
+
+static void qwen_idx_state_stream_range(uint32_t n_stream, llama_seq_id seq_id, uint32_t & s0, uint32_t & ns) {
+    if (seq_id < 0) {
+        s0 = 0;
+        ns = n_stream;
+        return;
+    }
+    if ((uint32_t) seq_id >= n_stream) {
+        throw std::runtime_error("Qwen pooled indexer state sequence id out of range");
+    }
+    s0 = (uint32_t) seq_id;
+    ns = 1;
+}
+
+// only the rows the attention positions can reach are worth saving
+static void qwen_idx_state_write_cache(
+        llama_io_write_i & io,
+        const llama_kv_cache * kv,
+        const llama_kv_cache * attn,
+        uint32_t ratio,
+        llama_seq_id seq_id) {
+    const uint32_t kv_size = kv->get_size();
+    const auto layer_ids = kv->get_layer_ids();
+    const uint32_t n_layer = layer_ids.size();
+    uint32_t s0;
+    uint32_t ns;
+    qwen_idx_state_stream_range(kv->get_n_stream(), seq_id, s0, ns);
+
+    std::vector<uint32_t> n_rows(ns);
+    for (uint32_t s = 0; s < ns; ++s) {
+        const llama_pos pos_max = attn->seq_pos_max((llama_seq_id) (s0 + s));
+        n_rows[s] = pos_max < 0 ? 0 : (uint32_t) (pos_max + 1)/ratio;
+        if (n_rows[s] > kv_size) {
+            throw std::runtime_error("Qwen pooled indexer cache state row count exceeds cache size");
+        }
+    }
+
+    io.write(&ns, sizeof(ns));
+    io.write(&n_layer, sizeof(n_layer));
+
+    for (uint32_t il : layer_ids) {
+        io.write(&il, sizeof(il));
+        ggml_tensor * k = kv->get_k_storage(il);
+        for (uint32_t s = 0; s < ns; ++s) {
+            io.write_tensor(k, (size_t) (s0 + s)*k->nb[2], (size_t) n_rows[s]*k->nb[1]);
+        }
+    }
+}
+
+static void qwen_idx_state_read_cache(
+        llama_io_read_i & io,
+        llama_kv_cache * kv,
+        const llama_kv_cache * attn,
+        uint32_t ratio,
+        llama_seq_id seq_id) {
+    uint32_t ns;
+    uint32_t n_layer;
+    io.read(&ns, sizeof(ns));
+    io.read(&n_layer, sizeof(n_layer));
+    const uint32_t kv_size = kv->get_size();
+
+    uint32_t s0;
+    uint32_t ns_expected;
+    qwen_idx_state_stream_range(kv->get_n_stream(), seq_id, s0, ns_expected);
+    if (ns != ns_expected || n_layer != kv->get_layer_ids().size()) {
+        throw std::runtime_error("Qwen pooled indexer cache state stream/layer mismatch");
+    }
+
+    // the attention cells are restored first, so the row count is already known here
+    std::vector<uint32_t> n_rows(ns);
+    for (uint32_t s = 0; s < ns; ++s) {
+        const llama_pos pos_max = attn->seq_pos_max((llama_seq_id) (s0 + s));
+        n_rows[s] = pos_max < 0 ? 0 : (uint32_t) (pos_max + 1)/ratio;
+        if (n_rows[s] > kv_size) {
+            throw std::runtime_error("Qwen pooled indexer cache state row count exceeds cache size");
+        }
+    }
+
+    for (uint32_t il : kv->get_layer_ids()) {
+        uint32_t il_ref;
+        io.read(&il_ref, sizeof(il_ref));
+        if (il_ref != il) {
+            throw std::runtime_error("Qwen pooled indexer cache state layer mismatch");
+        }
+        ggml_tensor * k = kv->get_k_storage(il);
+        for (uint32_t s = 0; s < ns; ++s) {
+            io.read_tensor(k, (size_t) (s0 + s)*k->nb[2], (size_t) n_rows[s]*k->nb[1]);
+        }
+    }
+}
+
+// every QSA layer of this architecture shares one compression ratio, and the cache is
+// laid out for it, so a model that mixed ratios would need one cache per ratio
+static uint32_t qwen_idx_ratio(const llama_model & model) {
+    uint32_t ratio = 0;
+
+    for (uint32_t il = 0; il < model.hparams.n_layer(); ++il) {
+        const uint32_t r = model.hparams.dsv4_compress_ratios[il];
+        if (r == 0) {
+            continue;
+        }
+        if (ratio == 0) {
+            ratio = r;
+        } else if (ratio != r) {
+            throw std::runtime_error("the pooled Qwen indexer needs a single compression ratio");
+        }
+    }
+
+    return ratio == 0 ? 4 : ratio;
+}
 
 //
 // llama_memory_hybrid_idx
@@ -47,7 +384,18 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
         n_seq_max, n_rs_seq, offload, unified,
         filter_attn, filter_recr),
     hparams_idx(model.hparams),
+    idx_pooled(filter_idx != nullptr && qwen_idx_pooled_enabled()),
+    idx_ratio(qwen_idx_ratio(model)),
+    idx_n_seq_max(n_seq_max),
+    idx_raw_type(type_k),
+    idx_n_rows(filter_idx != nullptr && qwen_idx_pooled_enabled() ?
+            qwen_idx_comp_rows(kv_size, idx_ratio, n_pad) : kv_size),
     mem_idx(filter_idx == nullptr ? nullptr : [&] {
+        if (idx_pooled && unified && n_seq_max > 1) {
+            throw std::runtime_error("the pooled Qwen indexer does not support a unified KV cache with multiple sequences; "
+                    "run without --kv-unified");
+        }
+
         // MQA with a single key head of indexer_head_size, as llama_kv_cache_dsa shapes its own
         std::fill(hparams_idx.n_head_kv_arr.begin(), hparams_idx.n_head_kv_arr.end(), 1);
         hparams_idx.n_embd_head_k_full = model.hparams.indexer_head_size;
@@ -60,13 +408,28 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
         hparams_idx.n_embd_head_k_mla_impl = model.hparams.indexer_head_size;
         hparams_idx.n_embd_head_v_mla_impl = model.hparams.indexer_head_size;
 
-        LLAMA_LOG_INFO("%s: creating indexer KV cache, size = %u cells\n", __func__, kv_size);
+        // [TAG_QSA_POOLED] one row per completed block, plus a padded tail: a step that
+        // completes no block still writes, and its scratch row must miss every live block
+        const uint32_t idx_size = idx_pooled ? idx_n_rows + n_pad : kv_size;
+
+        // f32 pooled keys reproduce the per-token path exactly, because the members that
+        // reach the sum are the same f16-derived values in both.
+        const ggml_type idx_type = idx_pooled ? GGML_TYPE_F32 : type_k;
+
+        LLAMA_LOG_INFO("%s: creating indexer %scache, size = %u cells, type = %s\n", __func__,
+                idx_pooled ? "pooled K " : "K", idx_size, ggml_type_name(idx_type));
 
         return new llama_kv_cache(
-            model, hparams_idx, type_k, type_v, v_trans, offload, unified,
-            kv_size, n_seq_max, n_pad, n_swa, swa_type,
+            model, hparams_idx, idx_type, type_v, v_trans, offload, idx_pooled ? false : unified,
+            idx_size, n_seq_max, n_pad, idx_pooled ? 0 : n_swa, idx_pooled ? LLAMA_SWA_TYPE_NONE : swa_type,
             nullptr, filter_idx, nullptr, nullptr, "idx_");
-    }()) {}
+    }()),
+    // the members of the block no ubatch has completed yet: ratio rows per stream
+    idx_state(!idx_pooled ? nullptr : new llama_dsv4_comp_state(
+            model, offload, false, n_seq_max, idx_ratio, idx_ratio,
+            model.hparams.indexer_head_size, n_rs_seq, "qwen_idx", filter_idx)) {}
+
+llama_memory_hybrid_idx::~llama_memory_hybrid_idx() = default;
 
 llama_memory_context_ptr llama_memory_hybrid_idx::init_batch(llama_batch_allocr & balloc, uint32_t n_ubatch, bool embd_all) {
     // note: repeats llama_memory_hybrid::init_batch, as the indexer needs the attention slot infos that the base context hides
@@ -120,9 +483,10 @@ llama_memory_context_ptr llama_memory_hybrid_idx::init_batch(llama_batch_allocr 
             return std::make_unique<llama_memory_hybrid_idx_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
         }
 
-        // the indexer uses the attention cache's slot layout; a separate one can drift from it
+        // The raw indexer uses the attention cache's slot layout; a separate one can drift
+        // from it. The pooled indexer is addressed by block row instead, so it takes no slots.
         llama_kv_cache::slot_info_vec_t heads_idx;
-        if (mem_idx) {
+        if (mem_idx && !idx_pooled) {
             heads_idx = heads_attn;
         }
 
@@ -147,16 +511,47 @@ void llama_memory_hybrid_idx::clear(bool data) {
     if (mem_idx) {
         mem_idx->clear(data);
     }
+    if (idx_state) {
+        idx_state->clear(-1, data);
+    }
 }
 
 bool llama_memory_hybrid_idx::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+    // The pooled cache keeps whole blocks, so it can only follow a removal that ends a
+    // sequence on a block boundary. Anything else is refused before a cache is touched,
+    // which makes the caller reprocess instead of reading a half-pooled block.
+    bool pooled_removes_existing = true;
+    if (idx_pooled) {
+        if (p1 >= 0) {
+            return false;
+        }
+        if (p0 > 0) {
+            if (seq_id < 0 || (uint32_t) seq_id >= idx_n_seq_max) {
+                return false;
+            }
+            pooled_removes_existing = p0 <= get_mem_attn()->seq_pos_max(seq_id);
+            if (pooled_removes_existing && p0%idx_ratio != 0) {
+                return false;
+            }
+        }
+    }
+
     // same order as llama_memory_hybrid::seq_rm: the recurrent cache can refuse, so try it first
     if (!get_mem_recr()->seq_rm(seq_id, p0, p1)) {
         return false;
     }
 
     if (mem_idx) {
-        mem_idx->seq_rm(seq_id, p0, p1);
+        if (idx_pooled) {
+            // A suffix removal is safe because a query only ever reads the blocks below its
+            // own position. A range beyond pos_max removes nothing and must not throw away
+            // the open block.
+            if (p0 <= 0 || pooled_removes_existing) {
+                idx_state->clear(seq_id, true);
+            }
+        } else {
+            mem_idx->seq_rm(seq_id, p0, p1);
+        }
     }
 
     return get_mem_attn()->seq_rm(seq_id, p0, p1);
@@ -167,6 +562,9 @@ void llama_memory_hybrid_idx::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_i
 
     if (mem_idx) {
         mem_idx->seq_cp(seq_id_src, seq_id_dst, p0, p1);
+        if (idx_state) {
+            idx_state->seq_cp(seq_id_src, seq_id_dst);
+        }
     }
 }
 
@@ -175,6 +573,13 @@ void llama_memory_hybrid_idx::seq_keep(llama_seq_id seq_id) {
 
     if (mem_idx) {
         mem_idx->seq_keep(seq_id);
+        if (idx_state) {
+            for (llama_seq_id id = 0; id < (llama_seq_id) idx_n_seq_max; ++id) {
+                if (id != seq_id) {
+                    idx_state->clear(id, true);
+                }
+            }
+        }
     }
 }
 
@@ -182,6 +587,9 @@ void llama_memory_hybrid_idx::seq_add(llama_seq_id seq_id, llama_pos p0, llama_p
     llama_memory_hybrid::seq_add(seq_id, p0, p1, shift);
 
     if (mem_idx) {
+        // the pooled keys are rotated at read time by the block's position, so a shift would
+        // have to repool every block behind p0; context shift is refused instead
+        GGML_ASSERT(!idx_pooled && "the pooled Qwen indexer does not support context shift");
         mem_idx->seq_add(seq_id, p0, p1, shift);
     }
 }
@@ -190,6 +598,7 @@ void llama_memory_hybrid_idx::seq_div(llama_seq_id seq_id, llama_pos p0, llama_p
     llama_memory_hybrid::seq_div(seq_id, p0, p1, d);
 
     if (mem_idx) {
+        GGML_ASSERT(!idx_pooled && "the pooled Qwen indexer does not support context division");
         mem_idx->seq_div(seq_id, p0, p1, d);
     }
 }
@@ -199,6 +608,11 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_memory_hybrid_idx::memory_bre
 
     if (mem_idx) {
         for (const auto & buft_size : mem_idx->memory_breakdown()) {
+            mb[buft_size.first] += buft_size.second;
+        }
+    }
+    if (idx_state) {
+        for (const auto & buft_size : idx_state->memory_breakdown()) {
             mb[buft_size.first] += buft_size.second;
         }
     }
@@ -213,7 +627,18 @@ void llama_memory_hybrid_idx::state_write(llama_io_write_i & io, llama_seq_id se
     // The indexer mirrors the attention cache, so it uses the same PARTIAL_ONLY gate.
     if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
         if (mem_idx) {
-            mem_idx->state_write(io, seq_id, flags);
+            const uint32_t version = idx_pooled ?
+                LLAMA_HYBRID_IDX_STATE_VERSION_POOLED : LLAMA_HYBRID_IDX_STATE_VERSION_RAW;
+
+            io.write(&LLAMA_HYBRID_IDX_STATE_MAGIC, sizeof(LLAMA_HYBRID_IDX_STATE_MAGIC));
+            io.write(&version, sizeof(version));
+
+            if (idx_pooled) {
+                qwen_idx_state_write_cache(io, mem_idx.get(), get_mem_attn(), idx_ratio, seq_id);
+                idx_state->state_write(io, seq_id, flags, std::vector<uint32_t>(idx_n_seq_max, 0));
+            } else {
+                mem_idx->state_write(io, seq_id, flags);
+            }
         }
     }
 
@@ -238,7 +663,24 @@ void llama_memory_hybrid_idx::state_read(llama_io_read_i & io, llama_seq_id seq_
         // [TAG_HYBRID_IDX_STATE] must mirror the write order in state_write
         if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
             if (mem_idx) {
-                mem_idx->state_read_sinfo(io, seq_id, flags, nullptr, &sinfos_attn);
+                uint32_t magic;
+                uint32_t version;
+                io.read(&magic, sizeof(magic));
+                io.read(&version, sizeof(version));
+
+                const uint32_t version_expected = idx_pooled ?
+                    LLAMA_HYBRID_IDX_STATE_VERSION_POOLED : LLAMA_HYBRID_IDX_STATE_VERSION_RAW;
+
+                if (magic != LLAMA_HYBRID_IDX_STATE_MAGIC || version != version_expected) {
+                    throw std::runtime_error("incompatible indexer cache state format");
+                }
+
+                if (idx_pooled) {
+                    qwen_idx_state_read_cache(io, mem_idx.get(), get_mem_attn(), idx_ratio, seq_id);
+                    idx_state->state_read(io, seq_id, flags);
+                } else {
+                    mem_idx->state_read_sinfo(io, seq_id, flags, nullptr, &sinfos_attn);
+                }
             }
         }
 
@@ -263,12 +705,40 @@ void llama_memory_hybrid_idx::state_drop(llama_seq_id seq_id) {
     get_mem_recr()->seq_rm(seq_id, -1, -1);
 
     if (mem_idx) {
-        mem_idx->seq_rm(seq_id, -1, -1);
+        if (idx_pooled) {
+            idx_state->clear(seq_id, true);
+        } else {
+            mem_idx->seq_rm(seq_id, -1, -1);
+        }
     }
 }
 
 llama_kv_cache * llama_memory_hybrid_idx::get_mem_idx() const {
     return mem_idx.get();
+}
+
+llama_dsv4_comp_state * llama_memory_hybrid_idx::get_idx_state() const {
+    return idx_state.get();
+}
+
+bool llama_memory_hybrid_idx::get_idx_pooled() const {
+    return idx_pooled;
+}
+
+uint32_t llama_memory_hybrid_idx::get_idx_ratio() const {
+    return idx_ratio;
+}
+
+uint32_t llama_memory_hybrid_idx::get_idx_n_seq_max() const {
+    return idx_n_seq_max;
+}
+
+uint32_t llama_memory_hybrid_idx::get_idx_n_rows() const {
+    return idx_n_rows;
+}
+
+ggml_type llama_memory_hybrid_idx::get_idx_raw_type() const {
+    return idx_raw_type;
 }
 
 void llama_memory_hybrid_idx::set_input_qsa(
@@ -294,8 +764,15 @@ void llama_memory_hybrid_idx::set_input_qsa(
     const int64_t n_tps = n_tokens/n_ns;             // tokens per stream
 
     int32_t * dst_cell_blk  = (int32_t *) cell_blk->data;
-    int32_t * dst_blk_cells = (int32_t *) blk_cells->data;
     int32_t * dst_blk_pos   = (int32_t *) blk_pos->data;
+
+    // the pooled indexer builds no gather, so blk_cells has no tensor to fill
+    std::vector<int32_t> blk_cells_unused;
+    if (blk_cells == nullptr || blk_cells->data == nullptr) {
+        blk_cells_unused.resize((size_t) r*n_blocks*n_ns);
+    }
+    int32_t * dst_blk_cells = blk_cells_unused.empty() ?
+        (int32_t *) blk_cells->data : blk_cells_unused.data();
     float   * dst_bias      = (float   *) bias->data;
 
     // a block is keyed on (sequence set, index bucket): a unified cache counts every sequence
@@ -325,7 +802,10 @@ void llama_memory_hybrid_idx::set_input_qsa(
     for (int64_t s = 0; s < n_ns; ++s) {
         // ubatch index s*n_tps belongs to this stream; ask which cells array it uses
         const llama_seq_id seq_of_stream = ubatch->seq_id[s*n_tps][0];
-        const auto & cells = get_mem_idx()->get_cells(seq_of_stream);
+
+        // the pooled indexer keeps no per-token cells of its own, so the token layout is
+        // read from the attention cache it mirrors
+        const auto & cells = (idx_pooled ? get_mem_attn() : get_mem_idx())->get_cells(seq_of_stream);
 
         int32_t * cur_cell_blk  = dst_cell_blk  + s*n_kv;
         int32_t * cur_blk_cells = dst_blk_cells + s*(r*n_blocks);
@@ -345,6 +825,12 @@ void llama_memory_hybrid_idx::set_input_qsa(
         }
 
         const bool one_seq = n_seq_present <= 1;
+
+        // Pooled rows are addressed by pos/ratio, while the block ids below are handed out in
+        // order over the blocks that are full. The two agree only while a stream holds one
+        // sequence, which a per-sequence (non-unified) attention cache guarantees.
+        GGML_ASSERT((!idx_pooled || one_seq) &&
+                "the pooled Qwen indexer needs one sequence per stream: run without a unified KV cache");
 
         // a cell no block covers needs its own -inf, which a per-block bias cannot carry
         // every cache path keeps the position below the cell window, so this stays false
@@ -619,8 +1105,12 @@ llama_memory_hybrid_idx_context::llama_memory_hybrid_idx_context(llama_memory_hy
     // without it the reserved worst case is the dense graph, so ggml-alloc must grow the buffer on the first decode
     ns_ubatch(mem->get_mem_idx() == nullptr ?
         std::vector<uint32_t>() : std::vector<uint32_t>{ mem->get_mem_idx()->get_n_stream() }),
-    ctx_idx(mem->get_mem_idx() == nullptr ? nullptr :
-        new llama_kv_cache_context(mem->get_mem_idx())) {}
+    ctx_idx(mem->get_mem_idx() == nullptr || mem->get_idx_pooled() ? nullptr :
+        new llama_kv_cache_context(mem->get_mem_idx())),
+    // reservation walks ubatches this context never saw, so its plan is built on demand
+    idx_pool_reserve(mem->get_idx_pooled()),
+    ctx_idx_pooled(mem->get_idx_pooled() ?
+        new llama_kv_cache_dsv4_comp_context(mem->get_mem_idx()) : nullptr) {}
 
 llama_memory_hybrid_idx_context::llama_memory_hybrid_idx_context(
         llama_memory_hybrid_idx * mem,
@@ -630,7 +1120,8 @@ llama_memory_hybrid_idx_context::llama_memory_hybrid_idx_context(
     mem(mem),
     // update() applies a pending cross-stream seq_cp, else the copy keeps stale indexer keys
     ctx_idx(mem->get_mem_idx() == nullptr ? nullptr :
-        mem->get_mem_idx()->init_update(lctx, optimize)) {}
+        mem->get_mem_idx()->init_update(lctx, optimize)),
+    ctx_idx_pooled(nullptr) {}
 
 llama_memory_hybrid_idx_context::llama_memory_hybrid_idx_context(
         llama_memory_hybrid_idx * mem,
@@ -640,13 +1131,28 @@ llama_memory_hybrid_idx_context::llama_memory_hybrid_idx_context(
     // note: the base copies the ubatches; ctx_idx gets a copy of its own
     llama_memory_hybrid_context(mem, std::move(sinfos_attn), ubatches),
     mem(mem),
-    ns_ubatch(llama_memory_hybrid_idx_ns(sinfos_idx)),
-    ctx_idx(mem->get_mem_idx() == nullptr ? nullptr :
-        new llama_kv_cache_context(mem->get_mem_idx(), std::move(sinfos_idx), ubatches)) {}
+    ns_ubatch(mem->get_idx_pooled() ? qwen_idx_pool_ns(ubatches) : llama_memory_hybrid_idx_ns(sinfos_idx)),
+    ctx_idx(mem->get_mem_idx() == nullptr || mem->get_idx_pooled() ? nullptr :
+        new llama_kv_cache_context(mem->get_mem_idx(), std::move(sinfos_idx), ubatches)),
+    idx_pool_plans(mem->get_idx_pooled() ? qwen_idx_build_pool_plans(
+            ubatches, mem->get_idx_ratio(),
+            mem->get_mem_idx()->get_size(),
+            mem->get_idx_n_rows(),
+            mem->get_idx_n_seq_max()) : std::vector<idx_pool_plan>()),
+    ctx_idx_pooled(mem->get_idx_pooled() ? new llama_kv_cache_dsv4_comp_context(
+            // not moved: the order in which these two arguments are built is unspecified,
+            // and the sinfos are read from the same vector
+            mem->get_mem_idx(), qwen_idx_build_comp_sinfos(ubatches, mem->get_idx_n_seq_max()),
+            ubatches) : nullptr) {}
+
+llama_memory_hybrid_idx_context::~llama_memory_hybrid_idx_context() = default;
 
 bool llama_memory_hybrid_idx_context::next() {
     if (ctx_idx) {
         ctx_idx->next();
+    }
+    if (ctx_idx_pooled) {
+        ctx_idx_pooled->next();
     }
 
     ++i_cur;
@@ -661,11 +1167,55 @@ bool llama_memory_hybrid_idx_context::apply() {
         res = res & ctx_idx->apply();
     }
 
+    // the open-block state has no graph of its own, so a pending seq_cp is applied here
+    if (mem && mem->get_idx_pooled() && idx_pool_plans.empty() && mem->get_idx_state()) {
+        auto * state = mem->get_idx_state();
+        state->apply_copies(state->sc_info);
+        state->sc_info = {};
+    }
+
     return res;
 }
 
 const llama_kv_cache_context * llama_memory_hybrid_idx_context::get_idx() const {
     return static_cast<const llama_kv_cache_context *>(ctx_idx.get());
+}
+
+const llama_kv_cache_dsv4_comp_context * llama_memory_hybrid_idx_context::get_idx_pooled_ctx() const {
+    return ctx_idx_pooled.get();
+}
+
+const llama_dsv4_comp_state * llama_memory_hybrid_idx_context::get_idx_state() const {
+    return mem ? mem->get_idx_state() : nullptr;
+}
+
+const llama_memory_hybrid_idx_context::idx_pool_plan & llama_memory_hybrid_idx_context::get_idx_pool_plan(
+        const llama_ubatch & ubatch) const {
+    GGML_ASSERT(mem && mem->get_idx_pooled());
+
+    if (idx_pool_reserve) {
+        idx_pool_reserve_plan = qwen_idx_build_pool_plan(
+                ubatch, mem->get_idx_ratio(),
+                mem->get_mem_idx()->get_size(),
+                mem->get_idx_n_rows(),
+                mem->get_idx_n_seq_max(), true);
+
+        return idx_pool_reserve_plan;
+    }
+
+    GGML_ASSERT(i_cur < idx_pool_plans.size());
+
+    return idx_pool_plans[i_cur];
+}
+
+bool llama_memory_hybrid_idx_context::get_idx_pooled() const {
+    return mem && mem->get_idx_pooled();
+}
+
+ggml_type llama_memory_hybrid_idx_context::get_idx_raw_type() const {
+    GGML_ASSERT(mem);
+
+    return mem->get_idx_raw_type();
 }
 
 uint32_t llama_memory_hybrid_idx_context::get_n_stream() const {
@@ -685,4 +1235,31 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
     GGML_ASSERT(mem != nullptr);
 
     mem->set_input_qsa(cell_blk, blk_cells, blk_pos, bias, ubatch, ratio, blk_bias);
+}
+
+template<typename T>
+static void qwen_idx_set_tensor(ggml_tensor * dst, const std::vector<T> & src) {
+    if (dst == nullptr || dst->buffer == nullptr) {
+        return;
+    }
+
+    GGML_ASSERT(dst->ne[0] == (int64_t) src.size());
+
+    if (!src.empty()) {
+        ggml_backend_tensor_set(dst, src.data(), 0, src.size()*sizeof(T));
+    }
+}
+
+void llama_memory_hybrid_idx_context::set_input_idx_pool_plan(
+        ggml_tensor * state_persist_src_idxs,
+        ggml_tensor * state_persist_dst_idxs,
+        ggml_tensor * state_read_idxs,
+        ggml_tensor * state_write_idxs,
+        const llama_ubatch * ubatch) const {
+    const auto & plan = get_idx_pool_plan(*ubatch);
+
+    qwen_idx_set_tensor(state_persist_src_idxs, plan.state_persist_src_idxs);
+    qwen_idx_set_tensor(state_persist_dst_idxs, plan.state_persist_dst_idxs);
+    qwen_idx_set_tensor(state_read_idxs,        plan.state_read_idxs);
+    qwen_idx_set_tensor(state_write_idxs,       plan.state_write_idxs);
 }

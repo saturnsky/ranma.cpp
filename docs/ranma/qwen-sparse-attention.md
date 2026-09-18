@@ -22,6 +22,7 @@ for equivalence checks, or a diagnostic.
 | --- | --- | --- |
 | `GGML_CUDA_TOP_K_STABLE_TIES` | off | `1` makes the top-k pick the smallest columns among tied values, so selections and outputs can be compared between runs. Test switch. |
 | `LLAMA_QSA_DUMP` | unset | a path: write one line per indexer layer and graph evaluation there. Diagnostic; it changes the graph. |
+| `LLAMA_QSA_LEGACY` | off | `1` selects the per-token indexer cache instead of pooled block keys. Reference path. |
 
 ## Tie-breaking in the top-k
 
@@ -92,3 +93,36 @@ Enabling the dump is not free of side effects. It inserts a `ggml_cont` in
 front of every tensor it names, so the graph is not the graph a normal run
 builds, and it installs its own evaluation callback when the caller has set
 none. With the variable unset, nothing changes.
+
+## Pooled block keys in the indexer cache
+
+The indexer cache holds one pooled key per block. Since a step completes at
+most one block, only that block has to be pooled; the rest of the context is
+read from the cache as it stands.
+
+Each ubatch is planned on the host before its graph is built. The plan says
+which of the ubatch's raw keys belong to a block that is still open and must
+be kept for a later step, which blocks the ubatch completes, and which cache
+row each completed key is written to. The graph pools the completed blocks,
+writes them into the indexer cache, and copies the members of the still-open
+block into a small persistent state tensor, which the next ubatch reads back
+as the earlier members of that block. A reservation ubatch carries no real
+positions, so it is planned as if its tokens were consecutive and at the full
+block count - the worst case any later graph can ask for.
+
+`LLAMA_QSA_LEGACY=1` restores the previous per-token indexer cache, which
+stores one raw key per token and pools the whole context on every graph. It is
+kept as the reference the pooled path is compared against, not as a fallback.
+Keys pooled on the per-token path pass through the cache type first, so the
+pooled path applies the same rounding to its members before pooling them; both
+produce the same block key bit for bit, which the indexer dump shows directly.
+
+The pooled cache keeps one stream per sequence. A unified KV cache keeps a
+single stream for all sequences, so with more than one sequence the two
+shapes do not line up; that combination is refused when the context is
+created, with a message to run without `--kv-unified`. A single sequence, a
+split cache and `LLAMA_QSA_LEGACY=1` are not affected.
+
+The layout of the indexer cache is part of the sequence state. Each layout
+writes its own version into the state file, and a file written by another
+layout is refused instead of being read as keys that do not match it.
