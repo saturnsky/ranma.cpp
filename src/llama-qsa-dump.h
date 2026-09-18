@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <cstddef>
+#include <vector>
 
 struct ggml_tensor;
 
@@ -33,6 +34,15 @@ struct ggml_tensor;
 // Enabling the dump is not free of side effects: it changes the graph, because a
 // ggml_cont is inserted before every named debug tensor, and it installs its own
 // eval callback when the caller has set none.
+
+struct llama_qsa_dump_block {
+    int32_t row;
+    int32_t seq;
+    int32_t start;
+    int32_t pos[4];
+};
+
+void llama_qsa_dump_set_blocks(const std::vector<llama_qsa_dump_block> & blocks);
 
 bool llama_qsa_dump_enabled();
 

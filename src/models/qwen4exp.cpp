@@ -554,7 +554,7 @@ public:
         } else {
             mctx->get_idx()->set_input_k_idxs(k_idxs, ubatch);
         }
-        mctx->set_input_qsa(cell_blk, blk_cells, blk_pos, bias, ubatch, ratio, blk_bias);
+        mctx->set_input_qsa(cell_blk, blk_cells, blk_pos, bias, ubatch, ratio, blk_bias, completed_pos);
     }
 
     bool can_reuse(const llm_graph_params & params) override {
@@ -591,7 +591,7 @@ public:
         res &= cell_blk->ne[0]  == n_kv;
         res &= cell_blk->ne[1]  == n_stream;
         res &= pooled || blk_cells->ne[0] == (int64_t) ratio*n_blocks;
-        res &= blk_pos->ne[0]   == 4*n_blocks*n_stream;
+        res &= !blk_pos || blk_pos->ne[0] == 4*n_blocks*n_stream;
         res &= bias->ne[0]      == (blk_bias ? n_blocks : n_kv);
         res &= bias->ne[1]      == params.ubatch.n_tokens/n_stream;
 
@@ -610,6 +610,7 @@ public:
     ggml_tensor * state_persist_dst_idxs = nullptr;   // I32
     ggml_tensor * state_read_idxs        = nullptr;   // I32 [ratio*n_write]
     ggml_tensor * state_write_idxs       = nullptr;   // I64 [n_write]
+    ggml_tensor * completed_pos          = nullptr;   // I32 [4*n_write]
 
     const llama_memory_hybrid_idx_context * mctx;
     const uint32_t ratio;
@@ -629,6 +630,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         int *                                   sections,
         int                                     il) {
     const bool idx_pooled = mctx_hyb->get_idx_pooled();
+    const bool idx_norm_rope = mctx_hyb->get_idx_norm_rope();
 
     const llama_kv_cache_context           * mctx_idx        = mctx_hyb->get_idx();
     const llama_kv_cache_dsv4_comp_context * mctx_idx_pooled = mctx_hyb->get_idx_pooled_ctx();
@@ -670,14 +672,16 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         qsa->k_idxs    = idx_pooled ? nullptr : mctx_idx->build_input_k_idxs(ctx0, ubatch);
         qsa->cell_blk  = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_kv, n_stream);
         qsa->blk_cells = idx_pooled ? nullptr : ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, r*n_blocks, n_stream);
-        qsa->blk_pos   = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 4*n_blocks*n_stream);
+        qsa->blk_pos   = idx_norm_rope ? nullptr : ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 4*n_blocks*n_stream);
         qsa->bias      = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, blk_bias ? n_blocks : n_kv, n_tps, n_stream);
 
         ggml_set_input(qsa->cell_blk);
         if (qsa->blk_cells) {
             ggml_set_input(qsa->blk_cells);
         }
-        ggml_set_input(qsa->blk_pos);
+        if (qsa->blk_pos) {
+            ggml_set_input(qsa->blk_pos);
+        }
         ggml_set_input(qsa->bias);
 
         if (idx_pooled) {
@@ -692,6 +696,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
             ggml_set_input(qsa->state_persist_dst_idxs);
             ggml_set_input(qsa->state_read_idxs);
             ggml_set_input(qsa->state_write_idxs);
+            if (idx_norm_rope) {
+                qsa->completed_pos = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 4*plan.state_write_idxs.size());
+                ggml_set_input(qsa->completed_pos);
+            }
         }
 
         inp = qsa.get();
@@ -699,7 +707,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         qsa_inps.emplace(qsa_key, inp);
     }
 
-    // cached indexer keys are raw: pooling precedes norm and rotation, so apply neither
+    // Pool raw keys before applying norm and rotation.
     ggml_tensor * k_raw = build_lora_mm(model.layers[il].index_k_proj, cur);
     k_raw = ggml_reshape_3d(ctx0, k_raw, idx_dim, 1, n_tokens);
     cb(k_raw, "indexer_k_raw", il);
@@ -758,6 +766,16 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         completed = ggml_scale(ctx0, completed, 1.0f/(float) r);
         completed = ggml_reshape_3d(ctx0, completed, idx_dim, 1, n_write);
 
+        if (idx_norm_rope) {
+            completed = ggml_reshape_3d(ctx0, completed, idx_dim, n_write, 1);
+            completed = build_norm(completed, model.layers[il].index_k_norm, nullptr, LLM_NORM_RMS, il);
+            completed = ggml_reshape_3d(ctx0, completed, idx_dim, 1, n_write);
+            completed = ggml_rope_multi(ctx0, completed, inp->completed_pos, nullptr,
+                    n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
+                    ext_factor, attn_factor, beta_fast, beta_slow);
+            mctx_hyb->bind_idx_transform(completed, hparams.f_norm_rms_eps);
+        }
+
         // written before the read below is built, so the block this step seals is visible to it
         ggml_build_forward_expand(gf, mctx_idx_pooled->cpy_k(ctx0, completed, inp->state_write_idxs, il));
 
@@ -775,22 +793,28 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         }
     }
     cb(pooled, "indexer_k_pooled", il);
-    if (llama_qsa_dump_enabled()) {
+    if (!idx_norm_rope && llama_qsa_dump_enabled()) {
         pooled = ggml_cont(ctx0, pooled);
         ggml_format_name(pooled, "indexer_dbg_kpool-%d", il);
     }
 
-    // count blocks along ne1: rms_norm launches gridDim.y = ne2, capped at 65535, and 262144/4 = 65536
-    pooled = ggml_reshape_3d(ctx0, pooled, idx_dim, n_blocks*n_stream, 1);
-    pooled = build_norm(pooled, model.layers[il].index_k_norm, nullptr, LLM_NORM_RMS, il);
+    if (!idx_norm_rope) {
+        // count blocks along ne1: rms_norm launches gridDim.y = ne2, capped at 65535, and 262144/4 = 65536
+        pooled = ggml_reshape_3d(ctx0, pooled, idx_dim, n_blocks*n_stream, 1);
+        pooled = build_norm(pooled, model.layers[il].index_k_norm, nullptr, LLM_NORM_RMS, il);
 
-    // rope wants [n_dims, n_head, n_tokens]: lay every stream's blocks flat, split after.
-    pooled = ggml_reshape_3d(ctx0, pooled, idx_dim, 1, n_blocks*n_stream);
-    pooled = ggml_rope_multi(ctx0, pooled, inp->blk_pos, nullptr,
-            n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
-            ext_factor, attn_factor, beta_fast, beta_slow);
-    pooled = ggml_reshape_3d(ctx0, pooled, idx_dim, n_blocks, n_stream);
+        // rope wants [n_dims, n_head, n_tokens]: lay every stream's blocks flat, split after.
+        pooled = ggml_reshape_3d(ctx0, pooled, idx_dim, 1, n_blocks*n_stream);
+        pooled = ggml_rope_multi(ctx0, pooled, inp->blk_pos, nullptr,
+                n_rot, sections, rope_type, n_ctx_orig, freq_base, freq_scale,
+                ext_factor, attn_factor, beta_fast, beta_slow);
+        pooled = ggml_reshape_3d(ctx0, pooled, idx_dim, n_blocks, n_stream);
+    }
     cb(pooled, "indexer_k", il);
+    if (llama_qsa_dump_enabled()) {
+        pooled = ggml_cont(ctx0, pooled);
+        ggml_format_name(pooled, "indexer_ktrans_dump-%d", il);
+    }
 
     ggml_tensor * q = build_lora_mm(model.layers[il].index_q_proj, cur);
     q = ggml_reshape_3d(ctx0, q, idx_dim, n_idx_h, n_tokens);
