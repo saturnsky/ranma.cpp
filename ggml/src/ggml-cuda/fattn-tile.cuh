@@ -215,6 +215,8 @@ static constexpr __host__ __device__ uint32_t ggml_cuda_fattn_tile_get_config_am
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256,  2, 256, 2, 128,  64)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256,  4, 256, 2,  64, 128)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256,  8, 256, 2,  64, 128)
+    // 12 columns (one query row of a GQA-12 head group) need a warp count that divides 12: six warps, two columns each.
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 12, 192, 2,  32, 256)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 16, 256, 2,  32, 128)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 32, 256, 2,  32, 128)
 
@@ -293,6 +295,7 @@ static constexpr __host__ __device__ uint32_t ggml_cuda_fattn_tile_get_config_am
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256,  2,  64, 8,  32,  64)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256,  4, 128, 6,  32, 256)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256,  8, 128, 6,  32, 256)
+    GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 12, 192, 5,  32, 256)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 16, 256, 5,  32, 256)
     GGML_CUDA_FATTN_TILE_CONFIG_CASE(256, 256, 32, 256, 3,  64, 128)
 
@@ -1251,6 +1254,30 @@ static void launch_fattn_tile_switch_ncols2(ggml_backend_cuda_context & ctx, ggm
     const bool nvidia = GGML_CUDA_CC_IS_NVIDIA(ggml_cuda_info().devices[ggml_cuda_get_device()].cc);
     const int gqa_limit = nvidia && gqa_ratio <= 4 && DV <= 256 ? 16 : INT_MAX;
     const bool use_gqa_opt = mask && max_bias == 0.0f && Q->ne[1] <= gqa_limit && K->ne[1] % FATTN_KQ_STRIDE == 0;
+
+#ifdef GGML_USE_HIP
+    // A GQA ratio of 12 is not a power of two, so the generic switch below falls to 4 columns and reads every
+    // K/V head three times. For one query row (token generation) a 12-column block reads each head once.
+    // GGML_HIP_FATTN_GQA12=0 disables this path; the variable is read once per process.
+    static const bool hip_fattn_gqa12 = [] {
+        const char * value = getenv("GGML_HIP_FATTN_GQA12");
+        return !value || atoi(value) != 0;
+    }();
+    if constexpr (DKQ == 256 && DV == 256) {
+        if (hip_fattn_gqa12 && use_gqa_opt && Q->ne[1] == 1 && gqa_ratio % 12 == 0) {
+            constexpr int ncols1 = 1;
+            constexpr int ncols2 = 12;
+            const int id        = ggml_cuda_get_device();
+            const int cc        = ggml_cuda_info().devices[id].cc;
+            const int warp_size = 32;
+            const int nwarps    = ggml_cuda_fattn_tile_get_nthreads (DKQ, DV, ncols1*ncols2, cc) / warp_size;
+            const int nbatch_fa = ggml_cuda_fattn_tile_get_nbatch_fa(DKQ, DV, ncols1*ncols2, cc);
+            fattn_kernel_t fattn_kernel = flash_attn_tile<DKQ, DV, ncols1, ncols2, use_logit_softcap>;
+            launch_fattn<DV, ncols1, ncols2>(ctx, dst, fattn_kernel, nwarps, 0, nbatch_fa, true, true, false, false, warp_size);
+            return;
+        }
+    }
+#endif // GGML_USE_HIP
 
     if constexpr (DKQ == 320) {
         // This branch is only used for Mistral Small 4 which has a GQA ratio of 32.

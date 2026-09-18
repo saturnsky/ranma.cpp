@@ -79,6 +79,9 @@ applies, how to switch it, and its limits.
   [docs/ranma/rdna4-small-batch.md](docs/ranma/rdna4-small-batch.md)
 - **Four rows per block at one column** - single-token decode of a wide matrix reads the activation once per
   four weight rows; chosen per call from the matrix size. Same page.
+- **12-column tile attention for GQA-12 groups** - token generation on a model whose head group is a multiple
+  of twelve reads each K/V head once instead of three times. `GGML_HIP_FATTN_GQA12=0` restores the upstream
+  dispatch. Same page.
 
 ## Building
 
