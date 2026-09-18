@@ -1,4 +1,17 @@
-# RDNA4 small-batch matmul (HIP)
+# RDNA4 small-batch kernels (HIP)
+
+Two related pieces of the single-token and few-token path on HIP: the dispatch of the quantized
+dense matrix multiplication, and a tile flash-attention block shape for head groups of twelve.
+
+## Environment switches
+
+| Name | Default | Effect of the non-default value |
+| --- | --- | --- |
+| `GGML_HIP_FATTN_GQA12` | `1` (on) | `0` removes the 12-column tile attention dispatch below, so the selection falls back to the upstream one. Kept as the reference path for equivalence checks; read once per process. |
+
+The matmul dispatch has no switch and no CLI option.
+
+# Dense matmul dispatch
 
 ## What it is
 
@@ -121,3 +134,46 @@ differ from the MMVQ ones in the same way outputs at nine columns and above alwa
   curve no longer falls at the crossover.
 - Multi-slot decode throughput, the non-speculative way to reach 3..8 columns per call, is visible
   in `llama-batched-bench -npl 1,2,4,8`.
+
+# 12-column tile attention for GQA-12 head groups
+
+## What it is
+
+The tile flash-attention dispatch (`ggml/src/ggml-cuda/fattn-tile.cuh`) only knows blocks of 8, 4
+and 2 columns per K/V head, where a column is one head of the query group. A GQA ratio of twelve is
+not a power of two, so it falls back to four columns and reads every K/V head three times.
+
+On HIP, a single query row whose group size is a multiple of twelve now launches a 12-column block
+for 256-wide heads: 192 threads, six warps of two columns each, which is the warp count that divides
+twelve. Each K/V head is read once. The configuration tables of both AMD tile paths get the matching
+256/256/12 entry; the kernel itself is the existing tile template instantiated with one query row
+and twelve columns.
+
+## When it applies
+
+- a HIP build, and
+- head sizes 256 for both K and V, and
+- exactly one query row, which is token generation, and
+- a GQA ratio that is a multiple of twelve, and
+- the conditions under which the tile path already uses the GQA optimization: a mask is present,
+  there is no ALiBi slope, and the KV length is a multiple of the kernel's KV stride.
+
+Prompt processing, other head sizes and other GQA ratios keep the upstream dispatch.
+
+## Limits
+
+- The condition is a multiple of twelve, so ratios of 24, 36 and 48 also take the 12-column block
+  and read each head 2, 3 or 4 times - still fewer than the fallback, but not the single read that
+  a ratio of exactly twelve gets.
+- The path is compiled and selected for every HIP target, not only for RDNA4. Non-RDNA AMD devices
+  have a 64-lane physical warp while the tile path launches with a fixed 32-lane warp width, and
+  that combination was not measured. `GGML_HIP_FATTN_GQA12=0` is the way to take it out of the
+  selection there.
+- The block shape exists for 256-wide heads only.
+
+## How to verify
+
+- `test-backend-ops -o FLASH_ATTN_EXT` contains two cases with 12:1 head groups and F16 K/V at KV
+  512 and 8192; they exercise exactly this block shape.
+- An A/B against `GGML_HIP_FATTN_GQA12=0` on a model with a GQA ratio of twelve shows the effect on
+  the `FLASH_ATTN_EXT` operation time and on decode throughput at depth.
