@@ -125,6 +125,8 @@ applies, how to switch it, and its limits.
 - **Finite host tier with file backing (Windows)** - `--expert-l2-mib N` bounds the host memory of the cache;
   what fits in neither VRAM nor that budget stays in the GGUF file and is read on demand into a ring of host
   slots that the kernels address directly. [docs/ranma/expert-cache-l2.md](docs/ranma/expert-cache-l2.md)
+- **`llama-perplexity` takes the expert cache options**, with the cache frozen, so a model whose routed experts
+  do not fit in VRAM can be scored without `--n-cpu-moe`.
 
 ## Building
 

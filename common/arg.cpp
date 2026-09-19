@@ -3895,21 +3895,21 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
             params.expert_l1_mib = value;
         }
-    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_EXPERT_L1_MIB"));
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PERPLEXITY}).set_env("LLAMA_ARG_EXPERT_L1_MIB"));
     add_opt(common_arg(
         {"--expert-cache-mode"}, "MODE",
         string_format("how the expert cache holds the weights: inclusive or exclusive (default: %s)", params.expert_cache_mode.c_str()),
         [](common_params & params, const std::string & value) {
             params.expert_cache_mode = value;
         }
-    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_EXPERT_CACHE_MODE"));
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PERPLEXITY}).set_env("LLAMA_ARG_EXPERT_CACHE_MODE"));
     add_opt(common_arg(
         {"--expert-profile-dir"}, "DIR",
         "root directory of the expert profiles; omitted = seeded fixed placement without profiling",
         [](common_params & params, const std::string & value) {
             params.expert_profile_dir = value;
         }
-    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_EXPERT_PROFILE_DIR"));
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PERPLEXITY}).set_env("LLAMA_ARG_EXPERT_PROFILE_DIR"));
     add_opt(common_arg(
         {"--expert-prefill-swap"},
         "keep the plan of the prompt-processing profile in the expert cache while a prompt is processed and "
@@ -3918,7 +3918,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params) {
             params.expert_prefill_swap = true;
         }
-    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_EXPERT_PREFILL_SWAP"));
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PERPLEXITY}).set_env("LLAMA_ARG_EXPERT_PREFILL_SWAP"));
     add_opt(common_arg(
         {"--expert-l2-mib"}, "N",
         string_format("host memory budget in MiB for the expert cache (default: %d; -1 = unlimited)\n"
@@ -3931,7 +3931,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
             params.expert_l2_mib = value;
         }
-    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PERPLEXITY}));
     add_opt(common_arg(
         {"--expert-l2-staging-mib"}, "N",
         "size in MiB of the staging ring the SSD tier reads into (default: 0 = automatic); sets both ring sizes "
@@ -3939,14 +3939,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, int value) {
             params.expert_l2_staging_mib = value;
         }
-    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PERPLEXITY}));
     add_opt(common_arg(
         {"--expert-l2-prefill-ring-mib"}, "N",
         "staging ring size in MiB while a prompt is processed (default: the staging value; 0 = automatic)",
         [](common_params & params, int value) {
             params.expert_l2_prefill_ring_mib = value;
         }
-    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PERPLEXITY}));
     add_opt(common_arg(
         {"--expert-l2-decode-ring-mib"}, "N",
         "staging ring size in MiB while tokens are generated (default: the staging value; 0 = automatic); the "
@@ -3955,36 +3955,36 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params, int value) {
             params.expert_l2_decode_ring_mib = value;
         }
-    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PERPLEXITY}));
     add_opt(common_arg(
         {"--expert-seed"}, "N", "seed for fixed random expert placement (default: 1)",
         [](common_params & params, int value) { params.expert_seed = value; }
-    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PERPLEXITY}));
     add_opt(common_arg(
         {"--expert-l2-worker-cpu"}, "N", "logical CPU for the L2 worker (-1 = last active logical CPU; default: -1)",
         [](common_params & params, int value) { params.expert_l2_worker_cpu = value; }
-    ).set_examples({LLAMA_EXAMPLE_SERVER}));
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PERPLEXITY}));
     add_opt(common_arg(
         {"--expert-freeze"},
         "keep the expert cache contents as they are and only collect the profile (default: off)",
         [](common_params & params) {
             params.expert_freeze = true;
         }
-    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_EXPERT_FREEZE"));
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PERPLEXITY}).set_env("LLAMA_ARG_EXPERT_FREEZE"));
     add_opt(common_arg(
         {"--expert-profile-archive"},
         "keep the profile records that leave the score window under archive/ instead of deleting them (default: off)",
         [](common_params & params) {
             params.expert_profile_archive = true;
         }
-    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_EXPERT_PROFILE_ARCHIVE"));
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PERPLEXITY}).set_env("LLAMA_ARG_EXPERT_PROFILE_ARCHIVE"));
     add_opt(common_arg(
         {"--expert-profile-reset"},
         "discard the stored expert profiles at startup (default: off)",
         [](common_params & params) {
             params.expert_profile_reset = true;
         }
-    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_EXPERT_PROFILE_RESET"));
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PERPLEXITY}).set_env("LLAMA_ARG_EXPERT_PROFILE_RESET"));
     add_opt(common_arg(
         {"--simple-io"},
         "use basic IO for better compatibility in subprocesses and limited consoles",

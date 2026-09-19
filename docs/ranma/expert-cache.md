@@ -124,6 +124,11 @@ described in `expert-cache-l2.md`.
 run with no cache, a run from the seeded placement that writes a profile, or a run from a profile
 written earlier, and reports a `ctl ms` column that separates policy and install time from compute.
 
+`llama-perplexity` accepts the same options. It runs the cache frozen: it reports the budget and
+never profiles or changes the placement, so a scoring run leaves the profile directory as it found
+it, and two runs with the same seed or the same stored profile score the same placement. This is the
+supported way to score a model whose routed experts do not fit in VRAM.
+
 | Environment switch | Default | Effect |
 |---|---|---|
 | `RANMA_EXPERT_TRACE=<mask>` | 0 | Bit mask of log lines: 1 install, 2 profile, 4 prompt processing, 8 host tier and per-commit round lines. |
