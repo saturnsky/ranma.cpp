@@ -46,7 +46,9 @@ public:
                llama_memory_t   mem_other,
         const layer_filter_cb & filter,
         const  layer_reuse_cb & reuse,
-        const  layer_share_cb & share);
+        const  layer_share_cb & share,
+        // optional external K storage for the SWA half only (see llama_kv_cache::k_storage_info)
+        const llama_kv_cache::layer_k_storage_cb & k_storage_swa = nullptr);
 
     ~llama_kv_cache_iswa() = default;
 

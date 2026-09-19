@@ -182,6 +182,8 @@ applies, how to switch it, and its limits.
   fallback. Same page.
 - **Fused KV compressor** - gather, per-feature softmax and weighted sum in one op. Same page.
 - **No dummy HCA compression** on the decode steps in which no block completes. Same page.
+- **Raw and compressed K of a layer in one tensor**, so the attention reads a view instead of a concatenated
+  copy on every token. Same page.
 
 ## Building
 
