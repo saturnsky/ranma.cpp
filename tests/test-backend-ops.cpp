@@ -4344,6 +4344,90 @@ struct test_dsv4_hc : public test_case {
     }
 };
 
+struct test_dsv4_compress : public test_case {
+    const int64_t n_embd_head;
+    const int64_t ratio;
+    const int64_t n_blocks;
+    const bool    overlap;
+    const bool    missing_prev; // first block's previous window uses the sentinel row
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "DSV4_COMPRESS";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR5(n_embd_head, ratio, n_blocks, overlap, missing_prev);
+    }
+
+    double max_nmse_err() override {
+        return 5e-6;
+    }
+
+    test_dsv4_compress(int64_t n_embd_head = 512, int64_t ratio = 4, int64_t n_blocks = 1,
+            bool overlap = true, bool missing_prev = false)
+        : n_embd_head(n_embd_head), ratio(ratio), n_blocks(n_blocks),
+          overlap(overlap), missing_prev(missing_prev) {}
+
+    int64_t n_rows() const {
+        return ratio*(n_blocks + 1) + 7;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t n_cols = overlap ? 2*n_embd_head : n_embd_head;
+
+        ggml_tensor * kv = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_cols, n_rows());
+        ggml_set_name(kv, "kv");
+
+        ggml_tensor * score = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_cols, n_rows());
+        ggml_set_name(score, "score");
+
+        ggml_tensor * idxs = ggml_new_tensor_1d(ctx, GGML_TYPE_I32,
+                (overlap ? 2*ratio : ratio)*n_blocks);
+        ggml_set_name(idxs, "idxs");
+
+        ggml_tensor * out = ggml_dsv4_compress(ctx, kv, score, idxs, (int32_t) ratio, overlap);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type != GGML_TYPE_I32) {
+                init_tensor_uniform(t, -2.0f, 2.0f);
+                continue;
+            }
+
+            // contiguous windows, as the model's read plan builds them:
+            // [ all blocks' previous window | all blocks' current window ]
+            const int64_t n_idx = ggml_nelements(t);
+            std::vector<int32_t> data(n_idx);
+            for (int64_t ib = 0; ib < n_blocks; ++ib) {
+                for (int64_t j = 0; j < ratio; ++j) {
+                    if (overlap) {
+                        // block ib covers rows [ib*ratio, ib*ratio + ratio), its
+                        // previous window the ratio rows before that
+                        const int64_t prev = ib*ratio + j;               // shifted by one window
+                        const int64_t cur  = (ib + 1)*ratio + j;
+                        data[ib*ratio + j]                  = (int32_t) prev;
+                        data[ratio*n_blocks + ib*ratio + j] = (int32_t) cur;
+                    } else {
+                        data[ib*ratio + j] = (int32_t) (ib*ratio + j);
+                    }
+                }
+            }
+            if (missing_prev) {
+                GGML_ASSERT(overlap);
+                for (int64_t j = 0; j < ratio; ++j) {
+                    data[j] = (int32_t) n_rows(); // sentinel: zero value, -INFINITY score
+                }
+            }
+            ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(int32_t));
+        }
+    }
+};
+
 struct test_dsv4_hc_comb : public test_dsv4_hc {
     const int64_t n_tokens;
     const int32_t n_iter;
@@ -9465,6 +9549,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_hc_coef(1, 1));
     test_cases.emplace_back(new test_dsv4_hc_coef(17, 4));
     test_cases.emplace_back(new test_dsv4_hc_coef(257, 8));
+    // DeepSeek V4 KV compressor: CSA/HCA head dim 512, indexer head dim 128
+    test_cases.emplace_back(new test_dsv4_compress(512,   4,   1, true,  false));
+    test_cases.emplace_back(new test_dsv4_compress(512,   4,   1, true,  true));
+    test_cases.emplace_back(new test_dsv4_compress(512,   4, 128, true,  false));
+    test_cases.emplace_back(new test_dsv4_compress(512,   4, 128, true,  true));
+    test_cases.emplace_back(new test_dsv4_compress(128,   4,   1, true,  false));
+    test_cases.emplace_back(new test_dsv4_compress(128,   4,   1, true,  true));
+    test_cases.emplace_back(new test_dsv4_compress(128,   4, 128, true,  false));
+    test_cases.emplace_back(new test_dsv4_compress(128,   4, 128, true,  true));
+    test_cases.emplace_back(new test_dsv4_compress(512, 128,   1, false, false));
+    test_cases.emplace_back(new test_dsv4_compress(512, 128,   4, false, false));
+    test_cases.emplace_back(new test_dsv4_compress( 37,   4,   3, true,  true));
+    test_cases.emplace_back(new test_dsv4_compress( 37, 128,   2, false, false));
 
     test_cases.emplace_back(new test_dsv4_hc_pre(1, 4, 1));
     test_cases.emplace_back(new test_dsv4_hc_pre(31, 4, 17));

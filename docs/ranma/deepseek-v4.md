@@ -182,3 +182,60 @@ turns the fusion off there.
 - The load log reports `fused DeepSeek V4 HC coefficients enabled` or, if the
   probe rejected the op, that it is disabled.
 - `LLAMA_DSV4_HC_COEF_FUSED=0` gives the unfused graph for a comparison run.
+
+## Fused KV compressor
+
+### What it is
+
+The compressed caches are filled by a compressor: when a block of `ratio` raw
+cells is complete, the compressor reads the value and the score state of those
+cells, takes a softmax over the block independently per feature, and writes the
+weighted sum as one compressed cell. The model uses two variants: ratio 128 for
+the HCA layers, and an overlapping ratio 4 for the CSA layers and the indexer,
+where each block reads the previous window as well as the current one and takes
+the low half of the features from the previous and the high half from the
+current window.
+
+That was a chain of two `get_rows`, permutes with `cont`, `soft_max`, `mul` and
+`sum_rows`, and for the overlapping variant additional zero-row appends,
+strided copies and concatenations. `GGML_OP_DSV4_COMPRESS` does the gather, the
+per-feature softmax over the gathered rows and the weighted sum in one kernel.
+It reads the value state, the score state and the row indices of the compress
+plan, and writes one column per block. The norm and rope tail of the compressor
+is unchanged.
+
+### The missing-segment convention
+
+The first block of a sequence has no previous window. Instead of appending a
+zero row to the state and pointing at it, the plan writes an index outside the
+state. The op treats any index that is not inside the state as a missing row:
+its value reads as 0 and its score as `-INFINITY`, so it contributes nothing to
+the softmax. The comparison is made on the unsigned value of the index, so a
+negative index is out of range as well and cannot address memory in front of
+the state.
+
+### Switches
+
+| Switch | Default | Effect |
+|---|---|---|
+| `LLAMA_DSV4_COMPRESSOR_FUSED=0` | on | Build the previous op chain instead. The reference path for equivalence checks. |
+
+### Limits and fallbacks
+
+- The op takes part in the same fused-op probe as the hyper-connection
+  coefficients, so on a backend that does not implement it the graph falls back
+  to the op chain.
+- The CUDA/HIP implementation is selected only for F32 value and score states
+  with a unit first stride and contiguous `I32` indices; anything else is left
+  to the CPU implementation.
+- Results are not bit-identical to the op chain: the softmax and the weighted
+  sum are reduced in one pass in a different order.
+
+### How to verify
+
+- `test-backend-ops -o DSV4_COMPRESS` covers the shapes of the model (head size
+  512 and 128, ratio 4 with overlap and ratio 128, a single block and a full
+  batch of blocks), a head size that is not a multiple of the thread block, and
+  the missing-segment sentinel.
+- The load log reports whether the fused compressor is enabled.
+- `LLAMA_DSV4_COMPRESSOR_FUSED=0` gives the op chain for a comparison run.

@@ -188,6 +188,7 @@ applies, how to switch it, and its limits.
   [docs/ranma/deepseek-v4.md](docs/ranma/deepseek-v4.md)
 - **Hyper-connection coefficients in one op** with a backend capability probe and the upstream ops as the
   fallback. Same page.
+- **Fused KV compressor** - gather, per-feature softmax and weighted sum in one op. Same page.
 
 ## Building
 
