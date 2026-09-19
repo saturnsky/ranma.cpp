@@ -1085,6 +1085,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "DSV4_HC_PRE",
     "DSV4_HC_POST",
     "DSV4_HC_COEF",
+    "DSV4_COMPRESS",
 
     "UNARY",
 
@@ -1102,7 +1103,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1201,6 +1202,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "dsv4_hc_pre(x, weights)",
     "dsv4_hc_post(x, residual, post, comb)",
     "dsv4_hc_coef(mixes, scale, base)",
+    "dsv4_compress(kv, score, idxs)",
 
     "unary(x)",
 
@@ -1218,7 +1220,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6666,6 +6668,59 @@ struct ggml_tensor * ggml_dsv4_hc_post(
     result->src[1] = residual;
     result->src[2] = post;
     result->src[3] = comb;
+
+    return result;
+}
+
+// ggml_dsv4_compress
+
+struct ggml_tensor * ggml_dsv4_compress(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * kv,
+        struct ggml_tensor  * score,
+        struct ggml_tensor  * idxs,
+        int32_t               ratio,
+        bool                  overlap) {
+    GGML_ASSERT(kv    != NULL);
+    GGML_ASSERT(score != NULL);
+    GGML_ASSERT(idxs  != NULL);
+
+    GGML_ASSERT(kv->type    == GGML_TYPE_F32);
+    GGML_ASSERT(score->type == GGML_TYPE_F32);
+    GGML_ASSERT(idxs->type  == GGML_TYPE_I32);
+
+    GGML_ASSERT(ratio > 0);
+
+    GGML_ASSERT(kv->nb[0]    == sizeof(float));
+    GGML_ASSERT(score->nb[0] == sizeof(float));
+    GGML_ASSERT(ggml_is_contiguous(idxs));
+
+    GGML_ASSERT(kv->ne[0] == score->ne[0]);
+    GGML_ASSERT(kv->ne[1] == score->ne[1]);
+    GGML_ASSERT(kv->ne[2] == 1 && kv->ne[3] == 1);
+    GGML_ASSERT(score->ne[2] == 1 && score->ne[3] == 1);
+    GGML_ASSERT(idxs->ne[1] == 1 && idxs->ne[2] == 1 && idxs->ne[3] == 1);
+
+    const int64_t n_per_block = overlap ? 2*ratio : ratio;
+    const int64_t n_embd_head = overlap ? kv->ne[0]/2 : kv->ne[0];
+
+    GGML_ASSERT(n_embd_head > 0);
+    GGML_ASSERT(!overlap || kv->ne[0] % 2 == 0);
+    GGML_ASSERT(idxs->ne[0] % n_per_block == 0);
+
+    const int64_t n_blocks = idxs->ne[0]/n_per_block;
+
+    GGML_ASSERT(n_blocks > 0);
+
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd_head, 1, n_blocks);
+
+    ggml_set_op_params_i32(result, 0, ratio);
+    ggml_set_op_params_i32(result, 1, overlap ? 1 : 0);
+
+    result->op     = GGML_OP_DSV4_COMPRESS;
+    result->src[0] = kv;
+    result->src[1] = score;
+    result->src[2] = idxs;
 
     return result;
 }
