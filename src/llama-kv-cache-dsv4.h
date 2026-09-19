@@ -153,6 +153,30 @@ public:
     void reset_rs_idx_for_ubatches(const std::vector<llama_ubatch> & ubatches);
 
 private:
+    // joint raw + compressed K storage, allocated before the sub-caches so that they can view it
+    struct kall_layer {
+        ggml_tensor * joint    = nullptr;
+        ggml_tensor * view_raw = nullptr;
+        ggml_tensor * view_cmp = nullptr;
+
+        // set once the raw cache has accepted the joint storage for this layer
+        bool raw_ok = false;
+    };
+
+    uint32_t kall_raw_size = 0;
+
+    void init_kall(
+            const llama_model & model,
+                    ggml_type   type_k,
+                         bool   offload,
+                         bool   swa_full,
+                     uint32_t   kv_size,
+                     uint32_t   n_seq_max,
+                     uint32_t   n_ubatch);
+
+    std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> ctxs_bufs_kall;
+    std::unordered_map<int32_t, kall_layer> kall_layers;
+
     llama_hparams hparams_raw;
     llama_hparams hparams_csa;
     llama_hparams hparams_hca;
@@ -251,6 +275,10 @@ public:
 
     ggml_tensor * get_k(ggml_context * ctx, int32_t il) const;
     ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const;
+
+    // view of [n_raw + n_comp] cells of the joint raw/compressed K storage of the layer
+    // returns nullptr when the layer has no joint storage (then the caller has to concat)
+    ggml_tensor * get_k_joint(ggml_context * ctx, int32_t il, uint32_t n_raw, uint32_t n_comp) const;
 
     ggml_tensor * build_input_k_rot(ggml_context * ctx) const;
     void set_input_k_rot(ggml_tensor * dst) const;

@@ -1222,6 +1222,185 @@ size_t llama_dsv4_comp_state::total_size() const {
 // llama_kv_cache_dsv4
 //
 
+// env: LLAMA_DSV4_KALL_VIEW (default 1)
+// 1 = raw and compressed K of a layer live in one allocation and attention reads them as a single
+//     view; 0 = the previous layout, attention concatenates the two caches every token
+static bool dsv4_kall_view_enabled() {
+    static const bool res = []() {
+        const char * env = getenv("LLAMA_DSV4_KALL_VIEW");
+        return env == nullptr || atoi(env) != 0;
+    }();
+
+    return res;
+}
+
+void llama_kv_cache_dsv4::init_kall(
+        const llama_model & model,
+                ggml_type   type_k,
+                     bool   offload,
+                     bool   swa_full,
+                 uint32_t   kv_size,
+                 uint32_t   n_seq_max,
+                 uint32_t   n_ubatch) {
+    if (!dsv4_kall_view_enabled()) {
+        LLAMA_LOG_INFO("%s: DSV4 joint raw+compressed K layout disabled (LLAMA_DSV4_KALL_VIEW=0)\n", __func__);
+        return;
+    }
+
+    // the joint layout places the raw cells of a layer directly in front of its compressed cells,
+    // which only has a single well-defined stride with one stream
+    if (n_seq_max != 1) {
+        LLAMA_LOG_INFO("%s: DSV4 joint raw+compressed K layout disabled (n_seq_max = %u > 1)\n", __func__, n_seq_max);
+        return;
+    }
+
+    if (model.hparams.no_alloc) {
+        return;
+    }
+
+    // same sizing as llama_kv_cache_iswa - the DSV4 raw cache is never unified
+    const uint32_t size_swa = swa_full ? kv_size : GGML_PAD(std::min(kv_size, hparams_raw.n_swa + n_ubatch), 256u);
+
+    const uint32_t size_csa = GGML_PAD(dsv4_comp_size(kv_size, DSV4_CSA_RATIO), 256u);
+    const uint32_t size_hca = GGML_PAD(dsv4_comp_size(kv_size, DSV4_HCA_RATIO), 256u);
+
+    struct ggml_backend_buft_comparator {
+        bool operator()(const ggml_backend_buffer_type_t & lhs, const ggml_backend_buffer_type_t & rhs) const {
+            return strcmp(ggml_backend_buft_name(lhs), ggml_backend_buft_name(rhs)) < 0;
+        }
+    };
+
+    std::map<ggml_backend_buffer_type_t, ggml_context_ptr, ggml_backend_buft_comparator> ctx_map;
+
+    const uint32_t n_layer = hparams_raw.n_layer_all;
+
+    auto ctx_for_buft = [&](ggml_backend_buffer_type_t buft) -> ggml_context * {
+        auto it = ctx_map.find(buft);
+        if (it == ctx_map.end()) {
+            ggml_init_params params = {
+                /*.mem_size   =*/ size_t(4u*n_layer*ggml_tensor_overhead()),
+                /*.mem_buffer =*/ NULL,
+                /*.no_alloc   =*/ true,
+            };
+
+            ggml_context * ctx = ggml_init(params);
+            if (!ctx) {
+                return nullptr;
+            }
+
+            ctx_map.emplace(buft, ctx);
+
+            return ctx;
+        }
+
+        return it->second.get();
+    };
+
+    struct kall_plan {
+        int32_t        il;
+        uint32_t       n_cmp;
+        ggml_context * ctx;
+    };
+
+    std::vector<kall_plan> plan;
+
+    for (uint32_t il = 0; il < hparams_raw.n_layer(); ++il) {
+        const uint32_t ratio = model.hparams.dsv4_compress_ratios[il];
+
+        if (ratio != DSV4_CSA_RATIO && ratio != DSV4_HCA_RATIO) {
+            continue;
+        }
+
+        if (!hparams_raw.has_kv(il)) {
+            continue;
+        }
+
+        // the raw K of a DSV4 layer has to live in the SWA half of the raw cache
+        if (!hparams_raw.is_swa(il)) {
+            LLAMA_LOG_WARN("%s: DSV4 joint raw+compressed K layout disabled (layer %u is not SWA)\n", __func__, il);
+            kall_layers.clear();
+            ctx_map.clear();
+            return;
+        }
+
+        const uint32_t n_embd_k_gqa = hparams_raw.n_embd_k_gqa(il);
+
+        const llama_hparams & hparams_cmp = ratio == DSV4_CSA_RATIO ? hparams_csa : hparams_hca;
+
+        // the concatenated layout requires identical rows in both caches, and get_k_joint shapes the
+        // joint view with the compressed hparams, so the head split has to match as well
+        GGML_ASSERT(n_embd_k_gqa                  == hparams_cmp.n_embd_k_gqa(il));
+        GGML_ASSERT(hparams_raw.n_embd_head_k(il) == hparams_cmp.n_embd_head_k(il));
+        GGML_ASSERT(hparams_raw.n_head_kv(il)     == hparams_cmp.n_head_kv(il));
+
+        const uint32_t n_cmp = ratio == DSV4_CSA_RATIO ? size_csa : size_hca;
+
+        ggml_backend_buffer_type_t buft = ggml_backend_cpu_buffer_type();
+        if (offload) {
+            buft = ggml_backend_dev_buffer_type(model.dev_layer(il));
+        }
+
+        ggml_context * ctx = ctx_for_buft(buft);
+        if (!ctx) {
+            throw std::runtime_error("failed to create ggml context for the DSV4 joint K storage");
+        }
+
+        ggml_tensor * joint = ggml_new_tensor_3d(ctx, type_k, n_embd_k_gqa, size_swa + n_cmp, 1);
+        ggml_format_name(joint, "cache_kall_l%d", il);
+
+        kall_layers[il].joint = joint;
+
+        plan.push_back({ (int32_t) il, n_cmp, ctx });
+    }
+
+    if (kall_layers.empty()) {
+        return;
+    }
+
+    for (auto & [buft, ctx] : ctx_map) {
+        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft);
+        if (!buf) {
+            throw std::runtime_error("failed to allocate buffer for the DSV4 joint K storage");
+        }
+
+        LLAMA_LOG_INFO("%s: %10s DSV4 joint K buffer size = %8.2f MiB\n", __func__,
+                ggml_backend_buffer_name(buf), ggml_backend_buffer_get_size(buf)/1024.0/1024.0);
+
+        ggml_backend_buffer_clear(buf, 0);
+        ctxs_bufs_kall.emplace_back(std::move(ctx), buf);
+    }
+
+    // the sub-caches receive views of the joint tensors as their K storage
+    for (const auto & p : plan) {
+        const int32_t  il    = p.il;
+        const uint32_t n_cmp = p.n_cmp;
+        ggml_context * ctx   = p.ctx;
+
+        auto & kl = kall_layers[il];
+
+        ggml_tensor * joint = kl.joint;
+
+        kl.view_raw = ggml_view_3d(ctx, joint, joint->ne[0], size_swa, 1,
+                joint->nb[1], joint->nb[1]*size_swa, 0);
+        ggml_format_name(kl.view_raw, "cache_kall_raw_l%d", il);
+
+        kl.view_cmp = ggml_view_3d(ctx, joint, joint->ne[0], n_cmp, 1,
+                joint->nb[1], joint->nb[1]*n_cmp, size_swa*joint->nb[1]);
+        ggml_format_name(kl.view_cmp, "cache_kall_cmp_l%d", il);
+
+        const ggml_status st_raw = ggml_backend_view_init(kl.view_raw);
+        const ggml_status st_cmp = ggml_backend_view_init(kl.view_cmp);
+        if (st_raw != GGML_STATUS_SUCCESS || st_cmp != GGML_STATUS_SUCCESS) {
+            throw std::runtime_error("failed to initialize the DSV4 joint K views");
+        }
+    }
+
+    kall_raw_size = size_swa;
+
+    LLAMA_LOG_INFO("%s: DSV4 joint raw+compressed K layout enabled for %d layers, raw prefix = %u cells\n",
+            __func__, (int) kall_layers.size(), kall_raw_size);
+}
+
 llama_kv_cache_dsv4::llama_kv_cache_dsv4(
         const llama_model & model,
                 ggml_type   type_k,
@@ -1263,17 +1442,58 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
     hparams_hca.n_layer_nextn = 0;
     hparams_lid.n_layer_nextn = 0;
 
-    LLAMA_LOG_INFO("%s: creating DSV4 raw KV cache\n", __func__);
-
     dsv4_make_k_only(hparams_raw);
+    dsv4_make_k_only(hparams_csa);
+    dsv4_make_k_only(hparams_hca);
+
+    // one allocation per layer for the raw and the compressed K, so that the attention graph can read
+    // [raw | compressed] as a single view instead of copying both into a new tensor every token
+    init_kall(model, type_k, offload, swa_full, kv_size, n_seq_max, n_ubatch);
+
+    // the raw cache is built first: only a layer whose raw K went into the joint storage may hand the
+    // joint storage to its compressed cache, otherwise the view would read raw cells that are not there
+    const llama_kv_cache::layer_k_storage_cb kall_raw_cb =
+            [this](int32_t il, uint32_t n_embd_k_gqa, uint32_t kv_size_l, uint32_t n_stream_l) -> llama_kv_cache::k_storage_info {
+        auto it = kall_layers.find(il);
+        if (it == kall_layers.end()) {
+            return {};
+        }
+
+        ggml_tensor * view = it->second.view_raw;
+
+        if (n_stream_l != 1 || kv_size_l != kall_raw_size || n_embd_k_gqa != (uint32_t) view->ne[0]) {
+            throw std::runtime_error("DSV4 joint K storage: raw cache layout of layer " +
+                    std::to_string(il) + " differs from the joint allocation");
+        }
+
+        it->second.raw_ok = true;
+
+        return { view, it->second.joint, 0 };
+    };
+
+    const llama_kv_cache::layer_k_storage_cb kall_cmp_cb =
+            [this](int32_t il, uint32_t n_embd_k_gqa, uint32_t kv_size_l, uint32_t n_stream_l) -> llama_kv_cache::k_storage_info {
+        auto it = kall_layers.find(il);
+        if (it == kall_layers.end() || !it->second.raw_ok) {
+            return {};
+        }
+
+        ggml_tensor * view = it->second.view_cmp;
+
+        if (n_stream_l != 1 || kv_size_l != (uint32_t) view->ne[1] || n_embd_k_gqa != (uint32_t) view->ne[0]) {
+            throw std::runtime_error("DSV4 joint K storage: compressed cache layout of layer " +
+                    std::to_string(il) + " differs from the joint allocation");
+        }
+
+        return { view, it->second.joint, kall_raw_size };
+    };
+
+    LLAMA_LOG_INFO("%s: creating DSV4 raw KV cache\n", __func__);
 
     kv_raw = std::make_unique<llama_kv_cache_iswa>(
             model, hparams_raw, type_k, type_v,
             v_trans, offload, swa_full, unified_raw, kv_size, n_seq_max, n_ubatch, n_pad,
-            nullptr, filter_raw, reuse, nullptr);
-
-    dsv4_make_k_only(hparams_csa);
-    dsv4_make_k_only(hparams_hca);
+            nullptr, filter_raw, reuse, nullptr, kall_raw_cb);
 
     std::fill(hparams_lid.n_head_kv_arr.begin(), hparams_lid.n_head_kv_arr.end(), 1);
     hparams_lid.n_embd_head_k_full = model.hparams.indexer_head_size;
@@ -1307,7 +1527,7 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
     kv_csa = std::make_unique<llama_kv_cache>(
             model, hparams_csa, type_k, type_v,
             v_trans, offload, unified_compressed, GGML_PAD(dsv4_comp_size(kv_size, DSV4_CSA_RATIO), 256u), n_seq_max, n_pad,
-            0, LLAMA_SWA_TYPE_NONE, nullptr, filter_csa, nullptr, nullptr);
+            0, LLAMA_SWA_TYPE_NONE, nullptr, filter_csa, nullptr, nullptr, "", kall_cmp_cb);
 
     LLAMA_LOG_INFO("%s: creating DSV4 HCA compressed KV cache, size = %u cells\n",
             __func__, dsv4_comp_size(kv_size, DSV4_HCA_RATIO));
@@ -1315,7 +1535,7 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
     kv_hca = std::make_unique<llama_kv_cache>(
             model, hparams_hca, type_k, type_v,
             v_trans, offload, unified_compressed, GGML_PAD(dsv4_comp_size(kv_size, DSV4_HCA_RATIO), 256u), n_seq_max, n_pad,
-            0, LLAMA_SWA_TYPE_NONE, nullptr, filter_hca, nullptr, nullptr);
+            0, LLAMA_SWA_TYPE_NONE, nullptr, filter_hca, nullptr, nullptr, "", kall_cmp_cb);
 
     LLAMA_LOG_INFO("%s: creating DSV4 lightning-indexer KV cache, size = %u cells\n",
             __func__, dsv4_comp_size(kv_size, DSV4_CSA_RATIO));
@@ -1603,6 +1823,10 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache_dsv4::memory_breakdo
     for (const auto & buft_size : lid_state->memory_breakdown()) {
         mb[buft_size.first] += buft_size.second;
     }
+    // the joint raw/compressed K buffers are not owned by any of the sub-caches
+    for (const auto & [_, buf] : ctxs_bufs_kall) {
+        mb[ggml_backend_buffer_get_type(buf.get())] += ggml_backend_buffer_get_size(buf.get());
+    }
     return mb;
 }
 
@@ -1861,7 +2085,10 @@ bool llama_kv_cache_dsv4_raw_context::apply() {
     }
     if (!ubatches_write.empty()) {
         kv_swa->apply_ubatch(sinfos_write[i_next], ubatches_write[i_next]);
-        n_kv = kv_swa->get_n_kv(sinfos_read[i_next]);
+
+        // with joint raw/compressed K storage the compressed cells follow the whole raw cache, so the
+        // raw part of the attention input has a fixed size (the unused cells are masked out anyway)
+        n_kv = kv_swa->has_k_joint() ? kv_swa->get_size() : kv_swa->get_n_kv(sinfos_read[i_next]);
     }
 
     return res;
@@ -1992,6 +2219,10 @@ uint32_t llama_kv_cache_dsv4_comp_context::get_n_kv() const {
 
 ggml_tensor * llama_kv_cache_dsv4_comp_context::get_k(ggml_context * ctx, int32_t il) const {
     return kv->get_k(ctx, il, n_kv, sinfos[i_cur]);
+}
+
+ggml_tensor * llama_kv_cache_dsv4_comp_context::get_k_joint(ggml_context * ctx, int32_t il, uint32_t n_raw, uint32_t n_comp) const {
+    return kv->get_k_joint(ctx, il, n_raw, n_raw + n_comp);
 }
 
 ggml_tensor * llama_kv_cache_dsv4_comp_context::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const {

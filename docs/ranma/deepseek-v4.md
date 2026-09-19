@@ -278,3 +278,73 @@ The dummy block never contributed to any result, so output is expected to be
 unchanged, not merely close: a greedy continuation with the switch on and off
 has to agree. Rebuilds show up in the `graphs reused` counter of the
 performance summary.
+
+## Raw and compressed K of a layer in one tensor
+
+### What it is
+
+A CSA or HCA layer attends over `[raw window | compressed cells]`. The two
+halves live in two different caches, so the graph built that K with a concat,
+which copied the raw window and every compressed cell of the layer into a new
+tensor on every token; the copy grows with the context.
+
+The raw cache and the compressed cache of such a layer now share one
+allocation, the raw cells first and the compressed cells directly behind them.
+Each cache receives a view of that allocation as the K storage of the layer, so
+the attention input is a view of the joint tensor and no copy is needed. The
+allocation is made before the sub-caches are built, one buffer per buffer type,
+and it is reported in the memory breakdown.
+
+Because the compressed cells start behind the whole raw cache, the raw part of
+the attention input has a fixed size instead of the number of cells currently
+in use. The raw cache reports that fixed size for all of its sliding-window
+layers as soon as one layer uses the joint storage, so those layers attend over
+the full window; the cells that are not in use are masked out as before, so the
+result is the same.
+
+The sub-caches see ordinary K tensors, which happen to be views. Cache writes,
+the RoPE shift of a context shift, and session save and restore go through the
+same code as without the joint layout and are unaffected.
+
+### When the layout is used
+
+All of the following have to hold, otherwise the graph keeps the concat:
+
+- a single sequence: the raw prefix of a layer has a single well-defined stride
+  only with one stream,
+- the layer is a compressed layer (ratio 4 or ratio 128) that has a KV cache,
+- the layer is a sliding-window layer of the raw cache: its raw K has to live
+  in the sliding-window half. A compressed layer that is not sliding-window
+  disables the joint layout for the whole cache,
+- the raw and the compressed hparams of the layer agree on the row size and on
+  the split of that row into heads, because the joint view is shaped from the
+  compressed hparams and compared against a raw K.
+
+If a sub-cache then asks for a K storage whose size does not match the joint
+allocation, that is a bug and not a configuration, so it is reported as an
+error rather than silently ignored.
+
+### Switches
+
+| Switch | Default | Effect |
+|---|---|---|
+| `LLAMA_DSV4_KALL_VIEW=0` | on | Keep separate tensors for the raw and the compressed cache and concatenate them in the graph. Read once, when the cache is created. |
+
+### Limits and fallbacks
+
+- The concat path stays in the graph and is taken whenever the joint view is
+  not available for a layer, including the multi-sequence case.
+- The joint allocation sizes the raw half like the sliding-window cache it
+  replaces, so the memory footprint is the same as before; it is one buffer per
+  layer instead of two.
+- The output is unchanged: the same cells are read in the same order, only from
+  one tensor instead of a copy of two.
+
+### How to verify
+
+- The load log lists the joint K buffer sizes and the number of layers that use
+  the joint layout, or the reason why it is disabled.
+- A greedy continuation with `LLAMA_DSV4_KALL_VIEW=0` and with the default has
+  to agree token for token.
+- Saving and restoring a session, and a context shift, exercise the paths that
+  read the joint tensor through the sub-caches.

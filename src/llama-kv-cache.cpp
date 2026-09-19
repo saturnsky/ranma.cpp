@@ -79,7 +79,8 @@ llama_kv_cache::llama_kv_cache(
     const layer_filter_cb & filter,
     const  layer_reuse_cb & reuse,
     const  layer_share_cb & share,
-             const char *   name_tag) :
+             const char *   name_tag,
+ const layer_k_storage_cb & k_storage) :
     model(model), hparams(hparams), v_trans(v_trans),
     n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_pad(n_pad), n_swa(n_swa), swa_type(swa_type),
     other(static_cast<llama_kv_cache *>(mem_other)),
@@ -230,10 +231,29 @@ llama_kv_cache::llama_kv_cache(
         const bool has_k = true;
         const bool has_v = !is_mla;
 
-        ggml_tensor * k = has_k ? ggml_new_tensor_3d(ctx, type_k, n_embd_k_gqa, kv_size, n_stream) : nullptr;
+        // externally provided K storage (already allocated) - see k_storage_info
+        k_storage_info kst;
+        if (has_k && k_storage) {
+            kst = k_storage(il, n_embd_k_gqa, kv_size, n_stream);
+
+            if (kst.k) {
+                GGML_ASSERT(kst.k->type   == type_k);
+                GGML_ASSERT(kst.k->ne[0]  == n_embd_k_gqa);
+                GGML_ASSERT(kst.k->ne[1]  == kv_size);
+                GGML_ASSERT(kst.k->ne[2]  == n_stream);
+                GGML_ASSERT(kst.k->buffer != nullptr);
+                GGML_ASSERT(ggml_is_contiguous(kst.k));
+
+                k_joint_used = true;
+            }
+        }
+
+        ggml_tensor * k = has_k ? (kst.k ? kst.k : ggml_new_tensor_3d(ctx, type_k, n_embd_k_gqa, kv_size, n_stream)) : nullptr;
         ggml_tensor * v = has_v ? ggml_new_tensor_3d(ctx, type_v, n_embd_v_gqa, kv_size, n_stream) : nullptr;
 
-        has_k && ggml_format_name(k, "cache_%sk_l%d", name_tag, il);
+        if (has_k && !kst.k) {
+            ggml_format_name(k, "cache_%sk_l%d", name_tag, il);
+        }
         has_v && ggml_format_name(v, "cache_%sv_l%d", name_tag, il);
 
         std::vector<ggml_tensor *> k_stream;
@@ -246,7 +266,7 @@ llama_kv_cache::llama_kv_cache(
 
         map_layer_ids[il] = layers.size();
 
-        layers.push_back({ il, k, v, k_stream, v_stream, });
+        layers.push_back({ il, k, v, k_stream, v_stream, kst.joint, kst.n_prefix, });
     }
 
     if (reuse) {
@@ -284,11 +304,28 @@ llama_kv_cache::llama_kv_cache(
         } else {
             buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft); // real buffer
         }
+
+        // with externally provided K storage a context can end up holding only views of already
+        // allocated tensors - there is nothing to allocate then, but the views still need a buffer
+        bool buf_empty = false;
+        if (!buf && k_joint_used && ggml_backend_alloc_ctx_tensors_from_buft_size(ctx.get(), buft) == 0) {
+            buf = ggml_backend_buft_alloc_buffer(buft, /*size =*/ 0);
+            buf_empty = true;
+
+            for (ggml_tensor * t = ggml_get_first_tensor(ctx.get()); t != nullptr; t = ggml_get_next_tensor(ctx.get(), t)) {
+                if (t->buffer == nullptr && t->view_src != nullptr) {
+                    ggml_backend_view_init(t);
+                }
+            }
+        }
+
         if (!buf) {
             throw std::runtime_error("failed to allocate buffer for kv cache");
         }
 
-        LLAMA_LOG_INFO("%s: %10s KV buffer size = %8.2f MiB\n", __func__, ggml_backend_buffer_name(buf), ggml_backend_buffer_get_size(buf)/1024.0/1024.0);
+        if (!buf_empty) {
+            LLAMA_LOG_INFO("%s: %10s KV buffer size = %8.2f MiB\n", __func__, ggml_backend_buffer_name(buf), ggml_backend_buffer_get_size(buf)/1024.0/1024.0);
+        }
 
         ggml_backend_buffer_clear(buf, 0);
         ctxs_bufs.emplace_back(std::move(ctx), buf);
@@ -375,6 +412,15 @@ void llama_kv_cache::clear(bool data) {
     if (data) {
         for (auto & [_, buf] : ctxs_bufs) {
             ggml_backend_buffer_clear(buf.get(), 0);
+        }
+
+        // externally provided K storage lives in a buffer this cache does not own
+        if (k_joint_used) {
+            for (const auto & layer : layers) {
+                if (layer.k_joint) {
+                    ggml_backend_tensor_memset(layer.k, 0, 0, ggml_nbytes(layer.k));
+                }
+            }
         }
     }
 }
@@ -1281,6 +1327,41 @@ ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_k
             ggml_row_size(k->type, n_embd_k_gqa),
             ggml_row_size(k->type, n_embd_k_gqa*kv_size),
             ggml_row_size(k->type, n_embd_k_gqa*kv_size)*sinfo.s0);
+}
+
+bool llama_kv_cache::has_k_joint() const {
+    return k_joint_used;
+}
+
+ggml_tensor * llama_kv_cache::get_k_joint(ggml_context * ctx, int32_t il, uint32_t n_prefix, uint32_t n_kv_all) const {
+    const auto it = map_layer_ids.find(il);
+    if (it == map_layer_ids.end()) {
+        return nullptr;
+    }
+
+    const auto & layer = layers[it->second];
+
+    if (layer.k_joint == nullptr || layer.k_joint_prefix != n_prefix) {
+        return nullptr;
+    }
+
+    if (n_kv_all > (uint32_t) layer.k_joint->ne[1]) {
+        return nullptr;
+    }
+
+    ggml_tensor * k = layer.k_joint;
+
+    const uint64_t n_embd_k_gqa = k->ne[0];
+
+    // only the single-stream layout is supported - the joint tensor holds one stream
+    GGML_ASSERT(k->ne[2] == 1);
+
+    return ggml_view_4d(ctx, k,
+            hparams.n_embd_head_k(il), hparams.n_head_kv(il), n_kv_all, 1,
+            ggml_row_size(k->type, hparams.n_embd_head_k(il)),
+            ggml_row_size(k->type, n_embd_k_gqa),
+            ggml_row_size(k->type, n_embd_k_gqa*n_kv_all),
+            0);
 }
 
 ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const {

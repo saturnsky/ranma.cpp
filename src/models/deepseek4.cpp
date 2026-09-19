@@ -808,7 +808,13 @@ ggml_tensor * llama_model_deepseek4::graph::build_csa_lid_attention(
             csa_k->nb[1], csa_k->nb[2], csa_k->nb[3], 0);
     cb(csa_k, "csa_comp_k", il);
 
-    ggml_tensor * k_all = ggml_concat(ctx0, raw_k, csa_k, 2);
+    // when the raw and the compressed K of the layer share one allocation, [raw | compressed] is a
+    // plain view of that allocation and the per-token copy of the whole compressed cache disappears
+    ggml_tensor * k_all = raw_k->ne[3] == 1 ?
+        inp_dsv4->mctx->get_csa()->get_k_joint(ctx0, il, (uint32_t) raw_k->ne[2], (uint32_t) n_csa) : nullptr;
+    if (k_all == nullptr) {
+        k_all = ggml_concat(ctx0, raw_k, csa_k, 2);
+    }
     cb(k_all, "csa_k_all", il);
 
     ggml_tensor * raw_mask = inp_attn->get_kq_mask();
@@ -864,7 +870,11 @@ ggml_tensor * llama_model_deepseek4::graph::build_hca_attention(
             hca_k->nb[1], hca_k->nb[2], hca_k->nb[3], 0);
     cb(hca_k, "hca_comp_k", il);
 
-    ggml_tensor * k_all = ggml_concat(ctx0, raw_k, hca_k, 2);
+    ggml_tensor * k_all = raw_k->ne[3] == 1 ?
+        inp_dsv4->mctx->get_hca()->get_k_joint(ctx0, il, (uint32_t) raw_k->ne[2], (uint32_t) n_hca) : nullptr;
+    if (k_all == nullptr) {
+        k_all = ggml_concat(ctx0, raw_k, hca_k, 2);
+    }
     cb(k_all, "hca_k_all", il);
 
     ggml_tensor * raw_mask = inp_attn->get_kq_mask();
