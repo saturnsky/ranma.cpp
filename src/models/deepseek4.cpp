@@ -372,13 +372,34 @@ ggml_tensor * llama_model_deepseek4::graph::build_hc_pre(
     ggml_tensor * mixes = ggml_mul_mat(ctx0, hc_fn, flat_norm);
     cb(mixes, "hc_mixes", il);
 
+    ggml_tensor * pre = nullptr;
+
+    if (cparams.fused_dsv4_hc_coef) {
+        // one kernel produces pre, post and comb in the [(2 + hc)*hc, n_tokens] layout of mixes
+        ggml_tensor * coef = ggml_dsv4_hc_coef(ctx0, mixes, hc_scale, hc_base, hparams.dsv4_hc_eps,
+                (int32_t) hparams.dsv4_hc_sinkhorn_iters);
+        res->add_fused_node({LLM_FUSED_OP_DSV4_HC_COEF, coef, il});
+        cb(coef, "hc_coef", il);
+
+        pre   = dsv4_view_2d(ctx0, coef, hc, nt, 0);
+        *post = dsv4_view_2d(ctx0, coef, hc, nt, hc);
+        *comb = ggml_view_3d(ctx0, coef, hc, hc, nt,
+                dsv4_elem_offset(coef, hc), coef->nb[1], dsv4_elem_offset(coef, 2*hc));
+
+        cb(pre,   "hc_pre",  il);
+        cb(*post, "hc_post", il);
+        cb(*comb, "hc_comb", il);
+
+        return build_hc_pre(x, pre, il);
+    }
+
     ggml_tensor * scale_pre  = dsv4_view_1d(ctx0, hc_scale, 1, 0);
     ggml_tensor * scale_post = dsv4_view_1d(ctx0, hc_scale, 1, 1);
 
     ggml_tensor * base_pre  = dsv4_view_1d(ctx0, hc_base, hc, 0);
     ggml_tensor * base_post = dsv4_view_1d(ctx0, hc_base, hc, hc);
 
-    ggml_tensor * pre = dsv4_view_2d(ctx0, mixes, hc, nt, 0);
+    pre = dsv4_view_2d(ctx0, mixes, hc, nt, 0);
     pre = dsv4_hc_affine(ctx0, pre, scale_pre, base_pre);
     pre = ggml_sigmoid(ctx0, pre);
     pre = ggml_scale_bias(ctx0, pre, 1.0f, hparams.dsv4_hc_eps);

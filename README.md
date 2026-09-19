@@ -186,6 +186,8 @@ applies, how to switch it, and its limits.
 
 - **Selected-cell attention for 512-wide heads**, including attention calls with sinks.
   [docs/ranma/deepseek-v4.md](docs/ranma/deepseek-v4.md)
+- **Hyper-connection coefficients in one op** with a backend capability probe and the upstream ops as the
+  fallback. Same page.
 
 ## Building
 

@@ -1085,6 +1085,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "DSV4_HC_COMB",
     "DSV4_HC_PRE",
     "DSV4_HC_POST",
+    "DSV4_HC_COEF",
 
     "UNARY",
 
@@ -1102,7 +1103,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1201,6 +1202,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "dsv4_hc_comb(mixes, scale, base)",
     "dsv4_hc_pre(x, weights)",
     "dsv4_hc_post(x, residual, post, comb)",
+    "dsv4_hc_coef(mixes, scale, base)",
 
     "unary(x)",
 
@@ -1218,7 +1220,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6536,6 +6538,57 @@ struct ggml_tensor * ggml_dsv4_hc_comb(
     ggml_set_op_params_i32(result, 1, n_iter);
 
     result->op     = GGML_OP_DSV4_HC_COMB;
+    result->src[0] = mixes;
+    result->src[1] = scale;
+    result->src[2] = base;
+
+    return result;
+}
+
+// ggml_dsv4_hc_coef
+
+struct ggml_tensor * ggml_dsv4_hc_coef(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * mixes,
+        struct ggml_tensor  * scale,
+        struct ggml_tensor  * base,
+        float                 eps,
+        int32_t               n_iter) {
+    GGML_ASSERT(mixes->type == GGML_TYPE_F32);
+    GGML_ASSERT(scale->type == GGML_TYPE_F32);
+    GGML_ASSERT(base->type == GGML_TYPE_F32);
+    GGML_ASSERT(n_iter > 0);
+
+    const int64_t hc_mix_dim = mixes->ne[0];
+    const int64_t n_tokens   = mixes->ne[1];
+
+    int64_t hc = 0;
+    for (int64_t i = 1; i*i + 2*i <= hc_mix_dim; ++i) {
+        if ((2 + i)*i == hc_mix_dim) {
+            hc = i;
+            break;
+        }
+    }
+
+    GGML_ASSERT(hc > 0);
+    GGML_ASSERT(hc == 4);
+    GGML_ASSERT(mixes->ne[2] == 1);
+    GGML_ASSERT(mixes->ne[3] == 1);
+    GGML_ASSERT(scale->ne[0] >= 3);
+    GGML_ASSERT(scale->ne[1] == 1);
+    GGML_ASSERT(scale->ne[2] == 1);
+    GGML_ASSERT(scale->ne[3] == 1);
+    GGML_ASSERT(base->ne[0] == hc_mix_dim);
+    GGML_ASSERT(base->ne[1] == 1);
+    GGML_ASSERT(base->ne[2] == 1);
+    GGML_ASSERT(base->ne[3] == 1);
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc_mix_dim, n_tokens);
+
+    ggml_set_op_params_f32(result, 0, eps);
+    ggml_set_op_params_i32(result, 1, n_iter);
+
+    result->op     = GGML_OP_DSV4_HC_COEF;
     result->src[0] = mixes;
     result->src[1] = scale;
     result->src[2] = base;

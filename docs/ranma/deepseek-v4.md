@@ -124,3 +124,61 @@ between them:
 
 Generation gains 3.4 % and prompt processing 26 % at a depth of 32768, one run
 per row.
+
+## Hyper-connection coefficients in one kernel
+
+### What it is
+
+Every hyper-connection block of the model derives three things from one small
+mixing matmul whose result `mixes` has `(2 + hc)*hc` rows per token, with
+`hc = 4` streams: the pre coefficients that fold the streams into the block
+input, the post coefficients that scale the block output, and the `hc x hc`
+combination matrix that mixes the streams, which is normalized by a fixed
+number of Sinkhorn iterations.
+
+The pre and post coefficients were an affine transform, a sigmoid and a scale
+on 4-element tensors, one chain each, while the combination matrix was already
+computed by a single op from the same `mixes`, scale and base tensors.
+`GGML_OP_DSV4_HC_COEF` computes all three at once. It takes the same three
+sources and writes pre, post and comb into one `[(2 + hc)*hc, n_tokens]` tensor
+in the row layout of `mixes`: the pre coefficients in the first `hc` rows, the
+post coefficients in the next `hc`, the combination matrix in the remaining
+`hc*hc`. The graph takes three views of that tensor and the rest of the block
+is unchanged.
+
+### Switches
+
+| Switch | Default | Effect |
+|---|---|---|
+| `LLAMA_DSV4_HC_COEF_FUSED=0` | on | Build the separate coefficient ops and the combination op instead. The reference path for equivalence checks. |
+
+### How the fallback is chosen
+
+The op takes part in the fused-op probe that the context runs once before the
+first batch: a reserve graph is built and every fused node is checked against
+the device its layer is assigned to. If a node did not land on that device,
+usually because the backend does not implement the op, the fusion is disabled
+and the graph is built from the unfused ops. The coefficient fusion is resolved
+before the combination fusion, because with the coefficient fusion off the
+graph falls back to the separate combination op, which then has to be probed on
+a graph that contains it.
+
+Backends other than CPU and CUDA/HIP do not implement the op, so the probe
+turns the fusion off there.
+
+### Limits
+
+- The op is written for four hyper-connection streams, the configuration of
+  the published model, and asserts that.
+- The fused kernel does not produce bit-identical results: the coefficients and
+  the Sinkhorn iterations are computed in one pass with a different order of
+  operations. The difference is of the same size as the difference between two
+  micro-batch sizes of the unfused path.
+
+### How to verify
+
+- `test-backend-ops -o DSV4_HC_COEF` covers one and many tokens and one and
+  several Sinkhorn iterations.
+- The load log reports `fused DeepSeek V4 HC coefficients enabled` or, if the
+  probe rejected the op, that it is disabled.
+- `LLAMA_DSV4_HC_COEF_FUSED=0` gives the unfused graph for a comparison run.
