@@ -381,6 +381,8 @@ struct cmd_params {
     output_formats                   output_format_stderr;
     bench_expert_options             expert;
     llama_ple_prefetch               ple_prefetch;
+    // LoRA adapters applied to every context, as (path, scale) pairs
+    std::vector<std::pair<std::string, float>> lora;
 };
 
 static const cmd_params cmd_params_defaults = {
@@ -428,6 +430,7 @@ static const cmd_params cmd_params_defaults = {
     /* output_format_stderr */ NONE,
     /* expert               */ {},
     /* ple_prefetch         */ LLAMA_PLE_PREFETCH_ALWAYS,
+    /* lora                 */ {},
 };
 
 static void print_usage(int /* argc */, char ** argv) {
@@ -445,6 +448,8 @@ static void print_usage(int /* argc */, char ** argv) {
     printf("  --list-devices                              list available devices and exit\n");
     printf("  -v, --verbose                               verbose output\n");
     printf("  --progress                                  print test progress indicators\n");
+    printf("  --lora <fname>                              apply a LoRA adapter with scale 1.0 (repeatable)\n");
+    printf("  --lora-scaled <fname> <scale>               apply a LoRA adapter with the given scale (repeatable)\n");
     printf("  --no-warmup                                 skip warmup runs before benchmarking\n");
     printf("  -fitt, --fit-target <MiB>                   fit model to device memory with this margin per device in MiB (default: off)\n");
     printf("  -fitc, --fit-ctx <n>                        minimum ctx size for --fit-target (default: 4096)\n");
@@ -1084,6 +1089,19 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
                 invalid_param = !output_format_from_str(argv[i], params.output_format_stderr);
             } else if (arg == "-v" || arg == "--verbose") {
                 params.verbose = true;
+            } else if (arg == "--lora") {
+                if (++i >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                params.lora.emplace_back(argv[i], 1.0f);
+            } else if (arg == "--lora-scaled") {
+                if (i + 2 >= argc) {
+                    invalid_param = true;
+                    break;
+                }
+                const std::string fname = argv[++i];
+                params.lora.emplace_back(fname, std::stof(argv[++i]));
             } else if (arg == "--progress") {
                 params.progress = true;
             } else if (arg == "--no-warmup") {
@@ -2375,6 +2393,16 @@ int llama_bench(int argc, char ** argv) {
     llama_model *               lmodel    = nullptr;
     const cmd_params_instance * prev_inst = nullptr;
 
+    // LoRA adapters belonging to `lmodel`; reloaded whenever the model is reloaded
+    std::vector<llama_adapter_lora *> lora_adapters;
+    auto free_model = [&lora_adapters, &lmodel]() {
+        for (auto * a : lora_adapters) {
+            llama_adapter_lora_free(a);
+        }
+        lora_adapters.clear();
+        llama_model_free(lmodel);
+    };
+
     // store the llama_context state at the previous depth that we performed a test
     // ref: https://github.com/ggml-org/llama.cpp/pull/16944#issuecomment-3478151721
     ctx_state cstate;
@@ -2406,7 +2434,7 @@ int llama_bench(int argc, char ** argv) {
             if (run_expert.enabled() && run_expert.mode != "off") { run_expert.profile = profiles->active.string(); }
             if (run_expert.restore_each) {
                 expert.release(); expert_initialized = false;
-                if (lmodel) { llama_model_free(lmodel); lmodel = nullptr; prev_inst = nullptr; }
+                if (lmodel) { free_model(); lmodel = nullptr; prev_inst = nullptr; }
                 try { profiles->restore(); }
                 catch (const std::exception & e) { fprintf(stderr, "expert restore: %s\n", e.what()); return 1; }
                 cstate.depth = -1; cstate.buf.clear();
@@ -2441,7 +2469,7 @@ int llama_bench(int argc, char ** argv) {
             if (do_fit) {
                 // free the previous model so fit sees full free VRAM
                 if (lmodel) {
-                    llama_model_free(lmodel);
+                    free_model();
                     lmodel    = nullptr;
                     prev_inst = nullptr;
                 }
@@ -2469,7 +2497,7 @@ int llama_bench(int argc, char ** argv) {
             // keep the same model between tests when possible
             if (!lmodel || !prev_inst || !inst.equal_mparams(*prev_inst)) {
                 if (lmodel) {
-                    llama_model_free(lmodel);
+                    free_model();
                 }
 
                 cstate.depth = -1;
@@ -2481,13 +2509,30 @@ int llama_bench(int argc, char ** argv) {
                     return 1;
                 }
                 prev_inst = &inst;
+
+                for (const auto & la : params.lora) {
+                    llama_adapter_lora * adapter = llama_adapter_lora_init(lmodel, la.first.c_str());
+                    if (adapter == nullptr) {
+                        fprintf(stderr, "%s: error: failed to load lora adapter '%s'\n", __func__, la.first.c_str());
+                        return 1;
+                    }
+                    lora_adapters.push_back(adapter);
+                }
             }
 
             llama_context * ctx = llama_init_from_model(lmodel, cparams);
             if (ctx == NULL) {
                 fprintf(stderr, "%s: error: failed to create context with model '%s'\n", __func__, inst.model.c_str());
-                llama_model_free(lmodel);
+                free_model();
                 return 1;
+            }
+
+            if (!lora_adapters.empty()) {
+                std::vector<float> lora_scales;
+                for (const auto & la : params.lora) {
+                    lora_scales.push_back(la.second);
+                }
+                llama_set_adapters_lora(ctx, lora_adapters.data(), lora_adapters.size(), lora_scales.data());
             }
 
             test t(inst, lmodel, ctx);
@@ -2505,7 +2550,7 @@ int llama_bench(int argc, char ** argv) {
             if (!parse_cpu_mask(t.cpu_mask, tpp.cpumask)) {
                 fprintf(stderr, "%s: failed to parse cpu-mask: %s\n", __func__, t.cpu_mask.c_str());
                 llama_free(ctx);
-                llama_model_free(lmodel);
+                free_model();
                 return 1;
             }
             tpp.strict_cpu = t.cpu_strict;
@@ -2516,7 +2561,7 @@ int llama_bench(int argc, char ** argv) {
             if (!threadpool) {
                 fprintf(stderr, "%s: threadpool create failed : n_threads %d\n", __func__, tpp.n_threads);
                 llama_free(ctx);
-                llama_model_free(lmodel);
+                free_model();
                 return 1;
             }
 
@@ -2551,7 +2596,7 @@ int llama_bench(int argc, char ** argv) {
                     if (!res) {
                         fprintf(stderr, "%s: error: failed to run prompt warmup\n", __func__);
                         llama_free(ctx);
-                        llama_model_free(lmodel);
+                        free_model();
                         return 1;
                     }
                 }
@@ -2563,7 +2608,7 @@ int llama_bench(int argc, char ** argv) {
                     if (!res) {
                         fprintf(stderr, "%s: error: failed to run gen warmup\n", __func__);
                         llama_free(ctx);
-                        llama_model_free(lmodel);
+                        free_model();
                         return 1;
                     }
                 }
@@ -2597,7 +2642,7 @@ int llama_bench(int argc, char ** argv) {
                         if (!res) {
                             fprintf(stderr, "%s: error: failed to run depth\n", __func__);
                             llama_free(ctx);
-                            llama_model_free(lmodel);
+                            free_model();
                             return 1;
                         }
 
@@ -2631,7 +2676,7 @@ int llama_bench(int argc, char ** argv) {
                         expert.on_interrupted(0);
                         fprintf(stderr, "%s: error: failed to run prompt\n", __func__);
                         llama_free(ctx);
-                        llama_model_free(lmodel);
+                        free_model();
                         return 1;
                     }
                 }
@@ -2647,7 +2692,7 @@ int llama_bench(int argc, char ** argv) {
                     if (!res) {
                         fprintf(stderr, "%s: error: failed to run gen\n", __func__);
                         llama_free(ctx);
-                        llama_model_free(lmodel);
+                        free_model();
                         return 1;
                     }
                 }
@@ -2665,7 +2710,7 @@ int llama_bench(int argc, char ** argv) {
                 fprintf(stderr, "expert benchmark failed: %s\n", e.what());
                 llama_free(ctx);
                 ggml_threadpool_free_fn(threadpool);
-                llama_model_free(lmodel);
+                free_model();
                 return 1;
             }
             reps.add(t);
@@ -2693,7 +2738,7 @@ int llama_bench(int argc, char ** argv) {
     }
 
     expert.release();
-    llama_model_free(lmodel);
+    free_model();
 
     if (p) {
         p->print_footer();
