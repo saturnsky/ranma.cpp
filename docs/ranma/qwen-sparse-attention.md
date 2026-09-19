@@ -25,6 +25,10 @@ for equivalence checks, or a diagnostic.
 | `LLAMA_QSA_LEGACY` | off | `1` selects the per-token indexer cache instead of pooled block keys. Reference path. |
 | `LLAMA_QSA_CACHE_NORM_ROPE` | on | `0` stores the pooled keys untransformed and applies norm and rotation in every graph. Reference path. |
 | `LLAMA_QSA_BLOCK_TOP_K` | `1` | `0` selects over the cells, `2` forces the general block kernels. Reference paths. |
+| `LLAMA_QSA_RAW_PREFIX` | unset | a path prefix: the dump also writes raw output logits with their shape. Diagnostic. |
+| `GGML_CUDA_FATTN_SPARSE` | on | `0` keeps the dense flash-attention kernel. Reference path. |
+| `GGML_CUDA_FATTN_SPARSE_MIN_KV` | 4096 | lowest cell count at which the gather is used. |
+| `GGML_CUDA_FATTN_SPARSE_LOG` | off | `1` logs the first shape that takes the gather. Diagnostic. |
 
 ## Tie-breaking in the top-k
 
@@ -235,3 +239,51 @@ Radeon AI PRO R9700 with Qwen3.8-Flash-Next UD-Q4_K_XL, `llama-perplexity
 
 When two builds or two paths have to be compared exactly, set the tie switch
 and compare the dump.
+
+## Attending only to the selected cells
+
+The selection leaves a bounded number of finite entries in each mask row, but
+attention still read every cell of the KV cache and discarded the rest through
+the mask, so its traffic followed the context depth instead of the budget.
+
+The tile flash-attention kernel that RDNA4 uses for the Qwen generation shape
+- head size 256, GQA-12 groups, one query row per tile - can gather instead.
+The mask row is compacted into the ascending list of the cells it leaves
+finite, and the kernel loads its K and V rows through that list. The mask
+value is read at the original cell coordinate, and a padding slot of the list
+contributes nothing, so the attended set and the arithmetic are those of the
+dense masked kernel; only the memory traffic changes. The compaction votes
+through a ballot that does not assume a wave width, and only the mask rows
+that some block of the launch actually reads are compacted.
+
+The bound comes from the graph: the attention node carries the width of the
+indexer selection, and the model sets it only when it is smaller than the
+number of cells, so a short context builds exactly the node the dense path
+builds.
+
+The gather is taken on HIP only, and only when all of the following hold:
+
+- the per-row bound is set;
+- K and V are F16 - single rows are read, so they cannot go through the
+  on-the-fly conversion;
+- no ALiBi, no logit softcap, no attention sink;
+- the mask covers the whole cache contiguously and has a single head;
+- one query row per tile;
+- the wave is 32 lanes wide;
+- the cache holds at least `max(4096, 2*bound)` cells; below that the dense
+  kernel is already as cheap as compacting the mask.
+
+Every other shape, prompt processing included, keeps the dense kernel.
+
+| switch | default | effect |
+| --- | --- | --- |
+| `GGML_CUDA_FATTN_SPARSE` | on | `0` forces the dense kernel in the same binary |
+| `GGML_CUDA_FATTN_SPARSE_MIN_KV` | 4096 | replaces the 4096 of the bound above |
+| `GGML_CUDA_FATTN_SPARSE_LOG` | off | `1` logs the first shape that takes the gather |
+
+`test-backend-ops -o FLASH_ATTN_EXT` carries the Qwen generation shape with
+one and with two sequences, at the cell count where the gate opens, and with a
+short index list. For a comparison on a real model,
+`LLAMA_QSA_RAW_PREFIX=<path>` makes the dump write the raw output logits with
+their shape, so two runs can be compared on the distribution rather than on
+sampled text.

@@ -165,6 +165,9 @@ applies, how to switch it, and its limits.
 - **Block top-k** - the indexer selects over block scores weighted by the visible cells of each block, without
   expanding the scores to cells. The page states how this interacts with the unspecified tie order of a top-k
   and what run-to-run differences were measured. Same page.
+- **Attention reads only the selected cells** - on HIP the tile flash attention of the generation shape gathers
+  the selected K/V rows through a compacted index list instead of scanning the KV cache.
+  `GGML_CUDA_FATTN_SPARSE=0` keeps the dense kernel. Same page.
 
 ## Building
 

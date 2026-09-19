@@ -187,14 +187,35 @@ void llama_qsa_dump_set_blocks(const std::vector<llama_qsa_dump_block> & blocks)
             });
 }
 
+// LLAMA_QSA_RAW_PREFIX=<path> writes the raw bytes of a tensor plus its shape, so that two runs can be
+// compared on the distribution itself rather than on the sampled text.
+static void qsa_dump_raw_tensor(const std::string & key, const ggml_tensor * tensor) {
+    const char * prefix = getenv("LLAMA_QSA_RAW_PREFIX");
+    if (!prefix || !*prefix) { return; }
+    const std::string path = std::string(prefix) + "-" + key;
+    std::vector<uint8_t> data(ggml_nbytes(tensor));
+    ggml_backend_tensor_get(tensor, data.data(), 0, data.size());
+    FILE * f = fopen((path + ".bin").c_str(), "wb");
+    GGML_ASSERT(f);
+    GGML_ASSERT(fwrite(data.data(), 1, data.size(), f) == data.size());
+    fclose(f);
+    f = fopen((path + ".json").c_str(), "wb");
+    GGML_ASSERT(f);
+    fprintf(f, "{\"type\":%d,\"ne\":[%lld,%lld,%lld,%lld],\"nb\":[%zu,%zu,%zu,%zu],\"bytes\":%zu}\n",
+            (int) tensor->type, (long long) tensor->ne[0], (long long) tensor->ne[1], (long long) tensor->ne[2], (long long) tensor->ne[3],
+            tensor->nb[0], tensor->nb[1], tensor->nb[2], tensor->nb[3], data.size());
+    fclose(f);
+}
+
 bool llama_qsa_dump_eval_callback(ggml_tensor * t, bool ask, void * user_data) {
     GGML_UNUSED(user_data);
 
+    const bool is_logits = getenv("LLAMA_QSA_RAW_PREFIX") && strcmp(t->name, "result_output") == 0;
     const bool is_dbg = strncmp(t->name, "indexer_dbg_", 12) == 0;
 
     const bool is_trans = strncmp(t->name, "indexer_ktrans_dump-", 20) == 0;
 
-    if (!is_trans && !is_dbg && strncmp(t->name, LLAMA_QSA_DUMP_PREFIX, strlen(LLAMA_QSA_DUMP_PREFIX)) != 0) {
+    if (!is_logits && !is_trans && !is_dbg && strncmp(t->name, LLAMA_QSA_DUMP_PREFIX, strlen(LLAMA_QSA_DUMP_PREFIX)) != 0) {
         return false;
     }
 
@@ -205,6 +226,11 @@ bool llama_qsa_dump_eval_callback(ggml_tensor * t, bool ask, void * user_data) {
     auto & state = qsa_dump_get();
 
     std::lock_guard<std::mutex> lock(state.mutex);
+
+    if (is_logits) {
+        qsa_dump_raw_tensor("logits-s" + std::to_string(state.step), t);
+        return true;
+    }
 
     if (state.file == nullptr) {
         return true;

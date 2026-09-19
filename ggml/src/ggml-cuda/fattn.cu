@@ -5,24 +5,42 @@
 #include "fattn-vec.cuh"
 #include "fattn.cuh"
 
-#if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+#if !defined(GGML_USE_MUSA)
+// Portable warp vote: HIP returns a 64-bit mask, CUDA a 32-bit one.
+#if defined(GGML_USE_HIP)
+typedef unsigned long long fattn_sparse_ballot_t;
+static __device__ __forceinline__ fattn_sparse_ballot_t fattn_sparse_ballot(bool pred) {
+    return __ballot(pred);
+}
+#else
+typedef uint32_t fattn_sparse_ballot_t;
+static __device__ __forceinline__ fattn_sparse_ballot_t fattn_sparse_ballot(bool pred) {
+    return __ballot_sync(0xFFFFFFFF, pred);
+}
+#endif // defined(GGML_USE_HIP)
+
+static __device__ __forceinline__ int fattn_sparse_popc(fattn_sparse_ballot_t mask) {
+    return sizeof(fattn_sparse_ballot_t) == 4 ? __popc(uint32_t(mask)) : __popcll((unsigned long long) mask);
+}
+
 __launch_bounds__(256, 1)
 static __global__ void flash_attn_mask_to_sparse_indices(
-        const half * mask_ptr, int32_t * indices_ptr, const int ne30, const int n_kv_max,
+        const half * mask_ptr, int32_t * indices_ptr, const int ne30, const int ne31, const int n_kv_max,
         const int64_t s31, const int64_t s33) {
     ggml_cuda_pdl_sync();
 
     constexpr int values_per_lane = 8;
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
     const int tid      = threadIdx.x;
-    const int warp     = tid / WARP_SIZE;
-    const int lane     = tid % WARP_SIZE;
+    const int warp     = tid / warp_size;
+    const int lane     = tid % warp_size;
     const int sequence = blockIdx.y;
     const int query    = blockIdx.x;
 
     const half * mask = mask_ptr + sequence*s33 + query*s31;
-    int32_t * indices = indices_ptr + (int64_t(sequence)*gridDim.x + query)*n_kv_max;
+    int32_t * indices = indices_ptr + (int64_t(sequence)*ne31 + query)*n_kv_max;
 
-    __shared__ int warp_offsets[256/WARP_SIZE];
+    __shared__ int warp_offsets[256/warp_size];
     __shared__ int row_count;
     __shared__ int chunk_count;
 
@@ -32,14 +50,14 @@ static __global__ void flash_attn_mask_to_sparse_indices(
     __syncthreads();
 
     for (int i0 = 0; i0 < ne30; i0 += blockDim.x*values_per_lane) {
-        uint32_t selected_warp[values_per_lane];
+        fattn_sparse_ballot_t selected_warp[values_per_lane];
         int warp_count = 0;
 #pragma unroll
         for (int item = 0; item < values_per_lane; ++item) {
-            const int i = i0 + (warp*values_per_lane + item)*WARP_SIZE + lane;
+            const int i = i0 + (warp*values_per_lane + item)*warp_size + lane;
             const bool selected = i < ne30 && isfinite(__half2float(mask[i]));
-            selected_warp[item] = __ballot_sync(0xFFFFFFFF, selected);
-            warp_count += __popc(selected_warp[item]);
+            selected_warp[item] = fattn_sparse_ballot(selected);
+            warp_count += fattn_sparse_popc(selected_warp[item]);
         }
 
         if (lane == 0) {
@@ -50,7 +68,7 @@ static __global__ void flash_attn_mask_to_sparse_indices(
         if (tid == 0) {
             int offset = 0;
 #pragma unroll
-            for (int iw = 0; iw < 256/WARP_SIZE; ++iw) {
+            for (int iw = 0; iw < 256/warp_size; ++iw) {
                 const int count = warp_offsets[iw];
                 warp_offsets[iw] = offset;
                 offset += count;
@@ -59,16 +77,16 @@ static __global__ void flash_attn_mask_to_sparse_indices(
         }
         __syncthreads();
 
-        const uint32_t lane_mask = lane == 0 ? 0 : (1u << lane) - 1;
+        const fattn_sparse_ballot_t lane_mask = lane == 0 ? 0 : ((fattn_sparse_ballot_t(1) << lane) - 1);
         int warp_item_offset = 0;
 #pragma unroll
         for (int item = 0; item < values_per_lane; ++item) {
-            const int i = i0 + (warp*values_per_lane + item)*WARP_SIZE + lane;
-            const int dst = row_count + warp_offsets[warp] + warp_item_offset + __popc(selected_warp[item] & lane_mask);
-            if ((selected_warp[item] & (uint32_t(1) << lane)) && dst < n_kv_max) {
+            const int i = i0 + (warp*values_per_lane + item)*warp_size + lane;
+            const int dst = row_count + warp_offsets[warp] + warp_item_offset + fattn_sparse_popc(selected_warp[item] & lane_mask);
+            if ((selected_warp[item] & (fattn_sparse_ballot_t(1) << lane)) && dst < n_kv_max) {
                 indices[dst] = i;
             }
-            warp_item_offset += __popc(selected_warp[item]);
+            warp_item_offset += fattn_sparse_popc(selected_warp[item]);
         }
         __syncthreads();
 
@@ -87,23 +105,25 @@ static __global__ void flash_attn_mask_to_sparse_indices(
     // the dependent grid reads indices, signal once the row is complete
     ggml_cuda_pdl_lc();
 }
-#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+#endif // !defined(GGML_USE_MUSA)
 
 void ggml_cuda_flash_attn_ext_compact_mask(
-        const ggml_tensor * mask, int32_t * indices, int32_t n_kv_max, cudaStream_t stream) {
-#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
-    GGML_UNUSED_VARS(mask, indices, n_kv_max, stream);
-    GGML_ABORT("sparse flash attention is only supported on NVIDIA CUDA");
+        const ggml_tensor * mask, int32_t * indices, int32_t n_kv_max, int64_t n_rows, cudaStream_t stream) {
+#if defined(GGML_USE_MUSA)
+    GGML_UNUSED_VARS(mask, indices, n_kv_max, n_rows, stream);
+    GGML_ABORT("sparse flash attention is not supported on MUSA");
 #else
     const int64_t s31 = mask->nb[1] / sizeof(half);
     const int64_t s33 = mask->nb[3] / sizeof(half);
-    const dim3 blocks_num(mask->ne[1], mask->ne[3], 1);
+    // Only the mask rows that a kernel block actually looks up are compacted; the rest of the padded
+    // batch dimension would cost a full scan of the KV cache each.
+    const dim3 blocks_num(n_rows, mask->ne[3], 1);
     const dim3 block_dim(256, 1, 1);
     const ggml_cuda_kernel_launch_params launch_params(blocks_num, block_dim, 0, stream);
     ggml_cuda_kernel_launch(flash_attn_mask_to_sparse_indices, launch_params,
-        (const half *) mask->data, indices, int(mask->ne[0]), n_kv_max, s31, s33);
+        (const half *) mask->data, indices, int(mask->ne[0]), int(mask->ne[1]), n_kv_max, s31, s33);
     CUDA_CHECK(cudaGetLastError());
-#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+#endif // !defined(GGML_USE_MUSA)
 }
 
 bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
