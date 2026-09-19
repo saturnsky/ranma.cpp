@@ -587,6 +587,7 @@ extern "C" {
         GGML_OP_DSV4_HC_PRE,
         GGML_OP_DSV4_HC_POST,
         GGML_OP_DSV4_HC_COEF,
+        GGML_OP_DSV4_COMPRESS,
 
         GGML_OP_UNARY,
 
@@ -2774,6 +2775,35 @@ extern "C" {
             struct ggml_tensor  * residual,
             struct ggml_tensor  * post,
             struct ggml_tensor  * comb);
+
+    // DeepSeek V4 KV compressor: fused gather + per-feature softmax + weighted sum.
+    //
+    //   kv    [C, n_rows]   F32   compressor value state (C == n_embd_head, or 2*n_embd_head when overlap)
+    //   score [C, n_rows]   F32   compressor gate state, same shape as kv
+    //   idxs  [n_idx]       I32   row indices into kv/score
+    //                             n_idx == ratio*n_blocks, or 2*ratio*n_blocks when overlap
+    //   -> dst [n_embd_head, 1, n_blocks] F32
+    //
+    // non-overlap (ratio 128, HCA):
+    //   r(b, j)      = idxs[b*ratio + j],                  j in [0, ratio)
+    //   dst[f, 0, b] = sum_j softmax_j(score[f, r(b,j)])*kv[f, r(b,j)]
+    //
+    // overlap (ratio 4, CSA / indexer): each block reads a previous and a current window;
+    // the previous window takes the low half of the features, the current one the high half:
+    //   r(b, j)      = idxs[b*ratio + j]                        (previous, feature offset 0)
+    //   r(b, ratio+j)= idxs[ratio*n_blocks + b*ratio + j]       (current,  feature offset n_embd_head)
+    //   dst[f, 0, b] = sum_k softmax_k(score[f + off(k), r(b,k)])*kv[f + off(k), r(b,k)], k in [0, 2*ratio)
+    //
+    // An index >= n_rows is the "missing previous segment" sentinel: kv reads as 0 and score as -INFINITY.
+    // The softmax runs over the gathered rows, independently per feature.
+    //
+    GGML_API struct ggml_tensor * ggml_dsv4_compress(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * kv,
+            struct ggml_tensor  * score,
+            struct ggml_tensor  * idxs,
+            int32_t               ratio,
+            bool                  overlap);
 
     // custom operators
 
