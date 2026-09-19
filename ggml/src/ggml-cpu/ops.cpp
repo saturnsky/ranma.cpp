@@ -11427,6 +11427,107 @@ void ggml_compute_forward_dsv4_hc_coef(
     }
 }
 
+// ggml_compute_forward_dsv4_compress
+
+static void ggml_compute_forward_dsv4_compress_f32(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * kv    = dst->src[0];
+    const ggml_tensor * score = dst->src[1];
+    const ggml_tensor * idxs  = dst->src[2];
+
+    GGML_ASSERT(kv->type    == GGML_TYPE_F32);
+    GGML_ASSERT(score->type == GGML_TYPE_F32);
+    GGML_ASSERT(idxs->type  == GGML_TYPE_I32);
+    GGML_ASSERT(dst->type   == GGML_TYPE_F32);
+
+    const int64_t ratio   = ggml_get_op_params_i32(dst, 0);
+    const bool    overlap = ggml_get_op_params_i32(dst, 1) != 0;
+
+    const int64_t n_embd_head = dst->ne[0];
+    const int64_t n_blocks    = dst->ne[2];
+    const int64_t n_per_block = overlap ? 2*ratio : ratio;
+    const int64_t n_rows      = kv->ne[1];
+    const int64_t n_read      = ratio*n_blocks;
+
+    GGML_ASSERT(dst->ne[1] == 1);
+    GGML_ASSERT(idxs->ne[0] == n_per_block*n_blocks);
+
+    GGML_TENSOR_LOCALS(size_t, nbk, kv,    nb);
+    GGML_TENSOR_LOCALS(size_t, nbs, score, nb);
+    GGML_TENSOR_LOCALS(size_t, nbd, dst,   nb);
+
+    const int32_t * idx = (const int32_t *) idxs->data;
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    // one task per (feature, block) pair
+    const int64_t nr  = n_embd_head*n_blocks;
+    const int64_t dr  = (nr + nth - 1)/nth;
+    const int64_t ir0 = dr*ith;
+    const int64_t ir1 = MIN(ir0 + dr, nr);
+
+    for (int64_t ir = ir0; ir < ir1; ++ir) {
+        const int64_t f  = ir % n_embd_head;
+        const int64_t ib = ir / n_embd_head;
+
+        // pass 1: max of the gathered scores for this feature
+        float m = -INFINITY;
+        for (int64_t k = 0; k < n_per_block; ++k) {
+            const bool    cur  = overlap && k >= ratio;
+            const int64_t ii   = cur ? n_read + ib*ratio + (k - ratio) : ib*ratio + k;
+            const int64_t row  = idx[ii];
+            const int64_t col  = cur ? f + n_embd_head : f;
+
+            if ((uint64_t) row >= (uint64_t) n_rows) {
+                continue; // missing segment: score is -INFINITY
+            }
+
+            const float sv = *(const float *) ((const char *) score->data + col*nbs0 + row*nbs1);
+            m = MAX(m, sv);
+        }
+
+        // pass 2: unnormalized softmax weights, weighted sum
+        float sum = 0.0f;
+        float acc = 0.0f;
+        for (int64_t k = 0; k < n_per_block; ++k) {
+            const bool    cur  = overlap && k >= ratio;
+            const int64_t ii   = cur ? n_read + ib*ratio + (k - ratio) : ib*ratio + k;
+            const int64_t row  = idx[ii];
+            const int64_t col  = cur ? f + n_embd_head : f;
+
+            if ((uint64_t) row >= (uint64_t) n_rows) {
+                continue; // missing segment: weight 0, value 0
+            }
+
+            const float sv = *(const float *) ((const char *) score->data + col*nbs0 + row*nbs1);
+            const float vv = *(const float *) ((const char *) kv->data    + col*nbk0 + row*nbk1);
+
+            const float w = expf(sv - m);
+            sum += w;
+            acc += w*vv;
+        }
+
+        *(float *) ((char *) dst->data + f*nbd0 + ib*nbd2) = sum > 0.0f ? acc/sum : 0.0f;
+    }
+}
+
+void ggml_compute_forward_dsv4_compress(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    switch (dst->src[0]->type) {
+        case GGML_TYPE_F32:
+            {
+                ggml_compute_forward_dsv4_compress_f32(params, dst);
+            } break;
+        default:
+            {
+                GGML_ABORT("fatal error");
+            }
+    }
+}
+
 // ggml_compute_forward_dsv4_hc_pre
 
 static void ggml_compute_forward_dsv4_hc_pre_f32(
