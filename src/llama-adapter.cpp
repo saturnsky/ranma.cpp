@@ -6,6 +6,9 @@
 
 #include <map>
 #include <cassert>
+#include <cstdlib>
+#include <utility>
+#include <vector>
 #include <sstream>
 #include <stdexcept>
 
@@ -144,6 +147,146 @@ llama_adapter_lora_weight * llama_adapter_lora::get_weight(ggml_tensor * w) {
     }
 
     return nullptr;
+}
+
+bool llama_adapter_lora_fold_scale_enabled() {
+    static const bool enabled = [] {
+        const char * val = getenv("LLAMA_LORA_FOLD_SCALE");
+        return val == nullptr || atoi(val) != 0;
+    }();
+    return enabled;
+}
+
+void llama_adapter_lora::ensure_scaled_b(float adapter_scale) {
+    if (!llama_adapter_lora_fold_scale_enabled()) {
+        return;
+    }
+
+    if (scaled_b_done) {
+        // the copies exist for `scaled_b_adapter_scale` only; any other scale keeps the scale node
+        return;
+    }
+
+    // collect the weights that need a pre-scaled copy and can get one:
+    //  - effective scale != 1 (a scale of exactly 1 is dropped from the graph without a copy)
+    //  - dense (ne[2] == 1): routed weights hold one B per expert and are applied with
+    //    ggml_mul_mat_id, whose result cannot be fused with the following ggml_add anyway
+    //  - a float type we can scale on the host
+    std::vector<llama_adapter_lora_weight *> todo;
+    for (auto & it : ab_map) {
+        llama_adapter_lora_weight & w = it.second;
+
+        ggml_tensor * b = w.b;
+        if (!b || !b->buffer || b->ne[2] != 1 || b->ne[3] != 1 || !ggml_is_contiguous(b)) {
+            continue;
+        }
+        if (b->type != GGML_TYPE_F16 && b->type != GGML_TYPE_F32) {
+            continue;
+        }
+        if (w.get_scale(alpha, adapter_scale) == 1.0f) {
+            continue;
+        }
+        todo.push_back(&w);
+    }
+
+    if (todo.empty()) {
+        // nothing to do for this scale; stay in the "not built" state so that a later adapter
+        // scale that does need copies can still build them
+        return;
+    }
+
+    // one context (and one buffer) per buffer type, the same buffer type as the original `b`,
+    // so a `b` that lives in host memory keeps living in host memory
+    std::map<ggml_backend_buffer_type_t, ggml_context *> ctx_map;
+    std::vector<ggml_context_ptr> ctxs_new;
+    std::vector<std::pair<llama_adapter_lora_weight *, ggml_tensor *>> pending;
+
+    for (auto * w : todo) {
+        ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(w->b->buffer);
+
+        ggml_context * cb = nullptr;
+        auto it = ctx_map.find(buft);
+        if (it == ctx_map.end()) {
+            ggml_init_params params = {
+                /*.mem_size   =*/ todo.size()*ggml_tensor_overhead(),
+                /*.mem_buffer =*/ NULL,
+                /*.no_alloc   =*/ true,
+            };
+            cb = ggml_init(params);
+            if (!cb) {
+                LLAMA_LOG_WARN("%s: failed to create a context for the pre-scaled lora_b copies\n", __func__);
+                return;
+            }
+            ctxs_new.emplace_back(cb);
+            ctx_map[buft] = cb;
+        } else {
+            cb = it->second;
+        }
+
+        ggml_tensor * t = ggml_dup_tensor(cb, w->b);
+        ggml_set_name(t, w->b->name);
+        pending.emplace_back(w, t);
+    }
+
+    std::vector<ggml_backend_buffer_ptr> bufs_new;
+    size_t total = 0;
+    for (auto & it : ctx_map) {
+        ggml_backend_buffer_ptr buf { ggml_backend_alloc_ctx_tensors_from_buft(it.second, it.first) };
+        if (!buf) {
+            LLAMA_LOG_WARN("%s: failed to allocate the pre-scaled lora_b copies\n", __func__);
+            return;
+        }
+        total += ggml_backend_buffer_get_size(buf.get());
+        bufs_new.emplace_back(std::move(buf));
+    }
+
+    // copy and scale on the host, one tensor at a time
+    std::vector<uint8_t> tmp;
+    for (auto & it : pending) {
+        ggml_tensor * src = it.first->b;
+        ggml_tensor * dst = it.second;
+
+        const float scale = it.first->get_scale(alpha, adapter_scale);
+
+        const size_t nbytes = ggml_nbytes(src);
+        tmp.resize(nbytes);
+        ggml_backend_tensor_get(src, tmp.data(), 0, nbytes);
+
+        const int64_t n = ggml_nelements(src);
+        if (src->type == GGML_TYPE_F32) {
+            float * p = (float *) tmp.data();
+            for (int64_t i = 0; i < n; ++i) {
+                p[i] *= scale;
+            }
+        } else {
+            ggml_fp16_t * p = (ggml_fp16_t *) tmp.data();
+            for (int64_t i = 0; i < n; ++i) {
+                p[i] = ggml_fp32_to_fp16(ggml_fp16_to_fp32(p[i])*scale);
+            }
+        }
+
+        ggml_backend_tensor_set(dst, tmp.data(), 0, nbytes);
+    }
+
+    // keep the new contexts/buffers alive for as long as the adapter lives
+    for (auto & c : ctxs_new) {
+        ctxs.emplace_back(std::move(c));
+    }
+    for (auto & b : bufs_new) {
+        bufs.emplace_back(std::move(b));
+    }
+
+    for (auto & it : pending) {
+        it.first->b_scaled = it.second;
+    }
+
+    // mark the state only here: an early return above leaves the adapter in the "not built"
+    // state so that a later attach can retry
+    scaled_b_done          = true;
+    scaled_b_adapter_scale = adapter_scale;
+
+    LLAMA_LOG_DEBUG("%s: built %zu pre-scaled lora_b copies for adapter scale %g (%.2f MiB)\n",
+            __func__, pending.size(), (double) adapter_scale, total/1024.0/1024.0);
 }
 
 static void llama_adapter_lora_init_impl(llama_model & model, const char * path_lora, llama_adapter_lora & adapter) {

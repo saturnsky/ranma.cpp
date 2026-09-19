@@ -10954,6 +10954,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             true, 16, 8, b, false, true, false));
     }
 
+    // rank-2 LoRA "B" shapes: mul_mat(F16 [rank=2, n_embd], F32 [2, n_tokens]) directly followed by
+    // an ADD of the same shape (the base output). m = 1 is the fused single-token decode case,
+    // m = 2/4 keep the same k = 2 matmul but fall back to the unfused path.
+    for (int64_t m_lora : { 1, 2, 4 }) {
+        test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_F16, GGML_GLU_OP_SWIGLU, m_lora, 4096, 2,
+            /*use_id =*/ false, 1, 1, false, /*with_bias =*/ false, /*with_gate =*/ false, false, {1, 1}));
+    }
+
     // Fused row-pair coverage: minimum rows, an even pair, and an odd tail.
     // TODO: the max_nmse_err() for these cases is not estimated correctly causing sporadic false failures.
     //for (ggml_glu_op glu_op : { GGML_GLU_OP_SWIGLU, GGML_GLU_OP_GEGLU }) {

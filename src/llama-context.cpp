@@ -1326,6 +1326,10 @@ void llama_context::set_adapters_lora(llama_adapter_lora ** adapters, size_t n_a
     for (size_t i = 0; i < n_adapters; i ++) {
         if (scales[i] != 0.0f) {
             loras->insert({adapters[i], scales[i]});
+
+            // prepare the pre-scaled copies of lora_b here, where no graph exists yet, so that
+            // the graph can drop the per-target GGML_OP_SCALE node (see build_lora_mm)
+            adapters[i]->ensure_scaled_b(scales[i]);
         }
     }
 

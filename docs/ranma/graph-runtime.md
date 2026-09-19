@@ -1,8 +1,8 @@
 # Graph runtime
 
 Changes to the machinery that turns a graph into work for a backend: the compute
-buffers the graph allocator keeps, and the way the scheduler gets the inputs of a
-graph onto the device.
+buffers the graph allocator keeps, the way the scheduler gets the inputs of a
+graph onto the device, and the nodes a LoRA adapter adds to a graph.
 
 ## Compute buffer regrowth headroom
 
@@ -165,3 +165,88 @@ backends before it frees the scheduler.
   `LLAMA_INPUT_UPLOAD_ASYNC=0` shows.
 - For an equivalence check, run the same prompt with `LLAMA_INPUT_UPLOAD_ASYNC=1`
   and `=0`: the path is a pure transport change and the logits must not move.
+
+
+## LoRA scale folding
+
+### What it is
+
+The LoRA delta of a target is `scale * B * (A * x)`, and the graph builder used
+to express the `scale` factor as a `GGML_OP_SCALE` node between the `B` matmul
+and the `ggml_add` that folds the delta into the base output. That node is now
+emitted only when the effective scale is not exactly 1; where it is not 1, the
+scale is folded into a pre-scaled copy of the dense `B` matrices that is built
+when the adapter is attached to a context.
+
+The effective scale of a target is `alpha/rank` times the adapter scale the
+caller passed, so an adapter with `alpha == rank` used at scale 1 has an
+effective scale of exactly 1 and needs no copy at all.
+
+### When it applies
+
+The scale node costs a kernel launch per target and per token, which is
+significant for a small adapter attached to many targets during single-token
+decoding. It also sits between the `B` matmul and the add, so the CUDA/HIP
+backend's `mul_mat` + `add` fusion does not see the two nodes as adjacent and
+cannot fuse them. Removing the node gives back both.
+
+### How it works
+
+- `llama_adapter_lora::ensure_scaled_b()` is called from
+  `llama_context::set_adapters_lora()`, i.e. at a point where no graph exists.
+- It considers the dense weights only (`ne[2] == 1`), contiguous, F16 or F32, and
+  only those whose effective scale differs from 1. For each of them it allocates
+  a copy in the same buffer type as the original `B` - so a `B` that lives in
+  host memory keeps living in host memory - and fills it by reading, scaling on
+  the host and writing back.
+- The copies are built at most once per adapter, for the first adapter scale that
+  needs them. The adapter records that scale; a later attach with a different
+  scale keeps the scale node instead of rewriting the copies, which is what makes
+  it safe for a graph to point at them and for several contexts to attach the
+  same adapter one after another.
+- `build_lora_mm()` uses the pre-scaled copy when it exists and was built for the
+  scale of this attachment, and emits the scale node otherwise. It drops the node
+  outright when the effective scale is 1.
+- `build_lora_mm_id()` (routed targets) only drops a scale of exactly 1. A routed
+  target holds one `B` per expert and is applied with `ggml_mul_mat_id`, whose
+  result the backend cannot fuse with the following add anyway, so no copy is
+  kept for it.
+
+### Options
+
+| Name | Kind | Default | Effect |
+| --- | --- | --- | --- |
+| `LLAMA_LORA_FOLD_SCALE` | env | `1` | `0` restores the previous graph exactly: every target keeps its scale node and no copies are built. Read once per process. |
+| `--lora <fname>` | llama-bench | - | Apply a LoRA adapter with scale 1.0 to every context the tool creates. Repeatable. |
+| `--lora-scaled <fname> <scale>` | llama-bench | - | The same with an explicit adapter scale. Repeatable. |
+
+The adapters loaded by llama-bench belong to the loaded model and are freed with
+it when the tool moves on to the next model.
+
+### Limits
+
+- Only dense targets get a pre-scaled copy, and only F16 and F32 ones. Anything
+  else keeps the scale node unless its effective scale is 1.
+- The copies cost memory: one copy of every dense `B` of the adapter, in the
+  buffer type of the original. For a low-rank adapter that is small, but it grows
+  with the rank and the number of targets.
+- One scale per adapter. If the same adapter is attached with another scale
+  later, that attachment runs with the scale node.
+- If a context or a buffer for the copies cannot be allocated, the adapter stays
+  in the "not built" state and the graph keeps the scale node, so a later attach
+  can try again. Nothing fails.
+- `ensure_scaled_b()` mutates state that belongs to the adapter, not to the
+  context, so the adapter must not be attached from two contexts at the same
+  time.
+
+### How to verify it
+
+- `test-backend-ops -o MUL_MAT_VEC_FUSION` includes rank-2 F16 `B` shapes: one
+  token, which is the case the backend fuses, and two and four tokens, which keep
+  the same matmul but take the unfused path.
+- Run the same prompt with `LLAMA_LORA_FOLD_SCALE=1` and `=0` and compare the
+  logits; the pre-scaled copy is a different rounding of the same product only
+  where the copy is F16, so an adapter with an effective scale of 1 must match
+  exactly.
+- A kernel trace with an adapter attached shows the scale launches disappear, and
+  for a single-token decode the `B` matmul and the add appear as one kernel.
