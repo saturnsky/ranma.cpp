@@ -11305,6 +11305,128 @@ void ggml_compute_forward_dsv4_hc_comb(
     }
 }
 
+// ggml_compute_forward_dsv4_hc_coef
+
+static void ggml_compute_forward_dsv4_hc_coef_f32(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * mixes = dst->src[0];
+    const ggml_tensor * scale = dst->src[1];
+    const ggml_tensor * base  = dst->src[2];
+
+    GGML_ASSERT(mixes->type == GGML_TYPE_F32);
+    GGML_ASSERT(scale->type == GGML_TYPE_F32);
+    GGML_ASSERT(base->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+
+    constexpr int64_t hc = 4;
+    constexpr int64_t comb_offset = 2*hc;
+    constexpr int64_t hc_mix_dim = (2 + hc)*hc;
+
+    const int64_t n_tokens = mixes->ne[1];
+
+    GGML_ASSERT(mixes->ne[0] == hc_mix_dim);
+    GGML_ASSERT(dst->ne[0] == hc_mix_dim);
+    GGML_ASSERT(dst->ne[1] == n_tokens);
+    GGML_ASSERT(scale->ne[0] >= 3);
+    GGML_ASSERT(base->ne[0] == hc_mix_dim);
+
+    GGML_TENSOR_LOCALS(size_t, nbm, mixes, nb);
+    GGML_TENSOR_LOCALS(size_t, nbs, scale, nb);
+    GGML_TENSOR_LOCALS(size_t, nbb, base,  nb);
+    GGML_TENSOR_LOCALS(size_t, nbd, dst,   nb);
+
+    const float eps = ggml_get_op_params_f32(dst, 0);
+    const int32_t n_iter = ggml_get_op_params_i32(dst, 1);
+    GGML_ASSERT(n_iter > 0);
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int64_t dr  = (n_tokens + nth - 1) / nth;
+    const int64_t it0 = dr * ith;
+    const int64_t it1 = MIN(it0 + dr, n_tokens);
+
+    const float scale_pre  = *(const float *) ((const char *) scale->data + 0*nbs0);
+    const float scale_post = *(const float *) ((const char *) scale->data + 1*nbs0);
+    const float scale_comb = *(const float *) ((const char *) scale->data + 2*nbs0);
+
+    for (int64_t it = it0; it < it1; ++it) {
+        // pre: sigmoid(mixes*scale[0] + base) + eps
+        for (int64_t ih = 0; ih < hc; ++ih) {
+            const float xv = *(const float *) ((const char *) mixes->data + ih*nbm0 + it*nbm1);
+            const float bv = *(const float *) ((const char *) base->data  + ih*nbb0);
+            const float v = xv * scale_pre + bv;
+            *(float *) ((char *) dst->data + ih*nbd0 + it*nbd1) = 1.0f/(1.0f + expf(-v)) + eps;
+        }
+
+        // post: 2*sigmoid(mixes*scale[1] + base)
+        for (int64_t ih = 0; ih < hc; ++ih) {
+            const int64_t idx = hc + ih;
+            const float xv = *(const float *) ((const char *) mixes->data + idx*nbm0 + it*nbm1);
+            const float bv = *(const float *) ((const char *) base->data  + idx*nbb0);
+            const float v = xv * scale_post + bv;
+            *(float *) ((char *) dst->data + idx*nbd0 + it*nbd1) = 2.0f*(1.0f/(1.0f + expf(-v)));
+        }
+
+        // comb: identical to ggml_compute_forward_dsv4_hc_comb_f32
+        float comb[hc*hc];
+
+        for (int64_t isrc = 0; isrc < hc; ++isrc) {
+            float max = -INFINITY;
+            for (int64_t idst = 0; idst < hc; ++idst) {
+                const int64_t idx = idst + hc*isrc;
+                const float xv = *(const float *) ((const char *) mixes->data + (comb_offset + idx)*nbm0 + it*nbm1);
+                const float bv = *(const float *) ((const char *) base->data  + (comb_offset + idx)*nbb0);
+                const float v = xv * scale_comb + bv;
+                comb[idx] = v;
+                max = MAX(max, v);
+            }
+
+            float sum = 0.0f;
+            for (int64_t idst = 0; idst < hc; ++idst) {
+                const int64_t idx = idst + hc*isrc;
+                const float v = expf(comb[idx] - max);
+                comb[idx] = v;
+                sum += v;
+            }
+
+            const float inv_sum = 1.0f / sum;
+            for (int64_t idst = 0; idst < hc; ++idst) {
+                const int64_t idx = idst + hc*isrc;
+                comb[idx] = comb[idx] * inv_sum + eps;
+            }
+        }
+
+        ggml_dsv4_hc_comb_norm_cols(comb, eps);
+        for (int32_t i = 1; i < n_iter; ++i) {
+            ggml_dsv4_hc_comb_norm_rows(comb, eps);
+            ggml_dsv4_hc_comb_norm_cols(comb, eps);
+        }
+
+        for (int64_t idx = 0; idx < hc*hc; ++idx) {
+            *(float *) ((char *) dst->data + (comb_offset + idx)*nbd0 + it*nbd1) = comb[idx];
+        }
+    }
+}
+
+void ggml_compute_forward_dsv4_hc_coef(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+
+    switch (src0->type) {
+        case GGML_TYPE_F32:
+            {
+                ggml_compute_forward_dsv4_hc_coef_f32(params, dst);
+            } break;
+        default:
+            {
+                GGML_ABORT("fatal error");
+            }
+    }
+}
+
 // ggml_compute_forward_dsv4_hc_pre
 
 static void ggml_compute_forward_dsv4_hc_pre_f32(

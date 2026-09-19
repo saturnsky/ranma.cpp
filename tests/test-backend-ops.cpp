@@ -4306,6 +4306,39 @@ struct test_dsv4_hc_comb : public test_dsv4_hc {
     }
 };
 
+struct test_dsv4_hc_coef : public test_dsv4_hc {
+    const int64_t n_tokens;
+    const int32_t n_iter;
+    const float eps;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "DSV4_HC_COEF";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR3(n_tokens, n_iter, eps);
+    }
+
+    test_dsv4_hc_coef(int64_t n_tokens = 17, int32_t n_iter = 4, float eps = 1e-6f)
+        : n_tokens(n_tokens), n_iter(n_iter), eps(eps) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * mixes = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, (2 + hc)*hc, n_tokens);
+        ggml_set_name(mixes, "mixes");
+
+        ggml_tensor * scale = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 3);
+        ggml_set_name(scale, "scale");
+
+        ggml_tensor * base = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, (2 + hc)*hc);
+        ggml_set_name(base, "base");
+
+        out = ggml_dsv4_hc_coef(ctx, mixes, scale, base, eps, n_iter);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 struct test_dsv4_hc_pre : public test_dsv4_hc {
     const int64_t n_embd;
     const int64_t n_tokens;
@@ -9263,6 +9296,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (int64_t n_tokens : {1, 256, 336, 512, 513, 1024, 2048}) {
         test_cases.emplace_back(new test_dsv4_hc_comb(n_tokens, 20));
     }
+
+    // hc_coef: the same three sources as hc_comb, but the result also carries the
+    // pre/post coefficients. Production shapes: hc = 4, n_iter = 20, decode (1) and a 512 batch.
+    test_cases.emplace_back(new test_dsv4_hc_coef(1, 20));
+    test_cases.emplace_back(new test_dsv4_hc_coef(512, 20));
+    test_cases.emplace_back(new test_dsv4_hc_coef(1, 1));
+    test_cases.emplace_back(new test_dsv4_hc_coef(17, 4));
+    test_cases.emplace_back(new test_dsv4_hc_coef(257, 8));
 
     test_cases.emplace_back(new test_dsv4_hc_pre(1, 1));
     test_cases.emplace_back(new test_dsv4_hc_pre(31, 17));

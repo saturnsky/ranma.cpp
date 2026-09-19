@@ -16,6 +16,7 @@
 
 #include <cinttypes>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
@@ -80,6 +81,22 @@ static const llm_fused_op_probe llm_fused_op_dsv4_hc_post_probe = {
     /*.name             =*/ "fused DeepSeek V4 HC post",
     /*.n_tokens_per_seq =*/ 1,
 };
+
+static const llm_fused_op_probe llm_fused_op_dsv4_hc_coef_probe = {
+    /*.op               =*/ LLM_FUSED_OP_DSV4_HC_COEF,
+    /*.name             =*/ "fused DeepSeek V4 HC coefficients",
+    /*.n_tokens_per_seq =*/ 1,
+};
+
+// LLAMA_DSV4_HC_COEF_FUSED=0 restores the separate pre/post coefficient ops in the graph
+static bool llama_dsv4_hc_coef_fused_enabled() {
+    static const bool enabled = []() {
+        const char * env = getenv("LLAMA_DSV4_HC_COEF_FUSED");
+        return env == nullptr || atoi(env) != 0;
+    }();
+
+    return enabled;
+}
 
 llama_context::llama_context(
         const llama_model & model,
@@ -242,6 +259,7 @@ llama_context::llama_context(
     cparams.fused_dsv4_hc_pre  = true;
     cparams.fused_dsv4_hc_comb = true;
     cparams.fused_dsv4_hc_post = true;
+    cparams.fused_dsv4_hc_coef = llama_dsv4_hc_coef_fused_enabled();
     cparams.auto_fhc           = true;
 
     // with causal attention, the batch size is limited by the context size
@@ -599,6 +617,9 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
     if (cparams.auto_fhc) {
         LLAMA_LOG_INFO("%s: resolving fused DeepSeek V4 HC support:\n", func);
         resolve(llm_fused_op_dsv4_hc_pre_probe,  cparams.fused_dsv4_hc_pre);
+        // resolve the coefficient fusion first: when it is disabled the graph falls back to the
+        // separate comb op, so that one has to be probed on a graph that actually contains it
+        resolve(llm_fused_op_dsv4_hc_coef_probe, cparams.fused_dsv4_hc_coef);
         resolve(llm_fused_op_dsv4_hc_comb_probe, cparams.fused_dsv4_hc_comb);
         resolve(llm_fused_op_dsv4_hc_post_probe, cparams.fused_dsv4_hc_post);
         cparams.auto_fhc = false;
