@@ -16,3 +16,12 @@ void ggml_cuda_op_mul_mat_vec_q(
     const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, const char * src0_dd_i, const float * src1_ddf_i,
     const char * src1_ddq_i, float * dst_dd_i, const int64_t row_low, const int64_t row_high, const int64_t src1_ncols,
     const int64_t src1_padded_row_size, cudaStream_t stream);
+
+// Shared q8_1 quantization of src1 between MMVQ nodes of one graph.
+//
+// Several MUL_MATs of a layer read the very same activation tensor, and each of them quantizes it
+// again. The plan pass groups such nodes; the first node of a group keeps its q8_1 buffer alive so
+// that the rest of the group can reuse it. `allow` is false when the caller cannot guarantee that
+// all nodes run on the same stream. Must be paired with ggml_cuda_mmvq_share_q8_end().
+void ggml_cuda_mmvq_share_q8_plan(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, bool allow);
+void ggml_cuda_mmvq_share_q8_end(ggml_backend_cuda_context & ctx);
