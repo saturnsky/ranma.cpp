@@ -93,6 +93,22 @@ public:
 
     using slot_info_vec_t = std::vector<slot_info>;
 
+    // optional external storage for the K tensor of a layer
+    // used to place the K of two caches of the same layer into one allocation, so that a graph can
+    // read them as a single contiguous view instead of concatenating them (see llama_kv_cache_dsv4)
+    struct k_storage_info {
+        // storage for this layer - must already be allocated (a view of an allocated tensor)
+        ggml_tensor * k = nullptr;
+
+        // the tensor that contains k, with k starting at row n_prefix
+        ggml_tensor * joint = nullptr;
+
+        uint32_t n_prefix = 0;
+    };
+
+    // called once per layer during construction - return an empty k_storage_info for normal allocation
+    using layer_k_storage_cb = std::function<k_storage_info(int32_t il, uint32_t n_embd_k_gqa, uint32_t kv_size, uint32_t n_stream)>;
+
     // TODO: refactor the memory instances to not depend on `llama_model`
     //       instead pass all necessary info (e.g. hparams, dev layers, arch, etc.) directly
     //       likely through `struct llama_memory_params`
@@ -114,7 +130,8 @@ public:
         const  layer_reuse_cb & reuse,
         const  layer_share_cb & share,
         // a model can hold more than one cache, so the tensor names have to stay unique
-                 const char *   name_tag = "");
+                 const char *   name_tag = "",
+     const layer_k_storage_cb & k_storage = nullptr);
 
     ~llama_kv_cache() = default;
 
@@ -189,6 +206,14 @@ public:
     ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
     ggml_tensor * get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
 
+    // true if the layers of this cache use externally provided K storage that also holds another cache's K
+    bool has_k_joint() const;
+
+    // view of [n_kv_all] cells of the joint K storage of the layer, starting at the first cell of the
+    // tensor that holds this layer's K at row n_prefix. returns nullptr if the layer has no joint storage
+    // or if the requested prefix does not match the one the storage was built with
+    ggml_tensor * get_k_joint(ggml_context * ctx, int32_t il, uint32_t n_prefix, uint32_t n_kv_all) const;
+
     // store k_cur and v_cur in the cache based on the provided head location
     ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const;
     ggml_tensor * cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il, const slot_info & sinfo) const;
@@ -257,7 +282,13 @@ private:
 
         std::vector<ggml_tensor *> k_stream;
         std::vector<ggml_tensor *> v_stream;
+
+        // set when k is externally provided storage inside a larger tensor (see k_storage_info)
+        ggml_tensor * k_joint = nullptr;
+        uint32_t      k_joint_prefix = 0;
     };
+
+    bool k_joint_used = false;
 
     bool v_trans = true;  // the value tensor is transposed
 
