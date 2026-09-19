@@ -49,6 +49,8 @@ struct llama_cparams {
     bool fused_dsv4_hc_post;
     bool fused_dsv4_hc_coef;  // also produce the hc pre/post coefficients in the fused comb op
     bool auto_fhc;
+    bool fused_dsv4_compress; // use the fused KV compressor op
+    bool auto_fcomp;
     bool no_perf;
     bool warmup;             // TODO: remove [TAG_LLAMA_GRAPH_NO_WARMUP]
     bool op_offload;
