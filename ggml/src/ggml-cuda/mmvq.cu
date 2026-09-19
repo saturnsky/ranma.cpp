@@ -5,8 +5,11 @@
 #include "unary.cuh"
 #include "vecdotq.cuh"
 
+#include <algorithm>
 #include <cstdint>
+#include <cstdlib>
 #include <type_traits>
+#include <vector>
 
 // only enabled on DGX Spark, where it is a gain on every type below. On the higher-bandwidth parts the kernel
 // has little exposed latency left to hide and the extra requests cost more than they save.
@@ -1545,6 +1548,193 @@ static void mul_mat_vec_q_switch_type(
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// Sharing one q8_1 quantization of src1 between MMVQ nodes of the same graph.
+//
+// Several MUL_MATs of a layer read the very same activation tensor (for DeepSeek-style attention
+// the normed attention input feeds wq_a, wkv and the compressor projections). Every one of them
+// allocates a pool buffer and launches quantize_q8_1 on identical bytes. A pre-pass over the graph
+// groups MUL_MAT nodes that read the same src1 bytes with no node in between writing into that
+// memory range; the first node of a group keeps its q8_1 buffer alive and the others reuse it.
+//
+// Correctness under graph capture: the plan is rebuilt from the graph whenever the nodes are
+// actually evaluated (capture or plain evaluation), so the sequence of pool allocations is the
+// same on every capture of the same graph, and a replay does not run host code at all.
+
+static bool ggml_cuda_mmvq_share_q8_enabled() {
+    static const bool enabled = [] {
+        const char * val = getenv("GGML_CUDA_MMVQ_SHARE_Q8");
+        return val == nullptr || atoi(val) != 0;
+    }();
+    return enabled;
+}
+
+static bool ggml_cuda_mmvq_share_q8_stats_enabled() {
+    static const bool enabled = [] {
+        const char * val = getenv("GGML_CUDA_MMVQ_SHARE_Q8_STATS");
+        return val != nullptr && atoi(val) != 0;
+    }();
+    return enabled;
+}
+
+static void ggml_cuda_mmvq_share_q8_release(ggml_cuda_mmvq_share_state & st) {
+    if (st.buf.ptr != nullptr) {
+        st.buf.pool->free(st.buf.ptr, st.buf.actual_size);
+        st.buf.ptr         = nullptr;
+        st.buf.actual_size = 0;
+    }
+    st.key_data = nullptr;
+    st.key_size = 0;
+}
+
+// Upper bound of the byte range a tensor covers, also for strided views: the largest element
+// offset plus one element, never below ggml_nbytes.
+static void ggml_cuda_mmvq_share_range(const ggml_tensor * t, uintptr_t & beg, uintptr_t & end) {
+    size_t span = ggml_type_size(t->type);
+    for (int k = 0; k < GGML_MAX_DIMS; ++k) {
+        if (t->ne[k] > 1) {
+            span += (size_t) (t->ne[k] - 1) * t->nb[k];
+        }
+    }
+    const size_t nbytes = ggml_nbytes(t);
+    beg = (uintptr_t) t->data;
+    end = beg + (span > nbytes ? span : nbytes);
+}
+
+static bool ggml_cuda_mmvq_share_same_src1(const ggml_tensor * a, const ggml_tensor * b) {
+    if (a->data != b->data || a->type != b->type) {
+        return false;
+    }
+    for (int k = 0; k < GGML_MAX_DIMS; ++k) {
+        if (a->ne[k] != b->ne[k] || a->nb[k] != b->nb[k]) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void ggml_cuda_mmvq_share_q8_plan(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, bool allow) {
+    ggml_cuda_mmvq_share_state & st = ctx.mmvq_share_q8;
+    ggml_cuda_mmvq_share_q8_release(st);
+    st.slots.clear();
+    st.cursor   = 0;
+    st.n_total  = 0;
+    st.n_shared = 0;
+
+    if (!allow || cgraph == nullptr || !ggml_cuda_mmvq_share_q8_enabled()) {
+        return;
+    }
+
+    std::vector<int> cand;          // graph indices of the MUL_MAT nodes that may use MMVQ
+    std::vector<int> cand_of_node(cgraph->n_nodes, -1);
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        if (node->op != GGML_OP_MUL_MAT) {
+            continue;
+        }
+        if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            continue;
+        }
+        const ggml_tensor * src1 = node->src[1];
+        if (src1 == nullptr || src1->type != GGML_TYPE_F32 || src1->data == nullptr) {
+            continue;
+        }
+        if (!ggml_is_contiguous(src1)) {
+            continue;
+        }
+        if (src1->ne[1] > MMVQ_MAX_BATCH_SIZE) {
+            continue; // batches take MMQ, keep the pre-pass off the prefill graphs
+        }
+        cand_of_node[i] = (int) cand.size();
+        cand.push_back(i);
+    }
+
+    if (cand.size() < 2) {
+        return;
+    }
+
+    st.slots.resize(cand.size());
+    for (size_t a = 0; a < cand.size(); ++a) {
+        st.slots[a].src0 = cgraph->nodes[cand[a]]->src[0];
+        st.slots[a].src1 = cgraph->nodes[cand[a]]->src[1];
+    }
+
+    std::vector<char>   taken(cand.size(), 0);
+    std::vector<size_t> members;
+    for (size_t a = 0; a < cand.size(); ++a) {
+        if (taken[a]) {
+            continue;
+        }
+        taken[a] = 1;
+
+        const ggml_tensor * s1 = st.slots[a].src1;
+        uintptr_t beg = 0;
+        uintptr_t end = 0;
+        ggml_cuda_mmvq_share_range(s1, beg, end);
+
+        members.clear();
+        members.push_back(a);
+
+        for (int k = cand[a] + 1; k < cgraph->n_nodes; ++k) {
+            const ggml_tensor * n = cgraph->nodes[k];
+
+            // any node that writes into the src1 memory range ends the group: after it the
+            // quantized copy no longer matches the bytes a later MUL_MAT would read
+            if (!ggml_cuda_is_view_or_noop(n) && (n->flags & GGML_TENSOR_FLAG_COMPUTE)) {
+                uintptr_t wbeg = 0;
+                uintptr_t wend = 0;
+                ggml_cuda_mmvq_share_range(n, wbeg, wend);
+                if (wbeg < end && beg < wend) {
+                    break;
+                }
+            }
+
+            const int b = cand_of_node[k];
+            if (b >= 0 && !taken[b] && ggml_cuda_mmvq_share_same_src1(st.slots[b].src1, s1)) {
+                taken[b] = 1;
+                members.push_back((size_t) b);
+            }
+        }
+
+        if (members.size() < 2) {
+            continue;
+        }
+        for (size_t m = 0; m < members.size(); ++m) {
+            st.slots[members[m]].reuse = m > 0;
+            st.slots[members[m]].hold  = m + 1 < members.size();
+        }
+    }
+}
+
+void ggml_cuda_mmvq_share_q8_end(ggml_backend_cuda_context & ctx) {
+    ggml_cuda_mmvq_share_state & st = ctx.mmvq_share_q8;
+    ggml_cuda_mmvq_share_q8_release(st);
+    st.slots.clear();
+    st.cursor = 0;
+
+    if (ggml_cuda_mmvq_share_q8_stats_enabled() && !st.stats_logged && st.n_total > 0) {
+        st.stats_logged = true;
+        GGML_LOG_INFO("mmvq_share_q8: q8_1 quantize calls of the first evaluated graph: %lld total, %lld shared\n",
+                      (long long) st.n_total, (long long) st.n_shared);
+    }
+}
+
+// Look up the plan entry of this MMVQ call. The entries are in graph order, so the match is
+// normally the entry at the cursor; the bounded forward search skips MUL_MAT nodes that did not
+// take the MMVQ path. No match means "no sharing", which is always safe.
+static ggml_cuda_mmvq_share_slot ggml_cuda_mmvq_share_q8_take(
+        ggml_cuda_mmvq_share_state & st, const ggml_tensor * src0, const ggml_tensor * src1) {
+    const size_t window = 64; // plan entries, unrelated to the node window of the shared fold
+    const size_t last   = std::min(st.slots.size(), st.cursor + window);
+    for (size_t i = st.cursor; i < last; ++i) {
+        if (st.slots[i].src0 == src0 && st.slots[i].src1 == src1) {
+            st.cursor = i + 1;
+            return st.slots[i];
+        }
+    }
+    return ggml_cuda_mmvq_share_slot();
+}
+
 void ggml_cuda_mul_mat_vec_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
         const ggml_cuda_mm_fusion_args_host * fusion) {
@@ -1681,12 +1871,57 @@ void ggml_cuda_mul_mat_vec_q(
     }
 
     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
-    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
-    {
+    const size_t  q8_1_size   = ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1;
+
+    // reuse the q8_1 copy of src1 that an earlier MUL_MAT of the same group already produced
+    ggml_cuda_mmvq_share_state & share_st = ctx.mmvq_share_q8;
+
+    ggml_cuda_mmvq_share_slot share;
+    if (!ids) {
+        share = ggml_cuda_mmvq_share_q8_take(share_st, src0, src1);
+    }
+    share_st.n_total++;
+
+    const bool share_hit = share.reuse && share_st.key_data == (const void *) src1_d &&
+        share_st.key_size == q8_1_size &&
+        share_st.key_ne[0] == ne10 && share_st.key_ne[1] == ne11 &&
+        share_st.key_ne[2] == ne12 && share_st.key_ne[3] == ne13 &&
+        share_st.key_nb[1] == nb11 && share_st.key_nb[2] == nb12 && share_st.key_nb[3] == nb13 &&
+        share_st.buf.ptr != nullptr;
+
+    ggml_cuda_pool_alloc<char> src1_q8_1_own;
+    char * src1_q8_1_d = nullptr;
+    if (share_hit) {
+        src1_q8_1_d = share_st.buf.ptr;
+        share_st.n_shared++;
+    }
+
+    if (share.reuse && !share.hold) {
+        // last user of the held buffer: hand it back here, before this call allocates anything
+        // else, because the VMM pool frees strictly in reverse allocation order. The kernels of
+        // the earlier users are already enqueued on this stream, so a later allocation that gets
+        // the same memory is only written by a later kernel of the same stream.
+        ggml_cuda_mmvq_share_q8_release(share_st);
+    }
+
+    if (!share_hit) {
+        if (share.hold) {
+            ggml_cuda_mmvq_share_q8_release(share_st); // a held buffer of a group that ended early
+            share_st.buf.pool = &ctx.pool();
+            src1_q8_1_d = share_st.buf.alloc(q8_1_size);
+            share_st.key_data = (const void *) src1_d;
+            share_st.key_size = q8_1_size;
+            share_st.key_ne[0] = ne10; share_st.key_ne[1] = ne11;
+            share_st.key_ne[2] = ne12; share_st.key_ne[3] = ne13;
+            share_st.key_nb[1] = nb11; share_st.key_nb[2] = nb12; share_st.key_nb[3] = nb13;
+        } else {
+            src1_q8_1_d = src1_q8_1_own.alloc(ctx.pool(), q8_1_size);
+        }
+
         const int64_t s11 = src1->nb[1] / ts_src1;
         const int64_t s12 = src1->nb[2] / ts_src1;
         const int64_t s13 = src1->nb[3] / ts_src1;
-        quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+        quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1_d, src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
     }
 
     const int64_t s01 = src0->nb[1] / ts_src0;
@@ -1712,7 +1947,7 @@ void ggml_cuda_mul_mat_vec_q(
     const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
 
     mul_mat_vec_q_switch_type(
-        src0_d, src0->type, src1_q8_1.get(), ids_d, fusion_local, dst_d, ne00,
+        src0_d, src0->type, src1_q8_1_d, ids_d, fusion_local, dst_d, ne00,
         ne01,              ncols_dst,     s01, stride_col_y,     stride_col_dst,
         ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
         ne03,              ne3,           s03, s13,              s3,               ids_stride, stream);

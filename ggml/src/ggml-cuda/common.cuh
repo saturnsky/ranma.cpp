@@ -1452,6 +1452,35 @@ struct ggml_cuda_stream_context {
     }
 };
 
+// a node that neither writes memory nor runs a kernel
+bool ggml_cuda_is_view_or_noop(const ggml_tensor * t);
+
+// Shared q8_1 quantization of an MMVQ input between the MUL_MAT nodes of one graph [mmvq.cu].
+// The plan belongs to the evaluation that made it, i.e. to the context that runs it.
+struct ggml_cuda_mmvq_share_slot {
+    const ggml_tensor * src0 = nullptr;
+    const ggml_tensor * src1 = nullptr;
+    bool reuse = false; // an earlier node of the group already quantized these bytes
+    bool hold  = false; // a later node of the group still needs the buffer
+};
+
+struct ggml_cuda_mmvq_share_state {
+    std::vector<ggml_cuda_mmvq_share_slot> slots;
+    size_t cursor = 0;
+
+    // buffer held for the group that is currently being executed
+    ggml_cuda_pool_alloc<char> buf;
+    const void * key_data = nullptr;
+    int64_t      key_ne[4] = {0, 0, 0, 0};
+    size_t       key_nb[4] = {0, 0, 0, 0};
+    size_t       key_size  = 0;
+
+    // quantize calls of the graph in progress, logged for the first evaluated graph
+    int64_t n_total      = 0;
+    int64_t n_shared     = 0;
+    bool    stats_logged = false;
+};
+
 struct ggml_backend_cuda_context {
     int device;
     std::string name;
@@ -1570,6 +1599,10 @@ struct ggml_backend_cuda_context {
     ggml_cuda_pool & pool() {
         return pool(device);
     }
+
+    // plan of the graph evaluation in progress, see mmvq.cuh; it can hold a pool allocation, so it is
+    // declared after the pools and destroyed before them
+    ggml_cuda_mmvq_share_state mmvq_share_q8;
 };
 
 struct ggml_cuda_mm_fusion_args_host {

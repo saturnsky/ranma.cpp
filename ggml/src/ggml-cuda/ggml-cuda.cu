@@ -2910,7 +2910,7 @@ static void ggml_backend_cuda_synchronize(ggml_backend_t backend) {
     GGML_UNUSED(backend);
 }
 
-static bool ggml_cuda_is_view_or_noop(const ggml_tensor * t) {
+bool ggml_cuda_is_view_or_noop(const ggml_tensor * t) {
     return ggml_is_empty(t) || t->op == GGML_OP_RESHAPE || t->op == GGML_OP_TRANSPOSE ||
            t->op == GGML_OP_VIEW || t->op == GGML_OP_PERMUTE || t->op == GGML_OP_NONE;
 }
@@ -4647,6 +4647,11 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 stream_ctx.concurrent_events.clear();
             }
 
+            // group MUL_MAT nodes that read the same src1 so that one q8_1 quantization serves all
+            // of them; concurrent regions are excluded because the group members would then run on
+            // different streams
+            ggml_cuda_mmvq_share_q8_plan(*cuda_ctx, cgraph, !should_launch_concurrent_events);
+
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
                 if (is_concurrent_event_active) {
@@ -4732,6 +4737,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     try_launch_concurrent_event(node);
                }
             }
+
+            ggml_cuda_mmvq_share_q8_end(*cuda_ctx);
         }
 
 #ifdef USE_CUDA_GRAPH

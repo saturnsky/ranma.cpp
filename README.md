@@ -147,6 +147,11 @@ applies, how to switch it, and its limits.
   a pre-scaled copy of the dense B matrices at attach time. `llama-bench` gains `--lora` and `--lora-scaled`.
   Same page.
 
+### MoE decode kernels (HIP)
+
+- **One q8_1 quantization per shared input** - `MUL_MAT` nodes of one graph that read the same activation
+  share its quantization. [docs/ranma/moe-decode.md](docs/ranma/moe-decode.md)
+
 ## Building
 
 RANMA.cpp builds exactly like upstream. For the primary target, follow the HIP section of
