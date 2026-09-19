@@ -174,6 +174,11 @@ applies, how to switch it, and its limits.
   indexer scoring or top-k and attends through the dense path. `LLAMA_QSA_ALL_CELLS_BYPASS=0` keeps the
   selection at every length, as upstream does. Same page.
 
+### DeepSeek V4
+
+- **Selected-cell attention for 512-wide heads**, including attention calls with sinks.
+  [docs/ranma/deepseek-v4.md](docs/ranma/deepseek-v4.md)
+
 ## Building
 
 RANMA.cpp builds exactly like upstream. For the primary target, follow the HIP section of

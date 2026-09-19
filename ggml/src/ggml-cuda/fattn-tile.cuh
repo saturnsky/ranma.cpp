@@ -1205,6 +1205,17 @@ static __global__ void flash_attn_tile(
 #endif // FLASH_ATTN_AVAILABLE
 }
 
+// Shapes for which launch_fattn_tile_switch_ncols1 instantiates a gathering kernel variant. Every entry
+// costs compile time and code size, so only the shapes that a model actually annotates with n_kv_max are
+// listed here.
+//   512/512, ncols2  8: DeepSeek V4 Flash CSA-LID decode (head size 512, GQA 64, one query row).
+// 256/256 with ncols2 12 (Qwen QSA decode) also gathers, but launch_fattn_tile_switch_ncols2 dispatches
+// it directly and does not consult this function.
+static constexpr bool ggml_cuda_fattn_tile_may_use_sparse(
+        const int DKQ, const int DV, const int ncols1, const int ncols2) {
+    return ncols1 == 1 && DKQ == 512 && DV == 512 && ncols2 == 8;
+}
+
 // Whether the tile kernel should gather the cells that the mask selects instead of scanning the whole
 // KV cache. n_kv_max (op param 4) bounds the number of finite entries per mask row; the caller sets it.
 static bool ggml_cuda_fattn_tile_shall_use_sparse(const int device, const ggml_tensor * dst) {
@@ -1224,7 +1235,7 @@ static bool ggml_cuda_fattn_tile_shall_use_sparse(const int device, const ggml_t
     }
 
     const int32_t n_kv_max = ggml_get_op_params_i32(dst, 4);
-    if (n_kv_max <= 0 || mask == nullptr || dst->src[4] != nullptr) {
+    if (n_kv_max <= 0 || mask == nullptr) {
         return false;
     }
 
@@ -1301,6 +1312,17 @@ static void launch_fattn_tile_switch_ncols1(ggml_backend_cuda_context & ctx, ggm
     constexpr size_t nbytes_shared = 0;
 
 #ifdef GGML_USE_HIP
+    // One query row per block is the only layout the gather supports. For ncols2 >= 2 and a single query
+    // row the switch below picks exactly cols_per_block == ncols2, i.e. ncols1 == 1, so the gathering
+    // kernel uses the same configuration as the dense kernel it replaces.
+    if constexpr (ggml_cuda_fattn_tile_may_use_sparse(DKQ, DV, 1, ncols2)) {
+        static_assert(ncols2 >= 2 && ncols2 <= 32 && (ncols2 & (ncols2 - 1)) == 0,
+            "the switch below picks cols_per_block == ncols2 only for a power of two in [2, 32]");
+        if (Q->ne[1] == 1 && launch_fattn_tile_sparse<DKQ, DV, ncols2, use_logit_softcap>(ctx, dst, id, cc, warp_size)) {
+            return;
+        }
+    }
+
     if constexpr (DKQ <= 128) {
         if (Q->ne[1] > 32/ncols2) {
             constexpr int cols_per_block = 64;

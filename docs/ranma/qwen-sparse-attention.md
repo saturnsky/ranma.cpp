@@ -269,7 +269,9 @@ The gather is taken on HIP only, and only when all of the following hold:
 - the per-row bound is set;
 - K and V are F16 - single rows are read, so they cannot go through the
   on-the-fly conversion;
-- no ALiBi, no logit softcap, no attention sink;
+- no ALiBi and no logit softcap (a node with attention sinks may gather: the
+  sink correction acts after the KV loop and does not depend on which cells
+  the loop visited);
 - the mask covers the whole cache contiguously and has a single head;
 - one query row per tile;
 - the wave is 32 lanes wide;
