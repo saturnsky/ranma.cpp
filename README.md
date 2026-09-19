@@ -189,6 +189,7 @@ applies, how to switch it, and its limits.
 - **Hyper-connection coefficients in one op** with a backend capability probe and the upstream ops as the
   fallback. Same page.
 - **Fused KV compressor** - gather, per-feature softmax and weighted sum in one op. Same page.
+- **No dummy HCA compression** on the decode steps in which no block completes. Same page.
 
 ## Building
 
