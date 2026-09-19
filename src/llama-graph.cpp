@@ -17,6 +17,7 @@
 #include "llama-memory-recurrent.h"
 
 #include <cassert>
+#include <cstdlib>
 #include <cmath>
 #include <cstring>
 #include <numeric>
@@ -1530,12 +1531,29 @@ ggml_tensor * llm_graph_context::build_lora_mm(
         const float adapter_scale = lora.second;
         const float scale = lw->get_scale(lora.first->alpha, adapter_scale);
 
+        // Fold the LoRA scale (alpha/rank times the user adapter scale) out of the graph: the
+        // per-target GGML_OP_SCALE node disappears and mul_mat(lora_b) becomes directly adjacent
+        // to the GGML_OP_ADD that folds the delta into the base output, which the CUDA/HIP backend
+        // fuses into the mul_mat_vec kernel. LLAMA_LORA_FOLD_SCALE=0 restores the old graph.
+        const bool fold = llama_adapter_lora_fold_scale_enabled();
+
+        ggml_tensor * b          = lw->b;
+        bool          need_scale = scale != 1.0f;
+
+        if (fold && need_scale && lw->b_scaled && lora.first->scaled_b_adapter_scale == adapter_scale) {
+            // a copy of lora_b that already carries the scale was built when the adapter was set
+            b          = lw->b_scaled;
+            need_scale = false;
+        }
+
         ggml_tensor * ab_cur = ggml_mul_mat(
-                ctx0, lw->b,
+                ctx0, b,
                 ggml_mul_mat(ctx0, lw->a, cur)
                 );
 
-        ab_cur = ggml_scale(ctx0, ab_cur, scale);
+        if (need_scale || !fold) {
+            ab_cur = ggml_scale(ctx0, ab_cur, scale);
+        }
         res = ggml_add(ctx0, res, ab_cur);
     }
 
@@ -1573,7 +1591,11 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
                 ids
                 );
 
-        ab_cur = ggml_scale(ctx0, ab_cur, scale);
+        // routed targets keep one lora_b per expert, so no pre-scaled copy is kept for them:
+        // the scale node is only dropped when the effective scale is exactly 1
+        if (scale != 1.0f || !llama_adapter_lora_fold_scale_enabled()) {
+            ab_cur = ggml_scale(ctx0, ab_cur, scale);
+        }
         res = ggml_add(ctx0, res, ab_cur);
     }
 
