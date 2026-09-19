@@ -1,5 +1,6 @@
 #include "arg.h"
 #include "common.h"
+#include "expert-policy.h"
 #include "fit.h"
 #include "log.h"
 #include "llama.h"
@@ -2060,6 +2061,19 @@ int llama_perplexity(int argc, char ** argv) {
     if (ctx == nullptr) {
         LOG_ERR("%s: failed to create context\n", __func__);
         return 1;
+    }
+
+    // ranma: the expert cache itself is installed at model load from common_params. The policy is
+    // only initialised so that the run reports the budget; frozen, it never profiles or changes
+    // the placement, so a scoring run leaves the profile directory as it found it. The object is
+    // never used again: it exists for that log line and for its destructor at the end of the run.
+    common_expert expert;
+    if (params.expert_l1_mib > 0 || params.expert_l2_mib > 0) {
+        common_expert_params ep;
+        ep.l1_mib       = params.expert_l1_mib;
+        ep.prefill_swap = false;
+        ep.freeze       = true;
+        expert.init(ctx, ep);
     }
 
     const int n_ctx_train = llama_model_n_ctx_train(model);
