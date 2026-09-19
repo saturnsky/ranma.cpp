@@ -586,6 +586,7 @@ extern "C" {
         GGML_OP_DSV4_HC_COMB,
         GGML_OP_DSV4_HC_PRE,
         GGML_OP_DSV4_HC_POST,
+        GGML_OP_DSV4_HC_COEF,
 
         GGML_OP_UNARY,
 
@@ -2721,6 +2722,21 @@ extern "C" {
     // Softmax over dst, add eps, normalize over src, then repeat normalization
     // over dst followed by src for iterations 1 through n_iter - 1.
     GGML_API struct ggml_tensor * ggml_dsv4_hc_comb(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * mixes,
+            struct ggml_tensor  * scale,
+            struct ggml_tensor  * base,
+            float                 eps,
+            int32_t               n_iter);
+
+    // hc_coef: same sources as hc_comb, but the result also holds the pre and post coefficients.
+    //          mixes [(2 + hc)*hc, n_tokens], scale [3], base [(2 + hc)*hc]
+    //          -> [(2 + hc)*hc, n_tokens], contiguous, same row layout as mixes
+    // pre[h, t]  = sigmoid(mixes[h, t]*scale[0] + base[h]) + eps             at row h
+    // post[h, t] = 2*sigmoid(mixes[hc + h, t]*scale[1] + base[hc + h])       at row hc + h
+    // comb[dst, src, t] = same as ggml_dsv4_hc_comb                          at row 2*hc + dst + hc*src
+    // The caller views the result: pre and post are rows [hc, n_tokens], comb is [hc, hc, n_tokens].
+    GGML_API struct ggml_tensor * ggml_dsv4_hc_coef(
             struct ggml_context * ctx,
             struct ggml_tensor  * mixes,
             struct ggml_tensor  * scale,
