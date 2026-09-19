@@ -194,3 +194,42 @@ the state.
   the missing-segment sentinel.
 - The load log reports whether the fused compressor is enabled.
 - `LLAMA_DSV4_COMPRESSOR_FUSED=0` gives the op chain for a comparison run.
+
+## No dummy compression when no HCA block completes
+
+### What it is
+
+An HCA block covers 128 raw cells, so in decode a block completes on one step
+out of 128. To keep the shape of the graph the same on every step, a ubatch in
+which no block completed still ran the whole compressor on a dummy block and
+wrote the result to the masked last slot of the cache, where it could not be
+read. The compress plan no longer appends that dummy block; the graph builder
+already handles a plan without one, and the state update for the new token is
+unchanged.
+
+The graph shape therefore changes when a block completes and changes back
+afterwards, so the graph is rebuilt twice per 128 tokens. That is much less
+work than running the compressor and the cache write on every step.
+
+The dummy blocks of the ratio-4 compressors stay: a block completes every
+fourth token there, which is too short a period for graph reuse to pay.
+
+### Switches
+
+| Switch | Default | Effect |
+|---|---|---|
+| `LLAMA_DSV4_HCA_SKIP_DUMMY=0` | on | Keep the dummy block, and with it the fixed graph shape. The reference path for equivalence checks. |
+
+### Limits
+
+- Only the ratio-128 compressor is affected.
+- The dummy block was written to the last cache slot, which is only safe while
+  that slot is not live; the code that did so also asserted this. Dropping the
+  write removes that dependency.
+
+### How to verify
+
+The dummy block never contributed to any result, so output is expected to be
+unchanged, not merely close: a greedy continuation with the switch on and off
+has to agree. Rebuilds show up in the `graphs reused` counter of the
+performance summary.

@@ -424,6 +424,20 @@ static std::string dsv4_plan_positions(const std::vector<int32_t> & values) {
     return ss.str();
 }
 
+// When no HCA block completes in a ubatch the compressor result is discarded,
+// so the compress + cache-write subgraph can be dropped entirely instead of
+// being run on a dummy block. Set LLAMA_DSV4_HCA_SKIP_DUMMY=0 to restore the
+// dummy-block graph. Only HCA (ratio 128) is affected; the CSA/LID dummy block
+// (ratio 4) is kept because its period is too short for graph reuse to pay.
+static bool dsv4_hca_skip_dummy() {
+    static const bool skip = []() {
+        const char * env = getenv("LLAMA_DSV4_HCA_SKIP_DUMMY");
+        return env == nullptr || atoi(env) != 0;
+    }();
+
+    return skip;
+}
+
 static llama_kv_cache_dsv4_context::comp_plan dsv4_build_comp_plan(
         const llama_ubatch & ubatch,
         uint32_t ratio,
@@ -599,7 +613,8 @@ static llama_kv_cache_dsv4_context::comp_plan dsv4_build_comp_plan(
         }
     }
 
-    if (ratio == DSV4_HCA_RATIO && !plan.state_pos.empty() && plan.state_write_idxs.empty()) {
+    if (ratio == DSV4_HCA_RATIO && !plan.state_pos.empty() && plan.state_write_idxs.empty() &&
+            !dsv4_hca_skip_dummy()) {
         assert(kv_size > 0);
         // the last slot must not be live, or the dummy write would corrupt it;
         // a full stream implies a completed block, which implies real writes
