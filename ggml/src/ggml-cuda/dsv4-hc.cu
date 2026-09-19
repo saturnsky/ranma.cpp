@@ -442,3 +442,116 @@ void ggml_cuda_op_dsv4_hc_post(ggml_backend_cuda_context & ctx, ggml_tensor * ds
             nbc0 / sizeof(float), nbc1 / sizeof(float), nbc2 / sizeof(float),
             nbd0 / sizeof(float), nbd1 / sizeof(float), nbd2 / sizeof(float));
 }
+
+// DeepSeek V4 KV compressor: fused gather + per-feature softmax + weighted sum.
+// One block handles one compressor block; one thread handles one output feature.
+
+template <bool overlap>
+static __global__ void dsv4_compress_f32(
+        const float   * __restrict__ kv,
+        const float   * __restrict__ score,
+        const int32_t * __restrict__ idxs,
+        float         * __restrict__ dst,
+        int64_t n_embd_head,
+        int64_t n_rows,
+        int64_t n_read,
+        int     ratio,
+        int64_t sk0,
+        int64_t sk1,
+        int64_t ss0,
+        int64_t ss1,
+        int64_t sd0,
+        int64_t sd2) {
+    ggml_cuda_pdl_lc();
+
+    extern __shared__ int32_t s_idx[];
+
+    const int64_t ib    = blockIdx.y;
+    const int     n_per = overlap ? 2*ratio : ratio;
+
+    ggml_cuda_pdl_sync();
+
+    for (int k = threadIdx.x; k < n_per; k += blockDim.x) {
+        const bool cur = overlap && k >= ratio;
+        s_idx[k] = cur ? idxs[n_read + ib*ratio + (k - ratio)] : idxs[ib*ratio + k];
+    }
+    __syncthreads();
+
+    const int64_t f = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
+
+    if (f >= n_embd_head) {
+        return;
+    }
+
+    // pass 1: max of the gathered scores for this feature
+    float m = -INFINITY;
+    for (int k = 0; k < n_per; ++k) {
+        const int64_t row = s_idx[k];
+        if ((uint64_t) row >= (uint64_t) n_rows) {
+            continue; // missing segment: score is -INFINITY
+        }
+        const int64_t col = (overlap && k >= ratio) ? f + n_embd_head : f;
+        m = fmaxf(m, score[col*ss0 + row*ss1]);
+    }
+
+    // pass 2: unnormalized softmax weights, weighted sum
+    float sum = 0.0f;
+    float acc = 0.0f;
+    for (int k = 0; k < n_per; ++k) {
+        const int64_t row = s_idx[k];
+        if ((uint64_t) row >= (uint64_t) n_rows) {
+            continue; // missing segment: weight 0, value 0
+        }
+        const int64_t col = (overlap && k >= ratio) ? f + n_embd_head : f;
+
+        const float w = expf(score[col*ss0 + row*ss1] - m);
+        sum += w;
+        acc += w*kv[col*sk0 + row*sk1];
+    }
+
+    dst[f*sd0 + ib*sd2] = sum > 0.0f ? acc/sum : 0.0f;
+}
+
+void ggml_cuda_op_dsv4_compress(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * kv    = dst->src[0];
+    const ggml_tensor * score = dst->src[1];
+    const ggml_tensor * idxs  = dst->src[2];
+
+    GGML_ASSERT(kv->type    == GGML_TYPE_F32);
+    GGML_ASSERT(score->type == GGML_TYPE_F32);
+    GGML_ASSERT(idxs->type  == GGML_TYPE_I32);
+    GGML_ASSERT(dst->type   == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(idxs));
+
+    GGML_TENSOR_LOCALS(size_t, nbk, kv,    nb);
+    GGML_TENSOR_LOCALS(size_t, nbs, score, nb);
+    GGML_TENSOR_LOCALS(size_t, nbd, dst,   nb);
+
+    const int     ratio   = ggml_get_op_params_i32(dst, 0);
+    const bool    overlap = ggml_get_op_params_i32(dst, 1) != 0;
+
+    const int64_t n_embd_head = dst->ne[0];
+    const int64_t n_blocks    = dst->ne[2];
+    const int64_t n_rows      = kv->ne[1];
+    const int64_t n_read      = (int64_t) ratio*n_blocks;
+    const int64_t n_per_block = overlap ? 2*ratio : ratio;
+
+    GGML_ASSERT(dst->ne[1] == 1);
+    GGML_ASSERT(idxs->ne[0] == n_per_block*n_blocks);
+
+    // small blocks: the feature dimension is the only parallelism, and decode
+    // calls this with a single compressor block
+    const int block_size = 64;
+    const dim3 block_dims(block_size, 1, 1);
+    const dim3 grid_dims((n_embd_head + block_size - 1)/block_size, n_blocks, 1);
+    const size_t shmem = n_per_block*sizeof(int32_t);
+    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid_dims, block_dims, shmem, ctx.stream());
+
+    auto kernel = overlap ? dsv4_compress_f32<true> : dsv4_compress_f32<false>;
+    ggml_cuda_kernel_launch(kernel, launch_params,
+            (const float *) kv->data, (const float *) score->data, (const int32_t *) idxs->data, (float *) dst->data,
+            n_embd_head, n_rows, n_read, ratio,
+            (int64_t) (nbk0 / sizeof(float)), (int64_t) (nbk1 / sizeof(float)),
+            (int64_t) (nbs0 / sizeof(float)), (int64_t) (nbs1 / sizeof(float)),
+            (int64_t) (nbd0 / sizeof(float)), (int64_t) (nbd2 / sizeof(float)));
+}

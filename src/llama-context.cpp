@@ -172,6 +172,12 @@ static const llm_fused_op_probe llm_fused_op_dsv4_hc_coef_probe = {
     /*.n_tokens_per_seq =*/ 1,
 };
 
+static const llm_fused_op_probe llm_fused_op_dsv4_compress_probe = {
+    /*.op               =*/ LLM_FUSED_OP_DSV4_COMPRESS,
+    /*.name             =*/ "fused DeepSeek V4 KV compressor",
+    /*.n_tokens_per_seq =*/ 1,
+};
+
 // Stored batch shapes per context: a speculative server uses up to 16 verification widths, and the rest leaves room
 // for a second graph variant of a width.
 static constexpr int LLAMA_GRAPH_N_SHAPES = 24;
@@ -341,6 +347,9 @@ llama_context::llama_context(
     cparams.fused_dsv4_hc_post = true;
     cparams.fused_dsv4_hc_coef = true;
     cparams.auto_fhc           = true;
+
+    cparams.fused_dsv4_compress = true;
+    cparams.auto_fcomp          = true;
 
     // with causal attention, the batch size is limited by the context size
     cparams.n_batch = cparams.causal_attn ? std::min(cparams.n_ctx, params.n_batch) : params.n_batch;
@@ -718,6 +727,12 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
         resolve(llm_fused_op_dsv4_hc_comb_probe, cparams.fused_dsv4_hc_comb);
         resolve(llm_fused_op_dsv4_hc_post_probe, cparams.fused_dsv4_hc_post);
         cparams.auto_fhc = false;
+    }
+
+    if (cparams.auto_fcomp) {
+        LLAMA_LOG_INFO("%s: resolving fused DeepSeek V4 KV compressor support:\n", func);
+        resolve(llm_fused_op_dsv4_compress_probe, cparams.fused_dsv4_compress);
+        cparams.auto_fcomp = false;
     }
 }
 
