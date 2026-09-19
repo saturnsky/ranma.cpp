@@ -152,6 +152,9 @@ applies, how to switch it, and its limits.
   [docs/ranma/graph-runtime.md](docs/ranma/graph-runtime.md)
 - **Graph inputs are uploaded through a pinned staging ring** - asynchronously on the stream of the backend
   instead of one blocking copy per input. `LLAMA_INPUT_UPLOAD_ASYNC=0` restores the blocking path. Same page.
+- **LoRA scale folding** - a LoRA scale of exactly 1 produces no graph node, and other scales are folded into
+  a pre-scaled copy of the dense B matrices at attach time. `llama-bench` gains `--lora` and `--lora-scaled`.
+  Same page.
 
 ## Building
 
