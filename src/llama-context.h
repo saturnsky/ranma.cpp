@@ -407,6 +407,39 @@ private:
     // env: LLAMA_GRAPH_REUSE_DISABLE
     bool graph_reuse_disable = false;
 
+    // env: LLAMA_DECODE_HOST_TIMING - host-side phase timing of single-token decodes,
+    // printed every `every` tokens. Disabled (0) by default.
+    struct decode_host_timing {
+        int     every = 0;
+        int64_t n     = 0;
+
+        // accumulated microseconds
+        int64_t t_total   = 0;
+        int64_t t_batch   = 0;
+        int64_t t_memory  = 0;
+        int64_t t_graph   = 0;
+        int64_t t_inputs  = 0;
+        int64_t t_compute = 0;
+        int64_t t_output  = 0;
+        int64_t t_sync    = 0;
+
+        // graph-input uploads: deltas of the cumulative scheduler counters
+        uint64_t up_n_async = 0;
+        uint64_t up_n_sync  = 0;
+        uint64_t up_bytes   = 0;
+        uint64_t up_t_us    = 0;
+
+        uint64_t up_prev_n_async = 0;
+        uint64_t up_prev_n_sync  = 0;
+        uint64_t up_prev_bytes   = 0;
+        uint64_t up_prev_t_us    = 0;
+
+        bool up_init = false; // the upload counter baseline has been taken
+        bool active  = false; // the decode in progress is a single-token decode
+    };
+
+    mutable decode_host_timing dht;
+
     // perf
     mutable int64_t t_start_us  = 0;
     mutable int64_t t_load_us   = 0;

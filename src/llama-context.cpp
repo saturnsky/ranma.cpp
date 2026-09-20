@@ -286,6 +286,15 @@ llama_context::llama_context(
         }
     }
 
+    {
+        const char * LLAMA_DECODE_HOST_TIMING = getenv("LLAMA_DECODE_HOST_TIMING");
+        dht.every = LLAMA_DECODE_HOST_TIMING ? atoi(LLAMA_DECODE_HOST_TIMING) : 0;
+
+        if (dht.every > 0) {
+            LLAMA_LOG_INFO("%s: host-side decode timing every %d single-token decodes\n", __func__, dht.every);
+        }
+    }
+
     // ref: https://github.com/ggml-org/llama.cpp/pull/17046#discussion_r2503085732
     cparams.n_ctx = GGML_PAD(cparams.n_ctx, 256);
 
@@ -622,6 +631,7 @@ void llama_context::sched_reserve() {
     gf_res_prev_active = nullptr;
 
     sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
+    ggml_backend_sched_set_input_upload_timing(sched.get(), dht.every > 0);
 
     llama_memory_context_ptr mctx;
     if (memory) {
@@ -657,6 +667,7 @@ void llama_context::sched_reserve() {
                 LLAMA_LOG_WARN("%s: compute buffer allocation failed, retrying without pipeline parallelism\n", __func__);
                 cparams.pipeline_parallel = false;
                 sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
+                ggml_backend_sched_set_input_upload_timing(sched.get(), dht.every > 0);
                 gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get());
             }
             if (!gf) {
@@ -737,7 +748,13 @@ void llama_context::synchronize() {
         return;
     }
 
+    const int64_t t_sync_start_us = dht.every > 0 ? ggml_time_us() : 0;
+
     ggml_backend_sched_synchronize(sched.get());
+
+    if (dht.every > 0) {
+        dht.t_sync += ggml_time_us() - t_sync_start_us;
+    }
 
     // FIXME: if multiple single tokens are evaluated without a synchronization,
     // the stats will be added to the prompt evaluation stats
@@ -1357,6 +1374,8 @@ bool llama_context::set_adapter_cvec(
 }
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+    const int64_t t_ubatch_start_us = dht.active ? ggml_time_us() : 0;
+
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
@@ -1413,8 +1432,17 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     {
         //const auto t_start_us = ggml_time_us();
 
+        const int64_t t_inputs_start_us = dht.active ? ggml_time_us() : 0;
+
         // FIXME this call causes a crash if any model inputs were not used in the graph and were therefore not allocated
         res->set_inputs(&ubatch);
+
+        if (dht.active) {
+            const int64_t t_now_us = ggml_time_us();
+
+            dht.t_graph  += t_inputs_start_us - t_ubatch_start_us;
+            dht.t_inputs += t_now_us - t_inputs_start_us;
+        }
 
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
@@ -1440,7 +1468,14 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         expert_iface->profile_select(expert_backend, row_begin, row_end, expert_profiled_bank);
     }
 
+    const int64_t t_compute_us = dht.active ? ggml_time_us() : 0;
+
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+
+    if (dht.active) {
+        dht.t_compute += ggml_time_us() - t_compute_us;
+    }
+
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
@@ -1697,6 +1732,13 @@ int llama_context::decode(const llama_batch & batch_inp) {
     // ranma expert cache: an install may not run while this is on the stack
     expert_compute_guard expert_guard(expert_n_compute_in_flight);
 
+    // host-side timing probe [LLAMA_DECODE_HOST_TIMING], single-token decodes only
+    const int64_t t_decode_start_us = dht.every > 0 ? ggml_time_us() : 0;
+
+    int64_t t_mark_us = t_decode_start_us;
+
+    dht.active = false;
+
     // MTP hook batches carry both token (next-token id) and embd (h_nextn row),
     // so accept either present rather than requiring exactly one.
     GGML_ASSERT(batch_inp.token || batch_inp.embd);
@@ -1764,6 +1806,16 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     const uint32_t n_tokens_all  = balloc->get_n_tokens();
     const uint32_t n_outputs_all = balloc->get_n_outputs();
+
+    if (dht.every > 0 && n_tokens_all == 1) {
+        dht.active = true;
+
+        const int64_t t_now_us = ggml_time_us();
+
+        dht.t_batch += t_now_us - t_mark_us;
+
+        t_mark_us = t_now_us;
+    }
 
     if (output_all) {
         // require that all tokens are output
@@ -1850,6 +1902,14 @@ int llama_context::decode(const llama_batch & batch_inp) {
         return -2;
     };
 
+    if (dht.active) {
+        const int64_t t_now_us = ggml_time_us();
+
+        dht.t_memory += t_now_us - t_mark_us;
+
+        t_mark_us = t_now_us;
+    }
+
     // start a new sampling transaction for this logical batch
     for (const auto & entry : sampling.samplers) {
         llama_sampler_backend_begin(entry.second);
@@ -1910,6 +1970,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 case GGML_STATUS_FAILED:       return -3;
                 case GGML_STATUS_SUCCESS:      GGML_ABORT("should not happen");
             }
+        }
+
+        if (dht.active) {
+            t_mark_us = ggml_time_us();
         }
 
         // plot the computation graph in dot format (for debugging purposes)
@@ -2031,6 +2095,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
             copy_tensor_async_rows(res->t_candidates,     sampling.candidates, stride, n_outputs_prev, sched.get(), &sampling.candidates_count);
         }
 
+        if (dht.active) {
+            dht.t_output += ggml_time_us() - t_mark_us;
+        }
+
         n_outputs_prev += n_outputs;
         n_tokens_prev  += ubatch.n_tokens;
     } while (mctx->next());
@@ -2087,6 +2155,53 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     // wait for the computation to finish (automatically done when obtaining the model output)
     //synchronize();
+
+    if (dht.active) {
+        dht.t_total += ggml_time_us() - t_decode_start_us;
+        dht.n++;
+
+        uint64_t up_n_async = 0;
+        uint64_t up_n_sync  = 0;
+        uint64_t up_bytes   = 0;
+        uint64_t up_t_us    = 0;
+
+        ggml_backend_sched_get_input_upload_stats(sched.get(), &up_n_async, &up_n_sync, &up_bytes, &up_t_us);
+
+        if (dht.up_init) {
+            dht.up_n_async += up_n_async - dht.up_prev_n_async;
+            dht.up_n_sync  += up_n_sync  - dht.up_prev_n_sync;
+            dht.up_bytes   += up_bytes   - dht.up_prev_bytes;
+            dht.up_t_us    += up_t_us    - dht.up_prev_t_us;
+        }
+
+        dht.up_init = true;
+
+        dht.up_prev_n_async = up_n_async;
+        dht.up_prev_n_sync  = up_n_sync;
+        dht.up_prev_bytes   = up_bytes;
+        dht.up_prev_t_us    = up_t_us;
+
+        if (dht.n >= dht.every) {
+            const double f = 1.0/dht.n;
+
+            LLAMA_LOG_INFO("%s: host timing over %d single-token decodes (us/token): "
+                    "total %.1f | batch %.1f | memory %.1f | graph %.1f | inputs %.1f | "
+                    "compute %.1f (uploads %.1f us, %.1f async + %.1f sync, %.1f KiB) | out %.1f | sync %.1f\n",
+                    __func__, (int) dht.n,
+                    f*dht.t_total, f*dht.t_batch, f*dht.t_memory, f*dht.t_graph, f*dht.t_inputs,
+                    f*dht.t_compute, f*dht.up_t_us, f*dht.up_n_async, f*dht.up_n_sync,
+                    f*dht.up_bytes/1024.0, f*dht.t_output, f*dht.t_sync);
+
+            dht.n = 0;
+
+            dht.t_total = dht.t_batch = dht.t_memory = dht.t_graph = 0;
+            dht.t_inputs = dht.t_compute = dht.t_output = dht.t_sync = 0;
+
+            dht.up_n_async = dht.up_n_sync = dht.up_bytes = dht.up_t_us = 0;
+        }
+
+        dht.active = false;
+    }
 
     return 0;
 }

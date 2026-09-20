@@ -783,6 +783,16 @@ static bool ggml_is_view_op(enum ggml_op op) {
 #define GGML_SCHED_MAX_COPIES 4
 #endif
 
+// number of slots of the pinned staging ring used for asynchronous graph-input uploads
+#ifndef GGML_SCHED_INPUT_STAGING_SLOTS
+#define GGML_SCHED_INPUT_STAGING_SLOTS 4
+#endif
+
+// upper bound of one staging slot - inputs that do not fit take the synchronous path
+#ifndef GGML_SCHED_INPUT_STAGING_MAX
+#define GGML_SCHED_INPUT_STAGING_MAX (4*1024*1024)
+#endif
+
 struct ggml_backend_sched_split {
     int backend_id;
     int i_start;
@@ -845,6 +855,32 @@ struct ggml_backend_sched {
     bool op_offload;
 
     int debug;
+
+    // asynchronous graph-input uploads [LLAMA_INPUT_UPLOAD_ASYNC]
+    // the inputs of a split are copied into a pinned staging ring and uploaded on the stream of the
+    // split backend instead of being copied synchronously, one host synchronization per input
+    bool input_upload_async;
+
+    struct ggml_backend_sched_staging {
+        ggml_backend_buffer_t buf;
+        char * base;
+        size_t slot_size;   // bytes per slot, 0 if the ring is not available
+        size_t need;        // bytes requested during the current graph compute
+        size_t off;         // bump offset inside the current slot
+        int    cur;         // current slot
+        bool   pending;     // a copy was staged into the current slot but not yet marked by an event
+        bool   failed;      // allocation failed once, do not try again
+        ggml_backend_event_t events[GGML_SCHED_INPUT_STAGING_SLOTS];
+        bool                 ev_pending[GGML_SCHED_INPUT_STAGING_SLOTS];
+    } staging[GGML_SCHED_MAX_BACKENDS];
+
+    // graph-input upload statistics, cumulative, for the host timing probe
+    // the timestamps are only taken while `input_upload_timing` is set
+    bool     input_upload_timing;
+    uint64_t n_input_upload_async;
+    uint64_t n_input_upload_sync;
+    uint64_t n_input_upload_bytes;
+    uint64_t t_input_upload_us;
 
     // used for debugging graph reallocations [GGML_SCHED_DEBUG_REALLOC]
     // ref: https://github.com/ggml-org/llama.cpp/pull/17617
@@ -1685,9 +1721,204 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
     return true;
 }
 
+// LLAMA_INPUT_UPLOAD_ASYNC: 1 (default) uploads the graph inputs of a split through a pinned staging
+// ring on the stream of the split backend, 0 restores the synchronous copy of every single input
+static bool ggml_backend_sched_input_upload_async_enabled(void) {
+    static const bool enabled = []() {
+        const char * env = getenv("LLAMA_INPUT_UPLOAD_ASYNC");
+        return env ? atoi(env) != 0 : true;
+    }();
+
+    return enabled;
+}
+
+// (re)allocate the staging ring of one backend, pinned host memory so that the uploads are really asynchronous
+static void ggml_backend_sched_staging_alloc(ggml_backend_sched_t sched, int backend_id, size_t slot_size) {
+    auto & st = sched->staging[backend_id];
+
+    ggml_backend_t     backend = sched->backends[backend_id];
+    ggml_backend_dev_t dev     = ggml_backend_get_device(backend);
+
+    ggml_backend_buffer_type_t buft = dev ? ggml_backend_dev_host_buffer_type(dev) : NULL;
+    if (buft == NULL) {
+        // no pinned host memory on this device - keep the synchronous path
+        st.failed = true;
+        return;
+    }
+
+    // the old buffer may still be the source of copies that are queued on the backend
+    for (int s = 0; s < GGML_SCHED_INPUT_STAGING_SLOTS; s++) {
+        if (st.ev_pending[s]) {
+            ggml_backend_event_synchronize(st.events[s]);
+            st.ev_pending[s] = false;
+        }
+    }
+
+    if (st.buf != NULL) {
+        ggml_backend_buffer_free(st.buf);
+        st.buf  = NULL;
+        st.base = NULL;
+    }
+    st.slot_size = 0;
+
+    ggml_backend_buffer_t buf = ggml_backend_buft_alloc_buffer(buft, slot_size*GGML_SCHED_INPUT_STAGING_SLOTS);
+    if (buf == NULL) {
+        st.failed = true;
+        return;
+    }
+
+    for (int s = 0; s < GGML_SCHED_INPUT_STAGING_SLOTS; s++) {
+        if (st.events[s] == NULL) {
+            st.events[s] = ggml_backend_event_new(dev);
+        }
+        if (st.events[s] == NULL) {
+            // without events the slots cannot be recycled safely
+            ggml_backend_buffer_free(buf);
+            st.failed = true;
+            return;
+        }
+    }
+
+    st.buf       = buf;
+    st.base      = (char *) ggml_backend_buffer_get_base(buf);
+    st.slot_size = slot_size;
+    st.cur       = 0;
+    st.off       = 0;
+}
+
+// start a new graph compute: grow the staging rings if the previous compute needed more space and
+// move to the next slot, waiting until its copies of an earlier compute have been executed
+static void ggml_backend_sched_staging_begin(ggml_backend_sched_t sched) {
+    if (!sched->input_upload_async) {
+        return;
+    }
+
+    for (int b = 0; b < sched->n_backends; b++) {
+        auto & st = sched->staging[b];
+
+        if (st.need > st.slot_size && !st.failed) {
+            // keep some headroom: the input sizes grow with the context
+            size_t slot_size = std::min<size_t>(2*st.need, GGML_SCHED_INPUT_STAGING_MAX);
+            slot_size = std::max<size_t>(slot_size, 64*1024);
+
+            if (slot_size > st.slot_size) {
+                ggml_backend_sched_staging_alloc(sched, b, slot_size);
+            }
+        }
+
+        st.need = 0;
+
+        if (st.base == NULL) {
+            continue;
+        }
+
+        st.cur = (st.cur + 1) % GGML_SCHED_INPUT_STAGING_SLOTS;
+        if (st.ev_pending[st.cur]) {
+            ggml_backend_event_synchronize(st.events[st.cur]);
+            st.ev_pending[st.cur] = false;
+        }
+        st.off     = 0;
+        st.pending = false;
+    }
+}
+
+// stage one graph input into pinned memory and queue its upload on the stream of the split backend.
+// returns false if the input has to take the synchronous path
+static bool ggml_backend_sched_input_upload_staged(
+        ggml_backend_sched_t sched,
+        int backend_id,
+        const struct ggml_tensor * src,
+        struct ggml_tensor * dst) {
+    if (!sched->input_upload_async) {
+        return false;
+    }
+
+    ggml_backend_t backend = sched->backends[backend_id];
+
+    if (backend->iface.set_tensor_async == NULL) {
+        return false;
+    }
+
+    if (src->buffer == NULL || !ggml_backend_buffer_is_host(src->buffer)) {
+        return false;
+    }
+
+    // set_tensor_async of the backends expects the tensor to live in their own default buffer type
+    if (dst->buffer == NULL || dst->view_src != NULL ||
+            dst->buffer->buft != ggml_backend_get_default_buffer_type(backend)) {
+        return false;
+    }
+
+    auto & st = sched->staging[backend_id];
+
+    const size_t nbytes = ggml_nbytes(src);
+    const size_t nalloc = GGML_PAD(nbytes, 256);
+
+    st.need += nalloc;
+
+    if (st.base == NULL || st.off + nalloc > st.slot_size) {
+        return false;
+    }
+
+    char * stage = st.base + (size_t) st.cur*st.slot_size + st.off;
+    st.off += nalloc;
+
+    // the caller may overwrite the source as soon as this returns, so copy it on the host first
+    memcpy(stage, src->data, nbytes);
+
+    // the upload runs on the stream of the split backend: it is ordered after the previous graph
+    // (which may still be reading the destination) and before the graph that is queued next
+    backend->iface.set_tensor_async(backend, dst, stage, 0, nbytes);
+
+    st.pending = true;
+
+    return true;
+}
+
+// mark the point of the backend stream up to which the staged copies of the current slot have been executed
+static void ggml_backend_sched_staging_end_split(ggml_backend_sched_t sched, int backend_id) {
+    auto & st = sched->staging[backend_id];
+
+    if (!st.pending) {
+        return;
+    }
+
+    ggml_backend_event_record(st.events[st.cur], sched->backends[backend_id]);
+    st.ev_pending[st.cur] = true;
+    st.pending            = false;
+}
+
+void ggml_backend_sched_set_input_upload_timing(ggml_backend_sched_t sched, bool enable) {
+    if (sched) {
+        sched->input_upload_timing = enable;
+    }
+}
+
+void ggml_backend_sched_get_input_upload_stats(
+        ggml_backend_sched_t sched,
+        uint64_t * n_async,
+        uint64_t * n_sync,
+        uint64_t * n_bytes,
+        uint64_t * t_us) {
+    if (n_async) {
+        *n_async = sched ? sched->n_input_upload_async : 0;
+    }
+    if (n_sync) {
+        *n_sync = sched ? sched->n_input_upload_sync : 0;
+    }
+    if (n_bytes) {
+        *n_bytes = sched ? sched->n_input_upload_bytes : 0;
+    }
+    if (t_us) {
+        *t_us = sched ? sched->t_input_upload_us : 0;
+    }
+}
+
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
+
+    ggml_backend_sched_staging_begin(sched);
 
     ggml_tensor * prev_ids_tensor = nullptr;
     std::vector<int32_t> ids;
@@ -1717,13 +1948,26 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
 
             if (input->flags & GGML_TENSOR_FLAG_INPUT) {
+                const int64_t t_start_us = sched->input_upload_timing ? ggml_time_us() : 0;
+
                 // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
-                if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
-                    ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
+                if (ggml_backend_sched_input_upload_staged(sched, split_backend_id, input, input_cpy)) {
+                    // the data is already in the staging ring, the upload itself is queued on the split backend
+                    sched->n_input_upload_async++;
                 } else {
-                    ggml_backend_synchronize(split_backend);
+                    if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+                        ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
+                    } else {
+                        ggml_backend_synchronize(split_backend);
+                    }
+                    ggml_backend_tensor_copy(input, input_cpy);
+                    sched->n_input_upload_sync++;
                 }
-                ggml_backend_tensor_copy(input, input_cpy);
+
+                sched->n_input_upload_bytes += ggml_nbytes(input);
+                if (sched->input_upload_timing) {
+                    sched->t_input_upload_us += ggml_time_us() - t_start_us;
+                }
             } else {
                 // wait for the split backend to finish using the input before overwriting it
                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
@@ -1837,6 +2081,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
+        // record how far the staged input uploads of this split have progressed on the backend stream
+        ggml_backend_sched_staging_end_split(sched, split_backend_id);
+
         if (!sched->callback_eval) {
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
             if (ec != GGML_STATUS_SUCCESS) {
@@ -1913,6 +2160,9 @@ ggml_backend_sched_t ggml_backend_sched_new(
     sched->n_backends = n_backends;
     sched->n_copies = parallel ? GGML_SCHED_MAX_COPIES : 1;
 
+    // with pipeline parallelism the input copies are already double buffered and synchronized with events
+    sched->input_upload_async = ggml_backend_sched_input_upload_async_enabled() && sched->n_copies == 1;
+
     // initialize hash table
     // FIXME: needs to be size*2 to account for leafs (do it in graph_split instead)
     sched->hash_set    = ggml_hash_set_new(graph_size);
@@ -1969,6 +2219,16 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     for (int b = 0; b < sched->n_backends; b++) {
         for (int c = 0; c < sched->n_copies; c++) {
             ggml_backend_event_free(sched->events[b][c]);
+        }
+
+        auto & st = sched->staging[b];
+        // the backends may already be gone here (llama_context frees them before the scheduler), so a pending
+        // upload cannot be waited for; like the copy events above, the caller synchronizes before it frees
+        for (int s = 0; s < GGML_SCHED_INPUT_STAGING_SLOTS; s++) {
+            ggml_backend_event_free(st.events[s]);
+        }
+        if (st.buf != NULL) {
+            ggml_backend_buffer_free(st.buf);
         }
     }
     ggml_gallocr_free(sched->galloc);

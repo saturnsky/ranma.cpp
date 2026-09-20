@@ -340,6 +340,11 @@ extern "C" {
     GGML_API ggml_backend_buffer_type_t ggml_backend_sched_get_buffer_type(ggml_backend_sched_t sched, ggml_backend_t backend);
     GGML_API size_t                     ggml_backend_sched_get_buffer_size(ggml_backend_sched_t sched, ggml_backend_t backend);
 
+    // Cumulative graph-input upload statistics. The counts and the byte total are always accumulated,
+    // the upload time only while it is enabled. Any output pointer may be NULL.
+    GGML_API void                 ggml_backend_sched_set_input_upload_timing(ggml_backend_sched_t sched, bool enable);
+    GGML_API void                 ggml_backend_sched_get_input_upload_stats(ggml_backend_sched_t sched, uint64_t * n_async, uint64_t * n_sync, uint64_t * n_bytes, uint64_t * t_us);
+
     GGML_API void                 ggml_backend_sched_set_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node, ggml_backend_t backend);
     GGML_API ggml_backend_t       ggml_backend_sched_get_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node);
 
