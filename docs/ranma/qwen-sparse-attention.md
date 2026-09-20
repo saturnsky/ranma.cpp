@@ -29,6 +29,8 @@ for equivalence checks, or a diagnostic.
 | `GGML_CUDA_FATTN_SPARSE` | on | `0` keeps the dense flash-attention kernel. Reference path. |
 | `GGML_CUDA_FATTN_SPARSE_MIN_KV` | 4096 | lowest cell count at which the gather is used. |
 | `GGML_CUDA_FATTN_SPARSE_LOG` | off | `1` logs the first shape that takes the gather. Diagnostic. |
+| `GGML_CUDA_FATTN_COMPACT_PARALLEL` | on | `0` always compacts a mask row with the serial kernel. Reference path. |
+| `GGML_CUDA_FATTN_COMPACT_VERIFY` | off | `1` compares both compaction kernels on the host and aborts on a difference. Diagnostic. |
 
 ## Tie-breaking in the top-k
 
@@ -287,3 +289,32 @@ short index list. For a comparison on a real model,
 `LLAMA_QSA_RAW_PREFIX=<path>` makes the dump write the raw output logits with
 their shape, so two runs can be compared on the distribution rather than on
 sampled text.
+
+## Compacting the mask
+
+Turning a mask row into its list of selected cells is a scan of the row. One
+block of 256 threads walks the row in chunks of 2048 cells and carries the
+running count from chunk to chunk, so a long row becomes a chain of dependent
+steps - at a depth of 64k, 32 of them, for every sparse attention call.
+
+A row of five chunks or more is compacted by two launches with one block per
+row and chunk instead. The first counts the selected cells of every chunk; the
+second adds up the counts in front of its own chunk and writes its indices at
+that offset, and the block of the last chunk writes the padding behind the
+row. Both passes vote over the same cells in the same order as the serial
+kernel and only replace the carried row count by the sum of the chunk counts,
+so the list is the same: same cells, ascending, same truncation at the bound,
+same padding. Shorter rows keep the serial kernel, which needs one launch
+instead of two. The counts are a few kilobytes and are taken from the pool of
+the context for the duration of the two launches.
+
+| switch | default | effect |
+| --- | --- | --- |
+| `GGML_CUDA_FATTN_COMPACT_PARALLEL` | on | `0` always uses the serial kernel |
+| `GGML_CUDA_FATTN_COMPACT_VERIFY` | off | `1` runs both kernels on the real launch arguments, feeds the model from the serial one, compares every entry on the host and aborts on the first difference |
+
+The verify mode is the equivalence gate between the two kernels. It reads the
+result back, which a stream that is capturing a graph cannot do: in that case
+it warns once and compares nothing, so it has to be run with
+`GGML_CUDA_DISABLE_GRAPHS=1`. It reports the number of calls and rows it has
+checked as it goes.

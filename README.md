@@ -168,6 +168,8 @@ applies, how to switch it, and its limits.
 - **Attention reads only the selected cells** - on HIP the tile flash attention of the generation shape gathers
   the selected K/V rows through a compacted index list instead of scanning the KV cache.
   `GGML_CUDA_FATTN_SPARSE=0` keeps the dense kernel. Same page.
+- **Parallel mask compaction** for long rows, with `GGML_CUDA_FATTN_COMPACT_VERIFY=1` as the equivalence gate.
+  Same page.
 
 ## Building
 

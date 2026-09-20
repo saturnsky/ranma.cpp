@@ -719,7 +719,7 @@ static __global__ void flash_attn_mask_to_KV_max(
 }
 
 void ggml_cuda_flash_attn_ext_compact_mask(
-        const ggml_tensor * mask, int32_t * indices, int32_t n_kv_max, int64_t n_rows, cudaStream_t stream);
+        ggml_backend_cuda_context & ctx, const ggml_tensor * mask, int32_t * indices, int32_t n_kv_max, int64_t n_rows);
 
 template<int D, int ncols1, int ncols2> // D == head size
 __launch_bounds__(D, 1)
@@ -1101,7 +1101,7 @@ void launch_fattn(
 
         KV_max.alloc(size_t(n_kv_max) * mask_rows);
         const int64_t n_rows_used = std::min<int64_t>(mask->ne[1], int64_t(ntiles_x) * ncols1);
-        ggml_cuda_flash_attn_ext_compact_mask(mask, KV_max.ptr, n_kv_max, n_rows_used, main_stream);
+        ggml_cuda_flash_attn_ext_compact_mask(ctx, mask, KV_max.ptr, n_kv_max, n_rows_used);
     }
 
     // Optional optimization where the mask is scanned to determine whether part of the calculation can be skipped.
