@@ -677,11 +677,11 @@ static __global__ void mul_mat_vec_q(
     constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
 
     const     int tid = warp_size*threadIdx.y + threadIdx.x;
-    const     int row0 = rows_per_cuda_block*blockIdx.x;
+    const     int row0 = rows_per_cuda_block*(fusion.grid_experts_first ? blockIdx.y : blockIdx.x);
     const     int blocks_per_row_x = ncols_x / qk;
     constexpr int blocks_per_iter = vdr * nwarps*warp_size / qi;
 
-    const uint32_t channel_dst = blockIdx.y;
+    const uint32_t channel_dst = fusion.grid_experts_first ? blockIdx.x : blockIdx.y;
 
     uint32_t channel_x;
     uint32_t channel_y;
@@ -1314,10 +1314,23 @@ static void mul_mat_vec_q_switch_ncols_dst(
                 constexpr bool c_alt_rows = decltype(alt_rows_tag)::value && mmvq_alt_rows_compiled &&
                     calc_nwarps(type, c_ncols_dst, MMVQ_PARAMETERS_RDNA4) == 8;
 
-                const std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst,
+                std::pair<dim3, dim3> dims = calc_launch_params<type>(c_ncols_dst, nrows_x, nchannels_dst,
                                                                               nsamples_dst, warp_size, table_id, c_small_k, c_halve_iters, c_alt_rows);
+                ggml_cuda_mm_fusion_args_device fusion_grid = fusion;
+#if defined(GGML_USE_HIP)
+                // expert cache: alternate the experts in dispatch order, so that host reads and VRAM reads overlap
+                // (GGML_CUDA_MMVQ_ID_EXPERTS_FIRST=0 keeps the expert-major order)
+                static const bool experts_first = [] {
+                    const char * env = getenv("GGML_CUDA_MMVQ_ID_EXPERTS_FIRST");
+                    return env ? atoi(env) != 0 : true;
+                }();
+                if (experts_first && has_ids && fusion.x_cache_slots != nullptr && nchannels_dst > 1 && dims.first.x <= 65535) {
+                    std::swap(dims.first.x, dims.first.y);
+                    fusion_grid.grid_experts_first = true;
+                }
+#endif // defined(GGML_USE_HIP)
                 mul_mat_vec_q_switch_fusion<type, c_ncols_dst, c_small_k, c_halve_iters, c_alt_rows>(
-                    vx, vy, ids, fusion, dst, ncols_x, nrows_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
+                    vx, vy, ids, fusion_grid, dst, ncols_x, nrows_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
                     channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst, sample_ratio_fd,
                     stride_sample_x, stride_sample_y, stride_sample_dst, dims.first, dims.second, 0, ids_stride,
                     stream);
