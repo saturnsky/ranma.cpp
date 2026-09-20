@@ -168,15 +168,33 @@ unit expects.
 
 ### How it works
 
-**The unit.** On RDNA4 a routed IQ2/IQ3 kernel runs one warp and one row per
-block, while the standalone kernel of the Q6_K shared expert runs eight warps and
-four rows. A row of the result does not depend on how the rows are spread over
-blocks, so the folded unit replays the eight warp strides in one lane, keeps one
-partial sum per warp, adds them in warp order and finishes with the same lane
-reduction - the same summands in the same order, hence the same rows. The gate/up
-unit reads the q8_1 input the routed launch already made (it is the same tensor
-and the same bytes); the down unit quantizes the shared GLU result exactly as a
-launch of its own would.
+**The unit.** Which shared type a routed type can carry is a property of the
+routed type alone, so the matcher derives it and no dispatch or launch argument
+is needed. A model that pairs them differently does not fold.
+
+| Routed type | Shared type | Layout of the unit |
+| --- | --- | --- |
+| IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S | Q6_K | replayed |
+| Q4_K, Q5_K, Q5_1, Q8_0 | Q8_0 | mirrored |
+
+The two layouts follow from the RDNA4 parameter table. Where the routed kernel
+runs one warp and one row per block and the standalone shared kernel runs eight
+warps and four rows, the unit **replays**: a row of the result does not depend on
+how the rows are spread over blocks, so one lane walks all eight warp strides,
+keeps one partial sum per warp, adds them in warp order and finishes with the
+same lane reduction - the same summands in the same order, hence the same rows.
+Where both types run the same number of warps and the rows per block follow the
+row count, which is the same for both, the unit **mirrors** the standalone
+one-column kernel instead: every thread of a shared block does what the same
+thread of a standalone launch does, including the reduction over the warps
+through shared memory, the clamp of the last block and the rule that lane i
+writes row i. The kernel picks the layout at compile time from the warp and row
+counts of the two types, and refuses to compile a unit for which neither fits.
+
+The gate/up unit reads the q8_1 input the routed launch already made (it is the
+same tensor and the same bytes); the down unit quantizes the shared GLU result
+exactly as a launch of its own would. A gate unit only rides in the fused variant
+of the routed kernel, which is the one that has the shared memory for it.
 
 **The match.** A host-side matcher recognizes the layer structurally, without
 looking at any address, so the same matcher can run in the graph-optimize pass
@@ -187,8 +205,9 @@ before the tensors are allocated:
 - a shared GLU within a window of 64 nodes behind them, whose two `MUL_MAT`
   nodes are the two nodes directly in front of it, are read by nothing but the
   GLU, and are not graph outputs;
-- shared gate/up matrices of a supported type, in this device's memory, of the
-  same shape and stride as each other and of the routed shape;
+- shared gate/up matrices of the shared type that belongs to the routed type, in
+  this device's memory, of the same shape and stride as each other and of the
+  routed shape;
 - a shared input that is the input of the routed launch seen through reshapes;
 - shared results that are plain contiguous F32 row vectors.
 
@@ -231,10 +250,12 @@ evaluates the graph.
 
 ### Limits
 
-- HIP with the RDNA4 parameter table only, and only for the plain one-token
-  kernel of a supported routed type with one row per block. Shared type Q6_K;
-  routed types IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS and IQ3_S. Every pair is another
-  compiled kernel instance, which is why the list is short.
+- HIP with the RDNA4 parameter table only, and only for the one-token kernel of
+  a routed type that has a shared type in the table above. Every pair is another
+  compiled kernel instance, which is why the lists are short. The small-k and
+  halved-iteration variants of a routed kernel carry no unit; the
+  alternating-rows variant does, because the mirrored unit follows the rows per
+  block of the launch it rides in.
 - Only when the expert cache supplies the address table and the grid alternates
   the experts; without the wait there is nothing to hide the shared rows in.
 - Only SwiGLU and clamped SwiGLU shared activations, without swapped operands.

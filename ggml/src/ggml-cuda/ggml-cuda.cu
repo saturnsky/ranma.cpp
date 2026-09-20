@@ -4573,10 +4573,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 // unrelated to the plan-entry window of the shared q8_1 quantization
 static constexpr int GGML_CUDA_SHARED_FOLD_WINDOW = 64;
 
-static bool ggml_cuda_shared_fold_weights_ok(const ggml_tensor * w, int device) {
+static bool ggml_cuda_shared_fold_weights_ok(const ggml_tensor * w, int device, ggml_type shared_type) {
     return w != nullptr && w->buffer != nullptr &&
         w->buffer->buft == ggml_backend_cuda_buffer_type(device) &&
-        w->type == GGML_TYPE_Q6_K && w->ne[2] == 1 && w->ne[3] == 1 &&
+        w->type == shared_type && w->ne[2] == 1 && w->ne[3] == 1 &&
         w->nb[0] == ggml_type_size(w->type);
 }
 
@@ -4625,7 +4625,9 @@ static bool ggml_cuda_match_shared_fold(const ggml_cgraph * cgraph, int node_idx
     if (routed_w == nullptr || routed_in == nullptr) {
         return false;
     }
-    if (!ggml_cuda_mmvq_id_fold_shared_types(routed_w->type, GGML_TYPE_Q6_K, cc)) {
+    // the routed type decides which shared type its kernel can carry
+    const ggml_type shared_type = ggml_cuda_mmvq_id_fold_shared_type(routed_w->type, cc);
+    if (shared_type == GGML_TYPE_COUNT) {
         return false;
     }
 
@@ -4685,7 +4687,8 @@ static bool ggml_cuda_match_shared_fold(const ggml_cgraph * cgraph, int node_idx
 
     const ggml_tensor * w_up   = shared_up->src[0];
     const ggml_tensor * w_gate = shared_gate->src[0];
-    if (!ggml_cuda_shared_fold_weights_ok(w_up, device) || !ggml_cuda_shared_fold_weights_ok(w_gate, device) ||
+    if (!ggml_cuda_shared_fold_weights_ok(w_up, device, shared_type) ||
+            !ggml_cuda_shared_fold_weights_ok(w_gate, device, shared_type) ||
             !ggml_are_same_shape(w_up, w_gate) || !ggml_are_same_stride(w_up, w_gate) ||
             w_up->ne[0] != routed_w->ne[0] || w_up->ne[1] != routed_w->ne[1]) {
         m.reason = "the shared gate/up matrices do not fit the routed grid";
@@ -4737,7 +4740,7 @@ static bool ggml_cuda_match_shared_fold(const ggml_cgraph * cgraph, int node_idx
     // the allocator frees a tensor when the last reader has run, and the dependency that brings
     // the allocation forward counts as a reader too.
     const ggml_tensor * w_down = m.down->src[0];
-    if (!ggml_cuda_shared_fold_weights_ok(w_down, device) || m.down->src[2] != nullptr ||
+    if (!ggml_cuda_shared_fold_weights_ok(w_down, device, shared_type) || m.down->src[2] != nullptr ||
             !ggml_cuda_shared_fold_vector_ok(m.down) || m.down->ne[0] != w_down->ne[1] ||
             w_down->ne[0] != shared_glu->ne[0] || ggml_node_get_use_count(cgraph, m.idx_down) < 1) {
         m.reason    = "the shared down matmul does not fit";
@@ -4756,7 +4759,7 @@ static bool ggml_cuda_match_shared_fold(const ggml_cgraph * cgraph, int node_idx
             continue;
         }
         if (node->ne[1] > 1 && node->ne[2] == 1 && node->ne[3] == 1 && node->src[0] != nullptr &&
-                ggml_cuda_mmvq_id_fold_shared_types(node->src[0]->type, GGML_TYPE_Q6_K, cc) &&
+                ggml_cuda_mmvq_id_fold_shared_type(node->src[0]->type, cc) == shared_type &&
                 node->src[0]->ne[0] == w_down->ne[0] && node->src[0]->ne[1] == w_down->ne[1] &&
                 (node->flags & GGML_TENSOR_FLAG_COMPUTE) != 0) {
             m.routed_down     = node;
