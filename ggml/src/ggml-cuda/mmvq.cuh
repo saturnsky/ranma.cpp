@@ -34,8 +34,9 @@ void ggml_cuda_mmvq_share_q8_skip(ggml_backend_cuda_context & ctx, const ggml_te
 bool ggml_cuda_mmvq_id_fold_shared_enabled();
 bool ggml_cuda_mmvq_id_fold_shared_log();
 
-// true when the one-token kernel of `routed_type` is compiled with a `shared_type` unit on this arch
-bool ggml_cuda_mmvq_id_fold_shared_types(ggml_type routed_type, ggml_type shared_type, int cc);
+// the quantization type of a shared expert the one-token kernel of `routed_type` carries on this
+// arch, or GGML_TYPE_COUNT when it carries none
+ggml_type ggml_cuda_mmvq_id_fold_shared_type(ggml_type routed_type, int cc);
 
 // Offer the unit to the next launch of this context; the launch reports back whether it took it.
 // The caller may only treat the folded nodes as computed after ggml_cuda_mmvq_shared_fold_taken()

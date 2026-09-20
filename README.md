@@ -149,6 +149,8 @@ applies, how to switch it, and its limits.
   Same page.
 - **Shared expert folded into the routed launch** - on RDNA4 the dense shared expert of a layer is computed as
   one more unit of that grid, and its own launches disappear. Same page.
+- **The same fold for Q8_0 shared experts** of models whose routed experts are Q4_K, Q5_K, Q5_1 or Q8_0. Same
+  page.
 
 ## Building
 

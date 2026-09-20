@@ -646,20 +646,25 @@ static bool mmvq_id_experts_first() {
     return enabled;
 }
 
-// The one quantization type of a folded shared expert, and the routed types whose one-token kernel
-// carries it. Both lists are kept short on purpose: every combination is another compiled kernel.
-static constexpr ggml_type MMVQ_ID_FOLD_SHARED_TYPE = GGML_TYPE_Q6_K;
-
-static constexpr __host__ __device__ bool mmvq_id_fold_shared_routed_type(ggml_type type) {
-    switch (type) {
+// The quantization type of the shared expert a routed type can carry. One shared type per routed
+// type on purpose: every pair is another compiled kernel, and a model uses one pair per layer.
+static constexpr __host__ __device__ ggml_type mmvq_id_fold_shared_type_for(ggml_type routed_type) {
+    switch (routed_type) {
+        // one routed warp per row, eight shared warps: one lane walks the eight strides
         case GGML_TYPE_IQ2_XXS:
         case GGML_TYPE_IQ2_XS:
         case GGML_TYPE_IQ2_S:
         case GGML_TYPE_IQ3_XXS:
         case GGML_TYPE_IQ3_S:
-            return true;
+            return GGML_TYPE_Q6_K;
+        // same warp count and same rows per block: the unit runs like a launch of its own
+        case GGML_TYPE_Q4_K:
+        case GGML_TYPE_Q5_K:
+        case GGML_TYPE_Q5_1:
+        case GGML_TYPE_Q8_0:
+            return GGML_TYPE_Q8_0;
         default:
-            return false;
+            return GGML_TYPE_COUNT;
     }
 }
 
@@ -684,13 +689,15 @@ bool ggml_cuda_mmvq_id_fold_shared_log() {
     return enabled;
 }
 
-bool ggml_cuda_mmvq_id_fold_shared_types(ggml_type routed_type, ggml_type shared_type, int cc) {
+ggml_type ggml_cuda_mmvq_id_fold_shared_type(ggml_type routed_type, int cc) {
 #if defined(GGML_USE_HIP)
-    return get_device_table_id(cc) == MMVQ_PARAMETERS_RDNA4 &&
-        shared_type == MMVQ_ID_FOLD_SHARED_TYPE && mmvq_id_fold_shared_routed_type(routed_type);
+    if (get_device_table_id(cc) != MMVQ_PARAMETERS_RDNA4) {
+        return GGML_TYPE_COUNT;
+    }
+    return mmvq_id_fold_shared_type_for(routed_type);
 #else
-    GGML_UNUSED_VARS(routed_type, shared_type, cc);
-    return false;
+    GGML_UNUSED_VARS(routed_type, cc);
+    return GGML_TYPE_COUNT;
 #endif // defined(GGML_USE_HIP)
 }
 
@@ -780,6 +787,115 @@ static __device__ __forceinline__ void mul_mat_vec_q_shared_unit(
     fusion.shared_dst[row] = result;
 }
 
+// One row block of the folded shared expert, when the shared type fills a block the same way the
+// routed type does: same warp count, same rows per block, one column. Every thread then does what
+// the same thread of a launch of its own would do, down to the shared-memory reduction and the
+// rule that lane i writes row i, so the rows come out bit-identical.
+template <ggml_type type, bool has_fusion, int rows_per_cuda_block>
+static __device__ __forceinline__ void mul_mat_vec_q_shared_unit_native(
+        const ggml_cuda_mm_fusion_args_device & fusion, const int row0) {
+    constexpr int qk        = ggml_cuda_type_traits<type>::qk;
+    constexpr int qi        = ggml_cuda_type_traits<type>::qi;
+    constexpr int vdr       = get_vdr_mmvq(type);
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr int nwarps    = calc_nwarps(type, 1, get_device_table_id());
+    constexpr int blocks_per_iter = vdr * nwarps*warp_size / qi;
+
+    constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
+
+    const     int tid = warp_size*threadIdx.y + threadIdx.x;
+    const uint32_t nrows_x           = fusion.shared_nrows_x;
+    const     int blocks_per_row_x   = fusion.shared_ncols_x / qk;
+    const block_q8_1 * y             = (const block_q8_1 *) fusion.shared_y;
+    // the gate lane only exists in the fused variant, which is the launch a gate/up unit rides in
+    const bool use_gate = has_fusion && fusion.shared_gate != nullptr;
+
+    float tmp[rows_per_cuda_block]      = {0.0f};
+    float tmp_gate[rows_per_cuda_block] = {0.0f};
+
+    // the last block can cover fewer than rows_per_cuda_block rows, clamp the reads to stay inside the tensor
+    int kbx_offset[rows_per_cuda_block];
+#pragma unroll
+    for (int i = 0; i < rows_per_cuda_block; ++i) {
+        const int row_x = rows_per_cuda_block == 1 ? row0 : min(row0 + i, int(nrows_x) - 1);
+        kbx_offset[i]   = row_x * fusion.shared_stride_row_x;
+    }
+
+    for (int kbx = tid / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
+        const int kby = kbx * (qk/QK8_1); // y block index that aligns with kbx
+        const int kqs = vdr * (tid % (qi/vdr));
+
+#pragma unroll
+        for (int i = 0; i < rows_per_cuda_block; ++i) {
+            tmp[i] += vec_dot_q_cuda(fusion.shared_x, &y[kby], kbx_offset[i] + kbx, kqs);
+            if (use_gate) {
+                tmp_gate[i] += vec_dot_q_cuda(fusion.shared_gate, &y[kby], kbx_offset[i] + kbx, kqs);
+            }
+        }
+    }
+
+    __shared__ float tmp_shared[nwarps-1 > 0 ? nwarps-1 : 1][rows_per_cuda_block][warp_size];
+    [[maybe_unused]] __shared__ float tmp_shared_gate[(has_fusion && (nwarps-1 > 0)) ? nwarps-1 : 1][rows_per_cuda_block][warp_size];
+
+    if (threadIdx.y > 0) {
+#pragma unroll
+        for (int i = 0; i < rows_per_cuda_block; ++i) {
+            tmp_shared[threadIdx.y-1][i][threadIdx.x] = tmp[i];
+            if (use_gate) {
+                tmp_shared_gate[threadIdx.y-1][i][threadIdx.x] = tmp_gate[i];
+            }
+        }
+    }
+    __syncthreads();
+    if (threadIdx.y > 0) {
+        return;
+    }
+
+#pragma unroll
+    for (int i = 0; i < rows_per_cuda_block; ++i) {
+#pragma unroll
+        for (int l = 0; l < nwarps-1; ++l) {
+            tmp[i] += tmp_shared[l][i][threadIdx.x];
+            if (use_gate) {
+                tmp_gate[i] += tmp_shared_gate[l][i][threadIdx.x];
+            }
+        }
+        tmp[i] = warp_reduce_sum<warp_size>(tmp[i]);
+        if (use_gate) {
+            tmp_gate[i] = warp_reduce_sum<warp_size>(tmp_gate[i]);
+        }
+
+        if (threadIdx.x == i && (rows_per_cuda_block == 1 || uint32_t(row0 + i) < nrows_x)) {
+            float result = tmp[i];
+            if (use_gate) {
+                // the fused variant adds the (absent, hence zero) biases of both lanes before the
+                // GLU; keep those adds so that a zero keeps its sign
+                result += 0.0f;
+                float gate_value = tmp_gate[i];
+                gate_value += 0.0f;
+                switch (fusion.shared_glu_op) {
+                    case GGML_GLU_OP_SWIGLU:
+                        result *= ggml_cuda_op_silu_single(gate_value);
+                        break;
+                    case GGML_GLU_OP_GEGLU:
+                        result *= ggml_cuda_op_gelu_single(gate_value);
+                        break;
+                    case GGML_GLU_OP_SWIGLU_OAI:
+                        result = ggml_cuda_op_swiglu_oai_single(gate_value, result);
+                        break;
+                    case GGML_GLU_OP_SWIGLU_CLAMP:
+                        result = ggml_cuda_op_swiglu_clamp_single(gate_value, result, fusion.shared_glu_limit);
+                        break;
+                    default:
+                        result = result * gate_value;
+                        break;
+                }
+            }
+            fusion.shared_dst[row0 + i] = result;
+        }
+    }
+}
+
 template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, bool halve_iters = false, bool alt_rows = false,
           ggml_type shared_type = GGML_TYPE_COUNT>
 __launch_bounds__(calc_nwarps(type, ncols_dst, get_device_table_id(), small_k, halve_iters)*ggml_cuda_get_physical_warp_size(), 1)
@@ -819,11 +935,21 @@ static __global__ void mul_mat_vec_q(
     ggml_cuda_pdl_sync();
 
     if constexpr (shared_type != GGML_TYPE_COUNT) {
-        // the extra unit of the grid holds the dense shared expert of this layer; one row per block,
-        // like the routed blocks of this dispatch, so the two agree on the row of a block index
-        static_assert(rows_per_cuda_block == 1, "the folded shared unit needs one row per block");
+        // the extra unit of the grid holds the dense shared expert of this layer. Both kinds of
+        // block take their rows from the same grid dimension, so the row block of a shared block is
+        // the one the routed blocks next to it work on.
+        static_assert(ncols_dst == 1, "the folded shared unit is a one-column kernel");
+        constexpr int shared_nwarps = calc_nwarps(shared_type, 1, table_id);
+        constexpr int shared_rows_per_block = calc_rows_per_block(1, table_id, small_k, shared_nwarps, alt_rows);
+
         if (channel_dst == fusion.shared_unit) {
-            mul_mat_vec_q_shared_unit<shared_type>(fusion, blockIdx.y);
+            if constexpr (shared_nwarps == nwarps && shared_rows_per_block == rows_per_cuda_block) {
+                mul_mat_vec_q_shared_unit_native<shared_type, has_fusion, rows_per_cuda_block>(fusion, row0);
+            } else if constexpr (nwarps == 1 && rows_per_cuda_block == 1) {
+                mul_mat_vec_q_shared_unit<shared_type>(fusion, row0);
+            } else {
+                NO_DEVICE_CODE; // the host only folds where one of the two layouts fits
+            }
             return;
         }
     }
@@ -1467,19 +1593,18 @@ static void mul_mat_vec_q_switch_ncols_dst(
                 }
 
                 // the dense shared expert of this layer as one more unit of the alternating grid.
-                // Only the plain kernel of a routed type from the fold list carries it, which is
-                // what the caller checked before it offered the unit.
-                constexpr ggml_type c_shared_type =
-                    (mmvq_id_fold_shared_routed_type(type) && !c_small_k && !c_halve_iters && !c_alt_rows)
-                        ? MMVQ_ID_FOLD_SHARED_TYPE : GGML_TYPE_COUNT;
+                // Only the plain kernel of a routed type that has a shared type carries it, which
+                // is what the caller checked before it offered the unit.
+                constexpr ggml_type c_shared_type = (!c_small_k && !c_halve_iters)
+                    ? mmvq_id_fold_shared_type_for(type) : GGML_TYPE_COUNT;
                 if (fusion_grid.shared_x != nullptr) {
                     GGML_ASSERT(fusion_grid.grid_experts_first && c_shared_type != GGML_TYPE_COUNT &&
                         "a shared unit was handed to a launch that cannot carry it");
                     if constexpr (c_shared_type != GGML_TYPE_COUNT) {
-                        GGML_ASSERT(fusion_grid.shared_nrows_x == dims.first.y);
+                        GGML_ASSERT(fusion_grid.shared_nrows_x == (uint32_t) nrows_x);
                         fusion_grid.shared_unit = dims.first.x;
                         dims.first.x += 1;
-                        mul_mat_vec_q_switch_fusion<type, c_ncols_dst, c_small_k, c_halve_iters, c_alt_rows, MMVQ_ID_FOLD_SHARED_TYPE>(
+                        mul_mat_vec_q_switch_fusion<type, c_ncols_dst, c_small_k, c_halve_iters, c_alt_rows, c_shared_type>(
                             vx, vy, ids, fusion_grid, dst, ncols_x, nrows_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
                             channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst, sample_ratio_fd,
                             stride_sample_x, stride_sample_y, stride_sample_dst, dims.first, dims.second, 0, ids_stride,
@@ -2130,11 +2255,13 @@ void ggml_cuda_mul_mat_vec_q(
         const bool fold_ok = ids != nullptr && ne2 == 1 && ne3 == 1 && ne1 > 1 && ne01 <= 65535 &&
             fusion_local.x_cache_slots != nullptr && mmvq_id_experts_first() &&
             ggml_cuda_mmvq_id_fold_shared_enabled() &&
-            ggml_cuda_mmvq_id_fold_shared_types(src0->type, fold.x->type, cc_fold);
+            ggml_cuda_mmvq_id_fold_shared_type(src0->type, cc_fold) == fold.x->type;
 
         if (fold_ok) {
             GGML_ASSERT(fold.x->ne[0] == ne00 && fold.x->ne[1] == ne01);
             GGML_ASSERT(fold.gate == nullptr || ggml_are_same_stride(fold.gate, fold.x));
+            // a shared gate only rides in the fused launch, whose kernel has the shared memory for it
+            GGML_ASSERT(fold.gate == nullptr || fusion_local.gate != nullptr);
 
             fusion_local.shared_x            = fold.x->data;
             fusion_local.shared_gate         = fold.gate ? fold.gate->data : nullptr;
