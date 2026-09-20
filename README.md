@@ -140,6 +140,9 @@ applies, how to switch it, and its limits.
 - **Compute buffers regrow with headroom** - a compute buffer that has to grow after its first allocation is
   allocated one eighth larger, so a long prompt does not reallocate a slightly larger buffer at every step.
   [docs/ranma/graph-runtime.md](docs/ranma/graph-runtime.md)
+- **Graph inputs are uploaded through a pinned staging ring** - asynchronously on the stream of the backend
+  instead of one blocking copy per input. `LLAMA_INPUT_UPLOAD_ASYNC=0` restores the blocking path;
+  `LLAMA_DECODE_HOST_TIMING=N` logs the host-side phases of single-token decodes. Same page.
 
 ## Building
 
