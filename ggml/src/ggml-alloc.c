@@ -421,7 +421,8 @@ static size_t ggml_vbuffer_size(struct vbuffer * buf) {
     return size;
 }
 
-static struct vbuffer * ggml_vbuffer_alloc(ggml_backend_buffer_type_t buft, const struct ggml_dyn_tallocr * talloc, enum ggml_backend_buffer_usage usage) {
+// chunk_sizes is optional: a chunk is allocated with the larger of its planned size and chunk_sizes[n]
+static struct vbuffer * ggml_vbuffer_alloc(ggml_backend_buffer_type_t buft, const struct ggml_dyn_tallocr * talloc, enum ggml_backend_buffer_usage usage, const size_t * chunk_sizes) {
     struct vbuffer * buf = (struct vbuffer *)calloc(1, sizeof(struct vbuffer));
     if (buf == NULL) {
         return NULL;
@@ -429,6 +430,9 @@ static struct vbuffer * ggml_vbuffer_alloc(ggml_backend_buffer_type_t buft, cons
 
     for (int n = 0; n < talloc->n_chunks; n++) {
         size_t chunk_size = talloc->chunks[n]->max_size;
+        if (chunk_sizes != NULL && chunk_sizes[n] > chunk_size) {
+            chunk_size = chunk_sizes[n];
+        }
         buf->chunks[n] = ggml_backend_buft_alloc_buffer(buft, chunk_size);
         if (buf->chunks[n] == NULL) {
             ggml_vbuffer_free(buf);
@@ -822,6 +826,9 @@ static void ggml_gallocr_alloc_graph_impl(ggml_gallocr_t galloc, struct ggml_cgr
     }
 }
 
+// a chunk that has to grow after its first allocation is allocated 1/GGML_ALLOC_REGROW_HEADROOM_DIV larger
+#define GGML_ALLOC_REGROW_HEADROOM_DIV 8
+
 static bool ggml_gallocr_reserve_n_impl(
         ggml_gallocr_t galloc, struct ggml_cgraph * graph, const int * node_buffer_ids, const int * leaf_buffer_ids, bool no_alloc) {
     size_t min_hash_size = graph->n_nodes + graph->n_leafs;
@@ -914,6 +921,14 @@ static bool ggml_gallocr_reserve_n_impl(
         // even if there are no tensors allocated in this buffer, we still need to allocate it to initialize views
         bool realloc = galloc->buffers[i] == NULL;
         size_t new_size = 0;
+        // A buffer that has to grow after its first allocation grows with headroom. The plan of a graph is not
+        // monotonic in its tensor sizes, so a graph can need a little more than the worst case that was reserved,
+        // and then a little more again at every step of the context. Each of those steps would free the buffer
+        // and allocate one that is slightly larger; a device allocator that cannot place the larger block in the
+        // hole of the smaller one keeps both, and the memory of the process grows by a whole buffer per step.
+        const bool regrow = galloc->buffers[i] != NULL && ggml_vbuffer_size(galloc->buffers[i]) > 0;
+        size_t chunk_sizes[GGML_VBUFFER_MAX_CHUNKS] = {0};
+        const size_t max_chunk_size = ggml_backend_buft_get_max_size(galloc->bufts[i]);
         for (int c = 0; c < galloc->buf_tallocs[i]->n_chunks; c++) {
             size_t cur_chunk_size = galloc->buffers[i] ? ggml_vbuffer_chunk_size(galloc->buffers[i], c) : 0;
             size_t new_chunk_size = ggml_dyn_tallocr_max_size(galloc->buf_tallocs[i], c);
@@ -921,14 +936,27 @@ static bool ggml_gallocr_reserve_n_impl(
             if (new_chunk_size > cur_chunk_size) {
                 realloc = true;
             }
+            if (regrow) {
+                size_t padded = new_chunk_size > cur_chunk_size ?
+                    new_chunk_size + new_chunk_size/GGML_ALLOC_REGROW_HEADROOM_DIV : cur_chunk_size;
+                chunk_sizes[c] = padded < max_chunk_size ? padded : max_chunk_size;
+            }
         }
         if (realloc) {
 #ifndef NDEBUG
             {
                 size_t cur_size = galloc->buffers[i] ? ggml_vbuffer_size(galloc->buffers[i]) : 0;
+                // with headroom the buffer is larger than the plan, so log what is actually allocated
+                size_t log_size = new_size;
+                if (regrow) {
+                    log_size = 0;
+                    for (int c = 0; c < galloc->buf_tallocs[i]->n_chunks; c++) {
+                        log_size += chunk_sizes[c];
+                    }
+                }
                 if (cur_size > 0) {
                     GGML_LOG_DEBUG("%s: reallocating %s buffer from size %.02f MiB to %.02f MiB\n",
-                        __func__, ggml_backend_buft_name(galloc->bufts[i]), cur_size / 1024.0 / 1024.0, new_size / 1024.0 / 1024.0);
+                        __func__, ggml_backend_buft_name(galloc->bufts[i]), cur_size / 1024.0 / 1024.0, log_size / 1024.0 / 1024.0);
                 }
             }
 #endif
@@ -936,7 +964,7 @@ static bool ggml_gallocr_reserve_n_impl(
             if (no_alloc) {
                 galloc->buffers[i] = NULL;
             } else {
-                galloc->buffers[i] = ggml_vbuffer_alloc(galloc->bufts[i], galloc->buf_tallocs[i], GGML_BACKEND_BUFFER_USAGE_COMPUTE);
+                galloc->buffers[i] = ggml_vbuffer_alloc(galloc->bufts[i], galloc->buf_tallocs[i], GGML_BACKEND_BUFFER_USAGE_COMPUTE, regrow ? chunk_sizes : NULL);
                 if (galloc->buffers[i] == NULL) {
                     GGML_LOG_ERROR("%s: failed to allocate %s buffer of size %zu\n", __func__, ggml_backend_buft_name(galloc->bufts[i]), new_size);
                     return false;
