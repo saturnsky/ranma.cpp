@@ -1481,6 +1481,93 @@ struct ggml_cuda_mmvq_share_state {
     bool    stats_logged = false;
 };
 
+// One-token MUL_MAT_ID: the dense shared expert of a layer folded into the routed launch [mmvq.cu].
+//
+// A routed launch whose experts are partly read over the link waits for those reads, and its grid
+// alternates the experts so that the resident ones run inside that wait. The shared expert is
+// appended to that grid as one more unit, which hides its rows in the same wait and removes the
+// launches it would need of its own. The unit computes what a standalone launch of the shared
+// expert computes, in the same order, so the result is unchanged.
+struct ggml_cuda_mmvq_shared_fold {
+    const ggml_tensor * dst_routed = nullptr; // dst of the routed launch that is to carry the unit
+    const ggml_tensor * x          = nullptr; // up matrix, or the down matrix of the second launch
+    const ggml_tensor * gate       = nullptr; // gate matrix, null for the down launch
+    const ggml_tensor * src1       = nullptr; // input to quantize; null reuses the routed q8_1 input
+    ggml_tensor *       dst        = nullptr;
+    ggml_glu_op         glu_op     = GGML_GLU_OP_SWIGLU;
+    float               glu_limit  = 0.0f;
+};
+
+// The nodes of one shared expert and the routed launches that may take them over [ggml-cuda.cu].
+struct ggml_cuda_shared_fold_match {
+    ggml_tensor * routed_glu  = nullptr; // dst of the fused routed gate/up launch
+    ggml_tensor * routed_down = nullptr; // routed down MUL_MAT_ID of the same layer
+    ggml_tensor * up          = nullptr; // the three nodes the gate/up launch takes over
+    ggml_tensor * gate        = nullptr;
+    ggml_tensor * glu         = nullptr;
+    ggml_tensor * down        = nullptr; // the node the down launch takes over
+    int idx_glu         = -1;
+    int idx_down        = -1;
+    int idx_routed_down = -1;
+    const char * reason = nullptr;       // why a routed launch that looked right did not fold
+};
+
+// State of one graph evaluation: which nodes a launch has already computed, and the unit the next
+// routed down launch may take.
+struct ggml_cuda_shared_fold_state {
+    std::vector<const ggml_tensor *> done;
+    ggml_cuda_shared_fold_match      pending;   // the down fold a finished gate/up fold left behind
+    ggml_cuda_shared_fold_match      armed;     // what the launch of the current node was offered
+    bool         armed_is_down   = false;
+    bool         is_armed        = false;
+    int          n_gate_up       = 0;
+    int          n_down          = 0;
+    int          n_rejected      = 0;
+    bool         seen_mul_mat_id = false;
+
+    // every reason is a string literal, so the pointer identifies it
+    static constexpr int MAX_REASONS = 16;
+    const char * reasons[MAX_REASONS]    = { nullptr };
+    int          reason_count[MAX_REASONS] = { 0 };
+    int          n_reasons               = 0;
+
+    void reset() {
+        done.clear();
+        pending         = ggml_cuda_shared_fold_match();
+        armed           = ggml_cuda_shared_fold_match();
+        armed_is_down   = false;
+        is_armed        = false;
+        n_gate_up = n_down = n_rejected = 0;
+        n_reasons       = 0;
+        seen_mul_mat_id = false;
+    }
+
+    bool take_done(const ggml_tensor * node) {
+        for (size_t k = 0; k < done.size(); ++k) {
+            if (done[k] == node) {
+                done.erase(done.begin() + k);
+                return true;
+            }
+        }
+        return false;
+    }
+
+    void reject(const char * why) {
+        n_rejected++;
+        for (int k = 0; k < n_reasons; ++k) {
+            if (reasons[k] == why) {
+                reason_count[k]++;
+                return;
+            }
+        }
+        if (n_reasons < MAX_REASONS) {
+            reasons[n_reasons]      = why;
+            reason_count[n_reasons] = 1;
+            n_reasons++;
+        }
+    }
+};
+
 struct ggml_backend_cuda_context {
     int device;
     std::string name;
@@ -1551,6 +1638,13 @@ struct ggml_backend_cuda_context {
     }
 
     ggml_cuda_stream_context concurrent_stream_context;
+
+    // shared expert unit offered to the next launch of this context, and the state of the fold
+    // decisions of the graph evaluation in progress, see mmvq.cuh
+    ggml_cuda_mmvq_shared_fold  mmvq_shared_fold;
+    bool                        mmvq_shared_fold_taken = false;
+    ggml_cuda_shared_fold_state shared_fold;
+    int                         shared_fold_logs_left  = 3;
 
     ~ggml_backend_cuda_context();
 
@@ -1640,6 +1734,22 @@ struct ggml_cuda_mm_fusion_args_device {
     // with the experts alternating, the blocks of an expert that waits on host reads no longer hold up the blocks
     // of the experts that are resident in VRAM.
     bool grid_experts_first = false;
+    // MUL_MAT_ID at one token: the dense shared expert of the same layer runs as one more unit of
+    // the alternating grid, at block index shared_unit of the x dimension. Its rows are computed
+    // inside the wait of the routed blocks that read their expert over the link, and the launches
+    // the shared expert would need of its own disappear. shared_gate is null for the down matrix,
+    // which has no gate and no GLU; shared_y is the q8_1 input, which for the gate/up unit is the
+    // very buffer the routed blocks read.
+    const void * shared_x    = nullptr;
+    const void * shared_gate = nullptr;
+    const void * shared_y    = nullptr;
+    float      * shared_dst  = nullptr;
+    uint32_t     shared_unit          = 0;
+    uint32_t     shared_ncols_x       = 0;
+    uint32_t     shared_nrows_x       = 0;
+    uint32_t     shared_stride_row_x  = 0;
+    ggml_glu_op  shared_glu_op        = GGML_GLU_OP_SWIGLU;
+    float        shared_glu_limit     = 0.0f;
     ggml_glu_op glu_op;
     float glu_limit = 0.0f;
 };

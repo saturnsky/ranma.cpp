@@ -636,7 +636,152 @@ static constexpr bool mmvq_alt_rows_compiled = true;
 static constexpr bool mmvq_alt_rows_compiled = false;
 #endif
 
-template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, bool halve_iters = false, bool alt_rows = false>
+// expert cache: alternate the experts in dispatch order, so that host reads and VRAM reads overlap
+// (GGML_CUDA_MMVQ_ID_EXPERTS_FIRST=0 keeps the expert-major order)
+static bool mmvq_id_experts_first() {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_CUDA_MMVQ_ID_EXPERTS_FIRST");
+        return env ? atoi(env) != 0 : true;
+    }();
+    return enabled;
+}
+
+// The one quantization type of a folded shared expert, and the routed types whose one-token kernel
+// carries it. Both lists are kept short on purpose: every combination is another compiled kernel.
+static constexpr ggml_type MMVQ_ID_FOLD_SHARED_TYPE = GGML_TYPE_Q6_K;
+
+static constexpr __host__ __device__ bool mmvq_id_fold_shared_routed_type(ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_IQ2_XXS:
+        case GGML_TYPE_IQ2_XS:
+        case GGML_TYPE_IQ2_S:
+        case GGML_TYPE_IQ3_XXS:
+        case GGML_TYPE_IQ3_S:
+            return true;
+        default:
+            return false;
+    }
+}
+
+bool ggml_cuda_mmvq_id_fold_shared_enabled() {
+#if defined(GGML_USE_HIP)
+    // on by default; GGML_CUDA_MMVQ_ID_FOLD_SHARED=0 keeps the shared expert in launches of its own
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_CUDA_MMVQ_ID_FOLD_SHARED");
+        return env ? atoi(env) != 0 : true;
+    }();
+    return enabled;
+#else
+    return false;
+#endif // defined(GGML_USE_HIP)
+}
+
+bool ggml_cuda_mmvq_id_fold_shared_log() {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_CUDA_MMVQ_ID_FOLD_SHARED_LOG");
+        return env != nullptr && atoi(env) != 0;
+    }();
+    return enabled;
+}
+
+bool ggml_cuda_mmvq_id_fold_shared_types(ggml_type routed_type, ggml_type shared_type, int cc) {
+#if defined(GGML_USE_HIP)
+    return get_device_table_id(cc) == MMVQ_PARAMETERS_RDNA4 &&
+        shared_type == MMVQ_ID_FOLD_SHARED_TYPE && mmvq_id_fold_shared_routed_type(routed_type);
+#else
+    GGML_UNUSED_VARS(routed_type, shared_type, cc);
+    return false;
+#endif // defined(GGML_USE_HIP)
+}
+
+// One row of the folded shared expert, computed by one block of the routed dispatch.
+//
+// A standalone launch of this type spreads the K blocks of a row over nwarps warps: warp w starts at
+// the block its first thread lands on and steps by the block count of a whole iteration, and the row
+// result is the sum of the warp partials in warp order, reduced over the lanes of the first warp.
+// The routed dispatch gives the row a single warp, so one lane here walks all nwarps strides and
+// adds the partials in the same order. Same summands, same order, same lane reduction.
+template <ggml_type type>
+static __device__ __forceinline__ void mul_mat_vec_q_shared_unit(
+        const ggml_cuda_mm_fusion_args_device & fusion, const uint32_t row) {
+    constexpr int qk        = ggml_cuda_type_traits<type>::qk;
+    constexpr int qi        = ggml_cuda_type_traits<type>::qi;
+    constexpr int vdr       = get_vdr_mmvq(type);
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr int nwarps    = calc_nwarps(type, 1, get_device_table_id());
+    constexpr int blocks_per_iter = vdr * nwarps*warp_size / qi;
+
+    constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
+
+    const int blocks_per_row_x = fusion.shared_ncols_x / qk;
+    const int kbx_offset       = row * fusion.shared_stride_row_x;
+    const block_q8_1 * y       = (const block_q8_1 *) fusion.shared_y;
+    const bool use_gate        = fusion.shared_gate != nullptr;
+
+    float tmp[nwarps]      = {0.0f};
+    float tmp_gate[nwarps] = {0.0f};
+
+#pragma unroll
+    for (int w = 0; w < nwarps; ++w) {
+        const int tid = warp_size*w + threadIdx.x;
+        const int kqs = vdr * (tid % (qi/vdr));
+
+        for (int kbx = tid / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
+            const int kby = kbx * (qk/QK8_1); // y block index that aligns with kbx
+
+            tmp[w] += vec_dot_q_cuda(fusion.shared_x, &y[kby], kbx_offset + kbx, kqs);
+            if (use_gate) {
+                tmp_gate[w] += vec_dot_q_cuda(fusion.shared_gate, &y[kby], kbx_offset + kbx, kqs);
+            }
+        }
+    }
+
+    float result     = tmp[0];
+    float gate_value = tmp_gate[0];
+#pragma unroll
+    for (int w = 1; w < nwarps; ++w) {
+        result     += tmp[w];
+        gate_value += tmp_gate[w];
+    }
+
+    result = warp_reduce_sum<warp_size>(result);
+    if (use_gate) {
+        gate_value = warp_reduce_sum<warp_size>(gate_value);
+    }
+
+    if (threadIdx.x != 0) {
+        return;
+    }
+
+    if (use_gate) {
+        // a standalone gate/up launch runs the variant with the fused gate, which adds the (absent,
+        // hence zero) biases before the GLU; keep those adds so that a zero keeps its sign
+        result     += 0.0f;
+        gate_value += 0.0f;
+        switch (fusion.shared_glu_op) {
+            case GGML_GLU_OP_SWIGLU:
+                result *= ggml_cuda_op_silu_single(gate_value);
+                break;
+            case GGML_GLU_OP_GEGLU:
+                result *= ggml_cuda_op_gelu_single(gate_value);
+                break;
+            case GGML_GLU_OP_SWIGLU_OAI:
+                result = ggml_cuda_op_swiglu_oai_single(gate_value, result);
+                break;
+            case GGML_GLU_OP_SWIGLU_CLAMP:
+                result = ggml_cuda_op_swiglu_clamp_single(gate_value, result, fusion.shared_glu_limit);
+                break;
+            default:
+                result = result * gate_value;
+                break;
+        }
+    }
+
+    fusion.shared_dst[row] = result;
+}
+
+template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, bool halve_iters = false, bool alt_rows = false,
+          ggml_type shared_type = GGML_TYPE_COUNT>
 __launch_bounds__(calc_nwarps(type, ncols_dst, get_device_table_id(), small_k, halve_iters)*ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mul_mat_vec_q(
         const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion, float * dst_ptr,
@@ -672,6 +817,17 @@ static __global__ void mul_mat_vec_q(
     uint32_t sample_dst;
 
     ggml_cuda_pdl_sync();
+
+    if constexpr (shared_type != GGML_TYPE_COUNT) {
+        // the extra unit of the grid holds the dense shared expert of this layer; one row per block,
+        // like the routed blocks of this dispatch, so the two agree on the row of a block index
+        static_assert(rows_per_cuda_block == 1, "the folded shared unit needs one row per block");
+        if (channel_dst == fusion.shared_unit) {
+            mul_mat_vec_q_shared_unit<shared_type>(fusion, blockIdx.y);
+            return;
+        }
+    }
+
     channel_x  = ncols_dst == 1 && ids ? ids[channel_dst]                     : fastdiv(channel_dst, channel_ratio);
     channel_y  = ncols_dst == 1 && ids ? fastmodulo(channel_dst, nchannels_y) : channel_dst;
     sample_dst = blockIdx.z;
@@ -1114,7 +1270,8 @@ static std::pair<dim3, dim3> calc_launch_params(
     return {block_nums, block_dims};
 }
 
-template<ggml_type type, int c_ncols_dst, bool small_k = false, bool halve_iters = false, bool alt_rows = false>
+template<ggml_type type, int c_ncols_dst, bool small_k = false, bool halve_iters = false, bool alt_rows = false,
+         ggml_type shared_type = GGML_TYPE_COUNT>
 static void mul_mat_vec_q_switch_fusion(
         const void * vx, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
         const uint32_t ncols_x, const uint32_t nrows_x, const uint3 nchannels_y, const uint32_t stride_row_x, const uint32_t stride_col_y,
@@ -1129,7 +1286,7 @@ static void mul_mat_vec_q_switch_fusion(
     if constexpr (c_ncols_dst == 1) {
         if (has_fusion) {
             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
-            ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, true, small_k, halve_iters, alt_rows>, launch_params,
+            ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, true, small_k, halve_iters, alt_rows, shared_type>, launch_params,
                  vx, vy, ids, fusion, dst, ncols_x, nrows_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
                  channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
                  sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
@@ -1140,7 +1297,7 @@ static void mul_mat_vec_q_switch_fusion(
     GGML_ASSERT(!has_fusion && "fusion only supported for ncols_dst=1");
 
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
-    ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, false, small_k, halve_iters, alt_rows>, launch_params,
+    ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, false, small_k, halve_iters, alt_rows, shared_type>, launch_params,
         vx, vy, ids, fusion, dst, ncols_x, nrows_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
         channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
         sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
@@ -1304,13 +1461,31 @@ static void mul_mat_vec_q_switch_ncols_dst(
 #if defined(GGML_USE_HIP)
                 // expert cache: alternate the experts in dispatch order, so that host reads and VRAM reads overlap
                 // (GGML_CUDA_MMVQ_ID_EXPERTS_FIRST=0 keeps the expert-major order)
-                static const bool experts_first = [] {
-                    const char * env = getenv("GGML_CUDA_MMVQ_ID_EXPERTS_FIRST");
-                    return env ? atoi(env) != 0 : true;
-                }();
-                if (experts_first && has_ids && fusion.x_cache_slots != nullptr && nchannels_dst > 1 && dims.first.x <= 65535) {
+                if (mmvq_id_experts_first() && has_ids && fusion.x_cache_slots != nullptr && nchannels_dst > 1 && dims.first.x <= 65535) {
                     std::swap(dims.first.x, dims.first.y);
                     fusion_grid.grid_experts_first = true;
+                }
+
+                // the dense shared expert of this layer as one more unit of the alternating grid.
+                // Only the plain kernel of a routed type from the fold list carries it, which is
+                // what the caller checked before it offered the unit.
+                constexpr ggml_type c_shared_type =
+                    (mmvq_id_fold_shared_routed_type(type) && !c_small_k && !c_halve_iters && !c_alt_rows)
+                        ? MMVQ_ID_FOLD_SHARED_TYPE : GGML_TYPE_COUNT;
+                if (fusion_grid.shared_x != nullptr) {
+                    GGML_ASSERT(fusion_grid.grid_experts_first && c_shared_type != GGML_TYPE_COUNT &&
+                        "a shared unit was handed to a launch that cannot carry it");
+                    if constexpr (c_shared_type != GGML_TYPE_COUNT) {
+                        GGML_ASSERT(fusion_grid.shared_nrows_x == dims.first.y);
+                        fusion_grid.shared_unit = dims.first.x;
+                        dims.first.x += 1;
+                        mul_mat_vec_q_switch_fusion<type, c_ncols_dst, c_small_k, c_halve_iters, c_alt_rows, MMVQ_ID_FOLD_SHARED_TYPE>(
+                            vx, vy, ids, fusion_grid, dst, ncols_x, nrows_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
+                            channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst, sample_ratio_fd,
+                            stride_sample_x, stride_sample_y, stride_sample_dst, dims.first, dims.second, 0, ids_stride,
+                            stream);
+                        return;
+                    }
                 }
 #endif // defined(GGML_USE_HIP)
                 mul_mat_vec_q_switch_fusion<type, c_ncols_dst, c_small_k, c_halve_iters, c_alt_rows>(
@@ -1732,6 +1907,30 @@ static ggml_cuda_mmvq_share_slot ggml_cuda_mmvq_share_q8_take(
     return ggml_cuda_mmvq_share_slot();
 }
 
+void ggml_cuda_mmvq_share_q8_skip(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1) {
+    ggml_cuda_mmvq_share_state & st = ctx.mmvq_share_q8;
+
+    const ggml_cuda_mmvq_share_slot share = ggml_cuda_mmvq_share_q8_take(st, src0, src1);
+    if (share.reuse && !share.hold) {
+        // the group ends with a node that never runs, so nobody else hands the buffer back
+        ggml_cuda_mmvq_share_q8_release(st);
+    }
+}
+
+void ggml_cuda_mmvq_shared_fold_arm(ggml_backend_cuda_context & ctx, const ggml_cuda_mmvq_shared_fold & fold) {
+    ctx.mmvq_shared_fold       = fold;
+    ctx.mmvq_shared_fold_taken = false;
+}
+
+void ggml_cuda_mmvq_shared_fold_disarm(ggml_backend_cuda_context & ctx) {
+    ctx.mmvq_shared_fold       = ggml_cuda_mmvq_shared_fold();
+    ctx.mmvq_shared_fold_taken = false;
+}
+
+bool ggml_cuda_mmvq_shared_fold_taken(const ggml_backend_cuda_context & ctx) {
+    return ctx.mmvq_shared_fold_taken;
+}
+
 void ggml_cuda_mul_mat_vec_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
         const ggml_cuda_mm_fusion_args_host * fusion) {
@@ -1918,6 +2117,55 @@ void ggml_cuda_mul_mat_vec_q(
         const int64_t s13 = src1->nb[3] / ts_src1;
         quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1_d, src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
     }
+
+    ggml_cuda_pool_alloc<char> shared_q8_1;
+#if defined(GGML_USE_HIP)
+    // one-token MUL_MAT_ID: take the shared expert unit a graph pass offered to this launch
+    if (ctx.mmvq_shared_fold.dst_routed == dst && ctx.mmvq_shared_fold.x != nullptr) {
+        const ggml_cuda_mmvq_shared_fold & fold = ctx.mmvq_shared_fold;
+        const int cc_fold = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+
+        // the grid only alternates the experts, and only then has a unit to spare, under exactly
+        // these conditions; they are the ones the caller cannot see
+        const bool fold_ok = ids != nullptr && ne2 == 1 && ne3 == 1 && ne1 > 1 && ne01 <= 65535 &&
+            fusion_local.x_cache_slots != nullptr && mmvq_id_experts_first() &&
+            ggml_cuda_mmvq_id_fold_shared_enabled() &&
+            ggml_cuda_mmvq_id_fold_shared_types(src0->type, fold.x->type, cc_fold);
+
+        if (fold_ok) {
+            GGML_ASSERT(fold.x->ne[0] == ne00 && fold.x->ne[1] == ne01);
+            GGML_ASSERT(fold.gate == nullptr || ggml_are_same_stride(fold.gate, fold.x));
+
+            fusion_local.shared_x            = fold.x->data;
+            fusion_local.shared_gate         = fold.gate ? fold.gate->data : nullptr;
+            fusion_local.shared_dst          = (float *) fold.dst->data;
+            fusion_local.shared_ncols_x      = fold.x->ne[0];
+            fusion_local.shared_nrows_x      = fold.x->ne[1];
+            fusion_local.shared_stride_row_x = fold.x->nb[1] / ggml_type_size(fold.x->type);
+            fusion_local.shared_glu_op       = fold.glu_op;
+            fusion_local.shared_glu_limit    = fold.glu_limit;
+
+            if (fold.src1 == nullptr) {
+                // same input as the routed blocks, so the same q8_1 bytes a launch of its own would make
+                fusion_local.shared_y = src1_q8_1_d;
+            } else {
+                const int64_t shared_ne10        = fold.src1->ne[0];
+                const int64_t shared_ne10_padded = GGML_PAD(shared_ne10, MATRIX_ROW_PADDING);
+                const int64_t shared_s11         = fold.src1->nb[1] / ggml_type_size(fold.src1->type);
+                const int64_t shared_s12         = fold.src1->nb[2] / ggml_type_size(fold.src1->type);
+                const int64_t shared_s13         = fold.src1->nb[3] / ggml_type_size(fold.src1->type);
+
+                char * shared_q8_1_d = shared_q8_1.alloc(ctx.pool(),
+                    shared_ne10_padded * sizeof(block_q8_1)/QK8_1);
+                quantize_row_q8_1_cuda((const float *) fold.src1->data, nullptr, shared_q8_1_d, fold.x->type,
+                    shared_ne10, shared_s11, shared_s12, shared_s13, shared_ne10_padded, 1, 1, 1, stream);
+                fusion_local.shared_y = shared_q8_1_d;
+            }
+
+            ctx.mmvq_shared_fold_taken = true;
+        }
+    }
+#endif // defined(GGML_USE_HIP)
 
     const int64_t s01 = src0->nb[1] / ts_src0;
     const int64_t s11 = ne10_padded / QK8_1;
