@@ -638,7 +638,10 @@ static void test_reallocation() {
         bool result = ggml_gallocr_alloc_graph(galloc.get(), graph);
         GGML_ASSERT(result);
         check_all_allocated(graph);
-        GGML_ASSERT(backend.context->allocated_total() == 40);
+        // The first graph planned two chunks of 24 and 16. The second plans two chunks of 20 and 20, so the
+        // 24 chunk is kept and the 16 chunk has to grow. A chunk that grows after the first allocation gets
+        // headroom of plan/GGML_ALLOC_REGROW_HEADROOM_DIV (8): 20 + 20/8 = 22, so the total is 24 + 22 = 46.
+        GGML_ASSERT(backend.context->allocated_total() == 24 + 22);
     }
 }
 
