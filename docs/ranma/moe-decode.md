@@ -141,3 +141,118 @@ difference shows.
 The output must be bit-identical with the switch on and off - the same summands
 in the same order, only dispatched differently - so a greedy continuation with
 `GGML_CUDA_MMVQ_ID_EXPERTS_FIRST=0` and `=1` should reproduce token for token.
+
+
+## Folding the dense shared expert into the routed launch
+
+### What it is
+
+In a layer whose routed launch already alternates its experts, the dense shared
+expert of the same layer is computed as one more unit of that grid instead of by
+launches of its own: the shared gate and up matrices ride along with the routed
+gate/up launch and produce the shared GLU, the shared down matrix rides along
+with the routed down launch. The launches the shared expert would need - the
+fused gate/up matmul, the down matmul and their q8_1 quantizations - disappear.
+
+### When it applies
+
+A routed launch that reads at least one expert over the link is bound by that
+read, and the blocks of the resident experts run inside the wait. The shared
+expert is small compared to that wait, so its rows can be computed inside it for
+close to nothing. The unit has to alternate with the routed blocks to get that:
+appended behind them or placed in front of them, a synthetic kernel shows only
+part of the cost being hidden.
+
+The fold is tried per layer, and only where the graph has exactly the shape the
+unit expects.
+
+### How it works
+
+**The unit.** On RDNA4 a routed IQ2/IQ3 kernel runs one warp and one row per
+block, while the standalone kernel of the Q6_K shared expert runs eight warps and
+four rows. A row of the result does not depend on how the rows are spread over
+blocks, so the folded unit replays the eight warp strides in one lane, keeps one
+partial sum per warp, adds them in warp order and finishes with the same lane
+reduction - the same summands in the same order, hence the same rows. The gate/up
+unit reads the q8_1 input the routed launch already made (it is the same tensor
+and the same bytes); the down unit quantizes the shared GLU result exactly as a
+launch of its own would.
+
+**The match.** A host-side matcher recognizes the layer structurally, without
+looking at any address, so the same matcher can run in the graph-optimize pass
+before the tensors are allocated:
+
+- two routed `MUL_MAT_ID` matmuls of one token and more than one expert,
+  followed by their GLU;
+- a shared GLU within a window of 64 nodes behind them, whose two `MUL_MAT`
+  nodes are the two nodes directly in front of it, are read by nothing but the
+  GLU, and are not graph outputs;
+- shared gate/up matrices of a supported type, in this device's memory, of the
+  same shape and stride as each other and of the routed shape;
+- a shared input that is the input of the routed launch seen through reshapes;
+- shared results that are plain contiguous F32 row vectors.
+
+The shared down matmul is folded in addition when it reads the shared GLU, fits
+the same rules, and a routed down launch of the same layer follows it. If it does
+not, the gate/up half is still folded on its own.
+
+**Writing early.** A folded result is written at the routed launch, which comes
+before the node that would have produced it, so those bytes must belong to it
+from that point on. `ggml_backend_cuda_graph_optimize()` asks the allocator for
+that by adding an allocation dependency that pulls both results in front of the
+routed launch. The evaluation then verifies the addresses it actually got: a fold
+is refused when the target bytes touch any tensor read or written by a node of
+the window, or when the input of the shared expert is written in between. An
+address that cannot be compared counts as a conflict, which is the safe
+direction.
+
+**The handshake.** For each candidate node, the evaluation loop offers the unit
+to the launch that is about to run; the launch takes it only if it really is the
+alternating routed launch of a type that carries a unit, and reports back. A
+taken unit marks the folded nodes as computed, so the node loop skips them before
+any fusion matching, and tells the q8_1 sharing plan about the matmuls that never
+run so that their groups keep moving. A layer that does not fold runs exactly as
+before, including the fusion of the shared down matmul with the final add of the
+layer.
+
+The decision is made in the node loop, which runs on a plain evaluation and on a
+CUDA-graph capture but not on a replay, and it depends only on the graph and on
+the addresses the allocator handed out - both fixed for a captured graph - so a
+capture and each of its replays compute the same thing. The offered unit and the
+bookkeeping of a graph's fold decisions live in the backend context that
+evaluates the graph.
+
+### Options
+
+| Name | Kind | Default | Effect |
+| --- | --- | --- | --- |
+| `GGML_CUDA_MMVQ_ID_FOLD_SHARED` | env | `1` | `0` disables the fold; the shared expert keeps its own launches and the evaluation is the previous one. Reference path for equivalence checks, and the fallback for a model shape that should not fold. |
+| `GGML_CUDA_MMVQ_ID_FOLD_SHARED_LOG` | env | `0` | `1` reports, for the first three evaluations, how many gate/up and down units were folded, how many candidates were rejected and why. |
+
+### Limits
+
+- HIP with the RDNA4 parameter table only, and only for the plain one-token
+  kernel of a supported routed type with one row per block. Shared type Q6_K;
+  routed types IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS and IQ3_S. Every pair is another
+  compiled kernel instance, which is why the list is short.
+- Only when the expert cache supplies the address table and the grid alternates
+  the experts; without the wait there is nothing to hide the shared rows in.
+- Only SwiGLU and clamped SwiGLU shared activations, without swapped operands.
+- A layer whose shared matrices have another type, another shape or another
+  buffer is simply not folded, and so is a layer whose results do not get
+  private memory. Rejections are per layer; the rest of the model still folds.
+- The rejection reasons are counted in fixed-size arrays of the fold state
+  whether or not the log switch is on. Only the report itself is built under the
+  switch.
+
+### How to verify it
+
+- `GGML_CUDA_MMVQ_ID_FOLD_SHARED_LOG=1` prints the fold counts per evaluation:
+  on a model that folds, the gate/up count should be the number of layers whose
+  shared matrices match, and the down count the same minus the layers without a
+  routed down launch to carry it.
+- Compare logits or a greedy continuation against a run with
+  `GGML_CUDA_MMVQ_ID_FOLD_SHARED=0`. The unit computes the same sums in the same
+  order as a standalone launch, so the result is expected to be unchanged.
+- A kernel trace of one token should show the shared expert's own matmul and
+  quantize launches gone for every folded layer.

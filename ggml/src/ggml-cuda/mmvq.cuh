@@ -25,3 +25,21 @@ void ggml_cuda_op_mul_mat_vec_q(
 // all nodes run on the same stream. Must be paired with ggml_cuda_mmvq_share_q8_end().
 void ggml_cuda_mmvq_share_q8_plan(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, bool allow);
 void ggml_cuda_mmvq_share_q8_end(ggml_backend_cuda_context & ctx);
+
+// Tell the plan that this MUL_MAT never reaches the backend, so that the group it belongs to keeps
+// moving: the cursor passes its entry and the buffer of a finished group is handed back.
+void ggml_cuda_mmvq_share_q8_skip(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1);
+
+// GGML_CUDA_MMVQ_ID_FOLD_SHARED (on by default, 0 disables) and its one-line report, GGML_CUDA_MMVQ_ID_FOLD_SHARED_LOG=1
+bool ggml_cuda_mmvq_id_fold_shared_enabled();
+bool ggml_cuda_mmvq_id_fold_shared_log();
+
+// true when the one-token kernel of `routed_type` is compiled with a `shared_type` unit on this arch
+bool ggml_cuda_mmvq_id_fold_shared_types(ggml_type routed_type, ggml_type shared_type, int cc);
+
+// Offer the unit to the next launch of this context; the launch reports back whether it took it.
+// The caller may only treat the folded nodes as computed after ggml_cuda_mmvq_shared_fold_taken()
+// returned true. The unit is defined by ggml_cuda_mmvq_shared_fold in common.cuh.
+void ggml_cuda_mmvq_shared_fold_arm(ggml_backend_cuda_context & ctx, const ggml_cuda_mmvq_shared_fold & fold);
+void ggml_cuda_mmvq_shared_fold_disarm(ggml_backend_cuda_context & ctx);
+bool ggml_cuda_mmvq_shared_fold_taken(const ggml_backend_cuda_context & ctx);

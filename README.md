@@ -154,6 +154,8 @@ applies, how to switch it, and its limits.
 - **Expert-first launch grid** - with the expert cache, the routed `MUL_MAT_ID` launch alternates its blocks
   between the experts, so the experts in VRAM compute inside the wait for the experts read over the link.
   Same page.
+- **Shared expert folded into the routed launch** - on RDNA4 the dense shared expert of a layer is computed as
+  one more unit of that grid, and its own launches disappear. Same page.
 
 ## Building
 

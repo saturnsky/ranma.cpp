@@ -4549,6 +4549,442 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     return 0;
 }
 
+#if defined(GGML_USE_HIP)
+// One-token MUL_MAT_ID: fold the dense shared expert of a layer into the routed launches.
+//
+// The routed launch of the layer already alternates its experts in the dispatch, so the blocks of
+// the experts that are resident in VRAM run while the blocks of an expert that is read over the
+// link wait. The shared expert is appended to that dispatch as one more unit of the grid, which
+// hides its rows in the same wait; the gate/up matrices ride along with the routed gate/up launch
+// and the down matrix with the routed down launch. The unit computes the rows the way a standalone
+// launch computes them, so the result of the layer does not change.
+//
+// The two nodes the fold computes (the shared GLU and the shared down matmul) are written earlier
+// than their place in the graph, so their memory must belong to them alone from the routed launch
+// on. ggml_backend_cuda_graph_optimize() asks the allocator for that by having the tensors
+// allocated before the routed launch, and the checks below verify the result against the addresses
+// of every node in between: a fold only happens when nothing else owns that memory and when the
+// input of the shared expert keeps its bytes until the place where it would have been read.
+//
+// The match is purely structural, so a graph only folds when it has the exact shape the unit
+// expects: the shared matrices are Q6_K of the routed shape in this device's memory, they read the
+// input of the routed launch, and their results belong to the shared expert alone.
+// how far behind a routed gate/up launch the shared expert of the layer may sit, in nodes;
+// unrelated to the plan-entry window of the shared q8_1 quantization
+static constexpr int GGML_CUDA_SHARED_FOLD_WINDOW = 64;
+
+static bool ggml_cuda_shared_fold_weights_ok(const ggml_tensor * w, int device) {
+    return w != nullptr && w->buffer != nullptr &&
+        w->buffer->buft == ggml_backend_cuda_buffer_type(device) &&
+        w->type == GGML_TYPE_Q6_K && w->ne[2] == 1 && w->ne[3] == 1 &&
+        w->nb[0] == ggml_type_size(w->type);
+}
+
+// the tensor a chain of views ends at, plus the offset of the view inside it
+static const ggml_tensor * ggml_cuda_shared_fold_root(const ggml_tensor * t, size_t & offs) {
+    offs = 0;
+    while (t->view_src != nullptr) {
+        offs += t->view_offs;
+        t     = t->view_src;
+    }
+    return t;
+}
+
+static bool ggml_cuda_shared_fold_vector_ok(const ggml_tensor * t) {
+    return t != nullptr && t->type == GGML_TYPE_F32 && ggml_is_contiguous(t) &&
+        t->ne[1] == 1 && t->ne[2] == 1 && t->ne[3] == 1 &&
+        (t->flags & GGML_TENSOR_FLAG_COMPUTE) != 0;
+}
+
+// Structural match only; it uses no addresses, so the graph pass can run it before allocation.
+static bool ggml_cuda_match_shared_fold(const ggml_cgraph * cgraph, int node_idx, int device, int cc,
+                                        ggml_cuda_shared_fold_match & m) {
+    if (node_idx + 2 >= cgraph->n_nodes) {
+        return false;
+    }
+
+    ggml_tensor * routed_up   = cgraph->nodes[node_idx];
+    ggml_tensor * routed_gate = cgraph->nodes[node_idx + 1];
+    ggml_tensor * routed_glu  = cgraph->nodes[node_idx + 2];
+
+    if (routed_up->op != GGML_OP_MUL_MAT_ID || routed_gate->op != GGML_OP_MUL_MAT_ID ||
+            routed_glu->op != GGML_OP_GLU) {
+        return false;
+    }
+    if (!((routed_glu->src[0] == routed_gate && routed_glu->src[1] == routed_up) ||
+          (routed_glu->src[0] == routed_up   && routed_glu->src[1] == routed_gate))) {
+        return false;
+    }
+    // one token, one sample, more than one routed expert: the shape the alternating grid needs
+    if (routed_up->ne[1] <= 1 || routed_up->ne[2] != 1 || routed_up->ne[3] != 1) {
+        return false;
+    }
+
+    const ggml_tensor * routed_w  = routed_up->src[0];
+    const ggml_tensor * routed_in = routed_up->src[1];
+    if (routed_w == nullptr || routed_in == nullptr) {
+        return false;
+    }
+    if (!ggml_cuda_mmvq_id_fold_shared_types(routed_w->type, GGML_TYPE_Q6_K, cc)) {
+        return false;
+    }
+
+    // from here on the routed launch is a candidate, so a rejection is worth reporting
+    m.routed_glu = routed_glu;
+    m.reason     = "no shared expert behind the routed launch";
+
+    const int last = std::min(cgraph->n_nodes, node_idx + 3 + GGML_CUDA_SHARED_FOLD_WINDOW);
+
+    ggml_tensor * shared_glu = nullptr;
+    int           idx_glu    = -1;
+    for (int j = node_idx + 3; j < last; ++j) {
+        if (cgraph->nodes[j]->op == GGML_OP_GLU) {
+            shared_glu = cgraph->nodes[j];
+            idx_glu    = j;
+            break;
+        }
+    }
+    if (shared_glu == nullptr) {
+        return false;
+    }
+
+    m.reason = "the shared gate/up nodes do not match";
+
+    ggml_tensor * shared_gate = shared_glu->src[0];
+    ggml_tensor * shared_up   = shared_glu->src[1];
+    if (shared_gate == nullptr || shared_up == nullptr ||
+            shared_gate->op != GGML_OP_MUL_MAT || shared_up->op != GGML_OP_MUL_MAT) {
+        return false;
+    }
+    if (shared_gate->src[1] != shared_up->src[1] || shared_up->src[2] != nullptr || shared_gate->src[2] != nullptr) {
+        return false;
+    }
+
+    const ggml_glu_op glu_op = ggml_get_glu_op(shared_glu);
+    if ((glu_op != GGML_GLU_OP_SWIGLU && glu_op != GGML_GLU_OP_SWIGLU_CLAMP) ||
+            ggml_get_op_params_i32(shared_glu, 1) != 0) {
+        m.reason = "unsupported shared GLU";
+        return false;
+    }
+
+    // The shared expert reads the very input of the routed launch, so it can read its q8_1 copy.
+    // The two are the same tensor seen through different reshapes, which the graph pass has to
+    // recognize before the addresses exist, hence the walk to the tensor they view.
+    const ggml_tensor * shared_in = shared_up->src[1];
+    size_t shared_in_offs = 0;
+    size_t routed_in_offs = 0;
+    const ggml_tensor * shared_in_root = ggml_cuda_shared_fold_root(shared_in, shared_in_offs);
+    const ggml_tensor * routed_in_root = ggml_cuda_shared_fold_root(routed_in, routed_in_offs);
+    if (shared_in_root != routed_in_root || shared_in_offs != 0 || routed_in_offs != 0 ||
+            shared_in->type != routed_in->type || ggml_nelements(shared_in) != ggml_nelements(routed_in) ||
+            shared_in->ne[0] != routed_in->ne[0] ||
+            !ggml_is_contiguous(shared_in) || !ggml_is_contiguous(routed_in)) {
+        m.reason = "the shared expert reads another input";
+        return false;
+    }
+
+    const ggml_tensor * w_up   = shared_up->src[0];
+    const ggml_tensor * w_gate = shared_gate->src[0];
+    if (!ggml_cuda_shared_fold_weights_ok(w_up, device) || !ggml_cuda_shared_fold_weights_ok(w_gate, device) ||
+            !ggml_are_same_shape(w_up, w_gate) || !ggml_are_same_stride(w_up, w_gate) ||
+            w_up->ne[0] != routed_w->ne[0] || w_up->ne[1] != routed_w->ne[1]) {
+        m.reason = "the shared gate/up matrices do not fit the routed grid";
+        return false;
+    }
+    if (!ggml_cuda_shared_fold_vector_ok(shared_glu) || shared_glu->ne[0] != w_up->ne[1] ||
+            !ggml_cuda_shared_fold_vector_ok(shared_up) || !ggml_cuda_shared_fold_vector_ok(shared_gate)) {
+        m.reason = "the shared gate/up results are not plain row vectors";
+        return false;
+    }
+    // nothing else may read the two matmuls, and the GLU may only be read by the down matmul
+    // the two matmuls sit right in front of the GLU, in either order (the graph expands src[0] first)
+    const ggml_tensor * prev1 = cgraph->nodes[idx_glu - 1];
+    const ggml_tensor * prev2 = cgraph->nodes[idx_glu - 2];
+    if (!((prev1 == shared_gate && prev2 == shared_up) || (prev1 == shared_up && prev2 == shared_gate))) {
+        m.reason = "the shared gate/up matmuls are not the two nodes in front of the GLU";
+        return false;
+    }
+    // the fold never writes these two, so the GLU must be their only reader and nobody outside the
+    // graph may want them either
+    if (ggml_node_get_use_count(cgraph, idx_glu - 1) != 1 || ggml_node_get_use_count(cgraph, idx_glu - 2) != 1 ||
+            (shared_up->flags & GGML_TENSOR_FLAG_OUTPUT) != 0 || (shared_gate->flags & GGML_TENSOR_FLAG_OUTPUT) != 0) {
+        m.reason = "the shared gate/up nodes are not a private pair";
+        return false;
+    }
+
+    m.up    = shared_up;
+    m.gate  = shared_gate;
+    m.glu   = shared_glu;
+    m.idx_glu = idx_glu;
+
+    // the down matmul of the shared expert, and the routed down launch that may carry it
+    m.reason = "no shared down matmul behind the shared GLU";
+    for (int j = idx_glu + 1; j < last; ++j) {
+        ggml_tensor * node = cgraph->nodes[j];
+        if (node->op == GGML_OP_MUL_MAT && node->src[1] == shared_glu) {
+            m.down     = node;
+            m.idx_down = j;
+            break;
+        }
+    }
+    if (m.down == nullptr || ggml_node_get_use_count(cgraph, idx_glu) != 1) {
+        m.down     = nullptr;
+        m.idx_down = -1;
+        return true; // the gate/up fold alone is still worth doing
+    }
+
+    // A reader of its own keeps the down result allocated past the launch that writes it early:
+    // the allocator frees a tensor when the last reader has run, and the dependency that brings
+    // the allocation forward counts as a reader too.
+    const ggml_tensor * w_down = m.down->src[0];
+    if (!ggml_cuda_shared_fold_weights_ok(w_down, device) || m.down->src[2] != nullptr ||
+            !ggml_cuda_shared_fold_vector_ok(m.down) || m.down->ne[0] != w_down->ne[1] ||
+            w_down->ne[0] != shared_glu->ne[0] || ggml_node_get_use_count(cgraph, m.idx_down) < 1) {
+        m.reason    = "the shared down matmul does not fit";
+        m.down      = nullptr;
+        m.idx_down  = -1;
+        return true;
+    }
+
+    for (int j = node_idx + 3; j < idx_glu; ++j) {
+        ggml_tensor * node = cgraph->nodes[j];
+        if (node->op != GGML_OP_MUL_MAT_ID) {
+            continue;
+        }
+        const ggml_tensor * src1 = node->src[1];
+        if (src1 != routed_glu && !(src1 != nullptr && src1->view_src == routed_glu)) {
+            continue;
+        }
+        if (node->ne[1] > 1 && node->ne[2] == 1 && node->ne[3] == 1 && node->src[0] != nullptr &&
+                ggml_cuda_mmvq_id_fold_shared_types(node->src[0]->type, GGML_TYPE_Q6_K, cc) &&
+                node->src[0]->ne[0] == w_down->ne[0] && node->src[0]->ne[1] == w_down->ne[1] &&
+                (node->flags & GGML_TENSOR_FLAG_COMPUTE) != 0) {
+            m.routed_down     = node;
+            m.idx_routed_down = j;
+        }
+        break;
+    }
+    if (m.routed_down == nullptr) {
+        m.reason   = "no routed down launch to carry the shared down matmul";
+        m.down     = nullptr;
+        m.idx_down = -1;
+    }
+
+    return true;
+}
+
+static bool ggml_cuda_shared_fold_overlaps(const ggml_tensor * a, const ggml_tensor * b) {
+    if (a->data == nullptr || b->data == nullptr || a->buffer == nullptr || b->buffer == nullptr) {
+        return true; // an address we cannot compare is treated as a conflict
+    }
+
+    const char * a_beg = (const char *) a->data;
+    const char * a_end = a_beg + ggml_backend_buft_get_alloc_size(a->buffer->buft, a);
+    const char * b_beg = (const char *) b->data;
+    const char * b_end = b_beg + ggml_backend_buft_get_alloc_size(b->buffer->buft, b);
+
+    return a_beg < b_end && b_beg < a_end;
+}
+
+// Does `target` own its memory over the nodes [from, to]? The fold writes it at node `from`, so
+// nothing that another node of the window reads or writes may share those bytes. Nodes in `elided`
+// are computed by a fused or folded launch and never write anything of their own.
+static bool ggml_cuda_shared_fold_memory_ok(const ggml_cgraph * cgraph, int from, int to,
+        const ggml_tensor * target, const ggml_tensor * const * elided, int n_elided) {
+    auto overlaps = [](const ggml_tensor * a, const ggml_tensor * b) {
+        return ggml_cuda_shared_fold_overlaps(a, b);
+    };
+
+    auto is_elided = [&](const ggml_tensor * t) {
+        for (int k = 0; k < n_elided; ++k) {
+            if (elided[k] == t) {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    for (int j = from; j <= to; ++j) {
+        ggml_tensor * node = cgraph->nodes[j];
+        if (ggml_cuda_is_view_or_noop(node) || (node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            continue;
+        }
+        if (node != target && !is_elided(node) && overlaps(target, node)) {
+            return false;
+        }
+        for (int k = 0; k < GGML_MAX_SRC; ++k) {
+            const ggml_tensor * src = node->src[k];
+            if (src == nullptr || src == target || is_elided(src)) {
+                continue;
+            }
+            if (overlaps(target, src)) {
+                return false;
+            }
+        }
+    }
+
+    return true;
+}
+
+// Does `target` keep its bytes over the nodes [from, to]? The fold reads the input of the shared
+// expert at the routed launch, earlier than a launch of its own would read it, so a write into it
+// in between would feed the unit other values than the graph asks for.
+static bool ggml_cuda_shared_fold_input_stable(const ggml_cgraph * cgraph, int from, int to,
+        const ggml_tensor * target, const ggml_tensor * const * elided, int n_elided) {
+    for (int j = from; j <= to; ++j) {
+        ggml_tensor * node = cgraph->nodes[j];
+        if (ggml_cuda_is_view_or_noop(node) || (node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
+            continue;
+        }
+
+        bool skip = false;
+        for (int k = 0; k < n_elided; ++k) {
+            skip = skip || elided[k] == node;
+        }
+        if (skip) {
+            continue;
+        }
+
+        if (ggml_cuda_shared_fold_overlaps(target, node)) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+// Offer the shared expert of the layer to the launch that is about to run at node_idx. Returns
+// whether something was offered; the launch decides, and ggml_cuda_shared_fold_collect() asks it.
+static bool ggml_cuda_shared_fold_try_arm(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph,
+                                          int node_idx, int cc, ggml_cuda_shared_fold_state & state) {
+    ggml_tensor * node = cgraph->nodes[node_idx];
+
+    if (node->op == GGML_OP_MUL_MAT_ID) {
+        state.seen_mul_mat_id = true;
+    }
+
+    if (!ggml_cuda_mmvq_id_fold_shared_enabled()) {
+        return false;
+    }
+
+    // the routed down launch of a layer whose gate/up launch took the unit
+    if (state.pending.routed_down == node) {
+        const ggml_cuda_shared_fold_match pending = state.pending;
+        state.pending = ggml_cuda_shared_fold_match();
+
+        // the two matmuls of the gate/up fold never run, so they write nothing
+        const ggml_tensor * elided[] = { pending.up, pending.gate };
+        if (!ggml_cuda_shared_fold_memory_ok(cgraph, node_idx, pending.idx_down, pending.down, elided, 2)) {
+            state.reject("the shared down result shares memory with another tensor");
+            return false;
+        }
+
+        // the GLU the fold wrote is the input here, and the fold wrote it at the gate/up launch
+        const ggml_tensor * input_elided[] = { pending.up, pending.gate, pending.glu };
+        if (!ggml_cuda_shared_fold_input_stable(cgraph, node_idx, pending.idx_down - 1, pending.glu,
+                input_elided, 3)) {
+            state.reject("the input of the shared down matmul is written in between");
+            return false;
+        }
+
+        ggml_cuda_mmvq_shared_fold fold;
+        fold.dst_routed = node;
+        fold.x          = pending.down->src[0];
+        fold.gate       = nullptr;
+        fold.src1       = pending.glu;
+        fold.dst        = pending.down;
+        ggml_cuda_mmvq_shared_fold_arm(ctx, fold);
+
+        state.armed         = pending;
+        state.armed_is_down = true;
+        state.is_armed      = true;
+        return true;
+    }
+
+    if (node->op != GGML_OP_MUL_MAT_ID) {
+        return false;
+    }
+
+    ggml_cuda_shared_fold_match m;
+    if (!ggml_cuda_match_shared_fold(cgraph, node_idx, ctx.device, cc, m)) {
+        if (m.routed_glu != nullptr) {
+            state.reject(m.reason);
+        }
+        return false;
+    }
+
+    if (m.down == nullptr) {
+        state.reject(m.reason); // the gate/up half can still fold
+    }
+
+    // the fused routed launch writes the routed GLU, the two matmuls in front of it are elided
+    const ggml_tensor * elided[] = { cgraph->nodes[node_idx], cgraph->nodes[node_idx + 1], m.up, m.gate };
+    if (!ggml_cuda_shared_fold_memory_ok(cgraph, node_idx, m.idx_glu, m.glu, elided, 4)) {
+        state.reject("the shared GLU result shares memory with another tensor");
+        return false;
+    }
+
+    // the unit reads the input at the routed launch, through the q8_1 copy the launch makes there
+    if (!ggml_cuda_shared_fold_input_stable(cgraph, node_idx, m.idx_glu - 1, m.up->src[1], elided, 4)) {
+        state.reject("the input of the shared expert is written in between");
+        return false;
+    }
+
+    ggml_cuda_mmvq_shared_fold fold;
+    fold.dst_routed = m.routed_glu;
+    fold.x          = m.up->src[0];
+    fold.gate       = m.gate->src[0];
+    fold.src1       = nullptr; // the routed q8_1 input
+    fold.dst        = m.glu;
+    fold.glu_op     = ggml_get_glu_op(m.glu);
+    fold.glu_limit  = ggml_get_op_params_f32(m.glu, 3);
+    ggml_cuda_mmvq_shared_fold_arm(ctx, fold);
+
+    state.armed         = m;
+    state.armed_is_down = false;
+    state.is_armed      = true;
+    return true;
+}
+
+// Ask the launch that just ran whether it took the unit, and treat the folded nodes as computed.
+static void ggml_cuda_shared_fold_collect(ggml_backend_cuda_context & ctx, ggml_cuda_shared_fold_state & state) {
+    if (!state.is_armed) {
+        return;
+    }
+
+    const bool taken = ggml_cuda_mmvq_shared_fold_taken(ctx);
+    ggml_cuda_mmvq_shared_fold_disarm(ctx);
+
+    if (!taken) {
+        state.reject("the routed launch did not take the unit");
+        state.is_armed = false;
+        state.armed    = ggml_cuda_shared_fold_match();
+        return;
+    }
+
+    if (state.armed_is_down) {
+        state.done.push_back(state.armed.down);
+        state.n_down++;
+    } else {
+        // the two matmuls never run: tell the q8_1 plan so that their group keeps moving
+        ggml_cuda_mmvq_share_q8_skip(ctx, state.armed.up->src[0], state.armed.up->src[1]);
+        ggml_cuda_mmvq_share_q8_skip(ctx, state.armed.gate->src[0], state.armed.gate->src[1]);
+
+        state.done.push_back(state.armed.up);
+        state.done.push_back(state.armed.gate);
+        state.done.push_back(state.armed.glu);
+        state.n_gate_up++;
+
+        if (state.armed.down != nullptr && state.armed.routed_down != nullptr) {
+            state.pending = state.armed;
+        }
+    }
+
+    state.is_armed = false;
+    state.armed    = ggml_cuda_shared_fold_match();
+}
+#endif // defined(GGML_USE_HIP)
+
 static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
     bool graph_evaluated_or_captured = false;
 
@@ -4652,6 +5088,15 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             // different streams
             ggml_cuda_mmvq_share_q8_plan(*cuda_ctx, cgraph, !should_launch_concurrent_events);
 
+#if defined(GGML_USE_HIP)
+            // one-token MUL_MAT_ID: the shared expert of a layer may ride along with its routed
+            // launches, which computes its nodes before the loop reaches them
+            ggml_cuda_shared_fold_state & fold_state = cuda_ctx->shared_fold;
+            const int fold_cc = ggml_cuda_info().devices[cuda_ctx->device].cc;
+            fold_state.reset();
+            ggml_cuda_mmvq_shared_fold_disarm(*cuda_ctx);
+#endif // defined(GGML_USE_HIP)
+
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
                 if (is_concurrent_event_active) {
@@ -4694,9 +5139,19 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     continue;
                 }
 
+#if defined(GGML_USE_HIP)
+                if (fold_state.take_done(node)) {
+                    continue; // a routed launch of this layer already computed this node
+                }
+                ggml_cuda_shared_fold_try_arm(*cuda_ctx, cgraph, i, fold_cc, fold_state);
+#endif // defined(GGML_USE_HIP)
+
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
 
                 if (nodes_to_skip != 0) {
+#if defined(GGML_USE_HIP)
+                    ggml_cuda_shared_fold_collect(*cuda_ctx, fold_state);
+#endif // defined(GGML_USE_HIP)
 #ifdef GGML_CUDA_DEBUG
                     const int last_fused = i + nodes_to_skip;
                     GGML_LOG_INFO("nodes_fused: %d, first: %s (%s), last: %s (%s)\n",
@@ -4733,10 +5188,27 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 }
                 GGML_ASSERT(ok);
 
+#if defined(GGML_USE_HIP)
+                ggml_cuda_shared_fold_collect(*cuda_ctx, fold_state);
+#endif // defined(GGML_USE_HIP)
+
                 if (!is_concurrent_event_active) {
                     try_launch_concurrent_event(node);
                }
             }
+
+#if defined(GGML_USE_HIP)
+            if (ggml_cuda_mmvq_id_fold_shared_log() && fold_state.seen_mul_mat_id && cuda_ctx->shared_fold_logs_left > 0) {
+                cuda_ctx->shared_fold_logs_left--;
+                std::string reasons;
+                for (int k = 0; k < fold_state.n_reasons; ++k) {
+                    reasons += ", " + std::string(fold_state.reasons[k]) + " x" +
+                        std::to_string(fold_state.reason_count[k]);
+                }
+                GGML_LOG_INFO("mmvq_id_fold_shared: %d gate/up, %d down, %d rejected%s\n",
+                    fold_state.n_gate_up, fold_state.n_down, fold_state.n_rejected, reasons.c_str());
+            }
+#endif // defined(GGML_USE_HIP)
 
             ggml_cuda_mmvq_share_q8_end(*cuda_ctx);
         }
@@ -4903,6 +5375,31 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
             i += match.node_count - 1;
         }
     }
+
+#if defined(GGML_USE_HIP)
+    // One-token MUL_MAT_ID: a folded shared expert is written by the routed launches of its layer,
+    // which come before its own nodes. Ask for its two results to be allocated in front of the
+    // first of those launches, so that the memory is theirs from that point on; the evaluation
+    // checks the addresses it got before it folds anything.
+    if (ggml_cuda_mmvq_id_fold_shared_enabled()) {
+        const int cc = ggml_cuda_info().devices[cuda_ctx->device].cc;
+        for (int i = 1; i < cgraph->n_nodes; ++i) {
+            if (cgraph->nodes[i]->op != GGML_OP_MUL_MAT_ID) {
+                continue;
+            }
+
+            ggml_cuda_shared_fold_match match;
+            if (!ggml_cuda_match_shared_fold(cgraph, i, cuda_ctx->device, cc, match) || match.glu == nullptr) {
+                continue;
+            }
+
+            params->add_alloc_dep(params->user_data, match.glu, cgraph->nodes[i - 1]);
+            if (match.down != nullptr) {
+                params->add_alloc_dep(params->user_data, match.down, cgraph->nodes[i - 1]);
+            }
+        }
+    }
+#endif // defined(GGML_USE_HIP)
 
 #ifdef USE_CUDA_GRAPH
     const void * graph_key = ggml_cuda_graph_get_key(cgraph);
