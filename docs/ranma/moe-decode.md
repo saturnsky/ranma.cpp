@@ -80,3 +80,64 @@ produces the same sequence of pool allocations every time it is captured.
   counts of the first graph; the difference is the number of launches removed.
 - `test-backend-ops -o MUL_MAT` covers the path, and a run with
   `GGML_CUDA_MMVQ_SHARE_Q8=0` is the reference for comparing logits.
+
+
+## Expert-first launch grid for MUL_MAT_ID
+
+### What it is
+
+The one launch that computes the routed experts of a `MUL_MAT_ID` node uses the
+grid `(expert, row block)` instead of `(row block, expert)`, so that consecutive
+blocks of the dispatch belong to different experts.
+
+### When it applies
+
+With the expert cache, the experts a token routes to are read partly from VRAM
+and partly from mapped host memory, inside one launch. A device works a dispatch
+through in block order, and one expert already holds enough blocks to fill the
+device, so with the expert-major grid the blocks of an expert that waits on its
+host reads stand in front of the blocks of the experts that are resident. The
+launch then takes the sum of the two parts. With the experts alternating in
+dispatch order, the resident blocks flow through the execution slots the waiting
+blocks leave free, and the launch takes about the longer of the two parts.
+
+### How it works
+
+The two grid dimensions are swapped at launch time and the kernel is told about
+it through a flag in its fusion arguments: it reads the row block from the
+dimension the swap moved it to and the channel from the other. Every thread
+computes exactly what it computed before - only the mapping from a block index to
+an (expert, row block) pair changes - so the result is bit-identical.
+
+The swap is applied when all of the following hold:
+
+- the build is HIP;
+- the launch has an `ids` tensor and more than one channel, i.e. it is a routed
+  launch;
+- the expert cache supplied the address table the launch reads its weights
+  through;
+- the row-block count fits the 65535 limit of the grid dimension it moves to,
+  which is checked before the swap.
+
+Nothing restricts it to a single token: a multi-token `MUL_MAT_ID` launch that
+meets these conditions gets the alternating grid as well. It is the one-token
+launch of a decode that is bound by the host reads, so that is where the
+difference shows.
+
+### Options
+
+| Name | Kind | Default | Effect |
+| --- | --- | --- | --- |
+| `GGML_CUDA_MMVQ_ID_EXPERTS_FIRST` | env | `1` | `0` keeps the expert-major grid. Reference path for equivalence checks. |
+
+### Limits
+
+- HIP only; other backends are not compiled with the swap.
+- Without the expert cache there is no address table, so the grid is unchanged:
+  a launch whose weights are all in VRAM has nothing to overlap.
+
+### How to verify it
+
+The output must be bit-identical with the switch on and off - the same summands
+in the same order, only dispatched differently - so a greedy continuation with
+`GGML_CUDA_MMVQ_ID_EXPERTS_FIRST=0` and `=1` should reproduce token for token.

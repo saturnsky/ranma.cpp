@@ -144,6 +144,9 @@ applies, how to switch it, and its limits.
 
 - **One q8_1 quantization per shared input** - `MUL_MAT` nodes of one graph that read the same activation
   share its quantization. [docs/ranma/moe-decode.md](docs/ranma/moe-decode.md)
+- **Expert-first launch grid** - with the expert cache, the routed `MUL_MAT_ID` launch alternates its blocks
+  between the experts, so the experts in VRAM compute inside the wait for the experts read over the link.
+  Same page.
 
 ## Building
 
