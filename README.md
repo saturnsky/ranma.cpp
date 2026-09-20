@@ -128,6 +128,12 @@ applies, how to switch it, and its limits.
 - **`llama-perplexity` takes the expert cache options**, with the cache frozen, so a model whose routed experts
   do not fit in VRAM can be scored without `--n-cpu-moe`.
 
+### Graph runtime
+
+- **Compute buffers regrow with headroom** - a compute buffer that has to grow after its first allocation is
+  allocated one eighth larger, so a long prompt does not reallocate a slightly larger buffer at every step.
+  [docs/ranma/graph-runtime.md](docs/ranma/graph-runtime.md)
+
 ## Building
 
 RANMA.cpp builds exactly like upstream. For the primary target, follow the HIP section of
