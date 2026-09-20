@@ -1635,6 +1635,11 @@ struct ggml_cuda_mm_fusion_args_device {
     // expert the address table does not own.
     const uint64_t * x_host_addresses    = nullptr;
     const uint64_t * gate_host_addresses = nullptr;
+    // MUL_MAT_ID at one token: the launch grid is (expert, row block) instead of (row block, expert), so that
+    // consecutive blocks of the dispatch belong to different experts. The device runs a dispatch in block order;
+    // with the experts alternating, the blocks of an expert that waits on host reads no longer hold up the blocks
+    // of the experts that are resident in VRAM.
+    bool grid_experts_first = false;
     ggml_glu_op glu_op;
     float glu_limit = 0.0f;
 };
