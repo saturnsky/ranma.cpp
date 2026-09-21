@@ -7385,6 +7385,120 @@ struct test_top_k_inf : public test_top_k {
     }
 };
 
+// top_k with GGML_CUDA_TOP_K_STABLE_TIES=1 over a DSV4 LID-like row: n_valid finite scores and -inf behind them,
+// a run of equal scores across rank k. The stable rule (larger value first, the smaller column among equal ones,
+// +0 above -0 as in the radix select) fixes the selected set, so it must not depend on the row width that picks the
+// implementation (bitonic up to 1024 columns on HIP, radix select above). Without the env only the values are compared.
+struct test_top_k_stable_ties : public test_case {
+    const std::array<int64_t, 4> ne;
+    const int k;
+    const int n_valid;
+    const bool zeros; // the tied run is +0 / -0 instead of one finite value
+    ggml_tensor * input {};
+
+    std::string vars() override {
+        return VARS_TO_STR4(ne, k, n_valid, zeros);
+    }
+
+    test_top_k_stable_ties(std::array<int64_t, 4> ne, int k, int n_valid, bool zeros)
+        : ne(ne), k(k), n_valid(n_valid), zeros(zeros) {}
+
+    double max_err() override { return 0.0; }
+
+    bool run_whole_graph() override { return true; }
+
+    static bool stable() {
+        const char * v = getenv("GGML_CUDA_TOP_K_STABLE_TIES");
+        return v != nullptr && atoi(v) != 0;
+    }
+
+    static uint32_t ordered(float x) {
+        uint32_t b;
+        memcpy(&b, &x, sizeof(b));
+        return (b & 0x80000000u) ? ~b : (b | 0x80000000u);
+    }
+
+    double err(const float * a, const float * b, size_t n) override {
+        std::vector<float> src(ggml_nelements(input));
+        ggml_backend_tensor_get(input, src.data(), 0, ggml_nbytes(input));
+        const int64_t cols = input->ne[0];
+        GGML_ASSERT(n == (size_t) (ggml_nrows(input) * k));
+
+        double diff = 0.0;
+        std::vector<int32_t> idx(cols);
+        std::vector<int32_t> ia(k);
+        std::vector<int32_t> ib(k);
+        for (int64_t r = 0; r < ggml_nrows(input); r++) {
+            const float * row = src.data() + r * cols;
+            for (int c = 0; c < k; c++) {
+                ia[c] = (int32_t) a[r * k + c];
+                ib[c] = (int32_t) b[r * k + c];
+            }
+            std::sort(ia.begin(), ia.end());
+            std::sort(ib.begin(), ib.end());
+            if (stable()) {
+                // a is the tested backend: its set must be the stable one
+                for (int64_t c = 0; c < cols; c++) {
+                    idx[c] = (int32_t) c;
+                }
+                std::stable_sort(idx.begin(), idx.end(), [&](int32_t x, int32_t y) { return ordered(row[x]) > ordered(row[y]); });
+                std::sort(idx.begin(), idx.begin() + k);
+                for (int c = 0; c < k; c++) {
+                    diff += ia[c] != idx[c];
+                }
+            } else {
+                std::vector<float> va(k);
+                std::vector<float> vb(k);
+                for (int c = 0; c < k; c++) {
+                    va[c] = row[ia[c]];
+                    vb[c] = row[ib[c]];
+                }
+                std::sort(va.begin(), va.end());
+                std::sort(vb.begin(), vb.end());
+                for (int c = 0; c < k; c++) {
+                    diff += va[c] != vb[c];
+                }
+            }
+            if (std::adjacent_find(ia.begin(), ia.end()) != ia.end()) {
+                diff += 1;
+            }
+        }
+        return diff;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne.data());
+        ggml_set_name(a, "a");
+        input = a;
+
+        ggml_tensor * out = ggml_top_k(ctx, a, k);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::default_random_engine rng(1234);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            for (int64_t r = 0; r < ggml_nrows(t); r++) {
+                // k - 20 larger values, a run of 60 equal values across rank k, smaller values after it
+                std::vector<float> data(n_valid);
+                for (int i = 0; i < n_valid; i++) {
+                    if (i < k - 20) {
+                        data[i] = 2.0f + 0.001f * i;
+                    } else if (i < k + 40) {
+                        data[i] = zeros ? ((i & 1) ? -0.0f : 0.0f) : 0.25f;
+                    } else {
+                        data[i] = -1.0f - 0.001f * i;
+                    }
+                }
+                std::shuffle(data.begin(), data.end(), rng);
+                data.resize(t->ne[0], -INFINITY);
+                ggml_backend_tensor_set(t, data.data(), r * t->nb[1], t->ne[0] * sizeof(float));
+            }
+        }
+    }
+};
+
 // qwen4exp QSA indexer top-k fusion: expand per-block scores to cells, add the f16 mask, top-k.
 struct test_topk_qsa : public test_case {
     const int64_t n_blocks;
@@ -11632,6 +11746,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (int n = 1; n < 5; ++n) {
         for (int k = 1; k <= n; ++k) {
             test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {n, 2, 1, 3}, k, true));
+        }
+    }
+    // DSV4 LID rows narrowed by the raw chunk: one set of scores at the widths of the bitonic and the radix path
+    for (int64_t w : {768, 1024, 2048, 4096}) {
+        for (bool zeros : {false, true}) {
+            test_cases.emplace_back(new test_top_k_stable_ties({w, 4, 1, 1}, 512, 700, zeros));
         }
     }
     for (int k : {1, 10, 40}) {
