@@ -31,6 +31,7 @@ for equivalence checks, or a diagnostic.
 | `GGML_CUDA_FATTN_SPARSE_LOG` | off | `1` logs the first shape that takes the gather. Diagnostic. |
 | `GGML_CUDA_FATTN_COMPACT_PARALLEL` | on | `0` always compacts a mask row with the serial kernel. Reference path. |
 | `GGML_CUDA_FATTN_COMPACT_VERIFY` | off | `1` compares both compaction kernels on the host and aborts on a difference. Diagnostic. |
+| `LLAMA_QSA_ALL_CELLS_BYPASS` | on | `0` builds the selection at every context length, as upstream does. Reference path. |
 
 ## Tie-breaking in the top-k
 
@@ -318,3 +319,61 @@ result back, which a stream that is capturing a graph cannot do: in that case
 it warns once and compares nothing, so it has to be run with
 `GGML_CUDA_DISABLE_GRAPHS=1`. It reports the number of calls and rows it has
 checked as it goes.
+
+## While the budget covers every cell
+
+The indexer selects at most `indexer_top_k + ratio - 1` cells for a query.
+While the cache holds no more cells than that, the selection is the whole
+cache: the mask rebuilt from it equals the attention mask it started from, and
+the scores decide nothing. Building the selection anyway costs the projection,
+normalization and rotation of the indexer query, the scores against every
+block, the top-k and the rebuilt mask, in every sparse-attention layer of
+every step. That is the whole cost of the indexer, paid by a context that is
+too short to gain anything from it.
+
+A graph whose selection width equals its cell count therefore builds no
+selection, and the layer attends through the dense path, as a layer without an
+indexer does. The cell count of a graph is padded, so the dense path ends a
+few tokens before the context reaches the budget.
+
+What the later steps need is still done. The indexer keys are written as
+before, the pooled block keys and the members of the open block included,
+because the steps after the budget is exceeded select over them. The inputs of
+the selection stay in the graph although nothing reads them: the host pass
+that fills them is also the one that finds the blocks a ubatch completes.
+
+The selection is kept when the mask does not span exactly the cells of the
+graph, and under `LLAMA_QSA_DUMP`, which reads the selection back.
+`LLAMA_QSA_ALL_CELLS_BYPASS=0` keeps it at every length, which is the upstream
+behaviour and the reference path.
+
+The two settings compute the same attention: with every cell selected the
+rebuilt mask equals the attention mask value for value, and the attention node
+is the one the dense path builds. In the real model the attention output of
+the sparse-attention layers is bit-identical between the two settings, and so
+is every layer output up to layer 10 (first ubatch of 512 tokens, layers 3, 7
+and 11, processes in the same numerical mode). The output of layer 11 then
+differs in the last bit of 11 % of its elements, by at most 1.5e-8. It comes
+from the weighted sum of the expert outputs of that layer, which the bypass
+does not touch: the expert down projections are still equal, their sum is not.
+Every process of one setting gives the same bits there, so it is the shape of
+the graph that decides how the backend rounds that sum; why was not traced.
+The layers behind it grow that bit into a visible difference, as they do with
+the difference between two numerical modes. Its size was measured on a Radeon
+AI PRO R9700 with Qwen3.8-Flash-Next UD-Q4_K_XL, `llama-perplexity -c 4096`
+over 8 chunks of wikitext-2 with `GGML_CUDA_TOP_K_STABLE_TIES=1`, where the
+first half of every chunk is processed without a selection:
+
+- a run with the switch at `0` reproduces the statistics of the build without
+  this change to the last digit;
+- two runs with the switch at `0` that land in different numerical modes (see
+  [Tie-breaking and run-to-run differences](#tie-breaking-and-run-to-run-differences))
+  differ by mean KLD 0.0203 with the same top token 95.14 %;
+- one run of the default against a run with the switch at `0` in each of those
+  two modes gives mean KLD 0.0201 and 0.0193 with the same top token 95.14 %
+  and 95.23 %, and a second run of the default gives 0.0192 and 95.19 %. The
+  perplexity differs by +0.009, +0.005 and -0.010 with an error of 0.006 each,
+  so in both directions.
+
+The default never reproduces the bits of the reference path; it is as far from
+it as the reference path is from itself in another numerical mode.
