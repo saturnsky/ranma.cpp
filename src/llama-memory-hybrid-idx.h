@@ -100,10 +100,15 @@ public:
     //   bias      F32 [n_kv, n_tokens/ns, ns] -inf where invisible, large where always visible
     // blk_bias asks for the bias per block instead: [n_blocks, n_tokens/ns, ns]
     // the caller then adds the attention mask, the only part of the bias that varies within a block
+    //   blk_meta  I32 [GGML_TOP_K_BLOCK_META_N, n_tokens/ns, ns] what ggml_top_k_block needs to
+    //             select a decode row without reading every cell; allow_fast and width come from
+    //             the graph, and a row that cannot be described this way keeps its flag at 0
     void set_input_qsa(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
                        ggml_tensor * bias, const llama_ubatch * ubatch, uint32_t ratio,
                        bool blk_bias, ggml_tensor * completed_pos = nullptr,
-                       const std::vector<int64_t> * write_idxs = nullptr) const;
+                       const std::vector<int64_t> * write_idxs = nullptr,
+                       ggml_tensor * blk_meta = nullptr, uint32_t width = 0,
+                       bool allow_fast = false) const;
 
 private:
     // forget seq_id (all of it if seq_id < 0) in every cache at once, so a failed restore cannot leave the caches out of step
@@ -204,7 +209,9 @@ public:
 
     void set_input_qsa(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
                        ggml_tensor * bias, const llama_ubatch * ubatch, uint32_t ratio,
-                       bool blk_bias, ggml_tensor * completed_pos = nullptr) const;
+                       bool blk_bias, ggml_tensor * completed_pos = nullptr,
+                       ggml_tensor * blk_meta = nullptr, uint32_t width = 0,
+                       bool allow_fast = false) const;
 
     void set_input_idx_pool_plan(
             ggml_tensor * state_persist_src_idxs,

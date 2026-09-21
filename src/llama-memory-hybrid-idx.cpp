@@ -781,7 +781,10 @@ void llama_memory_hybrid_idx::set_input_qsa(
         uint32_t ratio,
         bool blk_bias,
         ggml_tensor * completed_pos,
-        const std::vector<int64_t> * write_idxs) const {
+        const std::vector<int64_t> * write_idxs,
+        ggml_tensor * blk_meta,
+        uint32_t width,
+        bool allow_fast) const {
     GGML_ASSERT(ratio > 0);
     GGML_ASSERT(get_mem_idx() != nullptr);
 
@@ -814,6 +817,24 @@ void llama_memory_hybrid_idx::set_input_qsa(
     int32_t * dst_blk_cells = blk_cells_unused.empty() ?
         (int32_t *) blk_cells->data : blk_cells_unused.data();
     float   * dst_bias      = (float   *) bias->data;
+
+    // [TAG_QSA_BLOCK_META] what the block top-k needs to select a single-query row without a
+    // pass over the cells: the count of full blocks, the spare block and the visible cells no
+    // full block covers. Every row starts at "not described"; the loops below promote a row
+    // only once all the properties the op relies on have been checked for it.
+    int32_t * dst_meta = blk_meta != nullptr && blk_meta->data != nullptr ?
+        (int32_t *) blk_meta->data : nullptr;
+
+    if (dst_meta != nullptr) {
+        GGML_ASSERT(ggml_backend_buffer_is_host(blk_meta->buffer));
+        GGML_ASSERT(blk_meta->ne[0] == GGML_TOP_K_BLOCK_META_N);
+        std::fill(dst_meta, dst_meta + GGML_TOP_K_BLOCK_META_N*n_tps*n_ns, 0);
+    }
+
+    // the inverse map is only usable as an input if it was filled into a real tensor
+    const bool have_cells = blk_cells != nullptr && blk_cells->data != nullptr;
+
+    std::vector<int32_t> dead_cells;
 
     // a block is keyed on (sequence set, index bucket): a unified cache counts every sequence
     // from zero, so the bucket alone would pool two sequences into one block
@@ -1028,6 +1049,12 @@ void llama_memory_hybrid_idx::set_input_qsa(
         const bool     have_dead = n_bid < n_blocks;
         const int32_t  dead_bid  = have_dead ? n_bid : n_blocks - 1;
 
+        dead_cells.clear();
+
+        // cells that carry a token but sit in no full block: they all share the spare block,
+        // so the block top-k cannot find them through the inverse map
+        bool dead_listed = true;
+
         for (int64_t j = 0; j < n_kv; ++j) {
             const int32_t g = cell_grp[j];
 
@@ -1037,6 +1064,12 @@ void llama_memory_hybrid_idx::set_input_qsa(
                 const int64_t idx = ranked ? rank[j] : cells.pos_get(j);
 
                 cur_blk_cells[blk_of[j]*r + (idx%r)] = (int32_t) j;
+            } else if (!cells.is_empty(j)) {
+                if ((int64_t) dead_cells.size() < GGML_TOP_K_BLOCK_META_CELLS) {
+                    dead_cells.push_back((int32_t) j);
+                } else {
+                    dead_listed = false;
+                }
             }
 
             cur_cell_blk[j] = blk_of[j] < 0 ? dead_bid : blk_of[j];
@@ -1079,6 +1112,13 @@ void llama_memory_hybrid_idx::set_input_qsa(
                 // the caller adds the attention mask, which drops empty, foreign and future cells
                 float * cur_blk_bias = dst_bias + i*n_blocks;
 
+                // [TAG_QSA_BLOCK_META] a described row promises the op that every visible full
+                // block contributes exactly `ratio` visible cells, which needs each of them to
+                // end at or before the query: a block the query cuts through is not described
+                bool    described = dst_meta != nullptr && allow_fast && have_cells &&
+                    width > 0 && !ranked && one_seq && dead_listed && !ubatch->is_pos_2d();
+                int64_t n_visible = 0;
+
                 for (int64_t b = 0; b < n_blocks; ++b) {
                     if (b >= n_bid || !cells.seq_has((uint32_t) bid_cell[b], seq_id)) {
                         cur_blk_bias[b] = -INFINITY;
@@ -1087,6 +1127,36 @@ void llama_memory_hybrid_idx::set_input_qsa(
 
                     // finite, so it can never meet a -inf and produce a nan
                     cur_blk_bias[b] = bid_idx[b] >= tail_start ? 1e9f : 0.0f;
+
+                    n_visible += r;
+
+                    if (bid_idx[b] + r - 1 > q) {
+                        described = false;
+                    }
+                }
+
+                if (described) {
+                    int32_t * meta_row = dst_meta + i*GGML_TOP_K_BLOCK_META_N;
+                    int32_t * meta_tail = meta_row + GGML_TOP_K_BLOCK_META_HEAD;
+                    int32_t   n_tail = 0;
+
+                    for (int32_t c : dead_cells) {
+                        if (cells.seq_has((uint32_t) c, seq_id) && (int64_t) cells.pos_get(c) <= q) {
+                            meta_tail[n_tail++] = c;
+                        }
+                    }
+
+                    n_visible += n_tail;
+
+                    // below the budget the boundary falls on the masked cells, which no block
+                    // lists: that row keeps the general walk
+                    if (n_visible >= (int64_t) width) {
+                        meta_row[0] = 1;
+                        meta_row[1] = n_bid;
+                        meta_row[2] = dead_bid;
+                        meta_row[3] = n_tail;
+                        meta_row[4] = (int32_t) (n_kv - n_visible);
+                    }
                 }
 
                 // the spare block holds the unpooled cells, which are the incomplete tail, so
@@ -1307,11 +1377,16 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
         ggml_tensor * bias,
         const llama_ubatch * ubatch,
         uint32_t ratio,
-        bool blk_bias, ggml_tensor * completed_pos) const {
+        bool blk_bias,
+        ggml_tensor * completed_pos,
+        ggml_tensor * blk_meta,
+        uint32_t width,
+        bool allow_fast) const {
     GGML_ASSERT(mem != nullptr);
 
     mem->set_input_qsa(cell_blk, blk_cells, blk_pos, bias, ubatch, ratio, blk_bias, completed_pos,
-            completed_pos ? &get_idx_pool_plan(*ubatch).state_write_idxs : nullptr);
+            completed_pos ? &get_idx_pool_plan(*ubatch).state_write_idxs : nullptr,
+            blk_meta, width, allow_fast);
 }
 
 template<typename T>

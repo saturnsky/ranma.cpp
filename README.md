@@ -162,6 +162,9 @@ applies, how to switch it, and its limits.
 - **Pooled block keys in the indexer cache** - a step pools only the block it completes instead of the whole
   context. Same page.
 - **Norm and rotation cached with the block keys**, so neither runs over the context on every step. Same page.
+- **Block top-k** - the indexer selects over block scores weighted by the visible cells of each block, without
+  expanding the scores to cells. The page states how this interacts with the unspecified tie order of a top-k
+  and what run-to-run differences were measured. Same page.
 
 ## Building
 

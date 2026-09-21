@@ -113,6 +113,7 @@ struct qsa_dump_state {
     int     last_il = 1 << 30;
 
     std::map<int, int64_t> n_kv;
+    std::map<int, std::string> selection_path;
 
     std::vector<int32_t> cell_blk;
     int64_t cell_blk_n_kv     = 0;
@@ -158,6 +159,12 @@ void llama_qsa_dump_set_n_kv(int il, int64_t n_kv) {
 
     std::lock_guard<std::mutex> lock(state.mutex);
     state.n_kv[il] = n_kv;
+}
+
+void llama_qsa_dump_set_selection_path(int il, const char * path) {
+    auto & state = qsa_dump_get();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    state.selection_path[il] = path;
 }
 
 void llama_qsa_dump_set_cell_blk(const int32_t * cell_blk, int64_t n_kv, int64_t n_stream) {
@@ -268,6 +275,11 @@ bool llama_qsa_dump_eval_callback(ggml_tensor * t, bool ask, void * user_data) {
             continue;
         }
 
+        for (int64_t i = 0; i < width; ++i) {
+            GGML_ASSERT(p[i] >= 0 && p[i] < state.cell_blk_n_kv);
+            GGML_ASSERT(i == 0 || p[i] != p[i - 1]);
+        }
+
         const int64_t s = n_tps > 0 ? row/n_tps : 0;
         const int32_t * map = state.cell_blk.data() + s*state.cell_blk_n_kv;
 
@@ -283,6 +295,8 @@ bool llama_qsa_dump_eval_callback(ggml_tensor * t, bool ask, void * user_data) {
     }
 
     const auto it = state.n_kv.find(il);
+    fprintf(state.file, "# select %" PRId64 " %d %s op=%s rows=%" PRId64 " width=%" PRId64 "\n",
+            state.step, il, state.selection_path[il].c_str(), ggml_op_name(t->op), n_rows, width);
 
     fprintf(state.file, "%" PRId64 " %d %" PRId64 " %" PRId64 " %s %s\n",
             state.step, il, it == state.n_kv.end() ? -1 : it->second, n_all,

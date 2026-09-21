@@ -6705,6 +6705,207 @@ struct test_top_k : public test_case {
     }
 };
 
+// GGML_OP_TOP_K_BLOCK: block-weighted cell selection for the qwen4exp QSA indexer.
+// The inputs describe one decode step of a cache whose cells are not in position order:
+// `described` rows carry the meta that lets the op skip the per-cell passes.
+struct test_top_k_block : public test_case {
+    const int64_t n_kv;
+    const int64_t ratio;
+    const int64_t n_tps;
+    const int64_t n_stream;
+    const int     k;
+    const bool    described;
+    const ggml_type mask_type;
+    // false leaves the choice among tied cells to the backend: the block scores are then all
+    // different and k has to end on a block boundary, so that no tie reaches the threshold
+    const bool    stable_ties;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "TOP_K_BLOCK";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR8(n_kv, ratio, n_tps, n_stream, k, described, mask_type, stable_ties);
+    }
+
+    test_top_k_block(int64_t n_kv = 8192, int64_t ratio = 4, int64_t n_tps = 1, int64_t n_stream = 1,
+            int k = 2051, bool described = true, ggml_type mask_type = GGML_TYPE_F16, bool stable_ties = true)
+        : n_kv(n_kv), ratio(ratio), n_tps(n_tps), n_stream(n_stream), k(k), described(described),
+          mask_type(mask_type), stable_ties(stable_ties) {}
+
+    double max_err() override { return 0.0; }
+    bool run_whole_graph() override { return true; }
+
+    int64_t n_blocks() const { return (n_kv + ratio - 1)/ratio; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * scores = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_blocks(), n_tps, n_stream);
+        ggml_set_name(scores, "scores");
+        ggml_tensor * cell_blk = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_kv, n_stream);
+        ggml_set_name(cell_blk, "cell_blk");
+        ggml_tensor * mask = ggml_new_tensor_3d(ctx, mask_type, n_kv, n_tps, n_stream);
+        ggml_set_name(mask, "mask");
+        ggml_tensor * blk_cells = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, ratio*n_blocks(), n_stream);
+        ggml_set_name(blk_cells, "blk_cells");
+        ggml_tensor * blk_meta = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, GGML_TOP_K_BLOCK_META_N, n_tps, n_stream);
+        ggml_set_name(blk_meta, "blk_meta");
+
+        ggml_tensor * out = ggml_top_k_block(ctx, scores, cell_blk, mask, blk_cells, blk_meta, k, stable_ties);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    // one consistent cache layout: live positions sit on shuffled cells, whole blocks of
+    // `ratio` positions are pooled, and what is left over shares the spare block
+    void initialize_tensors(ggml_context * ctx) override {
+        const int64_t nb = n_blocks();
+
+        std::mt19937 rng(1234);
+
+        std::vector<float>   scores((size_t) nb*n_tps*n_stream, -INFINITY);
+        std::vector<int32_t> cell_blk((size_t) n_kv*n_stream, 0);
+        std::vector<float>   mask_f((size_t) n_kv*n_tps*n_stream, -INFINITY);
+        std::vector<int32_t> blk_cells((size_t) ratio*nb*n_stream, 0);
+        std::vector<int32_t> meta((size_t) GGML_TOP_K_BLOCK_META_N*n_tps*n_stream, 0);
+
+        for (int64_t s = 0; s < n_stream; ++s) {
+            // a live cell layout that is neither identity nor contiguous per block
+            std::vector<int32_t> cell(n_kv);
+            for (int64_t i = 0; i < n_kv; ++i) {
+                cell[i] = (int32_t) i;
+            }
+            std::shuffle(cell.begin(), cell.end(), rng);
+
+            const int64_t n_live = std::max<int64_t>(1, n_kv - 3 - (s*37)%11);
+            const int64_t n_full = n_live/ratio;
+            const int64_t dead   = n_full < nb ? n_full : nb - 1;
+
+            for (int64_t c = 0; c < n_kv; ++c) {
+                cell_blk[s*n_kv + c] = (int32_t) dead;
+            }
+            for (int64_t b = 0; b < n_full; ++b) {
+                for (int64_t i = 0; i < ratio; ++i) {
+                    const int32_t c = cell[b*ratio + i];
+                    cell_blk[s*n_kv + c] = (int32_t) b;
+                    blk_cells[s*ratio*nb + b*ratio + i] = c;
+                }
+            }
+
+            for (int64_t ii = 0; ii < n_tps; ++ii) {
+                const int64_t row = s*n_tps + ii;
+                // the last query sees everything, earlier ones a shorter prefix
+                const int64_t q = n_live - 1 - (n_tps - 1 - ii);
+
+                float * sc = scores.data() + row*nb;
+                for (int64_t b = 0; b < n_full; ++b) {
+                    // scores are sums of rectified dot products: many are exactly zero
+                    sc[b] = (rng()%3 == 0) ? 0.0f : (float) (rng()%64)/8.0f;
+                }
+                if (!stable_ties) {
+                    std::vector<int32_t> order(n_full);
+                    for (int64_t b = 0; b < n_full; ++b) {
+                        order[b] = (int32_t) b;
+                    }
+                    std::shuffle(order.begin(), order.end(), rng);
+                    // the last full block scores lowest: a query that sees only a part of it would
+                    // otherwise leave a budget that ends inside a block, which is a tie
+                    std::swap(*std::find(order.begin(), order.end(), 0), order[n_full - 1]);
+                    for (int64_t b = 0; b < n_full; ++b) {
+                        sc[b] = (float) order[b];
+                    }
+                }
+                if (dead >= n_full) {
+                    sc[dead] = 1e9f;
+                } else {
+                    sc[dead] += 1e9f;
+                }
+
+                float * mk = mask_f.data() + row*n_kv;
+                for (int64_t p = 0; p <= q && p < n_live; ++p) {
+                    mk[cell[p]] = 0.0f;
+                }
+
+                int32_t * mr = meta.data() + row*GGML_TOP_K_BLOCK_META_N;
+                if (!described) {
+                    continue;
+                }
+                // a query that cuts through a full block cannot be described
+                int64_t visible = 0;
+                for (int64_t b = 0; b < n_full; ++b) {
+                    if (b*ratio + ratio - 1 > q) {
+                        visible = -1;
+                        break;
+                    }
+                    visible += ratio;
+                }
+                if (visible < 0) {
+                    continue;
+                }
+                int32_t tail = 0;
+                for (int64_t p = n_full*ratio; p < n_live && p <= q; ++p) {
+                    mr[GGML_TOP_K_BLOCK_META_HEAD + tail++] = cell[p];
+                }
+                GGML_ASSERT(tail <= GGML_TOP_K_BLOCK_META_CELLS);
+                visible += tail;
+                if (visible < k) {
+                    continue;
+                }
+                mr[0] = 1;
+                mr[1] = (int32_t) n_full;
+                mr[2] = (int32_t) dead;
+                mr[3] = tail;
+                mr[4] = (int32_t) (n_kv - visible);
+            }
+        }
+
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            const std::string name = ggml_get_name(t);
+            if (name == "scores") {
+                ggml_backend_tensor_set(t, scores.data(), 0, scores.size()*sizeof(float));
+            } else if (name == "cell_blk") {
+                ggml_backend_tensor_set(t, cell_blk.data(), 0, cell_blk.size()*sizeof(int32_t));
+            } else if (name == "blk_cells") {
+                ggml_backend_tensor_set(t, blk_cells.data(), 0, blk_cells.size()*sizeof(int32_t));
+            } else if (name == "blk_meta") {
+                ggml_backend_tensor_set(t, meta.data(), 0, meta.size()*sizeof(int32_t));
+            } else if (name == "mask") {
+                if (mask_type == GGML_TYPE_F32) {
+                    ggml_backend_tensor_set(t, mask_f.data(), 0, mask_f.size()*sizeof(float));
+                } else {
+                    std::vector<ggml_fp16_t> h(mask_f.size());
+                    for (size_t i = 0; i < mask_f.size(); ++i) {
+                        h[i] = ggml_fp32_to_fp16(mask_f[i]);
+                    }
+                    ggml_backend_tensor_set(t, h.data(), 0, h.size()*sizeof(ggml_fp16_t));
+                }
+            }
+        }
+    }
+
+    // the output order is unspecified, so compare the selected cells of each row as a set
+    double err(const float * a, const float * b, size_t n) override {
+        double diff = 0.0;
+        GGML_ASSERT(n == (size_t) (k*n_tps*n_stream));
+        for (int64_t row = 0; row < n_tps*n_stream; ++row) {
+            std::vector<int32_t> ia(k), ib(k);
+            for (int i = 0; i < k; ++i) {
+                ia[i] = (int32_t) a[row*k + i];
+                ib[i] = (int32_t) b[row*k + i];
+            }
+            std::sort(ia.begin(), ia.end());
+            std::sort(ib.begin(), ib.end());
+            if (std::adjacent_find(ia.begin(), ia.end()) != ia.end()) {
+                diff += 1;
+            }
+            if (ia != ib) {
+                diff += 1;
+            }
+        }
+        return diff;
+    }
+};
+
 // qwen4exp QSA indexer top-k fusion: expand per-block scores to cells, add the f16 mask, top-k.
 struct test_topk_qsa : public test_case {
     const int64_t n_blocks;
@@ -10588,6 +10789,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_topk_qsa(512,  2048,  2, 1, 1500));
     test_cases.emplace_back(new test_topk_qsa(256,  2048,  4, 2, 2000));
     test_cases.emplace_back(new test_topk_qsa(64,   256,   2, 1, 200));  // small k: unfused fallback
+
+    // qwen4exp QSA indexer block selection, at the model's ratio and budget
+    test_cases.emplace_back(new test_top_k_block(8192,  4, 1, 1, 2051));
+    test_cases.emplace_back(new test_top_k_block(65536, 4, 1, 1, 2051));
+    test_cases.emplace_back(new test_top_k_block(8192,  4, 1, 1, 2051, false)); // in-kernel fallback
+    test_cases.emplace_back(new test_top_k_block(8192,  4, 1, 2, 2051));
+    test_cases.emplace_back(new test_top_k_block(8192,  4, 2, 1, 2051)); // multi-query: cell walk
+    // unspecified ties: one spare cell plus whole blocks, so the selected set is still unique
+    test_cases.emplace_back(new test_top_k_block(8192,  4, 1, 1, 2049, true,  GGML_TYPE_F16, false));
+    test_cases.emplace_back(new test_top_k_block(8192,  4, 1, 1, 2049, false, GGML_TYPE_F16, false));
+    test_cases.emplace_back(new test_top_k_block(8195,  4, 2, 1, 2048, true,  GGML_TYPE_F16, false)); // multi-query: cell walk
+    test_cases.emplace_back(new test_top_k_block(2048,  4, 1, 1, 2048)); // budget == cells
+    test_cases.emplace_back(new test_top_k_block(2048,  4, 1, 1, 7));
+    test_cases.emplace_back(new test_top_k_block(2048, 16, 1, 1, 271));
+    test_cases.emplace_back(new test_top_k_block(1024,  4, 1, 1, 259, true, GGML_TYPE_F32));
 
     // exhaustive top_k tests
     //for (int i = 1; i < 9999; ++i) {
