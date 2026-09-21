@@ -1063,6 +1063,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "TIMESTEP_EMBEDDING",
     "ARGSORT",
     "TOP_K",
+    "TOP_K_BLOCK",
     "LEAKY_RELU",
     "TRI",
     "FILL",
@@ -1101,7 +1102,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1178,6 +1179,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "timestep_embedding(timesteps, dim, max_period)",
     "argsort(x)",
     "top_k(x)",
+    "top_k_block(x)",
     "leaky_relu(x)",
     "tri(x)",
     "fill(x, c)",
@@ -1216,7 +1218,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -5467,6 +5469,42 @@ struct ggml_tensor * ggml_top_k(
     result->op     = GGML_OP_TOP_K;
     result->src[0] = a;
 
+    return result;
+}
+
+struct ggml_tensor * ggml_top_k_block(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * scores,
+        struct ggml_tensor  * cell_blocks,
+        struct ggml_tensor  * mask,
+        struct ggml_tensor  * blk_cells,
+        struct ggml_tensor  * blk_meta,
+        int                   k,
+        bool                  preserve_ties) {
+    GGML_ASSERT(scores->type == GGML_TYPE_F32 && scores->ne[3] == 1);
+    GGML_ASSERT(cell_blocks->type == GGML_TYPE_I32 && cell_blocks->ne[2] == 1 && cell_blocks->ne[3] == 1);
+    GGML_ASSERT(mask->type == GGML_TYPE_F16 || mask->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(scores) && ggml_is_contiguous(cell_blocks) && ggml_is_contiguous(mask));
+    GGML_ASSERT(mask->ne[0] == cell_blocks->ne[0] && mask->ne[1] == scores->ne[1]);
+    GGML_ASSERT(mask->ne[2] == scores->ne[2] && mask->ne[3] == 1 && cell_blocks->ne[1] == scores->ne[2]);
+    GGML_ASSERT(k > 0 && k <= mask->ne[0]);
+    GGML_ASSERT((blk_cells == NULL) == (blk_meta == NULL));
+    if (blk_cells != NULL) {
+        GGML_ASSERT(blk_cells->type == GGML_TYPE_I32 && blk_meta->type == GGML_TYPE_I32);
+        GGML_ASSERT(ggml_is_contiguous(blk_cells) && ggml_is_contiguous(blk_meta));
+        GGML_ASSERT(blk_cells->ne[1] == scores->ne[2] && blk_cells->ne[2] == 1 && blk_cells->ne[3] == 1);
+        GGML_ASSERT(blk_cells->ne[0] % scores->ne[0] == 0);
+        GGML_ASSERT(blk_meta->ne[0] == GGML_TOP_K_BLOCK_META_N);
+        GGML_ASSERT(blk_meta->ne[1] == scores->ne[1] && blk_meta->ne[2] == scores->ne[2] && blk_meta->ne[3] == 1);
+    }
+    struct ggml_tensor * result = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, k, scores->ne[1], scores->ne[2]);
+    result->op = GGML_OP_TOP_K_BLOCK;
+    result->src[0] = scores;
+    result->src[1] = cell_blocks;
+    result->src[2] = mask;
+    result->src[3] = blk_cells;
+    result->src[4] = blk_meta;
+    ggml_set_op_params_i32(result, 0, preserve_ties);
     return result;
 }
 

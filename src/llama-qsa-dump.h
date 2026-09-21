@@ -48,6 +48,7 @@ bool llama_qsa_dump_enabled();
 
 // records the context width the layer was built with, so the dumped line can name it
 void llama_qsa_dump_set_n_kv(int il, int64_t n_kv);
+void llama_qsa_dump_set_selection_path(int il, const char * path);
 
 // records the cell -> block map of the current ubatch, for the block-level hash
 void llama_qsa_dump_set_cell_blk(const int32_t * cell_blk, int64_t n_kv, int64_t n_stream);

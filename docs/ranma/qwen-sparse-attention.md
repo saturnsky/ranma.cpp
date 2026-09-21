@@ -24,6 +24,7 @@ for equivalence checks, or a diagnostic.
 | `LLAMA_QSA_DUMP` | unset | a path: write one line per indexer layer and graph evaluation there. Diagnostic; it changes the graph. |
 | `LLAMA_QSA_LEGACY` | off | `1` selects the per-token indexer cache instead of pooled block keys. Reference path. |
 | `LLAMA_QSA_CACHE_NORM_ROPE` | on | `0` stores the pooled keys untransformed and applies norm and rotation in every graph. Reference path. |
+| `LLAMA_QSA_BLOCK_TOP_K` | `1` | `0` selects over the cells, `2` forces the general block kernels. Reference paths. |
 
 ## Tie-breaking in the top-k
 
@@ -159,3 +160,86 @@ The dump gains a line for the transformed cache:
 It hashes the valid blocks together with their sequence, their first position
 and their section positions, so a cached block can be compared with a
 recomputed one even when the two paths hold it in different cache rows.
+
+## Block top-k
+
+The indexer scores blocks, but the selection used to run over cells: the score
+of a block was expanded to each of its cells, the attention mask was added to
+the expanded scores, and a top-k walked all cells of the context for every
+query row. Both the temporary and the walk grew with the context, for a
+quantity that has one value per block.
+
+`GGML_OP_TOP_K_BLOCK` selects the same cells from the block scores directly.
+It takes the scores, the cell-to-block map and the mask, and weights each
+block with the number of its cells the mask leaves visible - which is exactly
+what the expansion encoded - so the per-cell expansion disappears while the
+result stays a list of cell indices. There is a CPU reference implementation;
+the device implementation is built for HIP only, and other backends report the
+op as unsupported.
+
+The device side has two paths:
+
+- a single-query row - the token-generation shape - whose inputs carry a
+  description of the blocks is selected by one workgroup. It reads the cells
+  of a block through the block-to-cells map and takes the per-block weights
+  from the description, so it never walks the cells. The description is a
+  promise about one row: every block below a given index holds `ratio` cells,
+  all of them visible unless the block itself is masked; one spare block
+  additionally holds a listed handful of visible cells that no full block
+  covers; and a given number of cells is masked. A row that cannot make that
+  promise sets the flag to zero and is selected by the general walk inside the
+  same kernel, so the list of launches does not depend on the data.
+- every other shape, prompt processing included, goes through the general
+  weighted radix kernels: count the visible cells per block, walk histograms
+  over the weighted block scores to find the threshold, then gather the cells.
+
+A budget equal to the number of cells short-circuits to "every cell". Scratch
+sizes are rounded - the weights to a power of two, the histograms to their
+maximum width - so a prompt processed in ubatches of changing size does not
+leave one pool buffer per size behind.
+
+`LLAMA_QSA_BLOCK_TOP_K` selects the path:
+
+| value | effect |
+| --- | --- |
+| `1` | default; every row is selected over the blocks |
+| `0` | selection over the cells, the reference path |
+| `2` | block selection forced through the general kernels, the reference for the single-row kernel |
+
+The graph also falls back to the cell selection when the device does not
+support the op, when the mask is not a plain contiguous causal mask over the
+whole context, under SWA or ALiBi, and when the indexer cache does not hold
+the transformed keys. The chosen path is recorded in the dump as a `# select`
+comment in front of each selection line.
+
+`test-backend-ops -o TOP_K_BLOCK` covers both device paths, one and two
+sequences, one and two query rows, described and undescribed rows, an F16 and
+an F32 mask, a budget equal to the cell count and a very small budget.
+
+### Tie-breaking and run-to-run differences
+
+The op takes a parameter that asks for the smallest cell indices among the
+tied ones, for tests; the model does not set it and relies on
+`GGML_CUDA_TOP_K_STABLE_TIES` instead. Two implementations may therefore
+select different cells at the budget boundary, as `ggml_top_k` permits, and
+that is visible in the output. The size of the effect was measured on a
+Radeon AI PRO R9700 with Qwen3.8-Flash-Next UD-Q4_K_XL, `llama-perplexity
+-c 4096` over 8 chunks of wikitext-2, 13 runs:
+
+- with `GGML_CUDA_TOP_K_STABLE_TIES=1` the block path gives logits identical
+  to the cell path (mean KLD 0, same top token 100 %), and 1740 of 1740
+  selections of a 64k decode are identical;
+- with the switch unset, two runs of the cell path in the same numerical mode
+  agree (mean KLD 0, same top token 100 %), while the block path against the
+  cell path in the same mode gives mean KLD 0.00015 and 0.00073 with the same
+  top token 99.91 % and 99.62 %, and no difference in perplexity;
+- independently of the selection path, a process start lands in one of several
+  numerical modes of the prompt-processing kernels. Two runs in different
+  modes differ by mean KLD 0.020 with the same top token 95.1 %, and do so
+  identically for the cell path and the block path. The modes were later
+  traced to small F32 products such as the MoE router, for which hipBLASLt
+  chose its solution per process; on RDNA4 these products now run on
+  fixed-order kernels ([rdna4-prefill.md](rdna4-prefill.md)).
+
+When two builds or two paths have to be compared exactly, set the tie switch
+and compare the dump.
