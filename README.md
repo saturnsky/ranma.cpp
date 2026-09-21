@@ -152,6 +152,12 @@ applies, how to switch it, and its limits.
 - **The same fold for Q8_0 shared experts** of models whose routed experts are Q4_K, Q5_K, Q5_1 or Q8_0. Same
   page.
 
+### Qwen sparse attention
+
+- **Test switch for a stable top-k tie selection** - `GGML_CUDA_TOP_K_STABLE_TIES=1` makes the radix top-k select
+  the smallest columns among exactly tied values, so selections and outputs can be compared between runs. Off by
+  default. [docs/ranma/qwen-sparse-attention.md](docs/ranma/qwen-sparse-attention.md)
+
 ## Building
 
 RANMA.cpp builds exactly like upstream. For the primary target, follow the HIP section of

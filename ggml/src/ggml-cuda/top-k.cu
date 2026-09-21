@@ -62,13 +62,34 @@ struct top_k_radix_state {
     int rank;
     int greater_count;
     int equal_count;
+
+    // the largest column a value that ties with prefix may have; every tied
+    // column at or below it is kept, which makes the result reproducible
+    uint32_t col_prefix;
+    int col_rank;
 };
 
-static __global__ void top_k_radix_init(top_k_radix_state * states, int nrows, int k) {
+// col_prefix is the largest column a value that ties with the threshold may have: UINT32_MAX
+// accepts all of them, 0 is the start of the walk that finds the bound of the stable selection
+static __global__ void top_k_radix_init(top_k_radix_state * states, int nrows, int k, uint32_t col_prefix) {
     const int row = blockIdx.x * blockDim.x + threadIdx.x;
     if (row < nrows) {
-        states[row] = {0, 0, k, 0, 0};
+        states[row] = {};
+        states[row].rank       = k;
+        states[row].col_prefix = col_prefix;
     }
+}
+
+// GGML_CUDA_TOP_K_STABLE_TIES=1: among the values that tie with the threshold the smallest
+// columns are selected, so the selected set is the same in every run. It is meant for tests
+// that compare selections or outputs between runs. Off by default: which of the tied values
+// are kept is then left to the order the gather happens to run in.
+static bool top_k_stable_ties() {
+    static const bool stable = [] {
+        const char * value = getenv("GGML_CUDA_TOP_K_STABLE_TIES");
+        return value != nullptr && atoi(value) != 0;
+    }();
+    return stable;
 }
 
 template<int BLOCK_SIZE, int RADIX_BITS>
@@ -138,6 +159,84 @@ static __global__ void top_k_radix_select(
     }
 }
 
+// The value selection above leaves `rank` values that tie exactly with `prefix`, and the
+// budget cuts through them. Which of those a parallel gather keeps is otherwise decided by
+// the order the atomics happen to run in, so the selection is not reproducible - and ties
+// are common here, because rectified scores collapse to exactly zero. Select the `rank`
+// smallest columns among them, by the same radix walk, taken from the low bin upwards.
+template<int BLOCK_SIZE, int RADIX_BITS>
+static __global__ void top_k_radix_col_histogram(
+        const float * __restrict__ src,
+        const top_k_radix_state * __restrict__ states,
+        int * __restrict__ block_histograms,
+        int ncols,
+        int blocks_per_row,
+        int shift) {
+    constexpr int NBINS = 1 << RADIX_BITS;
+
+    const int row = blockIdx.x / blocks_per_row;
+    const int row_block = blockIdx.x % blocks_per_row;
+    const int tid = threadIdx.x;
+    const float * row_src = src + (size_t) row * ncols;
+    __shared__ int histogram[NBINS];
+
+    histogram[tid] = 0;
+    __syncthreads();
+
+    const top_k_radix_state state = states[row];
+
+    // bits above this pass are already decided, bits below it are not looked at yet
+    const uint32_t col_mask = shift + RADIX_BITS >= 32 ? 0u : ~((1u << (shift + RADIX_BITS)) - 1);
+
+    for (int col = row_block * BLOCK_SIZE + tid;
+         col < ncols;
+         col += blocks_per_row * BLOCK_SIZE) {
+        const uint32_t key = top_k_float_to_ordered(row_src[col]);
+        if (key == state.prefix && (((uint32_t) col) & col_mask) == state.col_prefix) {
+            atomicAdd(&histogram[(((uint32_t) col) >> shift) & (NBINS - 1)], 1);
+        }
+    }
+    __syncthreads();
+
+    const size_t histogram_offset =
+        ((size_t) row * blocks_per_row + row_block) * NBINS;
+    block_histograms[histogram_offset + tid] = histogram[tid];
+}
+
+template<int BLOCK_SIZE, int RADIX_BITS>
+static __global__ void top_k_radix_col_select(
+        const int * __restrict__ block_histograms,
+        top_k_radix_state * __restrict__ states,
+        int blocks_per_row,
+        int shift,
+        int first) {
+    constexpr int NBINS = 1 << RADIX_BITS;
+
+    const int row = blockIdx.x;
+    const int tid = threadIdx.x;
+    __shared__ int histogram[NBINS];
+
+    int count = 0;
+    for (int row_block = 0; row_block < blocks_per_row; ++row_block) {
+        const size_t offset = ((size_t) row * blocks_per_row + row_block) * NBINS;
+        count += block_histograms[offset + tid];
+    }
+    histogram[tid] = count;
+    __syncthreads();
+
+    if (tid == 0) {
+        top_k_radix_state state = states[row];
+        int rank = first ? state.rank : state.col_rank;
+        int bin = 0;
+        while (bin < NBINS - 1 && histogram[bin] < rank) {
+            rank -= histogram[bin++];
+        }
+        state.col_prefix |= (uint32_t) bin << shift;
+        state.col_rank = rank;
+        states[row] = state;
+    }
+}
+
 static __global__ void top_k_radix_reset_counters(top_k_radix_state * states, int nrows) {
     const int row = blockIdx.x * blockDim.x + threadIdx.x;
     if (row < nrows) {
@@ -168,7 +267,9 @@ static __global__ void top_k_radix_gather(
         if (key > state->prefix) {
             const int pos = atomicAdd(&state->greater_count, 1);
             row_dst[pos] = col;
-        } else if (key == state->prefix) {
+        } else if (key == state->prefix && (uint32_t) col <= state->col_prefix) {
+            // exactly `rank` columns pass this test, so the set written here is fixed;
+            // only the order within the reserved slots depends on the atomics
             const int pos = atomicAdd(&state->equal_count, 1);
             if (pos < state->rank) {
                 row_dst[k - state->rank + pos] = col;
@@ -190,7 +291,10 @@ static void top_k_radix_cuda(
     top_k_radix_state * states = states_alloc.get();
     int * histograms = histograms_alloc.get();
 
-    top_k_radix_init<<<(nrows + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(states, nrows, k);
+    const bool stable_ties = top_k_stable_ties();
+
+    top_k_radix_init<<<(nrows + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(
+        states, nrows, k, stable_ties ? 0u : UINT32_MAX);
 
     const dim3 row_grid(blocks_per_row * nrows);
     for (int shift = 32 - RADIX_BITS; shift >= 0; shift -= RADIX_BITS) {
@@ -199,6 +303,23 @@ static void top_k_radix_cuda(
                 src, states, histograms, ncols, blocks_per_row, shift);
         top_k_radix_select<BLOCK_SIZE, RADIX_BITS>
             <<<nrows, BLOCK_SIZE, 0, stream>>>(histograms, states, blocks_per_row, shift);
+    }
+
+    // only the bits a column index can actually use
+    int col_bits = 1;
+    while (col_bits < 32 && ((uint32_t) 1 << col_bits) < (uint32_t) ncols) {
+        ++col_bits;
+    }
+    const int col_passes = stable_ties ? (col_bits + RADIX_BITS - 1) / RADIX_BITS : 0;
+
+    for (int pass = col_passes - 1; pass >= 0; --pass) {
+        const int shift = pass * RADIX_BITS;
+        top_k_radix_col_histogram<BLOCK_SIZE, RADIX_BITS>
+            <<<row_grid, BLOCK_SIZE, 0, stream>>>(
+                src, states, histograms, ncols, blocks_per_row, shift);
+        top_k_radix_col_select<BLOCK_SIZE, RADIX_BITS>
+            <<<nrows, BLOCK_SIZE, 0, stream>>>(
+                histograms, states, blocks_per_row, shift, pass == col_passes - 1);
     }
 
     top_k_radix_reset_counters
