@@ -69,7 +69,38 @@ misbehave. Other platforms and backends are not tested and not supported by this
 ## Changes over upstream
 
 Each user-visible change gets a line here and a page under `docs/ranma/` that describes what it is, when it
-applies, how to switch it, and its limits.
+applies, how to switch it, and its limits. Measured effects are collected in
+[docs/ranma/benchmark.md](docs/ranma/benchmark.md).
+
+### Measured
+
+`llama-bench` PP512 / TG128 in t/s at depth 0, 8192 and 65536, upstream `aa39d7a3e` on the Radeon AI PRO R9700
+(32 GiB) with 128 GiB of host memory against the last commit of this series on two systems: the same R9700 with
+128 GiB, and an RX 9070 XT (16 GiB) with 64 GiB of host memory, emulated on the R9700 by the placement and the
+host-tier budget. PCIe 5.0 x16 throughout. Upstream runs `-ncmoe 35`, the lowest offload that keeps the
+device buffers in VRAM at depth 65536; this fork runs the exclusive expert cache (20480 MiB on the R9700,
+3072 MiB for Qwen and 4096 MiB for DeepSeek on the emulated RX 9070 XT) with prefill swap where that is
+faster. The last column is the peak memory of the process, in GiB: VRAM in use on the card, and the commit
+charge on the host (which on Windows also carries part of the VRAM allocations, so it is an upper bound of
+the host memory the row needs). The expert cache budgets are conservative for their cards: the rows leave 2
+to 4 GiB of VRAM unused, so a larger budget than theirs is possible. The protocol, every other configuration and the 64 / 32 GB rows of
+both devices are in [docs/ranma/benchmark.md](docs/ranma/benchmark.md).
+
+| model | system | @0 | @8192 | @65536 | VRAM / host |
+|---|---|---:|---:|---:|---:|
+| Qwen3.8-Flash-Next UD-Q4_K_XL | upstream, R9700, 128 GB | 335 / 15.9 | 316 / 15.2 | 307 / 13.2 | 29.9 / 80.7 |
+| | this fork, R9700, 128 GB | 1014 / 49.7 | 949 / 47.9 | 692 / 44.8 | 29.1 / 78.2 |
+| | this fork, RX 9070 XT emulation, 64 GB | 625 / 36.7 | 596 / 38.2 | 480 / 35.2 | 12.0 / 48.8 |
+| DeepSeek V4 Flash UD-IQ3_XXS | upstream, R9700, 128 GB | 248 / 9.8 | 209 / 9.7 | (measured to 8192) | 27.8 / 98.7 |
+| | this fork, R9700, 128 GB | 310 / 31.8 | 255 / 30.9 | 108 / 28.1 | 27.9 / 90.3 |
+| | this fork, RX 9070 XT emulation, 64 GB | 129 / 18.8 | 128 / 20.3 | 78 / 18.9 | 11.8 / 49.0 |
+
+Gemma 4 31B Q4_K_M, dense in VRAM on the R9700 with `ROCBLAS_USE_HIPBLASLT=1`, at depth 0 / 8192 / 32768:
+
+| system | @0 | @8192 | @32768 | VRAM / host |
+|---|---:|---:|---:|---:|
+| upstream, R9700 | 897 / 28.3 | 628 / 26.3 | 328 / 24.2 | 23.8 / 21.0 |
+| this fork, R9700 | 1001 / 29.3 | 762 / 26.9 | 440 / 24.7 | 23.3 / 21.0 |
 
 ### RDNA4 kernels (HIP)
 
