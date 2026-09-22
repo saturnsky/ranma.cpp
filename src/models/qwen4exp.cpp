@@ -1017,7 +1017,13 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa(
     ggml_tensor * k = mctx_cur->get_k(ctx0, il);
     ggml_tensor * v = mctx_cur->get_v(ctx0, il);
 
-    ggml_tensor * cur = build_attn_mha(q, k, v, nullptr, kq_mask_top_k, nullptr, nullptr, top_k->ne[0], kq_scale, il);
+    // The top-k mask leaves at most top_k->ne[0] finite entries per row, which is exactly the bound a
+    // backend needs to attend to the selected cells only instead of scanning the whole KV cache.
+    // ref: https://github.com/ggml-org/llama.cpp/pull/27970
+    // Only when the budget actually cuts: if every cell is selected there is nothing to gather, and
+    // leaving the hint at zero keeps the node identical to the one the dense path builds.
+    const int64_t n_kv_max = top_k->ne[0] < kq_mask->ne[0] ? top_k->ne[0] : 0;
+    ggml_tensor * cur = build_attn_mha(q, k, v, nullptr, kq_mask_top_k, nullptr, nullptr, n_kv_max, kq_scale, il);
     cb(cur, "kqv_out", il);
 
     // the rotation is its own inverse, so undo it on the value side of the output
