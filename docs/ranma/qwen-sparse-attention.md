@@ -29,6 +29,8 @@ for equivalence checks, or a diagnostic.
 | `GGML_CUDA_FATTN_SPARSE` | on | `0` keeps the dense flash-attention kernel. Reference path. |
 | `GGML_CUDA_FATTN_SPARSE_MIN_KV` | 4096 | the floor of the cell count at which the gather is used. |
 | `GGML_CUDA_FATTN_SPARSE_LOG` | off | `1` logs the first shape that takes the gather. Diagnostic. |
+| `GGML_CUDA_FATTN_COMPACT_PARALLEL` | on | `0` always builds an index list with the serial kernel. Reference path. |
+| `GGML_CUDA_FATTN_COMPACT_VERIFY` | off | `1` compares both compaction kernels on the host and aborts on a difference. Diagnostic. |
 
 ## Tie-breaking in the top-k
 
@@ -351,3 +353,60 @@ lists are short. For a comparison on a real model,
 `LLAMA_QSA_RAW_PREFIX=<path>` makes the dump write the raw output logits with
 their shape, so two runs can be compared on the distribution rather than on
 sampled text.
+
+## Compacting the mask
+
+Turning the mask of a query tile into its index list is a scan of the mask. One
+block of 256 threads walks the cells in chunks of 2048, votes each chunk over
+the queries of the tile and carries the running count of the list from chunk to
+chunk, so a long list becomes a chain of dependent steps - at a depth of 64k, 32
+of them, for every sparse attention call.
+
+A list of five chunks or more is built by two launches with one block per list
+and chunk instead. The first counts the selected cells of every chunk; the
+second adds up the counts of the chunks in front of its own and writes its
+indices at that offset, and the block of the last chunk knows the count of the
+whole list, so it writes the padding behind it and stores the count. Both passes
+vote over the same cells in the same order as the serial kernel and only replace
+its carried count by the sum of the chunk counts, so the list is the same: same
+cells, ascending, same truncation at the budget, same padding, same count.
+Shorter lists keep the serial kernel, which needs one launch instead of two. The
+chunk counts are a few kilobytes and are taken from the pool of the context for
+the duration of the two launches.
+
+| switch | default | effect |
+| --- | --- | --- |
+| `GGML_CUDA_FATTN_COMPACT_PARALLEL` | on | `0` always uses the serial kernel |
+| `GGML_CUDA_FATTN_COMPACT_VERIFY` | off | `1` runs both kernels on the real launch arguments, feeds the model from the serial one, compares every index and every count on the host and aborts on the first difference |
+
+The verify mode is the equivalence gate between the two kernels. It reads the
+result back, which a stream that is capturing a graph cannot do: in that case it
+warns once and compares nothing, so it has to be run with
+`GGML_CUDA_DISABLE_GRAPHS=1`. It logs a line whenever the tile width or the
+number of chunks changes and every 1000 calls, with the number of calls and
+lists checked so far.
+
+### What was checked
+
+`test-backend-ops -o FLASH_ATTN_EXT` carries the generation shape with lists of
+8 and 32 chunks at one and four query rows per tile, with one and with two
+sequences, and a four-row case at 10240 cells where the gate stays shut. On a
+Radeon AI PRO R9700 the suite passes with the default, with
+`GGML_CUDA_FATTN_COMPACT_PARALLEL=0` and in the verify mode; the verify mode
+compared lists of 2, 4, 8 and 32 chunks at one, two and four query rows per
+tile, all equal. With Qwen3.8-Flash-Next UD-Q4_K_XL, a prompt of 66886 tokens
+and 64 generated tokens in the verify mode compared every list of 33 chunks
+without a difference.
+
+Base revision ec5a12b85 with this patch, the same model, `llama-bench -ncmoe 35
+-ngl 999 -t 16 -fa on -ctk f16 -ctv f16 -b 512 -ub 512 -p 512 -n 128 -r 1 -d
+32768,65536`, MoE tensors placed in host memory, one process per row with an
+idle gap of five minutes between them:
+
+| cells | serial tg128 | parallel tg128 |
+| --- | --- | --- |
+| 32768 | 25.01 | 25.12 |
+| 65536 | 24.31 | 24.70 |
+
+That is 0.4% at 32k cells and 1.6% at 64k, one run per row. Prompt processing
+does not go through the gather at a batch of 512 and is not claimed.

@@ -176,6 +176,8 @@ applies, how to switch it, and its limits.
   through the compacted index list of its query tile instead of scanning the KV cache. It applies to tiles of up
   to four query rows, from a cache length that depends on the selection budget. `GGML_CUDA_FATTN_SPARSE=0` keeps
   the dense kernel. Same page.
+- **Parallel mask compaction** for long index lists, with `GGML_CUDA_FATTN_COMPACT_VERIFY=1` as the equivalence
+  gate. Same page.
 
 ## Building
 
