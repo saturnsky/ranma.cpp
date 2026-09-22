@@ -683,6 +683,20 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         return value ? std::atoi(value) : 1;
     }();
 
+    // LLAMA_QSA_ALL_CELLS_BYPASS: 1 (default) builds no selection while the budget covers every
+    // cell of the cache, 0 keeps the selection graph at every length. A selection of all the
+    // cells leaves the attention mask as it is, so the scores decide nothing until n_kv exceeds
+    // the budget, and the layer attends through the dense path like a layer without an indexer.
+    // The indexer keys are still written, because later steps select over them. The dump reads
+    // the selection back, so it keeps the graph.
+    static const bool bypass_all_cells = []() {
+        const char * value = std::getenv("LLAMA_QSA_ALL_CELLS_BYPASS");
+        return value == nullptr || std::atoi(value) != 0;
+    }();
+
+    const bool all_cells = bypass_all_cells && width == n_kv &&
+        kq_mask != nullptr && kq_mask->ne[0] == n_kv && !llama_qsa_dump_enabled();
+
     // [TAG_QSA_BLOCK_META] the per-row description the block path needs holds only for the
     // plain causal mask: a windowed or alibi mask hides cells that a full block still counts
     const bool allow_fast = block_select == 1 && blk_bias && hparams.n_swa == 0 &&
@@ -756,7 +770,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
 
     if (!idx_pooled) {
         ggml_build_forward_expand(gf, mctx_idx->cpy_k(ctx0, k_raw, inp->k_idxs, il));
-
+    }
+    if (!idx_pooled && !all_cells) {
         // one key head, so rows are contiguous. get_k gives [idx_dim, n_head_kv, n_kv, n_stream].
         ggml_tensor * k_all = mctx_idx->get_k(ctx0, il);
         k_all = ggml_view_3d(ctx0, k_all, idx_dim, n_kv, n_stream, k_all->nb[2], k_all->nb[3], 0);
@@ -773,7 +788,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
             pooled = pooled ? ggml_add(ctx0, pooled, slice) : slice;
         }
         pooled = ggml_scale(ctx0, pooled, 1.0f/(float) r);
-    } else {
+    }
+    if (idx_pooled) {
         // [TAG_QSA_POOLED] pool only the blocks this ubatch completes and keep them; the rest of
         // the context is already pooled in the cache. Decode completes at most one block.
 
@@ -820,7 +836,8 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
 
         ggml_tensor * persist = ggml_get_rows(ctx0, k_state_cur, inp->state_persist_src_idxs);
         ggml_build_forward_expand(gf, idx_state->cpy_kv(ctx0, persist, inp->state_persist_dst_idxs, il));
-
+    }
+    if (idx_pooled && !all_cells) {
         ggml_tensor * k_all = mctx_idx_pooled->get_k(ctx0, il);
         pooled = ggml_view_3d(ctx0, k_all, idx_dim, n_blocks, n_stream, k_all->nb[2], k_all->nb[3], 0);
         if (pooled->type != GGML_TYPE_F32) {
@@ -831,6 +848,18 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
             pooled = ggml_cont(ctx0, pooled);
         }
     }
+
+    if (all_cells) {
+        // the host pass that fills these inputs also finds the blocks this ubatch completes, so
+        // it runs at every length and needs them allocated
+        for (ggml_tensor * input : { inp->cell_blk, inp->blk_cells, inp->blk_pos, inp->blk_meta, inp->bias }) {
+            if (input != nullptr) {
+                ggml_build_forward_expand(gf, input);
+            }
+        }
+        return nullptr;
+    }
+
     cb(pooled, "indexer_k_pooled", il);
     if (!idx_norm_rope && llama_qsa_dump_enabled()) {
         pooled = ggml_cont(ctx0, pooled);

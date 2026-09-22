@@ -31,6 +31,7 @@ for equivalence checks, or a diagnostic.
 | `GGML_CUDA_FATTN_SPARSE_LOG` | off | `1` logs the first shape that takes the gather. Diagnostic. |
 | `GGML_CUDA_FATTN_COMPACT_PARALLEL` | on | `0` always builds an index list with the serial kernel. Reference path. |
 | `GGML_CUDA_FATTN_COMPACT_VERIFY` | off | `1` compares both compaction kernels on the host and aborts on a difference. Diagnostic. |
+| `LLAMA_QSA_ALL_CELLS_BYPASS` | on | `0` builds the selection at every context length, as upstream does. Reference path. |
 
 ## Tie-breaking in the top-k
 
@@ -410,3 +411,58 @@ idle gap of five minutes between them:
 
 That is 0.4% at 32k cells and 1.6% at 64k, one run per row. Prompt processing
 does not go through the gather at a batch of 512 and is not claimed.
+
+## While the budget covers every cell
+
+The indexer selects at most `indexer_top_k + ratio - 1` cells for a query.
+While the cache holds no more cells than that, the selection is the whole
+cache: the mask rebuilt from it equals the attention mask it started from, and
+the scores decide nothing. Building the selection anyway costs the projection,
+normalization and rotation of the indexer query, the scores against every
+block, the top-k and the rebuilt mask, in every sparse-attention layer of
+every step. That is the whole cost of the indexer, paid by a context that is
+too short to gain anything from it.
+
+A graph whose selection width equals its cell count therefore builds no
+selection, and the layer attends through the dense path, as a layer without an
+indexer does. The cell count of a graph is padded, so the dense path ends a
+few tokens before the context reaches the budget.
+
+What the later steps need is still done. The indexer keys are written as
+before, the pooled block keys and the members of the open block included,
+because the steps after the budget is exceeded select over them. The inputs of
+the selection stay in the graph although nothing reads them: the host pass
+that fills them is also the one that finds the blocks a ubatch completes.
+
+The selection is kept when the mask does not span exactly the cells of the
+graph, and under `LLAMA_QSA_DUMP`, which reads the selection back.
+`LLAMA_QSA_ALL_CELLS_BYPASS=0` keeps it at every length, which is the upstream
+behaviour and the reference path.
+
+The two settings compute the same attention: with every cell selected the
+rebuilt mask equals the attention mask value for value, and the attention node
+is the one the dense path builds. The model output is still not bit-identical,
+and why the bits differ was not traced for this revision. Its size was
+measured on a Radeon AI PRO R9700 with Qwen3.8-Flash-Next UD-Q4_K_XL, base
+revision ec5a12b85 with this patch, `llama-perplexity -c 4096 --chunks 8` over
+wikitext-2 with `GGML_CUDA_TOP_K_STABLE_TIES=1`, where the first half of every
+chunk is processed without a selection:
+
+- two runs with the switch at `0` give the same statistics to the last digit
+  (PPL 3.1707, mean KLD 0.000000, same top token 100 %);
+- a run of the default against the switch at `0` gives mean KLD 0.0193 with the
+  same top token 95.20 %, and PPL 3.1764 against 3.1707, a difference of
+  +0.0057 with an error of 0.0059.
+
+The default does not reproduce the bits of the reference path. Numbers of the
+same size between two runs that land in different numerical modes are given in
+[Tie-breaking and run-to-run differences](#tie-breaking-and-run-to-run-differences).
+
+With `llama-bench -ncmoe 35 -ngl 999 -t 16 -fa on -ctk f16 -ctv f16 -b 512 -ub
+512 -p 512 -n 128 -r 1 -d 0,4096`, MoE tensors in host memory, one process per
+setting with an idle gap of five minutes between them, generation of 128
+tokens measured 26.09 t/s with the switch at `0` and 26.45 t/s with the
+default at a depth of 0 (+1.4%). At 4096 cells the budget no longer covers the
+cache and both settings build the selection, and the two runs still differ by
++0.7% (25.86 and 26.03 t/s), so a single run carries a spread of that size.
+Prompt processing of 512 tokens at a depth of 0 measured 593.7 and 594.5 t/s.

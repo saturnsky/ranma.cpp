@@ -178,6 +178,9 @@ applies, how to switch it, and its limits.
   the dense kernel. Same page.
 - **Parallel mask compaction** for long index lists, with `GGML_CUDA_FATTN_COMPACT_VERIFY=1` as the equivalence
   gate. Same page.
+- **No selection while the budget covers every cell** - a context that fits into the selection budget builds no
+  indexer scoring or top-k and attends through the dense path. `LLAMA_QSA_ALL_CELLS_BYPASS=0` keeps the
+  selection at every length, as upstream does. Same page.
 
 ## Building
 
