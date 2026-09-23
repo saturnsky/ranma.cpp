@@ -11,9 +11,11 @@ collects the fork's additions to that selection.
 | `GGML_HIP_PREFILL_BLAS` | `1` (on) | `0` removes the F16 BLAS matmul policy below, so those matmuls stay on MMQ. Kept as the reference path for equivalence checks. |
 | `ROCBLAS_USE_HIPBLASLT` | unset | The F16 BLAS policy arms only when this is exactly `1`, because it selects the library the measurements were taken with. |
 | `GGML_CUDA_CUBLAS_COMPUTE_TYPE` | unset | Setting it disarms the F16 BLAS policy, because it overrides the compute type the GEMM would use. |
+| `GGML_CUDA_SKINNY_F32` | `1` (on) | `0` sends the skinny F32 products below to hipBLAS again. |
 
 The variables are read once per process, so they have to be set before the process starts. A build
-with `GGML_CUDA_FORCE_MMQ` compiles the BLAS policy out entirely.
+with `GGML_CUDA_FORCE_MMQ` compiles the BLAS policy out entirely; the skinny F32 kernels do not depend
+on it.
 
 ## WMMA attention for 512-wide heads
 
@@ -136,3 +138,124 @@ only, not the library workspace, and the pool can retain the VRAM it handed out.
 - An A/B against `GGML_HIP_PREFILL_BLAS=0` on a model that uses one of the four types shows the
   effect on prompt throughput. Running without `ROCBLAS_USE_HIPBLASLT=1` is the same as running
   with the policy off.
+
+## Fixed-order kernels for skinny F32 matmuls
+
+### What it is
+
+Some models multiply a prompt batch with small F32 weight matrices: a handful to a few hundred weight
+rows against every token of the ubatch. In Qwen3.8-Flash-Next these are the hyper-connection
+injection (4 x n x 10240, weight rows x tokens x K), the alpha/beta projections of the SSM layers
+(48 x n x 2560) and the MoE router (512 x n x 2560). On RDNA4 no ggml kernel took them: MMVF stops at
+8 columns, MMF has no F32 path without F32 matrix cores, and MMQ is for quantized weights. They went
+to hipBLAS.
+
+`ggml/src/ggml-cuda/mmvf.cu` now carries two kernels for them:
+
+- up to 8 weight rows, a streaming kernel: every wave reads a few token rows once and keeps all weight
+  rows of the current K step in registers; K is split over the waves of a block and the partial sums
+  are added in a fixed order;
+- above that, a register-tiled SGEMM with both operands staged through shared memory. K is split
+  within the block and, when the grid would be too small to fill the device, over several blocks
+  whose partial results a second kernel adds in index order.
+
+### Why it exists
+
+hipBLAS, and hipBLASLt underneath it, chooses its solution for a GEMM once per process. For these
+shapes the choice was not stable: two processes with the same model and input could run the same
+product at very different speeds and with a different summation order, so both the prompt
+throughput and the logits depended on the process start. The shapes are also far from what a library
+GEMM is tuned for: the injection product is little more than one read of the activation, and the BLAS
+path took many times that.
+
+The new kernels have one summation order, fixed by the launch configuration and independent of the
+process, and use no atomics, so a product gives the same bits in every run.
+
+### When it applies
+
+`ggml_cuda_mul_mat` tries the kernels last, just before the BLAS fallback, so every earlier selection
+keeps its precedence. All of the following must hold:
+
+- the device is RDNA4, and
+- weight, activation and result are F32, and
+- both operands are single 2D matrices (all higher dimensions 1), and
+- rows have a unit element stride, K is a multiple of 4, and the row pitch and base address of both
+  operands are 16-byte aligned, and
+- the activation has more than 8 columns (above the MMVF limit) and the weight at most 512 rows, and
+- the weight is not in host memory of a discrete device.
+
+Single-token generation and small verification batches (8 columns or fewer) keep MMVF. Other element
+types, including the BF16 indexer products of the same model, stay on BLAS.
+
+### Numerics
+
+The kernels compute the same sums as the BLAS path in another order, so the results differ at
+rounding level. In a model whose MoE router reads such a product, a rounding difference can move an
+expert across the router's top-k boundary for some tokens, so the end-to-end difference is larger
+than the rounding itself. Against the BLAS path it is of the same size as the difference between two
+BLAS processes that landed on different hipBLASLt solutions.
+
+### Measured effect
+
+Base revision: the series of ranma_20260922 (`e48103e1e`) rebased on upstream `ec5a12b85`, with this patch; Radeon AI PRO R9700 (PCIe 5.0 x16) with the setup of
+[benchmark.md](benchmark.md) (-30 % power limit, 0 mV voltage offset, headless), Qwen3.8-Flash-Next
+UD-Q4_K_XL with the exclusive expert cache of 20480 MiB (warm, `--expert-l2-mib -1`, host-direct with
+`GGML_CUDA_HOST_DIRECT_MAX_BATCH=512`). The reference is the same binary with `GGML_CUDA_SKINNY_F32=0`
+and `ROCBLAS_USE_HIPBLASLT=0`: with hipBLASLt the reference itself moves between processes, while
+rocBLAS alone gave the same speed and the same bits in every process.
+
+`llama-perplexity -c 4096 --chunks 8` over wikitext-2, against the BLAS path:
+
+| run | mean KLD | same top token | PPL |
+| --- | ---: | ---: | ---: |
+| BLAS path, second process | 0.000096 | 99.945 % | 3.1644 |
+| this patch | 0.0212 | 95.14 % | 3.1688 |
+
+Two processes of the BLAS path with hipBLASLt that land on different solutions differ by a mean KLD of
+about 0.020 on the same measurement. With the patch the result no longer depends on the process or on
+`ROCBLAS_USE_HIPBLASLT`: repeated `llama-perplexity -c 512 --chunks 32` processes, with and without
+hipBLASLt, printed the same perplexity.
+
+`llama-bench` with the protocol of [benchmark.md](benchmark.md) (one process per setting, a discarded
+pass at depth 65536 first, five idle minutes between processes), PP512 and TG128 in t/s:
+
+| setting | PP @0 | PP @4096 | PP @8192 | PP @32768 | PP @65536 | TG @0 | TG @4096 | TG @8192 | TG @32768 | TG @65536 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| `GGML_CUDA_SKINNY_F32=0` | 905.1 | 899.4 | 868.1 | 765.5 | 638.5 | 50.22 | 48.87 | 48.69 | 46.66 | 44.27 |
+| default | 1066.6 | 1006.6 | 975.9 | 830.4 | 691.4 | 50.38 | 49.05 | 48.42 | 46.67 | 44.63 |
+
+Prompt processing gains 18 % at depth 0 and 8 % at depth 65536. Generation does not use the path and
+stays within the spread of single runs.
+
+Per product, `test-backend-ops perf -o MUL_MAT` (one op per graph, so the activation stays in the
+last-level cache), in microseconds; the hipBLASLt column is one process and moves with the solution
+that process chose:
+
+| product (rows x tokens x K) | this patch | rocBLAS | hipBLASLt |
+| --- | ---: | ---: | ---: |
+| 4 x 512 x 10240 | 13.7 | 492 | 583 |
+| 48 x 512 x 2560 | 24.2 | 191 | 225 |
+| 512 x 512 x 2560 | 111 | 155 | 164 |
+
+In a standalone graph of 128 such products, each with its own activation so that it is read from
+memory, the 4 x 512 x 10240 product took 37 us, close to one read of its 21 MB activation, against
+534 us with rocBLAS and 595 to 606 us in three hipBLASLt processes. With uniform random inputs, the
+maximum absolute error against a double-precision reference was 2 to 20 times smaller than
+hipBLASLt's for the three products.
+
+### Limits
+
+- The kernel configurations were tuned for the three products above. Other shapes inside the bounds
+  are computed correctly and take the nearest configuration, but carry no measured speed guarantee.
+- Weights with more than 512 rows, batched products and non-F32 types keep their previous path.
+- Only RDNA4 selects the kernels; their launch assumes its wave32 execution.
+
+### How to verify
+
+- `test-backend-ops -o MUL_MAT` compares the kernels against the CPU reference for the three model
+  products at column counts on both sides of the MMVF limit (1 to 512), for odd row counts (2, 5, 13,
+  100, 511) and for operands with a padded row pitch.
+- `test-backend-ops perf -o MUL_MAT` includes the three products at 9, 64, 256 and 512 columns; run it
+  with `GGML_CUDA_SKINNY_F32=0` for the BLAS side.
+- Two `llama-perplexity` processes of the same model print the same numbers with the default, whatever
+  `ROCBLAS_USE_HIPBLASLT` is set to.
