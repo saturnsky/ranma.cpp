@@ -1584,6 +1584,7 @@ void ggml_cuda_mul_mat_vec_q(
             // expert cache: resident experts of this tensor are read from the VRAM arena, and in
             // exclusive mode everything else from the host arena
             const ggml_cuda_expert_lookup cached = ggml_cuda_expert_lookup_tensor(src0);
+            ggml_cuda_expert_before_read(ctx, src0);
             fusion_local.x_cache       = cached.data;
             fusion_local.x_cache_slots = cached.slots;
             fusion_local.x_host_slots  = cached.host_slots;
@@ -1620,6 +1621,7 @@ void ggml_cuda_mul_mat_vec_q(
             GGML_ASSERT(fusion->gate->type == src0->type && ggml_are_same_stride(fusion->gate, src0));
             fusion_local.gate = fusion->gate->data;
 #if defined(GGML_USE_HIP)
+            ggml_cuda_expert_before_read(ctx, fusion->gate);
             if (ggml_backend_buffer_is_host(fusion->gate->buffer) || src0_is_exclusive) {
                 if (ggml_backend_buffer_is_host(fusion->gate->buffer)) {
                     fusion_local.gate = ggml_hip_mapped_host_device_alias(fusion->gate);
