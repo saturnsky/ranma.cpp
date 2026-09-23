@@ -30,6 +30,12 @@ void ggml_cuda_expert_profile_ids(ggml_backend_cuda_context & ctx, const ggml_te
 // slots. No-op unless the tier is built.
 void ggml_cuda_expert_layer_done(ggml_backend_cuda_context & ctx, const ggml_tensor * src0);
 
+// With the staged SSD tier service, orders the next kernel that reads `src0` after the file reads
+// of that expert kind. Called next to every lookup that can hand a kernel ring addresses. No-op
+// unless the finite tier is built, the plan leaves experts in the file and the layer was routed
+// with enough rows to be staged.
+void ggml_cuda_expert_before_read(ggml_backend_cuda_context & ctx, const ggml_tensor * src0);
+
 // True for the buffer type that exclusive mode allocates the routed expert weights on. Its tensors
 // carry logical addresses only: their bytes live in the VRAM arena or in the host arena, so every
 // kernel that reads them must resolve them through ggml_cuda_expert_lookup_tensor.

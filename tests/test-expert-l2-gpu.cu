@@ -106,7 +106,7 @@ static int serve_test() {
 }
 
 static __global__ void wait_started(l2_mailbox * m) {
-    __hip_atomic_store(&m->reserved0, 1u, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+    __hip_atomic_store(&m->need, 1u, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
 }
 
 static int wait_clock_test() {
@@ -116,7 +116,7 @@ static int wait_clock_test() {
     hipStream_t stream; CUDA_CHECK(hipStreamCreate(&stream));
     std::chrono::steady_clock::time_point begin;
     std::thread responder([&] {
-        while (!expert_os::load_acquire(&host->reserved0)) { std::this_thread::yield(); }
+        while (!expert_os::load_acquire(&host->need)) { std::this_thread::yield(); }
         begin = std::chrono::steady_clock::now();
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
         expert_os::store_release(&host->ready, 1);
