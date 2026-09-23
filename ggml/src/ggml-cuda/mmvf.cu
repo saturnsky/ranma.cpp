@@ -873,3 +873,409 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0
             return false;
     }
 }
+
+// Skinny dense F32 x F32 matrix multiplication, dst[j][i] = sum_k x[i][k]*y[j][k], for few weight rows (x) and more
+// columns (y) than MMVF takes. RDNA4 has no F32 MMF path, so such products (small projections of a prompt batch,
+// e.g. 4 x 512 x 10240 or 48 x 512 x 2560) went to hipBLAS. hipBLAS/hipBLASLt chooses its solution per process,
+// so both the speed and the summation order of these products varied from one process to the next. The kernels
+// below have a fixed summation order and use no atomics, so a result is the same in every run and process.
+
+// Very few output rows: every wave streams y rows once and keeps all rows of x in registers per k step.
+// The K dimension is split over ksplit waves of a block and the partial sums are added in a fixed order.
+template <int nrows_x, int ntok_per_wave, int ksplit>
+static __global__ void __launch_bounds__(256) mul_mat_f32_skinny_rows(
+        const float * __restrict__ x, const float * __restrict__ y, float * __restrict__ dst,
+        const int nrows, const int ntok, const int ncols4,
+        const int64_t stride_x, const int64_t stride_y, const int64_t stride_dst) {
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr int nwaves    = 256/warp_size;
+    constexpr int ngroups   = nwaves/ksplit;
+    static_assert(ngroups*ksplit == nwaves, "bad ksplit");
+    static_assert(ntok_per_wave*nrows_x <= warp_size, "one lane per output of a wave");
+
+    const int lane = threadIdx.x % warp_size;
+    const int wave = threadIdx.x / warp_size;
+    const int tg   = wave % ngroups;
+    const int ks   = wave / ngroups;
+    const int tok0 = (blockIdx.x*ngroups + tg)*ntok_per_wave;
+
+    const float4 * xr[nrows_x];
+#pragma unroll
+    for (int i = 0; i < nrows_x; ++i) {
+        xr[i] = (const float4 *) (x + min(i, nrows - 1)*stride_x);
+    }
+    const float4 * yr[ntok_per_wave];
+#pragma unroll
+    for (int t = 0; t < ntok_per_wave; ++t) {
+        yr[t] = (const float4 *) (y + min(tok0 + t, ntok - 1)*stride_y);
+    }
+
+    float sum[ntok_per_wave][nrows_x] = {{0.0f}};
+
+#pragma unroll 2
+    for (int c = ks*warp_size + lane; c < ncols4; c += ksplit*warp_size) {
+        float4 yv[ntok_per_wave];
+#pragma unroll
+        for (int t = 0; t < ntok_per_wave; ++t) {
+            yv[t] = yr[t][c];
+        }
+#pragma unroll
+        for (int i = 0; i < nrows_x; ++i) {
+            const float4 xv = xr[i][c];
+#pragma unroll
+            for (int t = 0; t < ntok_per_wave; ++t) {
+                ggml_cuda_mad(sum[t][i], xv.x, yv[t].x);
+                ggml_cuda_mad(sum[t][i], xv.y, yv[t].y);
+                ggml_cuda_mad(sum[t][i], xv.z, yv[t].z);
+                ggml_cuda_mad(sum[t][i], xv.w, yv[t].w);
+            }
+        }
+    }
+
+#pragma unroll
+    for (int t = 0; t < ntok_per_wave; ++t) {
+#pragma unroll
+        for (int i = 0; i < nrows_x; ++i) {
+            sum[t][i] = warp_reduce_sum<warp_size>(sum[t][i]);
+        }
+    }
+
+    if constexpr (ksplit == 1) {
+#pragma unroll
+        for (int t = 0; t < ntok_per_wave; ++t) {
+#pragma unroll
+            for (int i = 0; i < nrows_x; ++i) {
+                if (lane == t*nrows_x + i && tok0 + t < ntok && i < nrows) {
+                    dst[(tok0 + t)*stride_dst + i] = sum[t][i];
+                }
+            }
+        }
+    } else {
+        __shared__ float partial[ksplit][ngroups][ntok_per_wave][nrows_x];
+#pragma unroll
+        for (int t = 0; t < ntok_per_wave; ++t) {
+#pragma unroll
+            for (int i = 0; i < nrows_x; ++i) {
+                if (lane == t*nrows_x + i) {
+                    partial[ks][tg][t][i] = sum[t][i];
+                }
+            }
+        }
+        __syncthreads();
+
+        constexpr int nout = ngroups*ntok_per_wave*nrows_x;
+        for (int idx = threadIdx.x; idx < nout; idx += 256) {
+            const int i   = idx % nrows_x;
+            const int t   = (idx / nrows_x) % ntok_per_wave;
+            const int g   = idx / (nrows_x*ntok_per_wave);
+            const int tok = (blockIdx.x*ngroups + g)*ntok_per_wave + t;
+            float acc = partial[0][g][t][i];
+#pragma unroll
+            for (int s = 1; s < ksplit; ++s) {
+                acc += partial[s][g][t][i];
+            }
+            if (tok < ntok && i < nrows) {
+                dst[tok*stride_dst + i] = acc;
+            }
+        }
+    }
+}
+
+// More output rows: register-tiled GEMM with both operands staged through shared memory, K split over ksplit
+// thread groups of a block and optionally over gridDim.z blocks. The latter write partial sums that
+// mul_mat_f32_skinny_reduce adds in a fixed order.
+template <int bm, int bn, int bk, int tm, int tn, int ksplit>
+static __global__ void __launch_bounds__((bm/tm)*(bn/tn)*ksplit) mul_mat_f32_skinny_tile(
+        const float * __restrict__ x, const float * __restrict__ y, float * __restrict__ dst,
+        const int nrows, const int ntok, const int ncols, const int ncols_chunk,
+        const int64_t stride_x, const int64_t stride_y, const int64_t stride_dst, const int64_t stride_part) {
+    constexpr int ntg      = (bm/tm)*(bn/tn);
+    constexpr int nthreads = ntg*ksplit;
+    constexpr int bkt      = bk*ksplit;
+    constexpr int bkt4     = bkt/4;
+    constexpr int na4      = bm*bkt4;
+    constexpr int nb4      = bn*bkt4;
+    constexpr int la       = (na4 + nthreads - 1)/nthreads;
+    constexpr int lb       = (nb4 + nthreads - 1)/nthreads;
+    constexpr int pad      = 4;
+    // Each thread owns tm/4 groups of 4 rows and tn/vn groups of vn tokens, the groups spaced so that
+    // consecutive threads read consecutive float4 from shared memory.
+    constexpr int vn       = tn % 4 == 0 ? 4 : tn;
+    constexpr int sm       = (bm/tm)*4;
+    constexpr int sn       = (bn/tn)*vn;
+    static_assert(bk % 4 == 0 && tm % 4 == 0 && tn % vn == 0, "bad tile");
+
+    // Rows are read as float4, so the tiles are 16-byte aligned and the padded row length is a multiple of 4.
+    __shared__ __align__(16) float xs[bkt][bm + pad];
+    __shared__ __align__(16) float ys[bkt][bn + pad];
+
+    const int tid = threadIdx.x;
+    const int g   = tid / ntg;
+    const int lt  = tid % ntg;
+    const int tx  = lt % (bn/tn);
+    const int ty  = lt / (bn/tn);
+
+    const int i0   = blockIdx.y*bm;
+    const int j0   = blockIdx.x*bn;
+    const int kbeg = blockIdx.z*ncols_chunk;
+    const int kend = min(ncols, kbeg + ncols_chunk);
+    dst += blockIdx.z*stride_part;
+
+    float4 rx[la];
+    float4 ry[lb];
+
+    auto load = [&](const int kb) {
+#pragma unroll
+        for (int l = 0; l < la; ++l) {
+            const int f  = tid + l*nthreads;
+            const int r  = f / bkt4;
+            const int kk = kb + (f % bkt4)*4;
+            rx[l] = f < na4 && i0 + r < nrows && kk < kend ?
+                *(const float4 *) (x + (i0 + r)*stride_x + kk) : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        }
+#pragma unroll
+        for (int l = 0; l < lb; ++l) {
+            const int f  = tid + l*nthreads;
+            const int r  = f / bkt4;
+            const int kk = kb + (f % bkt4)*4;
+            ry[l] = f < nb4 && j0 + r < ntok && kk < kend ?
+                *(const float4 *) (y + (j0 + r)*stride_y + kk) : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        }
+    };
+
+    float sum[tn][tm] = {{0.0f}};
+
+    load(kbeg);
+    for (int kb = kbeg; kb < kend; kb += bkt) {
+#pragma unroll
+        for (int l = 0; l < la; ++l) {
+            const int f = tid + l*nthreads;
+            if (f < na4) {
+                const int r = f / bkt4;
+                const int k = (f % bkt4)*4;
+                xs[k + 0][r] = rx[l].x;
+                xs[k + 1][r] = rx[l].y;
+                xs[k + 2][r] = rx[l].z;
+                xs[k + 3][r] = rx[l].w;
+            }
+        }
+#pragma unroll
+        for (int l = 0; l < lb; ++l) {
+            const int f = tid + l*nthreads;
+            if (f < nb4) {
+                const int r = f / bkt4;
+                const int k = (f % bkt4)*4;
+                ys[k + 0][r] = ry[l].x;
+                ys[k + 1][r] = ry[l].y;
+                ys[k + 2][r] = ry[l].z;
+                ys[k + 3][r] = ry[l].w;
+            }
+        }
+        __syncthreads();
+
+        if (kb + bkt < kend) {
+            load(kb + bkt);
+        }
+
+#pragma unroll
+        for (int kk = 0; kk < bk; ++kk) {
+            const int k = g*bk + kk;
+            float xv[tm];
+            float yv[tn];
+#pragma unroll
+            for (int a = 0; a < tm; a += 4) {
+                const float4 v = *(const float4 *) &xs[k][(a/4)*sm + ty*4];
+                xv[a + 0] = v.x;
+                xv[a + 1] = v.y;
+                xv[a + 2] = v.z;
+                xv[a + 3] = v.w;
+            }
+            if constexpr (vn == 4) {
+#pragma unroll
+                for (int b = 0; b < tn; b += 4) {
+                    const float4 v = *(const float4 *) &ys[k][(b/4)*sn + tx*4];
+                    yv[b + 0] = v.x;
+                    yv[b + 1] = v.y;
+                    yv[b + 2] = v.z;
+                    yv[b + 3] = v.w;
+                }
+            } else {
+#pragma unroll
+                for (int b = 0; b < tn; ++b) {
+                    yv[b] = ys[k][tx*tn + b];
+                }
+            }
+#pragma unroll
+            for (int b = 0; b < tn; ++b) {
+#pragma unroll
+                for (int a = 0; a < tm; ++a) {
+                    ggml_cuda_mad(sum[b][a], xv[a], yv[b]);
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+    if constexpr (ksplit > 1) {
+        __shared__ float partial[ksplit - 1][ntg][tn][tm];
+        if (g > 0) {
+#pragma unroll
+            for (int b = 0; b < tn; ++b) {
+#pragma unroll
+                for (int a = 0; a < tm; ++a) {
+                    partial[g - 1][lt][b][a] = sum[b][a];
+                }
+            }
+        }
+        __syncthreads();
+        if (g > 0) {
+            return;
+        }
+#pragma unroll
+        for (int s = 0; s < ksplit - 1; ++s) {
+#pragma unroll
+            for (int b = 0; b < tn; ++b) {
+#pragma unroll
+                for (int a = 0; a < tm; ++a) {
+                    sum[b][a] += partial[s][lt][b][a];
+                }
+            }
+        }
+    }
+
+#pragma unroll
+    for (int b = 0; b < tn; ++b) {
+        const int j = j0 + (b/vn)*sn + tx*vn + b%vn;
+        if (j >= ntok) {
+            continue;
+        }
+#pragma unroll
+        for (int a = 0; a < tm; ++a) {
+            const int i = i0 + (a/4)*sm + ty*4 + a%4;
+            if (i < nrows) {
+                dst[j*stride_dst + i] = sum[b][a];
+            }
+        }
+    }
+}
+
+static __global__ void mul_mat_f32_skinny_reduce(
+        const float * __restrict__ part, float * __restrict__ dst, const int nrows, const int ntok, const int nparts,
+        const int64_t stride_dst) {
+    const int64_t n   = int64_t(nrows)*ntok;
+    const int64_t idx = int64_t(blockIdx.x)*blockDim.x + threadIdx.x;
+    if (idx >= n) {
+        return;
+    }
+    float acc = part[idx];
+    for (int p = 1; p < nparts; ++p) {
+        acc += part[p*n + idx];
+    }
+    dst[(idx / nrows)*stride_dst + idx % nrows] = acc;
+}
+
+template <int nrows_x, int ntok_per_wave, int ksplit>
+static void mul_mat_f32_skinny_rows_cuda(
+        const float * x, const float * y, float * dst, const int nrows, const int ntok, const int ncols,
+        const int64_t stride_x, const int64_t stride_y, const int64_t stride_dst, cudaStream_t stream) {
+    constexpr int warp_size = 32; // the dispatch is limited to RDNA4, which runs these kernels in wave32
+    constexpr int ntok_per_block = (256/warp_size/ksplit)*ntok_per_wave;
+    const dim3 grid((ntok + ntok_per_block - 1)/ntok_per_block, 1, 1);
+    mul_mat_f32_skinny_rows<nrows_x, ntok_per_wave, ksplit><<<grid, 256, 0, stream>>>
+        (x, y, dst, nrows, ntok, ncols/4, stride_x, stride_y, stride_dst);
+}
+
+template <int bm, int bn, int bk, int tm, int tn, int ksplit>
+static void mul_mat_f32_skinny_tile_cuda(
+        ggml_backend_cuda_context & ctx, const float * x, const float * y, float * dst, const int nrows, const int ntok,
+        const int ncols, const int64_t stride_x, const int64_t stride_y, const int64_t stride_dst, cudaStream_t stream) {
+    constexpr int nthreads = (bm/tm)*(bn/tn)*ksplit;
+    constexpr int bkt      = bk*ksplit;
+    const int nchunks     = (ncols + bkt - 1)/bkt;
+    // Split K over the grid until there are about four blocks per SM, keeping at least four shared memory stages per
+    // block. A block is latency bound on its serial K loop, so few large blocks leave the GPU mostly idle, while more
+    // parts cost partial-sum traffic: allow 16 parts only for tiny grids.
+    const int nblocks_mn = ((ntok + bn - 1)/bn)*((nrows + bm - 1)/bm);
+    const int nsm        = ggml_cuda_info().devices[ggml_cuda_get_device()].nsm;
+    const int max_parts  = nblocks_mn <= 4 ? 16 : 8;
+    const int nparts     = std::max(1, std::min({max_parts, (4*nsm + nblocks_mn - 1)/nblocks_mn, nchunks/4}));
+    const int ncols_chunk = ((nchunks + nparts - 1)/nparts)*bkt;
+    const dim3 grid((ntok + bn - 1)/bn, (nrows + bm - 1)/bm, nparts);
+
+    if (nparts == 1) {
+        mul_mat_f32_skinny_tile<bm, bn, bk, tm, tn, ksplit><<<grid, nthreads, 0, stream>>>
+            (x, y, dst, nrows, ntok, ncols, ncols_chunk, stride_x, stride_y, stride_dst, 0);
+        return;
+    }
+
+    const int64_t n = int64_t(nrows)*ntok;
+    ggml_cuda_pool_alloc<float> part(ctx.pool(), nparts*n);
+    mul_mat_f32_skinny_tile<bm, bn, bk, tm, tn, ksplit><<<grid, nthreads, 0, stream>>>
+        (x, y, part.get(), nrows, ntok, ncols, ncols_chunk, stride_x, stride_y, nrows, n);
+    const int nblocks = (n + 255)/256;
+    mul_mat_f32_skinny_reduce<<<nblocks, 256, 0, stream>>>(part.get(), dst, nrows, ntok, nparts, stride_dst);
+}
+
+bool ggml_cuda_should_use_mul_mat_f32_skinny(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst, int cc) {
+    // GGML_CUDA_SKINNY_F32=0 restores hipBLAS for these products.
+    static const bool enabled = [] {
+        const char * v = getenv("GGML_CUDA_SKINNY_F32");
+        return !v || atoi(v) != 0;
+    }();
+    if (!enabled || !GGML_CUDA_CC_IS_RDNA4(cc)) {
+        return false;
+    }
+    if (src0->type != GGML_TYPE_F32 || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
+        return false;
+    }
+    if (src0->buffer && ggml_backend_buffer_is_host(src0->buffer) && !ggml_cuda_info().devices[ggml_cuda_get_device()].integrated) {
+        return false;
+    }
+    // Plain 2D product with rows that can be read as float4.
+    if (src0->ne[2] != 1 || src0->ne[3] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1) {
+        return false;
+    }
+    if (src0->nb[0] != sizeof(float) || src1->nb[0] != sizeof(float) || dst->nb[0] != sizeof(float)) {
+        return false;
+    }
+    if (src0->ne[0] % 4 != 0 || src0->nb[1] % 16 != 0 || src1->nb[1] % 16 != 0 ||
+        (uintptr_t) src0->data % 16 != 0 || (uintptr_t) src1->data % 16 != 0) {
+        return false;
+    }
+    const int64_t nrows = src0->ne[1];
+    const int64_t ntok  = src1->ne[1];
+    if (ntok <= MMVF_MAX_BATCH_SIZE || nrows > 512 || src0->ne[0] > INT_MAX/2 || nrows*ntok > INT_MAX/8) {
+        return false;
+    }
+    return true;
+}
+
+void ggml_cuda_mul_mat_f32_skinny(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    const float * x_d   = (const float *) src0->data;
+    const float * y_d   = (const float *) src1->data;
+    float       * dst_d = (float       *) dst->data;
+
+    const int     nrows      = src0->ne[1];
+    const int     ntok       = src1->ne[1];
+    const int     ncols      = src0->ne[0];
+    const int64_t stride_x   = src0->nb[1] / sizeof(float);
+    const int64_t stride_y   = src1->nb[1] / sizeof(float);
+    const int64_t stride_dst = dst->nb[1]  / sizeof(float);
+    cudaStream_t  stream     = ctx.stream();
+
+    // The kernel shapes were tuned on RDNA4 for the 4 x n x 10240, 48 x n x 2560 and 512 x n x 2560 products; other
+    // shapes within the dispatch bounds take the nearest configuration.
+    if (nrows <= 4) {
+        mul_mat_f32_skinny_rows_cuda<4, 2, 8>(x_d, y_d, dst_d, nrows, ntok, ncols, stride_x, stride_y, stride_dst, stream);
+    } else if (nrows <= 8) {
+        mul_mat_f32_skinny_rows_cuda<8, 1, 4>(x_d, y_d, dst_d, nrows, ntok, ncols, stride_x, stride_y, stride_dst, stream);
+    } else if (nrows <= 64 && ntok <= 128) {
+        mul_mat_f32_skinny_tile_cuda<16, 32, 8, 4, 2, 4>(ctx, x_d, y_d, dst_d, nrows, ntok, ncols, stride_x, stride_y, stride_dst, stream);
+    } else if (nrows <= 64) {
+        mul_mat_f32_skinny_tile_cuda<48, 32, 8, 4, 4, 4>(ctx, x_d, y_d, dst_d, nrows, ntok, ncols, stride_x, stride_y, stride_dst, stream);
+    } else if (ntok <= 32) {
+        mul_mat_f32_skinny_tile_cuda<64, 32, 16, 4, 2, 1>(ctx, x_d, y_d, dst_d, nrows, ntok, ncols, stride_x, stride_y, stride_dst, stream);
+    } else {
+        mul_mat_f32_skinny_tile_cuda<128, 64, 8, 8, 8, 1>(ctx, x_d, y_d, dst_d, nrows, ntok, ncols, stride_x, stride_y, stride_dst, stream);
+    }
+}

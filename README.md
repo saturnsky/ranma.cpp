@@ -88,6 +88,10 @@ applies, how to switch it, and its limits.
 - **Padded F16 BLAS for wide dense Q2_K/Q6_K/IQ2 matmuls** - wide prompt matmuls of those types convert both
   operands to F16 with a padded row pitch and run hipBLASLt instead of MMQ. Needs `ROCBLAS_USE_HIPBLASLT=1`;
   `GGML_HIP_PREFILL_BLAS=0` turns it off. Same page.
+- **Fixed-order kernels for skinny F32 matmuls** - F32 products of up to 512 weight rows with more than eight
+  activation columns (router, SSM and hyper-connection projections of a prompt batch) run on dedicated kernels
+  instead of hipBLAS, whose per-process solution choice changed their speed and summation order from one process
+  to the next. `GGML_CUDA_SKINNY_F32=0` restores hipBLAS. Same page.
 
 ## Building
 
