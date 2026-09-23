@@ -136,6 +136,10 @@ static l2_config l2_debug_config(const ggml_expert_config & cfg, bool verify_all
     out.verify = number("RANMA_EXPERT_L2_VERIFY", out.verify ? 1 : 0, 0, 1) != 0;
     out.read_wait_ms = number("RANMA_EXPERT_L2_WAIT", out.read_wait_ms, 1, INT64_MAX);
     out.queue_depth = int(number("RANMA_EXPERT_L2_QD", out.queue_depth, 1, expert_os::max_queue_depth));
+    // 0 = off, 1 = the ubatches with more rows than the decode bound, N > 1 = ubatches of at least N rows.
+    const int64_t staged = number("RANMA_EXPERT_L2_STAGED", l2_staged_default ? 1 : 0, 0, INT32_MAX);
+    out.staged_min_rows = staged == 1 ? int64_t(std::max<uint64_t>(out.decode_rows, 1)) + 1 : staged;
+    out.staged_drain = number("RANMA_EXPERT_L2_STAGED_DRAIN", 0, 0, 1) != 0;
     return out;
 }
 
@@ -629,6 +633,10 @@ public:
         tier_route(ctx, layer, ids);
     }
 
+    void before_read(ggml_backend_cuda_context & ctx, const ggml_tensor * src0) {
+        tier_before_read(ctx, src0);
+    }
+
     void layer_done(ggml_backend_cuda_context & ctx, const ggml_tensor * src0) {
         tier_layer_done(ctx, src0);
     }
@@ -663,6 +671,20 @@ public:
     void tier_route(ggml_backend_cuda_context & ctx, int layer, const ggml_tensor * ids) {
         if (tier_ && state_ == state_t::installed && ctx.device == device_) {
             tier_->publish_and_wait(layer, ids, ctx.stream());
+        }
+    }
+
+    // Staged service: the kernel about to read `src0` waits for that kind's slices only.
+    void tier_before_read(ggml_backend_cuda_context & ctx, const ggml_tensor * src0) {
+        if (!tier_ || !tier_->staged() || !tier_->any_ssd() || state_ != state_t::installed || src0 == nullptr ||
+                ctx.device != device_) {
+            return;
+        }
+        int layer = -1;
+        int kind  = -1;
+        if (parse_expert_tensor_name(src0->name, layer, kind) && layer < geo_.n_layers &&
+                geo_.tensors[layer][kind] == src0) {
+            tier_->wait_kind(layer, kind, ctx.stream());
         }
     }
 
@@ -1679,6 +1701,10 @@ void ggml_cuda_expert_profile_ids(ggml_backend_cuda_context & ctx, const ggml_te
 
 void ggml_cuda_expert_layer_done(ggml_backend_cuda_context & ctx, const ggml_tensor * src0) {
     instance().layer_done(ctx, src0);
+}
+
+void ggml_cuda_expert_before_read(ggml_backend_cuda_context & ctx, const ggml_tensor * src0) {
+    instance().before_read(ctx, src0);
 }
 
 bool ggml_cuda_expert_is_exclusive_buffer_type(ggml_backend_buffer_type_t buft) {

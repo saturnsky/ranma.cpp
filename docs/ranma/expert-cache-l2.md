@@ -44,6 +44,9 @@ eviction needs no writeback.
 5. After the last down-weight read of the layer, a done kernel releases the layer's pins. The stream
    orders this before the next layer's demand.
 
+Prompt ubatches take a staged form of steps 3 and 4 ("Staged service for prompt batches" below);
+generation keeps the single wait.
+
 One row and a full ubatch use this same path. There is no whole-layer mode and no next-layer
 prefetch: a large prompt can select every expert of a layer, but only its actual bitmap decides which
 slices are read, and the next layer's selection is not known until its router has run.
@@ -52,6 +55,31 @@ The ring uses round-robin replacement with pinning, not LRU. A ring larger than 
 layer can retain recently read slices; the worker invalidates an evicted address before overwriting
 its slot, and a ring occupant stays marked in the serve bitmap so that the worker extends its lease
 before a later layer can evict a slot the current layer still reads.
+
+### Staged service for prompt batches
+
+A ubatch with more rows than the decode bound (`n_parallel * (draft_max + 1)`) is served one weight
+kind at a time. The worker issues the layer's file reads grouped by kind, in the order the graph
+multiplies them: up, gate, down. As soon as the last read of a kind is in place it publishes that
+kind's addresses and a per-kind readiness generation, while the reads of the next kind stay in
+flight in the same queue. On the GPU the route waits only for the up slices; the gate and down
+launches are each preceded by one small wait kernel for their own kind. So the gate reads overlap
+the up multiplication and the down reads overlap the gate multiplication.
+
+The ledger service is unchanged: the same slices are read into the same slots with the same pins
+and evictions, and the kernels and their arguments are the same, so the output is bit-identical to
+the single wait. Only the order of the reads and the moment each kind becomes visible differ. The
+up reads of a layer cannot overlap anything in that layer, because its routing is known only just
+before the up multiplication. Every kind wait also passes on the layer's whole-generation readiness,
+so a generation the GPU answered itself, or one the worker served in one piece, never blocks on a
+per-kind signal.
+
+The gain comes from the idle time the single wait leaves: with it, the GPU sits idle for all of a
+layer's file reads, while those reads use only a small share of the host I/O bandwidth that the
+GPU's own reads of host memory also need.
+
+`RANMA_EXPERT_L2_STAGED=0` restores the single wait for every ubatch. A plan that leaves nothing in
+the file launches no kind waits.
 
 The mailbox exists from the moment the tier allocates, not from the first plan that leaves something
 in the file: captured graphs hold its two kernels, so the alternative would be a plan-dependent
@@ -154,11 +182,15 @@ accepted by the tier; the prompt swap keeps its single-slot rule.
 | `RANMA_EXPERT_L2_QD` | 4 | Read queue depth of the worker. |
 | `RANMA_EXPERT_L2_WAIT` | 30000 | Deadline in ms for the CPU-side I/O queue. |
 | `RANMA_EXPERT_L2_VERIFY` | the `RANMA_EXPERT_VERIFY` value | Independent buffered payload and ownership checks. |
+| `RANMA_EXPERT_L2_STAGED` | 1 | Staged service: 0 is off, 1 covers the ubatches with more rows than the decode bound, N > 1 the ubatches of at least N rows. |
+| `RANMA_EXPERT_L2_STAGED_DRAIN` | 0 | 1 completes every read of a kind before the next kind is issued (a diagnostic; the queue then drains at each kind). |
 
-All three are read in one controller function, through the same validating parser.
+All of them are read in one controller function, through the same validating parser.
 `RANMA_EXPERT_TRACE=8` adds `expert_metrics` JSON lines with cumulative reads, ring hits, SSD payload
 bytes, CPU service time, GPU waiting per phase and per-ubatch samples, plus the round lines and
-install lines of the profile banks.
+install lines of the profile banks. With the staged service, `prompt_wait_ms` and the per-layer
+samples count the wait for the up slices only; `staged_wait_ms` adds up the gate and down waits, and
+`staged_generations` counts the generations the worker served in stages.
 
 ## What it costs
 
@@ -166,8 +198,12 @@ install lines of the profile banks.
   residents.
 - Per routed layer, always: two small kernel launches (publish and wait) that answer themselves when
   nothing is demanded from the file.
-- Per prompt ubatch with file residents: the synchronous file service, proportional to the bytes the
-  ubatch demands from the file.
+- Per prompt ubatch with file residents: the file service, proportional to the bytes the ubatch
+  demands from the file. The up reads of each layer stall the stream; the gate and down reads stall
+  it only for the part the preceding multiplication does not cover. Two more small wait kernels per
+  routed layer.
+- The SSD reads share the host I/O bandwidth with the GPU's reads of host memory, so the reads that
+  overlap a multiplication slow it somewhat.
 - One worker thread, spinning on the mailbox, pinned to one logical CPU.
 - At install: file reads for every slice promoted from the file, in addition to the copies.
 
@@ -175,9 +211,12 @@ install lines of the profile banks.
 
 - **Windows and HIP only**, for the unbuffered read queue and the address reservation. The validator
   refuses the option elsewhere before the model loads.
-- **Prompt processing with file residents is synchronous.** The wait kernel blocks the stream while
-  the worker reads; nothing overlaps that read with matrix multiplication. Chunking the current
-  layer's demand and overlapping its reads is a possible later change, not done here.
+- **The up reads of a layer are not overlapped.** The staged service hides the gate and down reads
+  behind the up and gate multiplications, but a layer's routing is known only just before its up
+  multiplication, so its up reads always stall the stream. There is no next-layer prefetch, and a
+  multiplication never starts on part of a kind's slices.
+- **Generation waits for all three kinds at once.** A decode ubatch reads few slices per layer, and
+  it keeps the single wait.
 - **The ring is sized for the worst possible distinct demand of one ubatch**, so a large ubatch
   reserves a large ring. When the ring is smaller than what one prompt ubatch reads from the file,
   and a prompt reads that set in layer order once per ubatch, a slice has been rotated out by the
@@ -204,3 +243,6 @@ install lines of the profile banks.
   is the check that the shift and the cleared tail are right on the device.
 - `RANMA_EXPERT_L2_VERIFY=1` re-reads every payload through a buffered path and checks ownership
   after each install; `RANMA_EXPERT_TRACE=8` reports what each interval read from each tier.
+- The staged service changes no byte a kernel reads: `llama-perplexity` with `RANMA_EXPERT_L2_STAGED=0`
+  and with the default must print identical values, and `staged_generations` in the trace shows that
+  the staged path ran.

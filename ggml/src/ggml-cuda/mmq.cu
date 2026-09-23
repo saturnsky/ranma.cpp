@@ -126,6 +126,7 @@ void ggml_cuda_mul_mat_q(
                 // expert cache: resident experts of this tensor are read from the VRAM arena, and in
                 // exclusive mode everything else from the host arena
                 const ggml_cuda_expert_lookup cached = ggml_cuda_expert_lookup_tensor(src0);
+                ggml_cuda_expert_before_read(ctx, src0);
                 x_cache       = (const char *) cached.data;
                 x_cache_slots = cached.slots;
                 x_host_slots  = cached.host_slots;

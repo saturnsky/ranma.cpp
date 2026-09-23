@@ -21,11 +21,13 @@ namespace ggml_cuda_expert {
 
 struct alignas(64) l2_mailbox {
     uint32_t published, ready, done, generation, invalid;
-    uint32_t rows, wait_generation, reserved0;
+    uint32_t rows, wait_generation;
+    uint32_t stage_ticks;     // staged service: wall ticks the later kinds waited, cumulative
     uint64_t wait_ticks, steady_ticks;
     uint32_t need;            // set by the publish kernel when a routed expert needs the worker
-    uint32_t reserved[3];
+    uint32_t kind_ready[3];   // staged service: the generation whose slices of that kind are in place
 };
+static_assert(sizeof(l2_mailbox) == 64, "the mailbox layout is part of the host budget");
 
 // `serve` marks the experts only the worker can place: file residents and ring occupants. It follows
 // a plan, not a generation. When no routed id needs the worker, this kernel answers its own wait, so
@@ -70,6 +72,28 @@ static __global__ void l2_wait_kernel(l2_mailbox * m) {
     m->steady_ticks = wall_clock64() - steady_begin;
     __threadfence_system();
     __hip_atomic_store(&m->wait_generation, m->generation, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+}
+
+// Staged service: waits until either the whole generation or the slices of `kind` are ready; a
+// generation the publish kernel answered itself passes at once. The first kind records the
+// per-generation sample exactly like l2_wait_kernel, the later kinds only add their wall time to
+// stage_ticks.
+static __global__ void l2_wait_kind_kernel(l2_mailbox * m, int kind, int record) {
+    const uint64_t begin = clock64(), steady_begin = wall_clock64();
+    const uint32_t seq = m->generation;
+    while (__hip_atomic_load(&m->ready, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM) != seq &&
+           __hip_atomic_load(&m->kind_ready[kind], __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM) != seq) {
+        __builtin_amdgcn_s_sleep(1);
+    }
+    if (record) {
+        m->wait_ticks = clock64() - begin;
+        m->steady_ticks = wall_clock64() - steady_begin;
+        __threadfence_system();
+        __hip_atomic_store(&m->wait_generation, seq, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+    } else {
+        m->stage_ticks += uint32_t(wall_clock64() - steady_begin);
+        __threadfence_system();
+    }
 }
 
 static __global__ void l2_done_kernel(l2_mailbox * m) {
@@ -170,6 +194,7 @@ bool l2_tier::allocate(int device) {
     CUDA_CHECK(hipDeviceGetAttribute(&steady_khz_, hipDeviceAttributeWallClockRate, device_));
     GGML_ASSERT(clock_khz_ > 0 && steady_khz_ > 0);
     pending_.resize(geo_.n_layers); wait_seen_.assign(geo_.n_layers, 0);
+    staged_layer_.assign(geo_.n_layers, 0); stage_seen_.assign(geo_.n_layers, 0);
     for (int l = 0; l < geo_.n_layers; ++l) {
         if (geo_.layer_class[l] >= 0) { first_layer_ = l; break; }
     }
@@ -246,6 +271,11 @@ bool l2_tier::allocate(int device) {
         metadata_bytes()/1024, cfg_.queue_depth);
     if (!size_note_.empty()) {
         GGML_LOG_INFO("expert cache: %s\n", size_note_.c_str());
+    }
+    if (staged()) {
+        GGML_LOG_INFO("expert cache: SSD tier staged service for ubatches of at least %lld rows: up, gate and "
+                      "down are released one kind at a time%s\n", (long long) cfg_.staged_min_rows,
+            cfg_.staged_drain ? ", each kind read to completion before the next is issued" : "");
     }
     return true;
 }
@@ -451,7 +481,8 @@ bool l2_tier::read_install(const std::vector<l2_read> & reads, std::string & rea
     return run_reads(reads, reason, true);
 }
 
-bool l2_tier::run_reads(const std::vector<l2_read> & reads, std::string & reason, bool install) {
+bool l2_tier::run_reads(const std::vector<l2_read> & reads, std::string & reason, bool install,
+        const std::function<bool(size_t)> & progress) {
     if (reads.empty()) {
         return true;
     }
@@ -478,10 +509,7 @@ bool l2_tier::run_reads(const std::vector<l2_read> & reads, std::string & reason
         reason = "the read queue refused a descriptor";
         return false;
     }
-    if (!queue_->wait_all(cfg_.read_wait_ms, &reason)) {
-        return false;
-    }
-    for (size_t i = 0; i < reads.size(); ++i) {
+    auto finish = [&](size_t i) {
         const int cls = geo_.layer_class[reads[i].layer];
         const size_t shift = backing_[(size_t) reads[i].layer][reads[i].kind].shift;
         const size_t need = geo_.class_bytes[cls][reads[i].kind] + shift;
@@ -495,14 +523,32 @@ bool l2_tier::run_reads(const std::vector<l2_read> & reads, std::string & reason
             0, ring_pitch_[reads[i].kind] - need);
         (install ? counters_.install_ssd_bytes : counters_.ssd_bytes) += geo_.class_bytes[cls][reads[i].kind];
         ++(install ? counters_.install_ssd_reads : counters_.ssd_reads);
-    }
-    if (verify_) {
-        for (const l2_read & read : reads) {
-            if (!verify_slice(read.layer, read.kind, read.expert,
-                    static_cast<char *>(ring_host(read.kind, read.slot)) + backing_[read.layer][read.kind].shift, reason)) {
-                return false;
+        return true;
+    };
+    auto check = [&](size_t i) {
+        const l2_read & read = reads[i];
+        return !verify_ || verify_slice(read.layer, read.kind, read.expert,
+            static_cast<char *>(ring_host(read.kind, read.slot)) + backing_[read.layer][read.kind].shift, reason);
+    };
+    if (progress) {
+        // Each completed prefix is finished and checked before its reader hears of it; the queue
+        // keeps the later reads in flight meanwhile.
+        size_t finished = 0;
+        return queue_->wait_all(cfg_.read_wait_ms, &reason, [&](size_t count) {
+            for (; finished < count; ++finished) {
+                if (!finish(finished) || !check(finished)) { return false; }
             }
-        }
+            return progress(count);
+        });
+    }
+    if (!queue_->wait_all(cfg_.read_wait_ms, &reason)) {
+        return false;
+    }
+    for (size_t i = 0; i < reads.size(); ++i) {
+        if (!finish(i)) { return false; }
+    }
+    for (size_t i = 0; i < reads.size(); ++i) {
+        if (!check(i)) { return false; }
     }
     return true;
 }
@@ -625,7 +671,9 @@ void l2_tier::service_layer(int layer, uint32_t seq, const std::vector<int> & id
     }
     counters_.ring_hits += (uint64_t) service.hits;
     std::string reason;
-    if (!run_reads(service.reads, reason)) {
+    if (staged() && item.rows >= uint64_t(cfg_.staged_min_rows)) {
+        serve_staged(layer, seq, service.reads);
+    } else if (!run_reads(service.reads, reason)) {
         GGML_ABORT("expert cache: the SSD tier failed to read layer %d: %s", layer, reason.c_str());
     }
     item.ssd_bytes = counters_.ssd_bytes - before_bytes;
@@ -635,12 +683,62 @@ void l2_tier::service_layer(int layer, uint32_t seq, const std::vector<int> & id
     counters_.service_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
 }
 
+// The reads of one generation, ordered by kind in the order the graph multiplies them (up, gate,
+// down). Each kind's addresses and readiness are published as soon as its last read is in place, so
+// the kernels of a kind run while the next kind is still being read. The slots, pins and evictions
+// are those the ledger chose for the whole generation; only the order of the reads and the moment
+// each kind is published differ from the single service.
+void l2_tier::serve_staged(int layer, uint32_t seq, const std::vector<l2_read> & reads) {
+    std::vector<l2_read> ordered;
+    ordered.reserve(reads.size());
+    std::array<size_t, geometry::n_kinds> end = {};
+    for (int kind = 0; kind < geometry::n_kinds; ++kind) {
+        for (const l2_read & read : reads) {
+            if (read.kind == kind) { ordered.push_back(read); }
+        }
+        end[kind] = ordered.size();
+    }
+    l2_mailbox & mail = static_cast<l2_mailbox *>(mail_host_)[layer];
+    int released = 0;
+    auto release = [&](size_t count) {
+        for (; released < geometry::n_kinds && end[released] <= count; ++released) {
+            publish_layer_kind(layer, released);
+            expert_os::store_release(&mail.kind_ready[released], seq);
+        }
+        return true;
+    };
+    release(0);   // the kinds with nothing to read
+    std::string reason;
+    bool ok = true;
+    if (cfg_.staged_drain) {
+        for (int kind = 0; kind < geometry::n_kinds && ok; ++kind) {
+            const size_t begin = kind == 0 ? 0 : end[kind - 1];
+            ok = run_reads(std::vector<l2_read>(ordered.begin() + begin, ordered.begin() + end[kind]), reason) &&
+                release(end[kind]);
+        }
+    } else {
+        ok = run_reads(ordered, reason, false, release);
+    }
+    if (!ok) {
+        GGML_ABORT("expert cache: the SSD tier failed to read layer %d: %s", layer, reason.c_str());
+    }
+    GGML_ASSERT(released == geometry::n_kinds);
+    ++counters_.staged_generations;
+}
+
 void l2_tier::publish_layer(int layer) {
     for (int expert = 0; expert < geo_.n_experts; ++expert) {
         for (int kind = 0; kind < geometry::n_kinds; ++kind) {
             maps_host_[((size_t) layer*geometry::n_kinds + kind)*geo_.n_experts + expert] =
                 address_of(layer, kind, expert);
         }
+    }
+    std::atomic_thread_fence(std::memory_order_release);
+}
+
+void l2_tier::publish_layer_kind(int layer, int kind) {
+    for (int expert = 0; expert < geo_.n_experts; ++expert) {
+        maps_host_[((size_t) layer*geometry::n_kinds + kind)*geo_.n_experts + expert] = address_of(layer, kind, expert);
     }
     std::atomic_thread_fence(std::memory_order_release);
 }
@@ -699,6 +797,7 @@ void l2_tier::worker_loop(std::vector<uint32_t> seen) {
             if (seq != seen[(size_t) layer]) {
                 std::lock_guard<std::mutex> lock(io_mutex_);
                 collect_wait(layer);   // the previous sample, before this one overwrites it
+                collect_stage(layer);
                 if (mail[layer].invalid) {
                     GGML_ABORT("expert cache: invalid router id at layer %d", layer);
                 }
@@ -748,7 +847,7 @@ void l2_tier::stop_worker() {
     running_.store(false, std::memory_order_relaxed);
     if (mail_host_) {
         std::lock_guard<std::mutex> lock(io_mutex_);
-        for (int l = 0; l < geo_.n_layers; ++l) { collect_wait(l); }
+        for (int l = 0; l < geo_.n_layers; ++l) { collect_wait(l); collect_stage(l); }
     }
 }
 
@@ -769,7 +868,25 @@ void l2_tier::publish_and_wait(int layer, const ggml_tensor * ids, cudaStream_t 
         demand_device_ + size_t(layer)*bitmap_words(), serve_device_ + size_t(layer)*bitmap_words(),
         (const int32_t *) ids->data, (int) ids->ne[1], (int) ids->ne[0],
         (int) (ids->nb[1]/sizeof(int32_t)), geo_.n_experts);
+    if (staged()) {
+        // The worker decides from the same row count. A mismatch would still be safe: every kind
+        // wait also passes on the whole generation, and the worker publishes that last either way.
+        staged_layer_[(size_t) layer] = any_ssd_ && ids->ne[1] >= cfg_.staged_min_rows;
+        if (staged_layer_[(size_t) layer]) {
+            ggml_cuda_kernel_launch(l2_wait_kind_kernel, launch, static_cast<l2_mailbox *>(mail_device_) + layer, 0, 1);
+            return;
+        }
+    }
     ggml_cuda_kernel_launch(l2_wait_kernel, launch, static_cast<l2_mailbox *>(mail_device_) + layer);
+}
+
+void l2_tier::wait_kind(int layer, int kind, cudaStream_t stream) {
+    if (!staged() || !mailbox_active_ || mail_device_ == nullptr || layer < 0 || layer >= geo_.n_layers ||
+            kind <= 0 || kind >= geometry::n_kinds || !staged_layer_[(size_t) layer]) {
+        return;
+    }
+    const ggml_cuda_kernel_launch_params launch(dim3(1), dim3(1), 0, stream);
+    ggml_cuda_kernel_launch(l2_wait_kind_kernel, launch, static_cast<l2_mailbox *>(mail_device_) + layer, kind, 0);
 }
 
 void l2_tier::mark_done(int layer, cudaStream_t stream) {
@@ -800,6 +917,15 @@ void l2_tier::collect_wait(int layer) {
     if (counters_.measured_layers % 64 == 0) { report_counters("periodic"); }
 }
 
+// The later kind waits of a staged layer add up in its mailbox; a generation's share arrives with the
+// next generation of the layer or when the worker stops.
+void l2_tier::collect_stage(int layer) {
+    if (!staged()) { return; }
+    const uint32_t ticks = expert_os::load_acquire(&static_cast<const l2_mailbox *>(mail_host_)[layer].stage_ticks);
+    counters_.staged_wait_ticks += uint32_t(ticks - stage_seen_[(size_t) layer]);
+    stage_seen_[(size_t) layer] = ticks;
+}
+
 void l2_tier::report(const char * what) { report_counters(what); }
 
 void l2_tier::report_counters(const char * what) {
@@ -820,6 +946,8 @@ void l2_tier::report_counters(const char * what) {
         << ",\"install_ssd_bytes\":" << counters_.install_ssd_bytes << ",\"install_ssd_reads\":" << counters_.install_ssd_reads
         << ",\"verify_fills\":" << counters_.verify_fills << ",\"verify_bytes\":" << counters_.verify_bytes
         << ",\"verify_bad\":" << counters_.verify_bad << ",\"owner_checks\":" << counters_.owner_checks
+        << ",\"staged_generations\":" << counters_.staged_generations
+        << ",\"staged_wait_ms\":" << (steady_khz_ > 0 ? double(counters_.staged_wait_ticks)/steady_khz_ : 0)
         << ",\"repartitions\":" << counters_.repartitions << ",\"ring_slots\":" << ledger_.ring_count()
         << ",\"samples\":[";
     bool comma = false;

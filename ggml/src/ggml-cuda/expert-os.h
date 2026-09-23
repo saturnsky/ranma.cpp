@@ -19,6 +19,7 @@
 #include <cstdint>
 #include <optional>
 #include <filesystem>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -113,7 +114,11 @@ public:
     bool submit(const read_op * ops, size_t n);
     // Issues and completes everything submitted since the last wait_all(). False on a failed read,
     // or when `deadline_ms` passes with reads still outstanding; `reason` then says which.
-    bool wait_all(int64_t deadline_ms, std::string * reason = nullptr);
+    // `progress`, when given, is called with n whenever the first n reads in submit order have all
+    // completed without error, while the later ones stay in flight; the queue is refilled before
+    // the call. Returning false cancels the outstanding reads and fails the wait.
+    bool wait_all(int64_t deadline_ms, std::string * reason = nullptr,
+                  const std::function<bool(size_t)> & progress = nullptr);
 
     // Result of the ops of the last wait_all(), in submit order.
     const std::vector<read_op> & results() const { return ops_; }

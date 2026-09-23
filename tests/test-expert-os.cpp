@@ -205,6 +205,56 @@ int main() {
     }
 
     {
+        // progress: each report names a completed prefix in submit order whose bytes are in place,
+        // the reports grow strictly, and the last one covers every read
+        const size_t n = 12;
+        uint8_t * many = (uint8_t *) expert_os::aligned_alloc(n*expert_os::io_alignment, expert_os::io_alignment);
+        check(many != nullptr, "progress buffer");
+        expert_os::read_queue queue(2);
+        std::vector<expert_os::read_op> ops;
+        for (size_t i = 0; i < n; ++i) {
+            expert_os::read_op op;
+            op.file   = file;
+            op.offset = (i % whole_sectors)*expert_os::io_alignment;
+            op.dst    = many + i*expert_os::io_alignment;
+            op.bytes  = expert_os::io_alignment;
+            ops.push_back(op);
+        }
+        memset(many, 0, n*expert_os::io_alignment);
+        check(queue.submit(ops.data(), ops.size()), "submit the progress batch");
+        std::vector<size_t> reports;
+        bool in_place = true;
+        std::string reason;
+        const bool ok = queue.wait_all(30000, &reason, [&](size_t count) {
+            reports.push_back(count);
+            for (size_t i = 0; i < count; ++i) {
+                const size_t base = (i % whole_sectors)*expert_os::io_alignment;
+                for (size_t b = 0; b < expert_os::io_alignment; b += 511) {
+                    in_place = in_place && many[i*expert_os::io_alignment + b] == byte_at(base + b);
+                }
+            }
+            return true;
+        });
+        check(ok, ("wait_all with progress: " + reason).c_str());
+        bool growing = !reports.empty();
+        for (size_t i = 1; i < reports.size(); ++i) {
+            growing = growing && reports[i] > reports[i - 1];
+        }
+        check(growing && reports.back() == n, "progress reports grow to the whole batch");
+        check(in_place, "a reported prefix is in place");
+
+        // a reader that gives up fails the wait, and the queue still works afterwards
+        check(queue.submit(ops.data(), ops.size()), "submit the refused batch");
+        reason.clear();
+        check(!queue.wait_all(30000, &reason, [](size_t) { return false; }), "a refusing reader fails the wait");
+        check(!reason.empty(), "a refusing reader gives a reason");
+        check(queue.submit(ops.data(), 1), "the queue takes work after a refusal");
+        reason.clear();
+        check(queue.wait_all(30000, &reason), ("the queue works after a refusal: " + reason).c_str());
+        expert_os::aligned_free(many);
+    }
+
+    {
         // a deadline that has already passed must not leave the queue unusable
         expert_os::read_queue queue(2);
         std::vector<expert_os::read_op> ops;
