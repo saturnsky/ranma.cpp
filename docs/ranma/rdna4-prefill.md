@@ -12,6 +12,7 @@ collects the fork's additions to that selection.
 | `ROCBLAS_USE_HIPBLASLT` | unset | The F16 BLAS policy arms only when this is exactly `1`, because it selects the library the measurements were taken with. |
 | `GGML_CUDA_CUBLAS_COMPUTE_TYPE` | unset | Setting it disarms the F16 BLAS policy, because it overrides the compute type the GEMM would use. |
 | `GGML_CUDA_SKINNY_F32` | `1` (on) | `0` sends the skinny F32 products below to hipBLAS again. |
+| `GGML_CUDA_MMQ_ID_NCOLS_OPT_SCALE` | `3` | Multiple of the mean expert column count that the MoE tile width below is sized for. `1` is the upstream rule; `0`, a negative value or a non-number keep the default. |
 
 The variables are read once per process, so they have to be set before the process starts. A build
 with `GGML_CUDA_FORCE_MMQ` compiles the BLAS policy out entirely; the skinny F32 kernels do not depend
@@ -259,3 +260,89 @@ hipBLASLt's for the three products.
   with `GGML_CUDA_SKINNY_F32=0` for the BLAS side.
 - Two `llama-perplexity` processes of the same model print the same numbers with the default, whatever
   `ROCBLAS_USE_HIPBLASLT` is set to.
+
+## Column tile width of MoE prompt matmuls
+
+### What it is
+
+MMQ processes the columns (tokens) of a matmul in tiles of width J, and for a `MUL_MAT_ID` it picks J
+per launch. On RDNA3 and RDNA4 upstream picks it against the mean column count per expert, the
+tokens of the batch times the experts used per token divided by the number of experts, rather than
+against the whole batch: most experts see only a small part of the batch, and a narrow tile wastes
+less work on the columns an expert does not have.
+
+Routing is not uniform, though. Popular experts receive several times the mean, and an expert with
+more columns than J is processed in several column tiles, each of which reads the weights of the
+expert again. For an expert in VRAM that is extra memory traffic; for an expert that is read in place
+from host memory ([host-direct-moe.md](host-direct-moe.md), and the host tier of the expert cache) every extra tile is
+another read of the whole expert over the link.
+
+On RDNA4 the width is now sized against three times the mean, capped at the number of tokens of the
+batch, so a popular expert fits in fewer tiles. RDNA3 keeps the upstream rule, because it was not
+measured.
+
+### Numerics
+
+The tiling decides which block computes a column, not how the column is summed: every column is
+still reduced over K in the same order. The result is bit-identical to the upstream rule.
+
+### Why three
+
+A wider tile costs work for every expert that has fewer columns than the tile, so the multiple is a
+trade between re-reads of popular experts and idle columns of rare ones. The measurements below
+compare the multiples 1 to 4: DeepSeek V4 Flash gains from 1 to 2 and from 2 to 3 and is the same at
+4, Qwen3.8-Flash-Next gains from 1 to 2 and is flat from there. Three is the smallest multiple at which
+both have stopped gaining.
+
+### Measured effect
+
+Base revision: the series of ranma_20260922 (`e48103e1e`) rebased on upstream `ec5a12b85`, with the
+skinny F32 kernels of the previous commit and this patch;
+Radeon AI PRO R9700 (PCIe 5.0 x16) with the setup of [benchmark.md](benchmark.md) (-30 % power limit,
+0 mV voltage offset, headless), `ROCBLAS_USE_HIPBLASLT=0`, exclusive expert cache of 20480 MiB (warm,
+`--expert-l2-mib -1`, host-direct with `GGML_CUDA_HOST_DIRECT_MAX_BATCH=512`). One process per
+multiple, set with `GGML_CUDA_MMQ_ID_NCOLS_OPT_SCALE`.
+
+Bit identity, `llama-perplexity -c 4096 --chunks 8` over wikitext-2 against the multiple 1: DeepSeek V4
+Flash UD-IQ3_XXS gives mean KLD 0, the same top token 100 % and PPL 4.744388 for a second run of 1 and
+for 2, 3 and 4. Qwen3.8-Flash-Next UD-Q4_K_XL gives mean KLD 0.00012 for a second run of 1 and
+0.00029, 0.00012 and 0.00011 for 2, 3 and 4, so the multiples differ from 1 no more than two runs of 1
+differ from each other.
+
+Qwen3.8-Flash-Next UD-Q4_K_XL, `llama-bench` with the protocol of [benchmark.md](benchmark.md) (a
+discarded pass at depth 65536 first, five idle minutes between processes), PP512 and TG128 in t/s:
+
+| multiple | PP @0 | PP @4096 | PP @8192 | PP @32768 | PP @65536 | TG @0 | TG @4096 | TG @8192 | TG @32768 | TG @65536 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 (upstream) | 1033.9 | 1002.8 | 964.8 | 836.3 | 693.5 | 50.27 | 48.69 | 48.73 | 46.63 | 44.77 |
+| 2 | 1089.4 | 1061.0 | 1023.9 | 881.2 | 717.8 | 50.32 | 48.99 | 48.41 | 46.52 | 44.80 |
+| 3 (default) | 1117.6 | 1054.0 | 1020.7 | 877.2 | 715.0 | 50.11 | 49.09 | 48.49 | 46.03 | 43.87 |
+| 4 | 1095.3 | 1056.1 | 1015.6 | 875.5 | 717.0 | 50.33 | 49.06 | 48.57 | 46.73 | 44.83 |
+
+DeepSeek V4 Flash UD-IQ3_XXS, the same command, one process per multiple but without the idle gap
+between processes:
+
+| multiple | PP @0 | PP @4096 | PP @8192 | PP @32768 | PP @65536 | TG @0 | TG @4096 | TG @8192 | TG @32768 | TG @65536 |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 (upstream) | 314.3 | 279.6 | 256.4 | 199.4 | 160.1 | 31.58 | 30.84 | 30.78 | 29.44 | 27.91 |
+| 2 | 332.6 | 293.4 | 269.0 | 206.3 | 164.7 | 31.71 | 30.94 | 30.78 | 29.21 | 27.75 |
+| 3 (default) | 340.4 | 300.2 | 273.9 | 209.5 | 167.0 | 31.72 | 30.90 | 30.76 | 29.43 | 27.89 |
+| 4 | 341.1 | 300.0 | 273.4 | 209.9 | 167.0 | 31.63 | 30.90 | 30.75 | 29.37 | 27.90 |
+
+Against the upstream rule the default gains 3 to 8 % of prompt throughput on Qwen and 4 to 8 % on
+DeepSeek, largest at depth 0. Generation runs on MMVQ and does not use the tile width; its rows differ
+by the spread of single runs.
+
+On real text the picture is smaller. The `llama-perplexity` runs above, whose prompts are 4096-token
+chunks of wikitext-2, took about 128.7, 124.1, 122.2 and 122.2 s on DeepSeek for the multiples 1 to 4 (5 %
+less time at 3), while on Qwen the multiples were within 1.5 % of each other, which is the spread of
+those runs.
+
+### How to verify
+
+- `test-backend-ops -o MUL_MAT_ID` compares MMQ against the CPU reference; the tile width is chosen
+  inside the kernel launch, so the same cases run with the new width.
+- Because the result is bit-identical, a `llama-perplexity --kl-divergence` run of a model without
+  run-to-run variation against `GGML_CUDA_MMQ_ID_NCOLS_OPT_SCALE=1` shows mean KLD 0.
+- A `llama-bench` prompt-throughput comparison of a MoE model against
+  `GGML_CUDA_MMQ_ID_NCOLS_OPT_SCALE=1` shows the effect.
