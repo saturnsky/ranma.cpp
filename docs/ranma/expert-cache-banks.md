@@ -45,8 +45,8 @@ which the next phase is known.
 ## How it works
 
 The backend knows bank ids and plan ids and nothing else (`ggml/include/ggml-expert.h`). The policy
-object (`common/expert-policy.h`), driven by the server and by `llama-bench`, names the moments. It
-profiles slot 0 only; other slots use the cache but feed no bank.
+object (`common/expert-policy.h`), driven by the server, by `llama-bench` and by `llama-completion`,
+names the moments. It profiles slot 0 only; other slots use the cache but feed no bank.
 
 | Server event | What the policy does |
 |---|---|
@@ -126,6 +126,7 @@ it needs a server with exactly one sequence and no second decode path.
 
 `llama-bench` drives the same policy object: its depth fill and its prompt test feed the prefill bank
 and its generation test the decode bank, and `--expert-prefill-swap` is an option of its warm mode.
+`llama-completion` drives it too, one request per turn, with sequence 0 in place of slot 0.
 
 ## What it costs
 
