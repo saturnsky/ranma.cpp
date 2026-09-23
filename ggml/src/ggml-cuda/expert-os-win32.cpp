@@ -12,6 +12,7 @@
 #include <chrono>
 #include <malloc.h>
 #include <system_error>
+#include <vector>
 
 #define WIN32_LEAN_AND_MEAN
 #ifndef NOMINMAX
@@ -213,7 +214,7 @@ bool read_queue::submit(const read_op * ops, size_t n) {
     return true;
 }
 
-bool read_queue::wait_all(int64_t deadline_ms, std::string * reason) {
+bool read_queue::wait_all(int64_t deadline_ms, std::string * reason, const std::function<bool(size_t)> & progress) {
     if (!valid_) {
         return false;
     }
@@ -223,6 +224,29 @@ bool read_queue::wait_all(int64_t deadline_ms, std::string * reason) {
     size_t done = 0;
     bool   ok   = true;
     char   message[256];
+
+    // With a progress callback: which reads completed without error, and how long the completed
+    // prefix in submit order was at the last report.
+    std::vector<uint8_t> finished(progress ? ops_.size() : 0, 0);
+    size_t reported = 0;
+    auto finish = [&](size_t index) {
+        if (progress && ops_[index].ok) { finished[index] = 1; }
+    };
+    auto report = [&]() {
+        size_t prefix = reported;
+        while (prefix < finished.size() && finished[prefix]) { ++prefix; }
+        if (prefix == reported) {
+            return true;
+        }
+        reported = prefix;
+        if (progress(prefix)) {
+            return true;
+        }
+        if (reason != nullptr && reason->empty()) {
+            *reason = "the reader of the completed reads gave up";
+        }
+        return false;
+    };
 
     auto remaining_ms = [&]() -> DWORD {
         if (deadline_ms < 0) {
@@ -258,6 +282,7 @@ bool read_queue::wait_all(int64_t deadline_ms, std::string * reason) {
                 op.got  = got;
                 op.ok   = true;
                 free_slot->busy = false;
+                finish(next);
                 ++done;
             } else {
                 const DWORD err = issue_error;
@@ -267,6 +292,7 @@ bool read_queue::wait_all(int64_t deadline_ms, std::string * reason) {
                     op.got = 0;
                     op.ok  = true;
                     free_slot->busy = false;
+                    finish(next);
                     ++done;
                 } else {
                     snprintf(message, sizeof(message), "read of %zu bytes at offset %llu failed with error %lu",
@@ -281,6 +307,12 @@ bool read_queue::wait_all(int64_t deadline_ms, std::string * reason) {
                 }
             }
             ++next;
+        }
+
+        // a longer completed prefix is reported only after the queue has been refilled
+        if (progress && !report()) {
+            cancel_pending();
+            return false;
         }
 
         // wait for one of the in-flight reads
@@ -339,7 +371,12 @@ bool read_queue::wait_all(int64_t deadline_ms, std::string * reason) {
             }
         }
         s->busy = false;
+        finish(s->op);
         ++done;
+    }
+    // the completions of the last pass
+    if (progress && ok && !report()) {
+        return false;
     }
 
     return ok;
