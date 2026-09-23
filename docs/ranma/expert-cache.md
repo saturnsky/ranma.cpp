@@ -76,9 +76,9 @@ is served is the subject of `expert-cache-banks.md`.
   routed-expert context after allocation and finalizes (plan, allocate, install) after the weights
   are written.
 - `common/expert.cpp` owns every rule about option combinations (`validate_expert_params`) and the
-  translation from `common_params` to the config. `common/expert-policy.h`, driven by the server and
-  by `llama-bench`, owns the policy: which slot is profiled, when a bank is committed, when a plan is
-  installed.
+  translation from `common_params` to the config. `common/expert-policy.h`, driven by the server,
+  by `llama-bench` and by `llama-completion`, owns the policy: which slot is profiled, when a bank is
+  committed, when a plan is installed.
 
 ## Requirements
 
@@ -128,6 +128,12 @@ written earlier, and reports a `ctl ms` column that separates policy and install
 never profiles or changes the placement, so a scoring run leaves the profile directory as it found
 it, and two runs with the same seed or the same stored profile score the same placement. This is the
 supported way to score a model whose routed experts do not fit in VRAM.
+
+`llama-completion` accepts the same options and drives the policy like a server with one slot: each
+turn is one request, its prompt feeds the prefill bank and its generated tokens the decode bank, and
+the request ends when control returns to the user or the run ends. A `-no-cnv` run is a single
+request; the plan it loaded is the plan it generates with unless `--expert-prefill-swap` is given, and
+with `--expert-freeze` it leaves the placement unchanged and only records the profile.
 
 | Environment switch | Default | Effect |
 |---|---|---|
