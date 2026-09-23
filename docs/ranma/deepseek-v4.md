@@ -348,3 +348,18 @@ error rather than silently ignored.
   to agree token for token.
 - Saving and restoring a session, and a context shift, exercise the paths that
   read the joint tensor through the sub-caches.
+
+## Small-kernel fusions in decode
+
+Several short chains of small kernels of every layer run as one launch each:
+the persisted compressor state rows, the FFN sum that feeds the
+hyper-connection post, the q, kv and compressor norm and rope including the
+store into the K cache, and the compressor source concatenations; the
+compressor APE add is taken by its matmul. The CUDA/HIP backend matches the
+unfused path; a KL-divergence comparison against it stays at the measurement
+floor.
+
+| Switch | Default | Effect |
+|---|---|---|
+| `GGML_DSV4_FUSION3=0` | on | Keep the original graph order and kernels. The reference path for equivalence checks. |
+| `GGML_DSV4_FUSION3_MASK=<bits>` | `0x3f` | Enable a subset: `0x01` APE add, `0x02` state rows, `0x04` FFN sum, `0x08` norm and rope, `0x10` concatenations, `0x20` K cache store (with `0x08`). |

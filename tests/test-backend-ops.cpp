@@ -4571,6 +4571,330 @@ struct test_dsv4_hc_post : public test_dsv4_hc {
     }
 };
 
+// GGML_OP_ADD + GGML_OP_DSV4_HC_POST (FFN output of a DeepSeek V4 layer: routed + shared expert)
+struct test_dsv4_add_hc_post : public test_dsv4_hc {
+    const int64_t n_embd;
+    const int64_t n_tokens;
+    const bool    identity;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "DSV4_ADD_HC_POST";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR3(n_embd, n_tokens, identity);
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    test_dsv4_add_hc_post(int64_t n_embd = 4096, int64_t n_tokens = 1, bool identity = false)
+        : n_embd(n_embd), n_tokens(n_tokens), identity(identity) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * moe = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+        ggml_set_name(moe, "x");
+
+        ggml_tensor * shexp = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+        ggml_set_name(shexp, "residual"); // same init range as x
+
+        ggml_tensor * residual = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, n_tokens);
+        ggml_set_name(residual, "residual");
+
+        ggml_tensor * post = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc, n_tokens);
+        ggml_set_name(post, "post");
+
+        ggml_tensor * comb = nullptr;
+        if (!identity) {
+            comb = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, hc, hc, n_tokens);
+            ggml_set_name(comb, "comb");
+        }
+
+        ggml_tensor * x = ggml_add(ctx, moe, shexp);
+        ggml_set_name(x, "ffn_out");
+
+        out = ggml_dsv4_hc_post(ctx, x, residual, post, comb);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
+// GGML_OP_CONCAT (kv) + GGML_OP_CONCAT (score) + GGML_OP_DSV4_COMPRESS: the compressor state rows
+// followed by the rows of the current tokens, as the DeepSeek V4 compressors build their sources
+struct test_dsv4_concat_compress : public test_case {
+    const int64_t n_embd_head;
+    const int64_t ratio;
+    const int64_t n_state;  // rows of the stored state
+    const int64_t n_tokens; // rows of the current tokens
+    const int64_t n_blocks;
+    const bool    overlap;
+    const bool    missing_prev;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "DSV4_CONCAT_COMPRESS";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR7(n_embd_head, ratio, n_state, n_tokens, n_blocks, overlap, missing_prev);
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    double max_nmse_err() override {
+        return 5e-6;
+    }
+
+    test_dsv4_concat_compress(int64_t n_embd_head = 512, int64_t ratio = 4, int64_t n_state = 8, int64_t n_tokens = 1,
+            int64_t n_blocks = 1, bool overlap = true, bool missing_prev = false)
+        : n_embd_head(n_embd_head), ratio(ratio), n_state(n_state), n_tokens(n_tokens), n_blocks(n_blocks),
+          overlap(overlap), missing_prev(missing_prev) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t n_cols = overlap ? 2*n_embd_head : n_embd_head;
+
+        ggml_tensor * kv_state = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_cols, n_state);
+        ggml_set_name(kv_state, "kv_state");
+        ggml_tensor * kv_cur = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_cols, n_tokens);
+        ggml_set_name(kv_cur, "kv_cur");
+
+        ggml_tensor * score_state = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_cols, n_state);
+        ggml_set_name(score_state, "score_state");
+        ggml_tensor * score_cur = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_cols, n_tokens);
+        ggml_set_name(score_cur, "score_cur");
+
+        ggml_tensor * kv    = ggml_concat(ctx, kv_state,    kv_cur,    1);
+        ggml_tensor * score = ggml_concat(ctx, score_state, score_cur, 1);
+
+        ggml_tensor * idxs = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, (overlap ? 2*ratio : ratio)*n_blocks);
+        ggml_set_name(idxs, "idxs");
+
+        ggml_tensor * out = ggml_dsv4_compress(ctx, kv, score, idxs, (int32_t) ratio, overlap);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        const int64_t n_rows = n_state + n_tokens;
+
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type != GGML_TYPE_I32) {
+                init_tensor_uniform(t, -2.0f, 2.0f);
+                continue;
+            }
+
+            // every read spans both sources: the windows walk down from the last row
+            const int64_t n_idx = ggml_nelements(t);
+            std::vector<int32_t> data(n_idx);
+            for (int64_t k = 0; k < n_idx; ++k) {
+                data[k] = (int32_t) ((n_rows - 1 - k % n_rows + n_rows) % n_rows);
+            }
+            if (missing_prev) {
+                GGML_ASSERT(overlap);
+                for (int64_t j = 0; j < ratio; ++j) {
+                    data[j] = (int32_t) n_rows; // sentinel: zero value, -INFINITY score
+                }
+            }
+            ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(int32_t));
+        }
+    }
+};
+
+// GGML_OP_GET_ROWS + GGML_OP_SET_ROWS, one or two pairs with shared index vectors: the persisted
+// rows of a DeepSeek V4 compressor state (kv, then score)
+struct test_dsv4_row_copy : public test_case {
+    const int64_t   ncols;
+    const int64_t   n_src;   // rows of the current-token matrix
+    const int64_t   n_state; // rows of the state
+    const int64_t   n;       // rows copied
+    const bool      two_pairs;
+    const ggml_type type_sidx;
+    const ggml_type type_didx;
+    const bool      dst_view; // destination is a 2D view of a [ncols, n_state, 2] state, as get_kv_all builds it
+
+    ggml_tensor * sr0 = nullptr;
+    ggml_tensor * sr1 = nullptr;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "DSV4_ROW_COPY";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR8(ncols, n_src, n_state, n, two_pairs, type_sidx, type_didx, dst_view);
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::vector<ggml_tensor *> fusion_test_nodes() override {
+        if (sr1 != nullptr && mode == MODE_TEST) {
+            return { sr0, sr1 };
+        }
+        return { sr0 };
+    }
+
+    test_dsv4_row_copy(int64_t ncols = 1024, int64_t n_src = 1, int64_t n_state = 8, int64_t n = 1, bool two_pairs = true,
+            ggml_type type_sidx = GGML_TYPE_I32, ggml_type type_didx = GGML_TYPE_I32, bool dst_view = false)
+        : ncols(ncols), n_src(n_src), n_state(n_state), n(n), two_pairs(two_pairs),
+          type_sidx(type_sidx), type_didx(type_didx), dst_view(dst_view) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * sidx = ggml_new_tensor_1d(ctx, type_sidx, n);
+        ggml_set_name(sidx, "sidx");
+        ggml_tensor * didx = ggml_new_tensor_1d(ctx, type_didx, n);
+        ggml_set_name(didx, "didx");
+
+        ggml_tensor * out = nullptr;
+        for (int p = 0; p < (two_pairs ? 2 : 1); ++p) {
+            ggml_tensor * src = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ncols, n_src);
+            ggml_set_name(src, p == 0 ? "src_kv" : "src_score");
+
+            ggml_tensor * state = nullptr;
+            if (dst_view) {
+                ggml_tensor * planes = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, ncols, n_state, 2);
+                ggml_set_name(planes, p == 0 ? "state_kv" : "state_score");
+                state = ggml_view_2d(ctx, planes, ncols, n_state, planes->nb[1], 0);
+            } else {
+                state = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ncols, n_state);
+                ggml_set_name(state, p == 0 ? "state_kv" : "state_score");
+            }
+
+            ggml_tensor * rows = ggml_get_rows(ctx, src, sidx);
+            ggml_tensor * sr   = ggml_set_rows(ctx, state, rows, didx);
+            ggml_set_name(sr, p == 0 ? "out_kv" : "out_score");
+
+            if (p == 0) {
+                sr0 = sr;
+                if (two_pairs && mode == MODE_TEST) {
+                    ggml_build_forward_expand(gf, sr);
+                }
+            } else {
+                sr1 = sr;
+            }
+            out = sr;
+        }
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "sidx") == 0) {
+                init_set_rows_row_ids(t, (int) n_src);
+            } else if (strcmp(t->name, "didx") == 0) {
+                init_set_rows_row_ids(t, (int) n_state);
+            } else if (t->type == GGML_TYPE_F32) {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
+// GGML_OP_RMS_NORM (+ GGML_OP_MUL) (+ GGML_OP_RESHAPE) + GGML_OP_ROPE with a rotation offset
+// (+ GGML_OP_VIEW + GGML_OP_SET_ROWS), the DeepSeek V4 q / kv / compressor chains
+struct test_dsv4_norm_rope_offs : public test_case {
+    const std::array<int64_t, 4> ne;  // rms_norm input
+    const bool      mul;
+    const bool      reshape;          // [ne0, ne1] -> [ne0, 1, ne1], as the kv chain does
+    const int       n_dims;
+    const int       n_offs;
+    const bool      yarn;             // the compressed-layer rope parameters instead of the raw ones
+    const bool      set_rows;
+    const ggml_type set_rows_type;
+    const bool      joint_view;       // the cache is a view into a larger allocation (joint raw+compressed K)
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "DSV4_NORM_ROPE_OFFS";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR9(ne, mul, reshape, n_dims, n_offs, yarn, set_rows, set_rows_type, joint_view);
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    test_dsv4_norm_rope_offs(std::array<int64_t, 4> ne, bool mul, bool reshape, int n_dims, int n_offs, bool yarn,
+            bool set_rows = false, ggml_type set_rows_type = GGML_TYPE_F16, bool joint_view = false)
+        : ne(ne), mul(mul), reshape(reshape), n_dims(n_dims), n_offs(n_offs), yarn(yarn),
+          set_rows(set_rows), set_rows_type(set_rows_type), joint_view(joint_view) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, ne[0], ne[1], ne[2], ne[3]);
+        ggml_set_name(a, "a");
+
+        a = ggml_rms_norm(ctx, a, 1e-6f);
+
+        if (mul) {
+            ggml_tensor * w = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ne[0]);
+            ggml_set_name(w, "w");
+            a = ggml_mul(ctx, a, w);
+        }
+
+        if (reshape) {
+            GGML_ASSERT(ne[2] == 1 && ne[3] == 1);
+            a = ggml_reshape_3d(ctx, a, ne[0], 1, ne[1]);
+        }
+
+        ggml_tensor * pos = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, a->ne[2]);
+        ggml_set_name(pos, "pos");
+
+        if (yarn) {
+            // compressed layers: YaRN with the compressor base
+            const float freq_scale  = 1.0f/16.0f;
+            const float attn_factor = 1.0f/(1.0f + 0.1f*logf(1.0f/freq_scale));
+            a = ggml_rope_ext(ctx, a, pos, nullptr, n_dims, GGML_ROPE_TYPE_NORMAL, 65536,
+                    160000.0f, freq_scale, 1.0f, attn_factor, 32.0f, 1.0f);
+        } else {
+            // raw layers: plain rope
+            a = ggml_rope_ext(ctx, a, pos, nullptr, n_dims, GGML_ROPE_TYPE_NORMAL, 0,
+                    10000.0f, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+        }
+        a = ggml_rope_set_offset(a, n_offs);
+
+        if (set_rows) {
+            GGML_ASSERT(a->ne[3] == 1);
+            ggml_tensor * view = ggml_view_2d(ctx, a, a->ne[0]*a->ne[1], a->ne[2], a->nb[2], 0);
+
+            ggml_tensor * dst = nullptr;
+            if (joint_view) {
+                // [raw | compressed] in one allocation, the scatter goes into the compressed part
+                ggml_tensor * joint = ggml_new_tensor_2d(ctx, set_rows_type, a->ne[0]*a->ne[1], a->ne[2]*2 + 5);
+                ggml_set_name(joint, "dst");
+                dst = ggml_view_2d(ctx, joint, joint->ne[0], a->ne[2]*2, joint->nb[1], 5*joint->nb[1]);
+            } else {
+                dst = ggml_new_tensor_2d(ctx, set_rows_type, a->ne[0]*a->ne[1], a->ne[2]*2);
+                ggml_set_name(dst, "dst");
+            }
+
+            ggml_tensor * row_idxs = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, a->ne[2]);
+            ggml_set_name(row_idxs, "row_idxs");
+
+            a = ggml_set_rows(ctx, dst, view, row_idxs);
+        }
+
+        ggml_set_name(a, "out");
+        return a;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_I64) {
+                init_set_rows_row_ids(t, (int) (t->ne[0]*2));
+            } else if (t->type == GGML_TYPE_I32) {
+                std::vector<int32_t> data(ggml_nelements(t));
+                for (int32_t & value : data) {
+                    value = rand() % 65536;
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 
 // GGML_OP_SSM_CONV
 struct test_ssm_conv : public test_case {
@@ -9580,6 +9904,58 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_hc_post(4096, 21));
     test_cases.emplace_back(new test_dsv4_hc_post(31, 17, true));
     test_cases.emplace_back(new test_dsv4_hc_post(4096, 21, true));
+
+    // DeepSeek V4 decode fusions (CUDA/HIP backend, on unless GGML_DSV4_FUSION3=0), DS4F shapes
+    test_cases.emplace_back(new test_dsv4_add_hc_post(4096, 1));
+    test_cases.emplace_back(new test_dsv4_add_hc_post(4096, 5));
+    test_cases.emplace_back(new test_dsv4_add_hc_post(4096, 1, true));
+    test_cases.emplace_back(new test_dsv4_add_hc_post(31, 17));
+
+    // CSA / LID compressors (ratio 4, overlapping windows), HCA (ratio 128)
+    test_cases.emplace_back(new test_dsv4_concat_compress(512,   4,   8,  1, 1, true,  false));
+    test_cases.emplace_back(new test_dsv4_concat_compress(512,   4,   8,  1, 1, true,  true));
+    test_cases.emplace_back(new test_dsv4_concat_compress(128,   4,   8,  1, 1, true,  false));
+    test_cases.emplace_back(new test_dsv4_concat_compress(128,   4,   8,  1, 1, true,  true));
+    test_cases.emplace_back(new test_dsv4_concat_compress(512,   4,   8, 16, 4, true,  false));
+    test_cases.emplace_back(new test_dsv4_concat_compress(512, 128, 128,  1, 1, false, false));
+    test_cases.emplace_back(new test_dsv4_concat_compress(512, 128, 128, 64, 2, false, false));
+
+    // persisted compressor state rows: CSA kv/score (2*512), LID (2*128), HCA (512)
+    test_cases.emplace_back(new test_dsv4_row_copy(1024, 1,   8, 1, true));
+    test_cases.emplace_back(new test_dsv4_row_copy( 256, 1,   8, 1, true));
+    test_cases.emplace_back(new test_dsv4_row_copy( 512, 1, 128, 1, true));
+    test_cases.emplace_back(new test_dsv4_row_copy(1024, 1,   8, 1, false));
+    test_cases.emplace_back(new test_dsv4_row_copy(1024, 5,   8, 4, true));
+    test_cases.emplace_back(new test_dsv4_row_copy( 512, 7, 128, 7, true, GGML_TYPE_I32, GGML_TYPE_I64));
+    test_cases.emplace_back(new test_dsv4_row_copy(  37, 3,   5, 2, true, GGML_TYPE_I32, GGML_TYPE_I64));
+    // the model's node pattern: the state operand of SET_ROWS is a view node
+    test_cases.emplace_back(new test_dsv4_row_copy(1024, 1,   8, 1, true,  GGML_TYPE_I32, GGML_TYPE_I32, true));
+    test_cases.emplace_back(new test_dsv4_row_copy( 256, 1,   8, 1, true,  GGML_TYPE_I32, GGML_TYPE_I32, true));
+    test_cases.emplace_back(new test_dsv4_row_copy( 512, 1, 128, 1, true,  GGML_TYPE_I32, GGML_TYPE_I32, true));
+    test_cases.emplace_back(new test_dsv4_row_copy(1024, 5,   8, 4, false, GGML_TYPE_I32, GGML_TYPE_I32, true));
+
+    for (bool yarn : { false, true }) {
+        // q: rms_norm without weight, 64 heads of 512, rope over the last 64 dims
+        test_cases.emplace_back(new test_dsv4_norm_rope_offs({ 512, 64, 1, 1 }, false, false, 64, 448, yarn));
+        test_cases.emplace_back(new test_dsv4_norm_rope_offs({ 512, 64, 3, 1 }, false, false, 64, 448, yarn));
+        // kv: weighted rms_norm, reshape, rope, store into the cache
+        test_cases.emplace_back(new test_dsv4_norm_rope_offs({ 512, 1, 1, 1 }, true, true, 64, 448, yarn, true, GGML_TYPE_F16));
+        test_cases.emplace_back(new test_dsv4_norm_rope_offs({ 512, 3, 1, 1 }, true, true, 64, 448, yarn, true, GGML_TYPE_F16));
+        test_cases.emplace_back(new test_dsv4_norm_rope_offs({ 512, 1, 1, 1 }, true, true, 64, 448, yarn, true, GGML_TYPE_F32));
+        test_cases.emplace_back(new test_dsv4_norm_rope_offs({ 512, 3, 1, 1 }, true, true, 64, 448, yarn));
+        // kv / CSA compressor into a K cache that is a view of the joint raw+compressed allocation
+        test_cases.emplace_back(new test_dsv4_norm_rope_offs({ 512, 1, 1, 1 }, true, true,  64, 448, yarn, true, GGML_TYPE_F16, true));
+        test_cases.emplace_back(new test_dsv4_norm_rope_offs({ 512, 3, 1, 1 }, true, true,  64, 448, yarn, true, GGML_TYPE_F16, true));
+        test_cases.emplace_back(new test_dsv4_norm_rope_offs({ 512, 1, 2, 1 }, true, false, 64, 448, yarn, true, GGML_TYPE_F16, true));
+        // CSA compressor output: [512, 1, n_blocks], stored into the compressed cache
+        test_cases.emplace_back(new test_dsv4_norm_rope_offs({ 512, 1, 1, 1 }, true, false, 64, 448, yarn, true, GGML_TYPE_F16));
+        test_cases.emplace_back(new test_dsv4_norm_rope_offs({ 512, 1, 4, 1 }, true, false, 64, 448, yarn, true, GGML_TYPE_F16));
+        // LID compressor output: [128, 1, n_blocks], rotated by a Hadamard matmul afterwards
+        test_cases.emplace_back(new test_dsv4_norm_rope_offs({ 128, 1, 1, 1 }, true, false, 64, 64, yarn));
+        test_cases.emplace_back(new test_dsv4_norm_rope_offs({ 128, 1, 4, 1 }, true, false, 64, 64, yarn));
+        // the 1024-thread block of the norm
+        test_cases.emplace_back(new test_dsv4_norm_rope_offs({ 1024, 2, 3, 1 }, true, false, 64, 960, yarn));
+    }
 
     // glu ops
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {

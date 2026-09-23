@@ -279,6 +279,54 @@ static bool dsv4_compressor_fused_enabled() {
     return enabled;
 }
 
+// Small-kernel fusions of the DeepSeek V4 decode graph, shared with the CUDA/HIP backend. On by default;
+// GGML_DSV4_FUSION3=0 keeps the original graph order and kernels. GGML_DSV4_FUSION3_MASK selects a subset
+// of the bits 0x01..0x20 (default 0x3f); the graph side uses the two bits below.
+static constexpr uint32_t DSV4_FUSION3_APE    = 1u << 0; // APE row gather ahead of the score matmul
+static constexpr uint32_t DSV4_FUSION3_CONCAT = 1u << 4; // compressor source concats next to the compressor
+
+static uint32_t dsv4_fusion3_mask() {
+    static const uint32_t mask = []() -> uint32_t {
+        const char * env = std::getenv("GGML_DSV4_FUSION3");
+        if (env != nullptr && std::atoi(env) == 0) {
+            return 0;
+        }
+        const char * env_mask = std::getenv("GGML_DSV4_FUSION3_MASK");
+        return env_mask != nullptr ? (uint32_t) std::strtoul(env_mask, nullptr, 0) & 0x3fu : 0x3fu;
+    }();
+
+    return mask;
+}
+
+// Expand the compressor inputs of one layer in the order the backend fusions expect:
+// the APE gather first, so that the score matmul is directly followed by its APE add, and
+// all state inputs before the concats, so that the two concats sit next to the compressor.
+static void dsv4_fusion3_expand_state(
+        ggml_cgraph * gf,
+        ggml_tensor * state_kv,
+        ggml_tensor * state_score,
+        ggml_tensor * ape_rows) {
+    const uint32_t mask = dsv4_fusion3_mask();
+    if ((mask & (DSV4_FUSION3_APE | DSV4_FUSION3_CONCAT)) == 0) {
+        return;
+    }
+
+    if (mask & DSV4_FUSION3_APE) {
+        ggml_build_forward_expand(gf, ape_rows);
+    }
+    ggml_build_forward_expand(gf, state_kv);
+    ggml_build_forward_expand(gf, state_score);
+}
+
+static void dsv4_fusion3_expand_restored(ggml_cgraph * gf, ggml_tensor * restored_kv, ggml_tensor * restored_score) {
+    if ((dsv4_fusion3_mask() & DSV4_FUSION3_CONCAT) == 0) {
+        return;
+    }
+
+    ggml_build_forward_expand(gf, restored_kv);
+    ggml_build_forward_expand(gf, restored_score);
+}
+
 // mean over the hyper-connection streams: [n_embd, hc, n_tokens] -> [n_embd, n_tokens]
 static ggml_tensor * dsv4_hc_mean(ggml_context * ctx, ggml_tensor * x) {
     const int64_t hc = x->ne[1];
@@ -1025,6 +1073,8 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention_impl(
         hca_state_score = ggml_add(ctx0, hca_state_score, ape_rows);
         cb(hca_state_score, "hca_state_score_ape", il);
 
+        dsv4_fusion3_expand_state(gf, hca_state_kv, hca_state_score, ape_rows);
+
     }
 
     if (ratio == DSV4_CSA_RATIO && inp_dsv4->get_csa().state_pos) {
@@ -1040,11 +1090,14 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention_impl(
         csa_state_score = ggml_add(ctx0, csa_state_score, csa_ape_rows);
         cb(csa_state_score, "csa_state_score_ape", il);
 
+        dsv4_fusion3_expand_state(gf, csa_state_kv, csa_state_score, csa_ape_rows);
+
         GGML_ASSERT(inp_dsv4->get_csa().state_write_idxs);
 
         const auto * csa_state = inp_dsv4->mctx->get_csa_state();
         const dsv4_state_tensors csa_restored = dsv4_build_state_restore(
                 ctx0, inp_dsv4->get_csa(), csa_state, il);
+        dsv4_fusion3_expand_restored(gf, csa_restored.kv, csa_restored.score);
         ggml_tensor * csa_base_kv = dsv4_view_2d(
                 ctx0, csa_restored.kv, csa_restored.kv->ne[0], csa_state->get_n_rows(), 0);
         ggml_tensor * csa_base_score = dsv4_view_2d(
@@ -1109,11 +1162,14 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention_impl(
         lid_state_score = ggml_add(ctx0, lid_state_score, lid_ape_rows);
         cb(lid_state_score, "lid_state_score_ape", il);
 
+        dsv4_fusion3_expand_state(gf, lid_state_kv, lid_state_score, lid_ape_rows);
+
         GGML_ASSERT(inp_dsv4->get_lid().state_write_idxs);
 
         const auto * lid_state = inp_dsv4->mctx->get_lid_state();
         const dsv4_state_tensors lid_restored = dsv4_build_state_restore(
                 ctx0, inp_dsv4->get_lid(), lid_state, il);
+        dsv4_fusion3_expand_restored(gf, lid_restored.kv, lid_restored.score);
         ggml_tensor * lid_base_kv = dsv4_view_2d(
                 ctx0, lid_restored.kv, lid_restored.kv->ne[0], lid_state->get_n_rows(), 0);
         ggml_tensor * lid_base_score = dsv4_view_2d(
@@ -1175,6 +1231,7 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention_impl(
 
         hca_state = inp_dsv4->mctx->get_hca_state();
         hca_restored = dsv4_build_state_restore(ctx0, inp_dsv4->get_hca(), hca_state, il);
+        dsv4_fusion3_expand_restored(gf, hca_restored.kv, hca_restored.score);
         ggml_tensor * hca_base_kv = dsv4_view_2d(
                 ctx0, hca_restored.kv, hca_restored.kv->ne[0], hca_state->get_n_rows(), 0);
         ggml_tensor * hca_base_score = dsv4_view_2d(
