@@ -588,6 +588,7 @@ extern "C" {
         GGML_OP_DSV4_HC_POST,
         GGML_OP_DSV4_HC_COEF,
         GGML_OP_DSV4_COMPRESS,
+        GGML_OP_RELU_SUM_HEADS,
 
         GGML_OP_UNARY,
 
@@ -2804,6 +2805,25 @@ extern "C" {
             struct ggml_tensor  * idxs,
             int32_t               ratio,
             bool                  overlap);
+
+    // rectified sum over the heads of a score product, as the indexers use it
+    //
+    // a:    [n, n_head*n_tokens, ne2, ne3] F32, head h of token t in row h + t*n_head
+    // bias: [n, n_tokens,        ne2, ne3] F32 or NULL
+    // res:  [n, n_tokens,        ne2, ne3] F32
+    //
+    //   res[i, t] = ((relu(a[i, t*n_head]) + relu(a[i, t*n_head + 1])) + ...) + bias[i, t]
+    //
+    // The heads are summed left to right and the bias is added last, in the order of the relu,
+    // add and add ops this replaces. Bit 0 of flags lets a backend compute the product that
+    // produces a in the same kernel when it can keep its rounding.
+    //
+    GGML_API struct ggml_tensor * ggml_relu_sum_heads(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * bias,
+            int32_t               n_head,
+            int32_t               flags);
 
     // custom operators
 
