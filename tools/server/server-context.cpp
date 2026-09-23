@@ -273,6 +273,11 @@ struct server_slot {
     bool spec_is_replay = false;
     std::mt19937 spec_synth_rng;
 
+    // context checkpoint restored for the current task; valid only until the first prompt batch
+    // after the restore has been built, while the memory still holds exactly the checkpoint state
+    const common_prompt_checkpoint * ckpt_restored = nullptr;
+    int ckpt_restored_id_task = -1;
+
     // TODO: move members that belong to the task (such as `generated_text`, `has_new_line`) to task_results_state
     //       see https://github.com/ggml-org/llama.cpp/pull/18283#issuecomment-3710175837
     std::unique_ptr<const server_task> task;
@@ -416,6 +421,9 @@ struct server_slot {
 
         // clear alora start
         alora_invocation_start = -1;
+
+        ckpt_restored         = nullptr;
+        ckpt_restored_id_task = -1;
 
         // clear multimodal state
         mbatch.reset();
@@ -925,6 +933,11 @@ private:
     int slots_debug = 0;  // env: LLAMA_SERVER_SLOTS_DEBUG
     int slots_n_diff = 0; // env: LLAMA_SERVER_SLOTS_N_DIFF
 
+    // env: LLAMA_SERVER_CKPT_REUSE
+    // 0 - always re-create a context checkpoint at the position of the one just restored
+    // 1 - keep the restored checkpoint instead of re-creating it from the unchanged memory state
+    int ckpt_reuse = 1;
+
     int n_empty_consecutive = 0;
 
     std::unique_ptr<server_prompt_cache> prompt_cache;
@@ -1350,6 +1363,13 @@ private:
             if (slots_debug) {
                 SRV_WRN("LLAMA_SERVER_SLOTS_DEBUG = %d\n", slots_debug);
             }
+        }
+
+        {
+            const char * LLAMA_SERVER_CKPT_REUSE = getenv("LLAMA_SERVER_CKPT_REUSE");
+            ckpt_reuse = LLAMA_SERVER_CKPT_REUSE ? atoi(LLAMA_SERVER_CKPT_REUSE) : 1;
+
+            SRV_INF("LLAMA_SERVER_CKPT_REUSE = %d\n", ckpt_reuse);
         }
 
         {
@@ -2369,17 +2389,60 @@ private:
             slot.prompt.checkpoints.erase(slot.prompt.checkpoints.begin());
         }
 
+        const int64_t n_tokens_new = slot.prompt.n_tokens() - n_tokens_cur;
+
+        // the checkpoint restored for this task while the memory still holds its state (see ckpt_restored);
+        // it is a candidate only if it survived the evictions above
+        const common_prompt_checkpoint * restored = nullptr;
+        if (ckpt_reuse == 1 && slot.ckpt_restored != nullptr && slot.ckpt_restored_id_task == id_task) {
+            restored = slot.ckpt_restored;
+        }
+        slot.ckpt_restored         = nullptr;
+        slot.ckpt_restored_id_task = -1;
+
+        auto it_reuse = slot.prompt.checkpoints.end();
+
         // replace an existing checkpoint at the same n_tokens instead of appending a duplicate
-        {
-            const int64_t n_tokens_new = slot.prompt.n_tokens() - n_tokens_cur;
-            for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end(); ) {
-                if (it->n_tokens == n_tokens_new) {
-                    SLT_TRC(slot, "superseding context checkpoint at n_tokens = %" PRId64 "\n", it->n_tokens);
-                    it = slot.prompt.checkpoints.erase(it);
-                } else {
+        for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end(); ) {
+            if (it->n_tokens == n_tokens_new) {
+                if (&*it == restored && it->pos_min == pos_min && it->pos_max == pos_max) {
+                    it_reuse = it;
                     ++it;
+                    continue;
                 }
+                SLT_TRC(slot, "superseding context checkpoint at n_tokens = %" PRId64 "\n", it->n_tokens);
+                it = slot.prompt.checkpoints.erase(it);
+            } else {
+                ++it;
             }
+        }
+
+        if (it_reuse != slot.prompt.checkpoints.end()) {
+            // the speculative state is small: compare it instead of assuming that set/get round-trips
+            std::vector<uint8_t> data_spec;
+            common_speculative_get_state(spec.get(), slot.id, data_spec);
+
+            const bool ok =
+                !it_reuse->data_tgt.empty() &&
+                (ctx_dft == nullptr) == it_reuse->data_dft.empty() &&
+                data_spec == it_reuse->data_spec;
+
+            if (ok) {
+                // move it to the back, where the re-created checkpoint would have been appended
+                slot.prompt.checkpoints.splice(slot.prompt.checkpoints.end(), slot.prompt.checkpoints, it_reuse);
+
+                auto & cur = slot.prompt.checkpoints.back();
+                cur.id_task = id_task;
+
+                SLT_TRC(slot,
+                        "reusing restored context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
+                        (int) slot.prompt.checkpoints.size(), params_base.n_ctx_checkpoints, cur.pos_min,
+                        cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
+                return;
+            }
+
+            SLT_TRC(slot, "superseding context checkpoint at n_tokens = %" PRId64 "\n", it_reuse->n_tokens);
+            slot.prompt.checkpoints.erase(it_reuse);
         }
 
         auto & cur = slot.prompt.checkpoints.emplace_back();
@@ -3184,6 +3247,9 @@ private:
                     if (slot.state == SLOT_STATE_STARTED) {
                         slot.stats.update_prompt_start();
 
+                        slot.ckpt_restored         = nullptr;
+                        slot.ckpt_restored_id_task = -1;
+
                         slot.state = SLOT_STATE_PROCESSING_PROMPT;
 
                         SLT_TRC(slot, "new prompt, n_ctx_slot = %d, n_keep = %d, task.n_tokens = %d\n",
@@ -3415,6 +3481,11 @@ private:
 
                                         pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
                                         n_past   = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) it->n_tokens);
+
+                                        // the memory now holds exactly this checkpoint's state
+                                        slot.ckpt_restored         = &*it;
+                                        slot.ckpt_restored_id_task = slot.task->id;
+
                                         SLT_TRC(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB)\n", it->pos_min, it->pos_max, it->n_tokens, n_past, (float) it->size() / 1024 / 1024);
                                     }
 
@@ -3675,6 +3746,11 @@ private:
                     if (do_checkpoint) {
                         create_checkpoint(slot, n_tokens_cur, pos_min, pos_max);
                     }
+
+                    // the batch built above is decoded before this slot is visited again, so a restored
+                    // checkpoint can only be reused by the first batch after the restore
+                    slot.ckpt_restored         = nullptr;
+                    slot.ckpt_restored_id_task = -1;
                 }
 
                 if (!slot_batched) {
