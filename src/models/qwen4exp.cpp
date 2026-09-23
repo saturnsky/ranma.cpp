@@ -892,26 +892,50 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
             ext_factor, attn_factor, beta_fast, beta_slow);
     cb(q, "indexer_q", il);
 
+    // LLAMA_QSA_SCORE_FUSE: 0 rectifies and sums the heads with relu, cont and add ops; 1 (default) does it, and adds
+    // the per-block bias, in one op that a backend may also compute in the kernel of the product; 2 is 1 without that
+    // fusion. The op adds the heads in the order of the add ops and the bias last, so the scores round the same.
+    static const int score_fuse = []() {
+        const char * value = std::getenv("LLAMA_QSA_SCORE_FUSE");
+        const int mode = value ? std::atoi(value) : 1;
+        if (value != nullptr) {
+            LLAMA_LOG_INFO("qwen4exp: LLAMA_QSA_SCORE_FUSE=%d, indexer score %s\n", mode,
+                    mode == 1 ? "through relu_sum_heads, fusable with the product" :
+                    mode == 2 ? "through relu_sum_heads" : "through relu, cont and add ops");
+        }
+        return mode;
+    }();
+
     // rectify each head dot product before the sum, as in the DeepSeek lightning indexer
     // mul_mat matches ne[2], so the queries of stream s only meet the blocks of stream s
     ggml_tensor * score = ggml_mul_mat(ctx0, pooled,
             ggml_reshape_3d(ctx0, q, idx_dim, n_idx_h*n_tps, n_stream));
-    score = ggml_reshape_4d(ctx0, score, n_blocks, n_idx_h, n_tps, n_stream);
-    score = ggml_relu(ctx0, score);
 
-    // the heads sit side by side on ne[1] and there are only a few of them
-    ggml_tensor * summed = nullptr;
-    for (int64_t h = 0; h < n_idx_h; ++h) {
-        ggml_tensor * slice = ggml_view_3d(ctx0, score, n_blocks, n_tps, n_stream,
-                score->nb[2], score->nb[3], h*score->nb[1]);
-        summed = summed ? ggml_add(ctx0, summed, slice) : ggml_cont(ctx0, slice);
+    bool bias_added = false;
+    if (score_fuse == 1 || score_fuse == 2) {
+        // the heads of token t are rows t*n_idx_h .. t*n_idx_h + n_idx_h - 1 of the product
+        score = ggml_relu_sum_heads(ctx0, score, blk_bias ? inp->bias : nullptr, (int32_t) n_idx_h,
+                score_fuse == 1 ? 1 : 0);
+        bias_added = blk_bias;
+        cb(score, "indexer_score", il);
+    } else {
+        score = ggml_reshape_4d(ctx0, score, n_blocks, n_idx_h, n_tps, n_stream);
+        score = ggml_relu(ctx0, score);
+
+        // the heads sit side by side on ne[1] and there are only a few of them
+        ggml_tensor * summed = nullptr;
+        for (int64_t h = 0; h < n_idx_h; ++h) {
+            ggml_tensor * slice = ggml_view_3d(ctx0, score, n_blocks, n_tps, n_stream,
+                    score->nb[2], score->nb[3], h*score->nb[1]);
+            summed = summed ? ggml_add(ctx0, summed, slice) : ggml_cont(ctx0, slice);
+        }
+
+        score = summed;
+        cb(score, "indexer_score", il);
     }
 
-    score = summed;
-    cb(score, "indexer_score", il);
-
     // one value per block, so it is cheaper to bias here than after the cells are expanded
-    if (blk_bias) {
+    if (blk_bias && !bias_added) {
         score = ggml_add(ctx0, score, inp->bias);
     }
 

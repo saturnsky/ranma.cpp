@@ -1087,6 +1087,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "DSV4_HC_POST",
     "DSV4_HC_COEF",
     "DSV4_COMPRESS",
+    "RELU_SUM_HEADS",
 
     "UNARY",
 
@@ -1104,7 +1105,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
+static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1205,6 +1206,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "dsv4_hc_post(x, residual, post, comb)",
     "dsv4_hc_coef(mixes, scale, base)",
     "dsv4_compress(kv, score, idxs)",
+    "relu_sum_heads(x, bias)",
 
     "unary(x)",
 
@@ -1222,7 +1224,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
+static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6750,6 +6752,39 @@ struct ggml_tensor * ggml_dsv4_compress(
     result->src[0] = kv;
     result->src[1] = score;
     result->src[2] = idxs;
+
+    return result;
+}
+
+// ggml_relu_sum_heads
+
+struct ggml_tensor * ggml_relu_sum_heads(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * bias,
+        int32_t               n_head,
+        int32_t               flags) {
+    GGML_ASSERT(a->type == GGML_TYPE_F32);
+    GGML_ASSERT(a->nb[0] == sizeof(float));
+    GGML_ASSERT(n_head > 0);
+    GGML_ASSERT(a->ne[1] % n_head == 0);
+
+    const int64_t ne[4] = { a->ne[0], a->ne[1]/n_head, a->ne[2], a->ne[3] };
+
+    if (bias) {
+        GGML_ASSERT(bias->type == GGML_TYPE_F32);
+        GGML_ASSERT(bias->nb[0] == sizeof(float));
+        GGML_ASSERT(bias->ne[0] == ne[0] && bias->ne[1] == ne[1] && bias->ne[2] == ne[2] && bias->ne[3] == ne[3]);
+    }
+
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    ggml_set_op_params_i32(result, 0, n_head);
+    ggml_set_op_params_i32(result, 1, flags);
+
+    result->op     = GGML_OP_RELU_SUM_HEADS;
+    result->src[0] = a;
+    result->src[1] = bias;
 
     return result;
 }

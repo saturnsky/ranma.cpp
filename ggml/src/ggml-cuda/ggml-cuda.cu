@@ -2213,6 +2213,31 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
 }
 
+// whether ggml_cuda_mul_mat computes dst with ggml_cuda_mul_mat_vec_f: the same tests in the same order, up to the
+// MMVF branch. A fused kernel that repeats the MMVF arithmetic relies on this to round as the unfused graph does.
+static bool ggml_cuda_mul_mat_uses_mmvf(ggml_backend_cuda_context & ctx, const ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+
+    if (dst->op != GGML_OP_MUL_MAT || ggml_get_op_params_i32(dst, 1) == GGML_HINT_SRC0_IS_HADAMARD) {
+        return false;
+    }
+    if (!src0->buffer) {
+        return false;
+    }
+    const bool bad_padding_clear = ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE
+        && ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) && src0->view_src;
+    if (bad_padding_clear || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
+        return false;
+    }
+    // the padded prefill BLAS branch before MMVF takes quantized src0 only
+    if (src0->type != GGML_TYPE_F32) {
+        return false;
+    }
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+    return ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, src1->ne[1]);
+}
+
 // returns true when ggml_cuda_mul_mat_id takes the fallback path that requires stream synchronization
 // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
 static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int cc) {
@@ -2760,6 +2785,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_DSV4_COMPRESS:
             ggml_cuda_op_dsv4_compress(ctx, dst);
+            break;
+        case GGML_OP_RELU_SUM_HEADS:
+            ggml_cuda_op_relu_sum_heads(ctx, dst);
             break;
         case GGML_OP_RWKV_WKV7:
             ggml_cuda_op_rwkv_wkv7(ctx, dst);
@@ -4314,6 +4342,22 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 ggml_cuda_op_fused_mul(*cuda_ctx, &fused_node, n_fuse);
             }
             return n_fuse - 1;
+        }
+    }
+
+    // indexer score: the MMVF product and the rectified head sum in one kernel, when the op allows it (bit 0 of
+    // op_params[1]) and ggml_cuda_mul_mat would have run this product through MMVF, whose arithmetic the kernel repeats
+    if (node->op == GGML_OP_MUL_MAT && i + 1 < cgraph->n_nodes) {
+        ggml_tensor * rsh = cgraph->nodes[i + 1];
+        if (rsh->op == GGML_OP_RELU_SUM_HEADS && rsh->src[0] == node && (ggml_get_op_params_i32(rsh, 1) & 1) &&
+                ggml_cuda_mul_mat_uses_mmvf(*cuda_ctx, node) && ggml_cuda_mul_mat_vec_f_relu_sum_heads_supported(node, rsh)) {
+            const ggml_op ops[2]       = { GGML_OP_MUL_MAT, GGML_OP_RELU_SUM_HEADS };
+            const int     out_nodes[1] = { i + 1 };
+            if (ggml_can_fuse_subgraph(cgraph, i, 2, ops, out_nodes, 1) &&
+                    ggml_cuda_check_fusion_memory_ranges(cgraph, i, 2, out_nodes, 1)) {
+                ggml_cuda_mul_mat_vec_f_relu_sum_heads(*cuda_ctx, node, rsh);
+                return 1;
+            }
         }
     }
 
@@ -6705,6 +6749,11 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 op->src[2]->type == GGML_TYPE_I32 && op->type == GGML_TYPE_F32 &&
                 op->src[0]->nb[0] == sizeof(float) && op->src[1]->nb[0] == sizeof(float) &&
                 ggml_is_contiguous(op->src[2]);
+        case GGML_OP_RELU_SUM_HEADS:
+            return op->src[0]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
+                op->src[0]->nb[0] == sizeof(float) &&
+                (op->src[1] == nullptr || (op->src[1]->type == GGML_TYPE_F32 && op->src[1]->nb[0] == sizeof(float))) &&
+                op->ne[0] <= INT_MAX && op->ne[1] <= 65535 && op->ne[2]*op->ne[3] <= 65535;
         case GGML_OP_FLASH_ATTN_EXT:
             return ggml_cuda_flash_attn_ext_supported(dev_ctx->device, op);
         case GGML_OP_CROSS_ENTROPY_LOSS:

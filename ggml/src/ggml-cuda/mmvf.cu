@@ -415,6 +415,27 @@ static void mul_mat_vec_f_switch_fusion(
 
 }
 
+// the fewest iterations over a row of ncols values, and the smallest block that reaches them
+static int64_t mul_mat_vec_f_block_size(const int64_t ncols) {
+    const int device = ggml_cuda_get_device();
+    const int warp_size = ggml_cuda_info().devices[device].warp_size;
+
+    int64_t block_size_best = warp_size;
+    int64_t niter_best      = (ncols + 2*warp_size - 1) / (2*warp_size);
+    int64_t max_block_size  = 256;
+    if(ggml_cuda_info().devices[device].cc > GGML_CUDA_CC_OFFSET_AMD && ggml_cuda_info().devices[device].cc < GGML_CUDA_CC_RDNA1) {
+        max_block_size = 128;
+    }
+    for (int64_t block_size = 2*warp_size; block_size <= max_block_size; block_size += warp_size) {
+        const int64_t niter = (ncols + 2*block_size - 1) / (2*block_size);
+        if (niter < niter_best) {
+            niter_best      = niter;
+            block_size_best = block_size;
+        }
+    }
+    return block_size_best;
+}
+
 template <typename T, typename type_acc, int ncols_dst, bool is_multi_token_id = false>
 void launch_mul_mat_vec_f_cuda(
         const T * x, const float * y, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
@@ -433,22 +454,8 @@ void launch_mul_mat_vec_f_cuda(
     const uint3 channel_ratio_fd = ids ? make_uint3(0, 0, 0) : init_fastdiv_values(nchannels_dst / nchannels_x);
     const uint3 sample_ratio_fd  = init_fastdiv_values(nsamples_dst  / nsamples_x);
 
-    const int device = ggml_cuda_get_device();
-    const int warp_size = ggml_cuda_info().devices[device].warp_size;
-
-    int64_t block_size_best = warp_size;
-    int64_t niter_best      = (ncols + 2*warp_size - 1) / (2*warp_size);
-    int64_t max_block_size  = 256;
-    if(ggml_cuda_info().devices[device].cc > GGML_CUDA_CC_OFFSET_AMD && ggml_cuda_info().devices[device].cc < GGML_CUDA_CC_RDNA1) {
-        max_block_size = 128;
-    }
-    for (int64_t block_size = 2*warp_size; block_size <= max_block_size; block_size += warp_size) {
-        const int64_t niter = (ncols + 2*block_size - 1) / (2*block_size);
-        if (niter < niter_best) {
-            niter_best      = niter;
-            block_size_best = block_size;
-        }
-    }
+    const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
+    const int64_t block_size_best = mul_mat_vec_f_block_size(ncols);
 
     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr;
 
@@ -1279,5 +1286,250 @@ void ggml_cuda_mul_mat_f32_skinny(ggml_backend_cuda_context & ctx, const ggml_te
         mul_mat_f32_skinny_tile_cuda<64, 32, 16, 4, 2, 1>(ctx, x_d, y_d, dst_d, nrows, ntok, ncols, stride_x, stride_y, stride_dst, stream);
     } else {
         mul_mat_f32_skinny_tile_cuda<128, 64, 8, 8, 8, 1>(ctx, x_d, y_d, dst_d, nrows, ntok, ncols, stride_x, stride_y, stride_dst, stream);
+    }
+}
+
+// GGML_OP_RELU_SUM_HEADS: the rectified head sum of an indexer score product, alone or fused with the MMVF product that
+// produces it. Both keep the rounding of the op chain they replace (unary relu, cont, add, add, add, add bias):
+// op_relu is fmaxf(x, 0), the heads are added left to right and the bias last, and nothing here multiplies, so no
+// contraction can change a sum. The fused kernel repeats the F32 path of mul_mat_vec_f step for step.
+
+static __device__ __forceinline__ float relu_sum_heads_relu(const float x) {
+    return fmaxf(x, 0);
+}
+
+static __global__ void relu_sum_heads_f32(
+        const float * __restrict__ a, const float * __restrict__ bias, float * __restrict__ dst,
+        const int n, const int n_head, const int n2,
+        const int64_t s_a1, const int64_t s_a2, const int64_t s_a3,
+        const int64_t s_b1, const int64_t s_b2, const int64_t s_b3,
+        const int64_t s_d1, const int64_t s_d2, const int64_t s_d3) {
+    const int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= n) {
+        return;
+    }
+    const int64_t i1 = blockIdx.y;
+    const int64_t i2 = blockIdx.z % n2;
+    const int64_t i3 = blockIdx.z / n2;
+
+    const float * a_row = a + i1*n_head*s_a1 + i2*s_a2 + i3*s_a3;
+
+    float acc = relu_sum_heads_relu(a_row[i]);
+    for (int h = 1; h < n_head; ++h) {
+        acc = acc + relu_sum_heads_relu(a_row[h*s_a1 + i]);
+    }
+    if (bias) {
+        acc = acc + bias[i1*s_b1 + i2*s_b2 + i3*s_b3 + i];
+    }
+    dst[i1*s_d1 + i2*s_d2 + i3*s_d3 + i] = acc;
+}
+
+void ggml_cuda_op_relu_sum_heads(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * a    = dst->src[0];
+    const ggml_tensor * bias = dst->src[1];
+
+    GGML_ASSERT(a->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(a->nb[0] == sizeof(float) && dst->nb[0] == sizeof(float));
+    GGML_ASSERT(!bias || (bias->type == GGML_TYPE_F32 && bias->nb[0] == sizeof(float)));
+
+    const int n_head = ggml_get_op_params_i32(dst, 0);
+
+    const int64_t n  = dst->ne[0];
+    const int64_t n1 = dst->ne[1];
+    const int64_t n2 = dst->ne[2];
+    const int64_t n3 = dst->ne[3];
+    GGML_ASSERT(n <= INT_MAX && n1 <= 65535 && n2*n3 <= 65535);
+
+
+    const int64_t ts = sizeof(float);
+    const int block_size = 256;
+    const dim3 block_nums((n + block_size - 1)/block_size, n1, n2*n3);
+    relu_sum_heads_f32<<<block_nums, block_size, 0, ctx.stream()>>>(
+        (const float *) a->data, bias ? (const float *) bias->data : nullptr, (float *) dst->data,
+        n, n_head, n2,
+        a->nb[1]/ts, a->nb[2]/ts, a->nb[3]/ts,
+        bias ? bias->nb[1]/ts : 0, bias ? bias->nb[2]/ts : 0, bias ? bias->nb[3]/ts : 0,
+        dst->nb[1]/ts, dst->nb[2]/ts, dst->nb[3]/ts);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+// One block per output row as in mul_mat_vec_f<float, float, ncols_dst, block_size> without ids or fusion, with sample
+// and channel ratios of 1. Only thread 0 writes: after the reductions every lane of warp 0 holds the same sums, and
+// mul_mat_vec_f writes column j from lane j.
+template <int ncols_dst, int block_size, int n_head>
+static __global__ void mul_mat_vec_f_relu_sum_heads(
+        const float * __restrict__ x, const float * __restrict__ y, const float * __restrict__ bias, float * __restrict__ dst,
+        const int ncols2, const int stride_row, const int stride_col_y2,
+        const int stride_channel_x, const int stride_channel_y, const int64_t stride_sample_x, const int64_t stride_sample_y,
+        const int stride_col_dst, const int stride_channel_dst, const int64_t stride_sample_dst,
+        const int stride_col_bias, const int stride_channel_bias, const int64_t stride_sample_bias) {
+    static_assert(ncols_dst % n_head == 0, "whole tokens only");
+    constexpr int n_tokens  = ncols_dst/n_head;
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+
+    const int row     = blockIdx.x;
+    const int channel = blockIdx.y;
+    const int sample  = blockIdx.z;
+    const int tid     = threadIdx.x;
+
+    x += int64_t(sample)*stride_sample_x + channel*stride_channel_x + row*stride_row;
+    y += int64_t(sample)*stride_sample_y + channel*stride_channel_y;
+
+    const float2 * y2 = (const float2 *) y;
+
+    extern __shared__ char data_mmv[];
+    float * buf_iw = (float *) data_mmv;
+
+    if (block_size > warp_size) {
+        if (tid < warp_size) {
+            buf_iw[tid] = 0.0f;
+        }
+        __syncthreads();
+    }
+
+    float sumf[ncols_dst] = {0.0f};
+
+    const float2 * x2 = (const float2 *) x;
+    for (int col2 = tid; col2 < ncols2; col2 += block_size) {
+        const float2 tmpx = x2[col2];
+#pragma unroll
+        for (int j = 0; j < ncols_dst; ++j) {
+            const float2 tmpy = y2[j*stride_col_y2 + col2];
+            ggml_cuda_mad(sumf[j], tmpx.x, tmpy.x);
+            ggml_cuda_mad(sumf[j], tmpx.y, tmpy.y);
+        }
+    }
+
+#pragma unroll
+    for (int j = 0; j < ncols_dst; ++j) {
+        sumf[j] = warp_reduce_sum<warp_size>(sumf[j]);
+
+        if (block_size > warp_size) {
+            buf_iw[tid/warp_size] = sumf[j];
+            __syncthreads();
+            if (tid < warp_size) {
+                sumf[j] = buf_iw[tid];
+                sumf[j] = warp_reduce_sum<warp_size>(sumf[j]);
+            }
+
+            if (j < ncols_dst) {
+                __syncthreads();
+            }
+        }
+    }
+
+    if (tid != 0) {
+        return;
+    }
+
+#pragma unroll
+    for (int t = 0; t < n_tokens; ++t) {
+        float acc = relu_sum_heads_relu(sumf[t*n_head]);
+#pragma unroll
+        for (int h = 1; h < n_head; ++h) {
+            acc = acc + relu_sum_heads_relu(sumf[t*n_head + h]);
+        }
+        if (bias) {
+            acc = acc + bias[int64_t(sample)*stride_sample_bias + channel*stride_channel_bias + t*stride_col_bias + row];
+        }
+        dst[int64_t(sample)*stride_sample_dst + channel*stride_channel_dst + t*stride_col_dst + row] = acc;
+    }
+}
+
+static constexpr int MMVF_RELU_SUM_HEADS_N_HEAD = 4;
+
+bool ggml_cuda_mul_mat_vec_f_relu_sum_heads_supported(const ggml_tensor * mm, const ggml_tensor * rsh) {
+    const ggml_tensor * src0 = mm->src[0];
+    const ggml_tensor * src1 = mm->src[1];
+    const ggml_tensor * bias = rsh->src[1];
+
+    if (src0->type != GGML_TYPE_F32 || src1->type != GGML_TYPE_F32 || mm->type != GGML_TYPE_F32 ||
+            rsh->type != GGML_TYPE_F32 || (bias && bias->type != GGML_TYPE_F32)) {
+        return false;
+    }
+    if (ggml_get_op_params_i32(rsh, 0) != MMVF_RELU_SUM_HEADS_N_HEAD) {
+        return false;
+    }
+    const int64_t ncols_dst = src1->ne[1];
+    if (ncols_dst != MMVF_RELU_SUM_HEADS_N_HEAD && ncols_dst != 2*MMVF_RELU_SUM_HEADS_N_HEAD) {
+        return false;
+    }
+    // no broadcast: every channel and sample of src1 meets its own of src0
+    if (src0->ne[2] != src1->ne[2] || src0->ne[3] != src1->ne[3]) {
+        return false;
+    }
+    if (src0->nb[0] != sizeof(float) || src1->nb[0] != sizeof(float) || rsh->nb[0] != sizeof(float) ||
+            (bias && bias->nb[0] != sizeof(float))) {
+        return false;
+    }
+    if (src0->ne[0] % 2 != 0 || (src0->nb[1]/sizeof(float)) % 2 != 0 || (src1->nb[1]/sizeof(float)) % 2 != 0) {
+        return false;
+    }
+    const int64_t block_size = mul_mat_vec_f_block_size(src0->ne[0]);
+    if (block_size % 32 != 0 || block_size < 32 || block_size > 256) {
+        return false;
+    }
+    const int64_t ts = sizeof(float);
+    return src0->ne[1] <= INT_MAX && src0->ne[2] <= 65535 && src0->ne[3] <= 65535 &&
+        src0->nb[1]/ts <= INT_MAX && src1->nb[1]/ts <= INT_MAX && src0->nb[2]/ts <= INT_MAX && src1->nb[2]/ts <= INT_MAX &&
+        rsh->nb[1]/ts <= INT_MAX && rsh->nb[2]/ts <= INT_MAX &&
+        (!bias || (bias->nb[1]/ts <= INT_MAX && bias->nb[2]/ts <= INT_MAX));
+}
+
+template <int ncols_dst, int block_size>
+static void mul_mat_vec_f_relu_sum_heads_launch(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * bias,
+        ggml_tensor * dst) {
+    const int64_t ts = sizeof(float);
+    const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
+
+    const dim3 block_nums(src0->ne[1], src0->ne[2], src0->ne[3]);
+    const dim3 block_dims(block_size, 1, 1);
+    const int nbytes_shared = warp_size*sizeof(float);
+
+    mul_mat_vec_f_relu_sum_heads<ncols_dst, block_size, MMVF_RELU_SUM_HEADS_N_HEAD><<<block_nums, block_dims, nbytes_shared, ctx.stream()>>>(
+        (const float *) src0->data, (const float *) src1->data, bias ? (const float *) bias->data : nullptr, (float *) dst->data,
+        src0->ne[0]/2, src0->nb[1]/ts, (src1->nb[1]/ts)/2,
+        src0->nb[2]/ts, src1->nb[2]/ts, src0->nb[3]/ts, src1->nb[3]/ts,
+        dst->nb[1]/ts, dst->nb[2]/ts, dst->nb[3]/ts,
+        bias ? bias->nb[1]/ts : 0, bias ? bias->nb[2]/ts : 0, bias ? bias->nb[3]/ts : 0);
+    CUDA_CHECK(cudaGetLastError());
+}
+
+template <int ncols_dst>
+static void mul_mat_vec_f_relu_sum_heads_switch_block_size(
+        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * bias,
+        ggml_tensor * dst) {
+    switch (mul_mat_vec_f_block_size(src0->ne[0])) {
+        case  32: mul_mat_vec_f_relu_sum_heads_launch<ncols_dst,  32>(ctx, src0, src1, bias, dst); break;
+        case  64: mul_mat_vec_f_relu_sum_heads_launch<ncols_dst,  64>(ctx, src0, src1, bias, dst); break;
+        case  96: mul_mat_vec_f_relu_sum_heads_launch<ncols_dst,  96>(ctx, src0, src1, bias, dst); break;
+        case 128: mul_mat_vec_f_relu_sum_heads_launch<ncols_dst, 128>(ctx, src0, src1, bias, dst); break;
+        case 160: mul_mat_vec_f_relu_sum_heads_launch<ncols_dst, 160>(ctx, src0, src1, bias, dst); break;
+        case 192: mul_mat_vec_f_relu_sum_heads_launch<ncols_dst, 192>(ctx, src0, src1, bias, dst); break;
+        case 224: mul_mat_vec_f_relu_sum_heads_launch<ncols_dst, 224>(ctx, src0, src1, bias, dst); break;
+        case 256: mul_mat_vec_f_relu_sum_heads_launch<ncols_dst, 256>(ctx, src0, src1, bias, dst); break;
+        default: GGML_ABORT("fatal error");
+    }
+}
+
+void ggml_cuda_mul_mat_vec_f_relu_sum_heads(ggml_backend_cuda_context & ctx, const ggml_tensor * mm, ggml_tensor * rsh) {
+    const ggml_tensor * src0 = mm->src[0];
+    const ggml_tensor * src1 = mm->src[1];
+    const ggml_tensor * bias = rsh->src[1];
+
+    ggml_cuda_assert_src0_is_device_readable(src0);
+    GGML_ASSERT(ggml_cuda_mul_mat_vec_f_relu_sum_heads_supported(mm, rsh));
+
+
+    switch (src1->ne[1]) {
+        case MMVF_RELU_SUM_HEADS_N_HEAD:
+            mul_mat_vec_f_relu_sum_heads_switch_block_size<MMVF_RELU_SUM_HEADS_N_HEAD>(ctx, src0, src1, bias, rsh);
+            break;
+        case 2*MMVF_RELU_SUM_HEADS_N_HEAD:
+            mul_mat_vec_f_relu_sum_heads_switch_block_size<2*MMVF_RELU_SUM_HEADS_N_HEAD>(ctx, src0, src1, bias, rsh);
+            break;
+        default:
+            GGML_ABORT("fatal error");
     }
 }

@@ -27,6 +27,7 @@ for equivalence checks, or a diagnostic.
 | `LLAMA_QSA_BLOCK_TOP_K` | `1` | `0` selects over the cells, `2` forces the general block kernels. Reference paths. |
 | `LLAMA_QSA_LAYOUT_CACHE` | on | `0` rebuilds the indexer inputs from every cell for each ubatch instead of updating a cached block layout. Reference path. |
 | `LLAMA_QSA_LAYOUT_CHECK` | off | `1` also runs the full rebuild for every ubatch and aborts if any input byte differs from the cached layout. Test switch. |
+| `LLAMA_QSA_SCORE_FUSE` | `1` | `0` rectifies and sums the indexer heads with separate relu, cont and add ops; `2` uses the fused op but not its fusion with the score product. Reference paths. |
 | `LLAMA_QSA_RAW_PREFIX` | unset | a path prefix: the dump also writes raw output logits with their shape. Diagnostic. |
 | `GGML_CUDA_FATTN_SPARSE` | on | `0` keeps the dense flash-attention kernel. Reference path. |
 | `GGML_CUDA_FATTN_SPARSE_MIN_KV` | 4096 | the floor of the cell count at which the gather is used. |

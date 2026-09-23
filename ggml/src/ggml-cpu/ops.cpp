@@ -11528,6 +11528,74 @@ void ggml_compute_forward_dsv4_compress(
     }
 }
 
+// ggml_compute_forward_relu_sum_heads
+
+static void ggml_compute_forward_relu_sum_heads_f32(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * bias = dst->src[1];
+
+    GGML_ASSERT(src0->nb[0] == sizeof(float));
+    GGML_ASSERT(dst->nb[0]  == sizeof(float));
+    GGML_ASSERT(!bias || bias->nb[0] == sizeof(float));
+
+    const int32_t n_head = ggml_get_op_params_i32(dst, 0);
+
+    const int64_t n  = dst->ne[0];
+    const int64_t n1 = dst->ne[1];
+    const int64_t n2 = dst->ne[2];
+    const int64_t nr = n1*dst->ne[2]*dst->ne[3];
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int64_t dr  = (nr + nth - 1)/nth;
+    const int64_t ir0 = dr*ith;
+    const int64_t ir1 = MIN(ir0 + dr, nr);
+
+    for (int64_t ir = ir0; ir < ir1; ++ir) {
+        const int64_t i3 = ir/(n1*n2);
+        const int64_t i2 = (ir - i3*n1*n2)/n1;
+        const int64_t i1 = ir - i3*n1*n2 - i2*n1;
+
+        const char * a_row = (const char *) src0->data + (i1*n_head)*src0->nb[1] + i2*src0->nb[2] + i3*src0->nb[3];
+        float      * d_row = (float *) ((char *) dst->data + i1*dst->nb[1] + i2*dst->nb[2] + i3*dst->nb[3]);
+
+        // the relu, cont and add ops this replaces, in their order
+        for (int64_t i = 0; i < n; ++i) {
+            const float x0 = *(const float *) (a_row + i*sizeof(float));
+            float acc = x0 > 0.0f ? x0 : 0.0f;
+            for (int32_t h = 1; h < n_head; ++h) {
+                const float x = *(const float *) (a_row + h*src0->nb[1] + i*sizeof(float));
+                acc = acc + (x > 0.0f ? x : 0.0f);
+            }
+            d_row[i] = acc;
+        }
+        if (bias) {
+            const float * b_row = (const float *) ((const char *) bias->data + i1*bias->nb[1] + i2*bias->nb[2] + i3*bias->nb[3]);
+            for (int64_t i = 0; i < n; ++i) {
+                d_row[i] = d_row[i] + b_row[i];
+            }
+        }
+    }
+}
+
+void ggml_compute_forward_relu_sum_heads(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+    switch (dst->src[0]->type) {
+        case GGML_TYPE_F32:
+            {
+                ggml_compute_forward_relu_sum_heads_f32(params, dst);
+            } break;
+        default:
+            {
+                GGML_ABORT("fatal error");
+            }
+    }
+}
+
 // ggml_compute_forward_dsv4_hc_pre
 
 static void ggml_compute_forward_dsv4_hc_pre_f32(
