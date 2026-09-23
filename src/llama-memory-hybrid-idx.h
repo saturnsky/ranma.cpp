@@ -6,6 +6,7 @@
 #include <vector>
 
 class llama_dsv4_comp_state;
+struct llama_qsa_layout_cache;
 class llama_kv_cache_dsv4_comp_context;
 
 //
@@ -111,6 +112,25 @@ public:
                        bool allow_fast = false) const;
 
 private:
+    // the full rescan of the cells that set_input_qsa has always done
+    void set_input_qsa_scan(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
+                       ggml_tensor * bias, const llama_ubatch * ubatch, uint32_t ratio,
+                       bool blk_bias, ggml_tensor * completed_pos,
+                       const std::vector<int64_t> * write_idxs,
+                       ggml_tensor * blk_meta, uint32_t width,
+                       bool allow_fast) const;
+
+    // [TAG_QSA_LAYOUT_CACHE] the same inputs from a block layout kept up to date through the
+    // change journal of the cells; returns false, having set nothing reliable, where it does not apply
+    bool set_input_qsa_cached(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
+                       ggml_tensor * bias, const llama_ubatch * ubatch, uint32_t ratio,
+                       bool blk_bias, ggml_tensor * completed_pos,
+                       const std::vector<int64_t> * write_idxs,
+                       ggml_tensor * blk_meta, uint32_t width,
+                       bool allow_fast) const;
+
+    mutable std::unique_ptr<llama_qsa_layout_cache> qsa_layout;
+
     // forget seq_id (all of it if seq_id < 0) in every cache at once, so a failed restore cannot leave the caches out of step
     // seq_id < 0 drops the whole context, as the caches themselves do on a failed restore
     void state_drop(llama_seq_id seq_id);

@@ -11,11 +11,15 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cinttypes>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <iterator>
 #include <map>
+#include <memory>
+#include <set>
 #include <stdexcept>
 
 // the indexer cache layout is part of the sequence state, so a file written by another
@@ -357,6 +361,423 @@ static uint32_t qwen_idx_ratio(const llama_model & model) {
 
     return ratio == 0 ? 4 : ratio;
 }
+
+// [TAG_QSA_LAYOUT_CACHE] LLAMA_QSA_LAYOUT_CACHE: 1 (default) keeps the block layout of each
+// stream's cells from one ubatch to the next and updates it from the change journal of the
+// cells, so a decode step touches only the cells that changed instead of every cell of the
+// context. 0 rescans every cell for every ubatch, as before.
+// LLAMA_QSA_LAYOUT_CHECK: 1 also runs the rescan after every cached fill and aborts if a
+// single byte of the inputs differs; the rescan's inputs are the ones the graph then reads.
+static bool qwen_qsa_layout_cache_enabled() {
+    static const bool enabled = []() {
+        const char * env = std::getenv("LLAMA_QSA_LAYOUT_CACHE");
+        return env == nullptr || std::atoi(env) != 0;
+    }();
+    return enabled;
+}
+
+static bool qwen_qsa_layout_check_enabled() {
+    static const bool enabled = []() {
+        const char * env = std::getenv("LLAMA_QSA_LAYOUT_CHECK");
+        return env != nullptr && std::atoi(env) != 0;
+    }();
+    return enabled;
+}
+
+// The block layout of one stream's cells, as the rescan in set_input_qsa_scan derives it, for
+// the case the cached fill covers: a single sequence that every used cell carries alone, no
+// two cells on one position of a block and no position past the cell window. Blocks are then
+// keyed on the position bucket alone, and block ids number the full blocks in position order.
+// Anything else drops the layout and leaves the ubatch to the rescan.
+struct llama_qsa_layout {
+    const llama_kv_cells * cells = nullptr;
+
+    int64_t      r        = 0;
+    int64_t      n_kv     = 0;
+    int64_t      n_blocks = 0;
+    llama_seq_id seq      = -1;
+    uint64_t     gen      = 0;     // generation of the cells the layout matches
+    bool         valid    = false;
+
+    // after a failed rebuild, ubatches left to the rescan before the next attempt
+    int32_t skip    = 0;
+    int32_t backoff = 0;
+
+    std::vector<int32_t> pos;         // [n_kv] position of each cell as last seen, -1 if empty
+    std::vector<int32_t> slot_cell;   // [n_blocks*r] cell at each position of a block, -1 if none
+    std::vector<int32_t> n_fill;      // [n_blocks] positions of the block that have a cell
+    std::vector<int32_t> bid_of;      // [n_blocks] block id of a full block, -1 otherwise
+    std::vector<int32_t> full;        // [n_bid] block id -> block, ascending
+    std::set<int32_t>    dead;        // used cells in no full block, ascending
+    std::vector<int32_t> empty;       // empty cells, in no order
+    std::vector<int32_t> empty_at;    // [n_kv] index of each empty cell in `empty`, -1 if used
+    int32_t              dead_bid = 0;
+
+    // the per-stream rows of cell_blk and blk_cells, as the rescan writes them
+    std::vector<int32_t> out_cell_blk;    // [n_kv]
+    std::vector<int32_t> out_blk_cells;   // [r*n_blocks]
+
+    // scratch
+    std::vector<uint32_t> journal;
+    std::vector<uint32_t> changed;
+    std::vector<uint32_t> cell_mark;
+    std::vector<uint32_t> blk_mark;
+    uint32_t              mark = 0;
+    std::vector<std::pair<int32_t, bool>> blocks;   // blocks the changed cells touch, full before
+    std::vector<int32_t>  gained;
+    std::vector<int32_t>  to_dead;
+
+    void reset(const llama_kv_cells & c, llama_seq_id s, int64_t n_kv_new) {
+        cells    = &c;
+        seq      = s;
+        n_kv     = n_kv_new;
+        n_blocks = (n_kv + r - 1)/r;
+
+        pos      .assign(n_kv, -1);
+        slot_cell.assign(n_blocks*r, -1);
+        n_fill   .assign(n_blocks, 0);
+        bid_of   .assign(n_blocks, -1);
+        full     .clear();
+        dead     .clear();
+
+        empty   .resize(n_kv);
+        empty_at.resize(n_kv);
+        for (int64_t j = 0; j < n_kv; ++j) {
+            empty[j]    = (int32_t) j;
+            empty_at[j] = (int32_t) j;
+        }
+
+        // no full block yet, so every cell points at block 0, the spare
+        dead_bid = 0;
+
+        out_cell_blk .assign(n_kv, 0);
+        out_blk_cells.assign(r*n_blocks, 0);
+
+        cell_mark.assign(n_kv, 0);
+        blk_mark .assign(n_blocks, 0);
+        mark = 0;
+    }
+
+    // the cell window grew (n_kv is padded, so this happens every few hundred tokens): the new
+    // cells start out empty, and the caller passes them to update() as changed
+    void grow(int64_t n_kv_new) {
+        const int64_t n_blocks_new = (n_kv_new + r - 1)/r;
+
+        pos     .resize(n_kv_new, -1);
+        empty_at.resize(n_kv_new, -1);
+        for (int64_t j = n_kv; j < n_kv_new; ++j) {
+            empty_at[j] = (int32_t) empty.size();
+            empty.push_back((int32_t) j);
+        }
+
+        slot_cell.resize(n_blocks_new*r, -1);
+        n_fill   .resize(n_blocks_new, 0);
+        bid_of   .resize(n_blocks_new, -1);
+
+        // written by update(), which sees the spare block move if the block count changes it
+        out_cell_blk .resize(n_kv_new, dead_bid);
+        out_blk_cells.resize(r*n_blocks_new, 0);
+
+        cell_mark.resize(n_kv_new, 0);
+        blk_mark .resize(n_blocks_new, 0);
+
+        n_kv     = n_kv_new;
+        n_blocks = n_blocks_new;
+    }
+
+    // brings the layout from the cells as last seen to the cells now, given every cell that
+    // changed in between. false leaves the layout unusable.
+    bool update(const llama_kv_cells & c, const std::vector<uint32_t> & list) {
+        if (++mark == 0) {
+            std::fill(cell_mark.begin(), cell_mark.end(), 0);
+            std::fill(blk_mark .begin(), blk_mark .end(), 0);
+            mark = 1;
+        }
+
+        changed.clear();
+        blocks .clear();
+        gained .clear();
+        to_dead.clear();
+
+        for (uint32_t j : list) {
+            if ((int64_t) j < n_kv && cell_mark[j] != mark) {
+                cell_mark[j] = mark;
+                changed.push_back(j);
+            }
+        }
+
+        const auto touch = [&](int64_t pb) {
+            if (blk_mark[pb] != mark) {
+                blk_mark[pb] = mark;
+                blocks.emplace_back((int32_t) pb, bid_of[pb] >= 0);
+            }
+        };
+
+        // take out what the changed cells held before putting in what they hold now, so that
+        // two cells trading positions never look like two cells on one position
+        for (uint32_t j : changed) {
+            const int32_t p = pos[j];
+
+            if (p < 0) {
+                const int32_t k    = empty_at[j];
+                const int32_t last = empty.back();
+
+                empty[k]       = last;
+                empty_at[last] = k;
+                empty.pop_back();
+                empty_at[j]    = -1;
+
+                continue;
+            }
+
+            const int64_t pb = p/r;
+
+            touch(pb);
+
+            int32_t & sc = slot_cell[pb*r + p%r];
+            if (sc != (int32_t) j) {
+                return false;
+            }
+
+            sc = -1;
+            n_fill[pb]--;
+            dead.erase((int32_t) j);
+            pos[j] = -1;
+        }
+
+        for (uint32_t j : changed) {
+            if (c.is_empty(j)) {
+                empty_at[j] = (int32_t) empty.size();
+                empty.push_back((int32_t) j);
+
+                continue;
+            }
+
+            if (c.seq_count(j) != 1 || !c.seq_has(j, seq)) {
+                return false;
+            }
+
+            const llama_pos p = c.pos_get(j);
+
+            if (p < 0 || p/r >= n_blocks) {
+                return false;
+            }
+
+            const int64_t pb = p/r;
+
+            touch(pb);
+
+            int32_t & sc = slot_cell[pb*r + p%r];
+            if (sc >= 0) {
+                return false;
+            }
+
+            sc = (int32_t) j;
+            n_fill[pb]++;
+            pos[j] = p;
+        }
+
+        // block ids number the full blocks in order, so they stay put only while blocks stop
+        // or start being full at the end of that order. Anything else renumbers.
+        const int64_t n_old  = (int64_t) full.size();
+        int64_t       n_lost = 0;
+
+        for (const auto & [pb, was_full] : blocks) {
+            const bool is_full = n_fill[pb] == r;
+
+            if (was_full && !is_full) {
+                n_lost++;
+            } else if (!was_full && is_full) {
+                gained.push_back(pb);
+            }
+        }
+
+        for (const auto & [pb, was_full] : blocks) {
+            if (was_full && n_fill[pb] != r && bid_of[pb] < n_old - n_lost) {
+                return false;
+            }
+        }
+
+        for (int64_t b = n_old - n_lost; b < n_old; ++b) {
+            const int32_t pb = full[b];
+
+            bid_of[pb] = -1;
+
+            for (int64_t k = 0; k < r; ++k) {
+                out_blk_cells[b*r + k] = 0;
+
+                const int32_t cell = slot_cell[pb*r + k];
+                if (cell >= 0) {
+                    dead.insert(cell);
+                    to_dead.push_back(cell);
+                }
+            }
+        }
+        full.resize(n_old - n_lost);
+
+        std::sort(gained.begin(), gained.end());
+
+        if (!gained.empty() && !full.empty() && gained.front() <= full.back()) {
+            return false;
+        }
+
+        for (int32_t pb : gained) {
+            const int32_t b = (int32_t) full.size();
+
+            full.push_back(pb);
+            bid_of[pb] = b;
+
+            for (int64_t k = 0; k < r; ++k) {
+                const int32_t cell = slot_cell[pb*r + k];
+
+                out_blk_cells[b*r + k] = cell;
+                out_cell_blk[cell]     = b;
+                dead.erase(cell);
+            }
+        }
+
+        for (uint32_t j : changed) {
+            const int32_t p = pos[j];
+            if (p < 0) {
+                continue;
+            }
+
+            const int32_t b = bid_of[p/r];
+
+            if (b >= 0) {
+                out_blk_cells[(int64_t) b*r + p%r] = (int32_t) j;
+                out_cell_blk[j] = b;
+            } else {
+                dead.insert((int32_t) j);
+            }
+        }
+
+        // every cell in no full block points at the spare block, which moves with the count
+        const int64_t n_bid        = (int64_t) full.size();
+        const int32_t dead_bid_new = (int32_t) (n_bid < n_blocks ? n_bid : n_blocks - 1);
+
+        if (dead_bid_new != dead_bid) {
+            dead_bid = dead_bid_new;
+
+            for (int32_t cell : empty) {
+                out_cell_blk[cell] = dead_bid;
+            }
+            for (int32_t cell : dead) {
+                out_cell_blk[cell] = dead_bid;
+            }
+        } else {
+            for (uint32_t j : changed) {
+                if (pos[j] < 0 || bid_of[pos[j]/r] < 0) {
+                    out_cell_blk[j] = dead_bid;
+                }
+            }
+            for (int32_t cell : to_dead) {
+                out_cell_blk[cell] = dead_bid;
+            }
+        }
+
+        return true;
+    }
+};
+
+struct llama_qsa_layout_cache {
+    std::vector<std::unique_ptr<llama_qsa_layout>> layouts;
+
+    uint64_t n_cached   = 0;   // ubatches filled from the layouts
+    uint64_t n_scan     = 0;   // ubatches left to the rescan
+    uint64_t n_checked  = 0;   // cached fills the rescan reproduced byte for byte
+    uint64_t n_same     = 0;   // per stream: cells unchanged since the last fill
+    uint64_t n_update   = 0;   // per stream: layout updated from the journal
+    uint64_t n_rebuild  = 0;   // per stream: layout rebuilt from every cell
+    uint64_t n_failed   = 0;   // per stream: rebuilds that met a case the layout does not cover
+
+    bool announced = false;
+
+    ~llama_qsa_layout_cache() {
+        if (n_cached + n_scan == 0) {
+            return;
+        }
+
+        LLAMA_LOG_INFO("%s: QSA layout cache: %" PRIu64 " cached fills (streams: %" PRIu64
+                " unchanged, %" PRIu64 " updated, %" PRIu64 " rebuilt, %" PRIu64 " not covered), %" PRIu64
+                " full rescans, %" PRIu64 " checked identical\n",
+                __func__, n_cached, n_same, n_update, n_rebuild, n_failed, n_scan, n_checked);
+    }
+
+    llama_qsa_layout & get(const llama_kv_cells * cells, int64_t r) {
+        for (auto & lay : layouts) {
+            if (lay->cells == cells && lay->r == r) {
+                return *lay;
+            }
+        }
+
+        layouts.push_back(std::make_unique<llama_qsa_layout>());
+        layouts.back()->cells = cells;
+        layouts.back()->r     = r;
+
+        return *layouts.back();
+    }
+
+    // true when the layout matches the cells now
+    bool sync(llama_qsa_layout & lay, const llama_kv_cells & cells, llama_seq_id seq, int64_t n_kv) {
+        if (lay.valid && lay.seq == seq && lay.n_kv <= n_kv) {
+            lay.journal.clear();
+
+            if (cells.get_changed_since(lay.gen, lay.journal)) {
+                if (lay.n_kv < n_kv) {
+                    const int64_t n_kv_old = lay.n_kv;
+
+                    lay.grow(n_kv);
+
+                    for (int64_t j = n_kv_old; j < n_kv; ++j) {
+                        lay.journal.push_back((uint32_t) j);
+                    }
+                }
+
+                if (lay.journal.empty()) {
+                    n_same++;
+                    return true;
+                }
+
+                if (lay.update(cells, lay.journal)) {
+                    lay.gen = cells.get_gen();
+                    n_update++;
+                    return true;
+                }
+            }
+        }
+
+        lay.valid = false;
+
+        if (lay.skip > 0) {
+            lay.skip--;
+            return false;
+        }
+
+        lay.reset(cells, seq, n_kv);
+
+        lay.journal.resize(n_kv);
+        for (int64_t j = 0; j < n_kv; ++j) {
+            lay.journal[j] = (uint32_t) j;
+        }
+
+        lay.valid = lay.update(cells, lay.journal);
+        n_rebuild++;
+
+        if (lay.valid) {
+            lay.gen     = cells.get_gen();
+            lay.backoff = 0;
+        } else {
+            // a context the layout does not cover (repeated positions of an image, say) tends to
+            // stay, so the rebuild is retried at a falling rate
+            lay.backoff = std::min(std::max(1, 2*lay.backoff), 256);
+            lay.skip    = lay.backoff;
+            n_failed++;
+        }
+
+        return lay.valid;
+    }
+};
 
 //
 // llama_memory_hybrid_idx
@@ -777,7 +1198,7 @@ ggml_type llama_memory_hybrid_idx::get_idx_raw_type() const {
     return idx_raw_type;
 }
 
-void llama_memory_hybrid_idx::set_input_qsa(
+void llama_memory_hybrid_idx::set_input_qsa_scan(
         ggml_tensor * cell_blk,
         ggml_tensor * blk_cells,
         ggml_tensor * blk_pos,
@@ -1223,6 +1644,323 @@ void llama_memory_hybrid_idx::set_input_qsa(
         llama_qsa_dump_set_blocks(dump_blocks);
         llama_qsa_dump_set_cell_blk(dst_cell_blk, n_kv, n_ns);
     }
+}
+
+// [TAG_QSA_LAYOUT_CACHE] fills what set_input_qsa_scan fills, byte for byte, from the stream
+// layouts. Per ubatch this costs the changed cells, one copy of cell_blk and blk_cells, and one
+// pass over the blocks per query row for the bias, instead of a walk over every cell.
+bool llama_memory_hybrid_idx::set_input_qsa_cached(
+        ggml_tensor * cell_blk,
+        ggml_tensor * blk_cells,
+        ggml_tensor * blk_pos,
+        ggml_tensor * bias,
+        const llama_ubatch * ubatch,
+        uint32_t ratio,
+        bool blk_bias,
+        ggml_tensor * completed_pos,
+        const std::vector<int64_t> * write_idxs,
+        ggml_tensor * blk_meta,
+        uint32_t width,
+        bool allow_fast) const {
+    // the per-cell bias and the dump stay with the rescan
+    if (!blk_bias || llama_qsa_dump_enabled()) {
+        return false;
+    }
+
+    GGML_ASSERT(ratio > 0);
+    GGML_ASSERT(get_mem_idx() != nullptr);
+
+    GGML_ASSERT(ggml_backend_buffer_is_host(cell_blk->buffer));
+
+    const int64_t n_kv     = cell_blk->ne[0];
+    const int64_t n_ns     = cell_blk->ne[1];
+    const int64_t n_blocks = (n_kv + ratio - 1)/ratio;
+    const int64_t n_tokens = ubatch->n_tokens;
+    const int64_t r        = ratio;
+
+    if (n_kv <= 0 || n_ns <= 0 || n_tokens % n_ns != 0 || r > 64) {
+        return false;
+    }
+
+    const int64_t n_tps = n_tokens/n_ns;
+
+    if (!qsa_layout) {
+        qsa_layout = std::make_unique<llama_qsa_layout_cache>();
+    }
+
+    auto & lc = *qsa_layout;
+
+    std::vector<const llama_qsa_layout *> lays(n_ns, nullptr);
+
+    for (int64_t s = 0; s < n_ns; ++s) {
+        const llama_seq_id seq_of_stream = ubatch->seq_id[s*n_tps][0];
+
+        const auto & cells = (idx_pooled ? get_mem_attn() : get_mem_idx())->get_cells(seq_of_stream);
+
+        int          n_seq_present = 0;
+        llama_seq_id seq           = -1;
+
+        for (int sq = 0; sq < LLAMA_MAX_SEQ && n_seq_present < 2; ++sq) {
+            if (cells.seq_pos_min(sq) >= 0) {
+                n_seq_present++;
+                seq = sq;
+            }
+        }
+
+        if (n_seq_present != 1) {
+            return false;
+        }
+
+        auto & lay = lc.get(&cells, r);
+
+        if (!lc.sync(lay, cells, seq, n_kv)) {
+            return false;
+        }
+
+        lays[s] = &lay;
+    }
+
+    int32_t * dst_cell_blk = (int32_t *) cell_blk->data;
+    float   * dst_bias     = (float   *) bias->data;
+
+    const bool have_cells = blk_cells != nullptr && blk_cells->data != nullptr;
+
+    int32_t * dst_blk_cells = have_cells ? (int32_t *) blk_cells->data : nullptr;
+    int32_t * dst_blk_pos   = blk_pos != nullptr && blk_pos->data != nullptr ? (int32_t *) blk_pos->data : nullptr;
+
+    int32_t * dst_meta = blk_meta != nullptr && blk_meta->data != nullptr ?
+        (int32_t *) blk_meta->data : nullptr;
+
+    if (dst_meta != nullptr) {
+        GGML_ASSERT(ggml_backend_buffer_is_host(blk_meta->buffer));
+        GGML_ASSERT(blk_meta->ne[0] == GGML_TOP_K_BLOCK_META_N);
+        std::fill(dst_meta, dst_meta + GGML_TOP_K_BLOCK_META_N*n_tps*n_ns, 0);
+    }
+
+    if (dst_blk_pos != nullptr) {
+        std::fill(dst_blk_pos, dst_blk_pos + 4*n_blocks*n_ns, 0);
+    }
+
+    for (int64_t s = 0; s < n_ns; ++s) {
+        const llama_qsa_layout & lay = *lays[s];
+
+        const auto & cells = *lay.cells;
+
+        GGML_ASSERT(lay.n_kv == n_kv && lay.n_blocks == n_blocks);
+
+        memcpy(dst_cell_blk + s*n_kv, lay.out_cell_blk.data(), n_kv*sizeof(int32_t));
+
+        if (have_cells) {
+            memcpy(dst_blk_cells + s*(r*n_blocks), lay.out_blk_cells.data(), r*n_blocks*sizeof(int32_t));
+        }
+
+        const auto &  full      = lay.full;
+        const int64_t n_bid     = (int64_t) full.size();
+        const bool    have_dead = n_bid < n_blocks;
+        const int32_t dead_bid  = lay.dead_bid;
+
+        GGML_ASSERT(n_bid <= n_blocks);
+        GGML_ASSERT(dead_bid == (have_dead ? n_bid : n_blocks - 1));
+
+        if (dst_blk_pos != nullptr) {
+            for (int64_t b = 0; b < n_bid; ++b) {
+                for (int64_t sec = 0; sec < 4; ++sec) {
+                    dst_blk_pos[sec*(n_blocks*n_ns) + s*n_blocks + b] = (int32_t) (full[b]*r);
+                }
+            }
+        }
+
+        const bool dead_listed = (int64_t) lay.dead.size() <= GGML_TOP_K_BLOCK_META_CELLS;
+
+        for (int64_t ii = 0; ii < n_tps; ++ii) {
+            const int64_t      i      = s*n_tps + ii;
+            const llama_seq_id seq_id = ubatch->seq_id[i][0];
+
+            const int64_t q = ubatch->pos[i];
+
+            // the tail is an incomplete block and is always visible, as in the reference
+            const int64_t tail_start = (q + 1)/r*r;
+
+            float * cur_blk_bias = dst_bias + i*n_blocks;
+
+            // a valid layout has at most one cell per position (see llama_qsa_layout::update),
+            // which is the condition the rescan checks with its duplicate detection
+            bool    described = dst_meta != nullptr && allow_fast && have_cells &&
+                width > 0 && dead_listed;
+            int64_t n_visible = 0;
+
+            // every full block holds cells of the layout's one sequence only
+            if (seq_id == lay.seq) {
+                // the blocks ascend, so those at or past the tail are one run at the end
+                const int64_t b_tail = std::partition_point(full.begin(), full.end(),
+                        [&](int32_t pb) { return (int64_t) pb*r < tail_start; }) - full.begin();
+
+                std::fill(cur_blk_bias,          cur_blk_bias + b_tail, 0.0f);
+                std::fill(cur_blk_bias + b_tail, cur_blk_bias + n_bid,  1e9f);
+
+                n_visible = r*n_bid;
+
+                if (n_bid > 0 && (int64_t) full.back()*r + r - 1 > q) {
+                    described = false;
+                }
+            } else {
+                std::fill(cur_blk_bias, cur_blk_bias + n_bid, -INFINITY);
+            }
+
+            std::fill(cur_blk_bias + n_bid, cur_blk_bias + n_blocks, -INFINITY);
+
+            if (described) {
+                int32_t * meta_row  = dst_meta + i*GGML_TOP_K_BLOCK_META_N;
+                int32_t * meta_tail = meta_row + GGML_TOP_K_BLOCK_META_HEAD;
+                int32_t   n_tail    = 0;
+
+                for (int32_t c : lay.dead) {
+                    if (cells.seq_has((uint32_t) c, seq_id) && (int64_t) cells.pos_get(c) <= q) {
+                        meta_tail[n_tail++] = c;
+                    }
+                }
+
+                n_visible += n_tail;
+
+                if (n_visible >= (int64_t) width) {
+                    meta_row[0] = 1;
+                    meta_row[1] = (int32_t) n_bid;
+                    meta_row[2] = dead_bid;
+                    meta_row[3] = n_tail;
+                    meta_row[4] = (int32_t) (n_kv - n_visible);
+                }
+            }
+
+            if (have_dead) {
+                cur_blk_bias[dead_bid] = 1e9f;
+            }
+        }
+    }
+
+    if (completed_pos) {
+        GGML_ASSERT(write_idxs && completed_pos->ne[0] == (int64_t) (4*write_idxs->size()));
+        std::vector<int32_t> positions(completed_pos->ne[0], 0);
+        const int64_t cache_size = mem_idx->get_size();
+        for (size_t w = 0; w < write_idxs->size(); ++w) {
+            const int64_t row = (*write_idxs)[w]%cache_size;
+            if (row >= idx_n_rows) {
+                continue; // scratch never names a live block
+            }
+            const llama_seq_id seq = (llama_seq_id) ((*write_idxs)[w]/cache_size);
+            int64_t s = 0;
+            while (s < n_ns && ubatch->seq_id[s*n_tps][0] != seq) {
+                ++s;
+            }
+            GGML_ASSERT(s < n_ns && row < n_blocks);
+            // the rescan reads this from its block positions, indexed by block id
+            const auto & full = lays[s]->full;
+            const int32_t v = row < (int64_t) full.size() ? (int32_t) (full[row]*r) : 0;
+            for (int64_t sec = 0; sec < 4; ++sec) {
+                positions[sec*write_idxs->size() + w] = v;
+            }
+        }
+        ggml_backend_tensor_set(completed_pos, positions.data(), 0, positions.size()*sizeof(int32_t));
+    }
+
+    return true;
+}
+
+static std::vector<uint8_t> qwen_qsa_snapshot(const ggml_tensor * t) {
+    std::vector<uint8_t> res;
+    if (t != nullptr && t->buffer != nullptr && t->data != nullptr) {
+        res.resize(ggml_nbytes(t));
+        ggml_backend_tensor_get(t, res.data(), 0, res.size());
+    }
+    return res;
+}
+
+void llama_memory_hybrid_idx::set_input_qsa(
+        ggml_tensor * cell_blk,
+        ggml_tensor * blk_cells,
+        ggml_tensor * blk_pos,
+        ggml_tensor * bias,
+        const llama_ubatch * ubatch,
+        uint32_t ratio,
+        bool blk_bias,
+        ggml_tensor * completed_pos,
+        const std::vector<int64_t> * write_idxs,
+        ggml_tensor * blk_meta,
+        uint32_t width,
+        bool allow_fast) const {
+    if (!qwen_qsa_layout_cache_enabled()) {
+        set_input_qsa_scan(cell_blk, blk_cells, blk_pos, bias, ubatch, ratio, blk_bias, completed_pos,
+                write_idxs, blk_meta, width, allow_fast);
+        return;
+    }
+
+    if (!set_input_qsa_cached(cell_blk, blk_cells, blk_pos, bias, ubatch, ratio, blk_bias, completed_pos,
+                write_idxs, blk_meta, width, allow_fast)) {
+        if (qsa_layout) {
+            qsa_layout->n_scan++;
+        }
+        set_input_qsa_scan(cell_blk, blk_cells, blk_pos, bias, ubatch, ratio, blk_bias, completed_pos,
+                write_idxs, blk_meta, width, allow_fast);
+        return;
+    }
+
+    auto & lc = *qsa_layout;
+
+    lc.n_cached++;
+
+    if (!lc.announced) {
+        lc.announced = true;
+        LLAMA_LOG_INFO("%s: QSA inputs are filled from the cached block layout%s\n", __func__,
+                qwen_qsa_layout_check_enabled() ? ", each fill checked against a full rescan" : "");
+    }
+
+    if (!qwen_qsa_layout_check_enabled()) {
+        return;
+    }
+
+    const ggml_tensor * tensors[] = { cell_blk, blk_cells, blk_pos, blk_meta, bias, completed_pos };
+    const char *        names[]   = { "cell_blk", "blk_cells", "blk_pos", "blk_meta", "bias", "completed_pos" };
+    constexpr int       n_check   = 6;
+
+    std::vector<uint8_t> cached[n_check];
+    for (int k = 0; k < n_check; ++k) {
+        cached[k] = qwen_qsa_snapshot(tensors[k]);
+    }
+
+    set_input_qsa_scan(cell_blk, blk_cells, blk_pos, bias, ubatch, ratio, blk_bias, completed_pos,
+            write_idxs, blk_meta, width, allow_fast);
+
+    for (int k = 0; k < n_check; ++k) {
+        const std::vector<uint8_t> scan = qwen_qsa_snapshot(tensors[k]);
+
+        if (scan == cached[k]) {
+            continue;
+        }
+
+        size_t first = 0;
+        size_t n_diff = 0;
+        const size_t n = std::min(scan.size(), cached[k].size())/sizeof(int32_t);
+        for (size_t e = n; e-- > 0;) {
+            if (memcmp(scan.data() + e*4, cached[k].data() + e*4, 4) != 0) {
+                first = e;
+                n_diff++;
+            }
+        }
+
+        int32_t v_scan   = 0;
+        int32_t v_cached = 0;
+        if (n > 0) {
+            memcpy(&v_scan,   scan.data()      + first*4, 4);
+            memcpy(&v_cached, cached[k].data() + first*4, 4);
+        }
+
+        LLAMA_LOG_ERROR("%s: QSA layout check failed on %s: %zu of %zu elements differ"
+                " (sizes %zu/%zu bytes), first at %zu: rescan %d (0x%08x) cached %d (0x%08x), ubatch pos %d, n_tokens %u\n",
+                __func__, names[k], n_diff, n, scan.size(), cached[k].size(), first, v_scan, (unsigned) v_scan,
+                v_cached, (unsigned) v_cached, ubatch->pos[0], ubatch->n_tokens);
+        GGML_ABORT("QSA layout check failed");
+    }
+
+    lc.n_checked++;
 }
 
 //
