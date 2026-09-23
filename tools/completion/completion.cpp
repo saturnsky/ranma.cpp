@@ -5,6 +5,7 @@
 #include "sampling.h"
 #include "llama.h"
 #include "chat.h"
+#include "expert-policy.h"
 
 #include <clocale>
 #include <cstdio>
@@ -150,6 +151,36 @@ int llama_completion(int argc, char ** argv) {
         LOG_ERR("%s: error: unable to create context\n", __func__);
         return 1;
     }
+
+    // ranma: the expert cache itself is installed at model load from common_params; the policy
+    // (common/expert-policy.h) is driven here the way the server drives it for slot 0. One turn is
+    // one request: the prompt interval runs from the first input token to the first sampled token,
+    // the generation interval from there until control returns to the user or the run ends.
+    common_expert expert;
+    if (params.expert_l1_mib > 0 || params.expert_l2_mib > 0) {
+        common_expert_params ep;
+        ep.l1_mib       = params.expert_l1_mib;
+        ep.prefill_swap = params.expert_prefill_swap;
+        ep.freeze       = params.expert_freeze;
+        expert.init(ctx, ep);
+    }
+
+    enum expert_phase_t { EXPERT_PHASE_IDLE, EXPERT_PHASE_PROMPT, EXPERT_PHASE_GENERATION };
+    expert_phase_t expert_phase = EXPERT_PHASE_IDLE;
+    uint64_t expert_n_prompt = 0; // tokens decoded in the open prompt interval
+    uint64_t expert_n_gen    = 0; // tokens decoded in the open generation interval
+
+    // commit the open generation interval, or discard a prompt interval that never reached generation
+    auto expert_turn_end = [&]() {
+        if (expert_phase == EXPERT_PHASE_GENERATION) {
+            expert.on_request_end(0, expert_n_prompt, expert_n_gen, false);
+        } else if (expert_phase == EXPERT_PHASE_PROMPT) {
+            expert.on_interrupted(0);
+        }
+        expert_phase    = EXPERT_PHASE_IDLE;
+        expert_n_prompt = 0;
+        expert_n_gen    = 0;
+    };
 
     llama_memory_t mem = llama_get_memory(ctx);
     const llama_vocab * vocab = llama_model_get_vocab(model);
@@ -645,7 +676,13 @@ int llama_completion(int argc, char ** argv) {
                 const bool save_now = session_do_save && is_last_batch;
                 session_tokens.insert(session_tokens.end(), embd.begin(), embd.end());
                 if (!common_prompt_batch_decode(ctx, session_tokens, embd.size(), n_past, params.n_batch, path_session, save_now)) {
+                    expert.on_interrupted(0);
                     return 1;
+                }
+                if (expert_phase == EXPERT_PHASE_PROMPT) {
+                    expert_n_prompt += embd.size();
+                } else if (expert_phase == EXPERT_PHASE_GENERATION) {
+                    expert_n_gen += embd.size();
                 }
                 n_session_consumed += embd.size();
                 if (save_now) {
@@ -664,6 +701,12 @@ int llama_completion(int argc, char ** argv) {
         embd.clear();
 
         if ((int) embd_inp.size() <= n_consumed && !is_interacting) {
+
+            // the logits of the processed prompt are ready: the rows decoded from here on are generation
+            if (expert_phase != EXPERT_PHASE_GENERATION) {
+                expert.on_generation_start(0, expert_n_prompt);
+                expert_phase = EXPERT_PHASE_GENERATION;
+            }
 
             const llama_token id = common_sampler_sample(smpl, ctx, -1);
 
@@ -687,6 +730,11 @@ int llama_completion(int argc, char ** argv) {
         } else {
             // some user input remains from prompt or interaction, forward it to processing
             LOG_DBG("embd_inp.size(): %d, n_consumed: %d\n", (int) embd_inp.size(), n_consumed);
+            // these tokens are decoded on the next pass: open the prompt interval of this turn
+            if (expert_phase == EXPERT_PHASE_IDLE && (int) embd_inp.size() > n_consumed) {
+                expert.on_prompt_start(0);
+                expert_phase = EXPERT_PHASE_PROMPT;
+            }
             while ((int) embd_inp.size() > n_consumed) {
                 embd.push_back(embd_inp[n_consumed]);
 
@@ -803,6 +851,12 @@ int llama_completion(int argc, char ** argv) {
 
             if ((n_past > 0 || waiting_for_first_input) && is_interacting) {
                 LOG_DBG("waiting for user input\n");
+
+                // control returns to the user: the turn ends here unless its prompt is still pending
+                // (a system prompt or -p text queued before the first input stays in the same interval)
+                if (expert_phase == EXPERT_PHASE_GENERATION) {
+                    expert_turn_end();
+                }
 
                 if (params.conversation_mode) {
                     LOG("\n> ");
@@ -938,6 +992,8 @@ int llama_completion(int argc, char ** argv) {
             is_interacting = true;
         }
     }
+
+    expert_turn_end();
 
     if (!path_session.empty() && params.prompt_cache_all && !params.prompt_cache_ro) {
         LOG("\n%s: saving final output to session file '%s'\n", __func__, path_session.c_str());
