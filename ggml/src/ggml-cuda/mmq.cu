@@ -250,6 +250,17 @@ void ggml_cuda_mul_mat_q(
     if (GGML_CUDA_CC_IS_RDNA3(cc) || GGML_CUDA_CC_IS_RDNA4(cc)) {
         ncols_opt = (ne12*n_expert_used + ne02 - 1) / ne02;
     }
+    // Popular experts get many more columns than the mean, and an expert with more columns than the tile width
+    // reads its weights once per column tile, over the link if the expert is in host memory. On RDNA4 the width is
+    // therefore sized against a multiple of the mean. Column tiling does not change the summation order of a column.
+    // GGML_CUDA_MMQ_ID_NCOLS_OPT_SCALE=N overrides the multiple, 1 keeps the mean.
+    if (GGML_CUDA_CC_IS_RDNA4(cc)) {
+        static const int64_t ncols_opt_scale = [] {
+            const char * value = getenv("GGML_CUDA_MMQ_ID_NCOLS_OPT_SCALE");
+            return value && atoll(value) > 0 ? atoll(value) : 3;
+        }();
+        ncols_opt = std::min<int64_t>(ne12, ncols_opt*ncols_opt_scale);
+    }
 
     // Note that ne02 is used instead of ne12 because the number of y channels determines the z dimension of the CUDA grid.
     const mmq_args args = {

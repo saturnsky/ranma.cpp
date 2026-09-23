@@ -92,6 +92,9 @@ applies, how to switch it, and its limits.
   activation columns (router, SSM and hyper-connection projections of a prompt batch) run on dedicated kernels
   instead of hipBLAS, whose per-process solution choice changed their speed and summation order from one process
   to the next. `GGML_CUDA_SKINNY_F32=0` restores hipBLAS. Same page.
+- **Wider MoE column tiles** - the MMQ tile width of a `MUL_MAT_ID` is sized against three times the mean
+  column count per expert, so popular experts re-read their weights less often. Bit-identical;
+  `GGML_CUDA_MMQ_ID_NCOLS_OPT_SCALE=1` restores the upstream width. Same page.
 
 ## Building
 
