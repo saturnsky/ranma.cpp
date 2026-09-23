@@ -14,6 +14,7 @@
 #include <array>
 #include <cstdint>
 #include <fstream>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -33,7 +34,17 @@ struct l2_config {
     bool   phase_rings        = false;   // a smaller ring during generation, lending its tail slots
     bool   verify             = false;
     uint32_t log_mask         = 0;
+    // Staged service: ubatches of at least this many rows publish their file reads one kind at a
+    // time, in the order the graph multiplies them, so the kernels of a kind wait only for that
+    // kind's slices while the next kind is still being read. 0 = one wait per layer for everything.
+    int64_t staged_min_rows   = 0;
+    bool    staged_drain      = false;   // complete every read of a kind before issuing the next kind
 };
+
+// Whether the staged service is on when RANMA_EXPERT_L2_STAGED is not set. On, it covers the
+// ubatches with more rows than the decode bound, i.e. prompt processing; generation keeps the
+// single wait. It reads the same bytes into the same slots and runs the same kernels.
+static constexpr bool l2_staged_default = true;
 
 // What the tier reports every so often under GGML_EXPERT_LOG_L2.
 struct l2_counters {
@@ -52,6 +63,7 @@ struct l2_counters {
     uint64_t verify_bytes  = 0;
     uint64_t verify_bad    = 0;
     uint64_t owner_checks  = 0;
+    uint64_t staged_generations = 0, staged_wait_ticks = 0;
 };
 
 // Class arena addresses. Lent residents use the common location map.
@@ -122,6 +134,10 @@ public:
     // ---- the hot path ------------------------------------------------------------------------------
     const uint64_t * addresses(int layer, int kind) const;
     void publish_and_wait(int layer, const ggml_tensor * ids, cudaStream_t stream);
+    // Staged service only: orders the kernel that reads `kind` of `layer` after that kind's reads.
+    // A no-op for the first kind, which the route waits for, and for a layer routed unstaged.
+    bool staged() const { return cfg_.staged_min_rows > 0; }
+    void wait_kind(int layer, int kind, cudaStream_t stream);
     void mark_done(int layer, cudaStream_t stream);
 
     void start_worker();
@@ -147,6 +163,7 @@ private:
     void   size_ring();
     void   publish_tables();
     void   publish_layer(int layer);
+    void   publish_layer_kind(int layer, int kind);
     void   verify_addresses(int demanded_layer, const std::vector<int> & ids);
     uint64_t address_of(int layer, int kind, int expert) const;
     void * ring_host(int kind, int slot) const {
@@ -155,9 +172,14 @@ private:
     bool   verify_slice(int layer, int kind, int expert, const void * data, std::string & reason);
     bool   read_raw(int layer, int kind, int expert, void * dst, std::string & reason);
     void   service_layer(int layer, uint32_t seq, const std::vector<int> & ids);
-    bool   run_reads(const std::vector<l2_read> & reads, std::string & reason, bool install = false);
+    void   serve_staged(int layer, uint32_t seq, const std::vector<l2_read> & reads);
+    // `progress(n)` runs once the first n reads are in place (checked, tails cleared) while the
+    // rest are still in flight.
+    bool   run_reads(const std::vector<l2_read> & reads, std::string & reason, bool install = false,
+                     const std::function<bool(size_t)> & progress = nullptr);
     void   worker_loop(std::vector<uint32_t> seen);
     void   collect_wait(int layer);
+    void   collect_stage(int layer);
     void   report_counters(const char * what);
     struct sample {
         uint32_t seq = 0, rows = 0;
@@ -224,6 +246,8 @@ private:
     std::atomic<int> phase_{-1}; // Without a profile, classify by the configured decode row bound.
     std::vector<sample> pending_, samples_;
     std::vector<uint32_t> wait_seen_;
+    std::vector<uint8_t>  staged_layer_;   // compute thread: the last route of the layer was staged
+    std::vector<uint32_t> stage_seen_;     // worker: the stage wait ticks of each layer already counted
 };
 
 } // namespace ggml_cuda_expert
