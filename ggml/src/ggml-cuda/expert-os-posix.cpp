@@ -103,8 +103,9 @@ bool read_queue::submit(const read_op * ops, size_t n) {
     return false;
 }
 
-bool read_queue::wait_all(int64_t deadline_ms, std::string * reason) {
+bool read_queue::wait_all(int64_t deadline_ms, std::string * reason, const std::function<bool(size_t)> & progress) {
     GGML_UNUSED(deadline_ms);
+    GGML_UNUSED(progress);
     if (reason != nullptr && reason->empty()) {
         *reason = "unbuffered reads are not implemented on this platform";
     }
