@@ -43,8 +43,25 @@ target's arena or is read from host memory on every draft call.
   shapes, bytes per expert). The manifest keeps the full signature, so a profile of another model or
   geometry is ignored with a log line. A cache of one model uses the same layout and the same key,
   so a model finds its records whether it runs alone or with a draft in the joint cache.
-- **Modes.** Inclusive and exclusive both work; the mode is one for the whole cache. The prefill swap
-  and a finite L2 are refused together with speculative decoding, as before (see limits).
+- **Modes.** Inclusive and exclusive both work; the mode is one for the whole cache. With the draft
+  in the joint cache the validator accepts a finite `--expert-l2-mib` and `--expert-prefill-swap`
+  (both stay refused for other speculative setups, which no run has checked). Inclusive with an
+  unlimited host tier keeps a host copy of every expert of both models; for a model the size of the
+  machine's RAM use a finite L2, which stores both in the owned host arena.
+- **Finite L2.** One host budget and one greedy over every model: the host cut ranks the slices that
+  are not in VRAM by the same weighted scores. Each model's file-resident experts are read from its
+  own GGUF: the tier numbers files by path, so the draft's file joins the target's shards. The tier
+  starts when the target loads (its files open, its backing checked); when the draft loads, the
+  worker is stopped, the draft's loader writes its host residents and records its file offsets, and
+  at the end of that load its file is opened, one host resident per layer and kind is checked
+  against the file, and the worker restarts.
+- **Prefill swap.** The target is seeded from the `prefill` bank and every other model from the
+  first bank that has records for it (the draft: `decode`). A `prefill` plan re-plans the target's
+  classes over the target's share with the target's prompt scores; a model that has no records in
+  the prompt bank (the draft) keeps the VRAM slices it has when the plan is installed, and its share
+  of the host cut is ranked with its `decode` scores, so the swap moves no draft slice. This needs
+  the draft's size classes to be its own (true for an MXFP4 draft next to a K-quant or IQ target);
+  a draft that shares a class with the target is re-planned like the target, with a log line.
 
 ## Options
 
@@ -61,16 +78,19 @@ target's arena or is read from host memory on every draft call.
 - `expert cache: plan budget=... models=<key>*<w>,...` and `installed ... models=...` (inclusive).
 - `expert cache: model <i> <key> at model load|after a model joined|after install: L1 n experts / MiB, host n experts / MiB`.
 - `expert cache: compute context <n> runs model <i> (<key>)`.
+- `expert cache: model <i> <key> seeds the plan from bank '<label>': R records, S selections, weight w`.
+- Finite L2: `SSD tier backing checked on N slices` once at the target's load and once after the draft
+  joined, then `SSD tier after a model joined: ... slices in VRAM, ... in the host arena, ... in the file`.
 
 ## Limits and fallbacks
 
 - **One expert count.** All models of a joint cache must route the same number of experts per layer;
   a model that does not is not cached.
-- **Finite L2.** Not implemented for a joint cache: the SSD tier numbers the files of one model. The
-  server refuses a finite L2 with speculative decoding anyway; a backend config that asks for both
-  caches the target only.
-- **Prefill swap.** Refused with speculative decoding, as before. A plan that swaps only the draft's
-  share is not implemented.
+- **Prefill swap: the draft's VRAM share stays the draft's.** The class capacities are frozen at load,
+  and the draft's MXFP4 slots cannot hold a target expert, so during prompt processing the draft's
+  share of L1 holds draft experts nobody reads. Giving that share to target prefill experts needs
+  class-flexible capacity (arenas that change their class partition at an install), which is not
+  implemented.
 - **One device.** The draft's routed experts must be on the cache's device.
 - **Frozen classes.** The share of each size class is fixed at load from the stored profiles (or the
   cold split); later plans move slices inside the classes only.
