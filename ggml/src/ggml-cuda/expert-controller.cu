@@ -761,10 +761,15 @@ public:
         ++b.commits;
         if (cfg_.log_mask & GGML_EXPERT_LOG_L2) { report_round_locked(b.label, b.commits, *record, delta, save_ms); }
         std::vector<uint64_t> scores;
-        joint_scores_locked(b, scores);
         std::vector<uint8_t> keep;
-        if (joint_ && b.prompt) {
-            keep_members_locked(b, scores, keep);
+        if (joint_) {
+            std::vector<const profile_store *> sources = joint_sources_locked(b);
+            if (b.prompt) {
+                keep_members_locked(b, sources, keep);
+            }
+            assemble_joint_scores_locked(sources, scores, b.label.c_str());
+        } else {
+            joint_scores_locked(b, scores);
         }
         placement_inputs in;
         in.geo              = &geo_;
@@ -2108,10 +2113,10 @@ private:
                 labels.push_back(label);
             }
         }
-        scores.assign(geo_.n_counts(), 0);
+        std::vector<const profile_store *> sources(members_.size(), nullptr);
         bool any = false;
         for (size_t m = 0; m < members_.size(); ++m) {
-            const char * from = nullptr;
+            std::string from;
             uint64_t selections = 0;
             size_t records = 0;
             for (const std::string & label : labels) {
@@ -2119,22 +2124,25 @@ private:
                 if (!open_bank_locked(label.c_str(), false, &bank)) {
                     continue;
                 }
-                selections = member_scores_locked(banks_[bank], m, scores);
-                if (selections != 0) {
-                    from    = banks_[bank].label.c_str();
-                    records = banks_[bank].stores[m]->window().size();
+                const bank_state & bs = banks_[bank];
+                if (m < bs.stores.size() && bs.stores[m] && bs.usable[m] && bs.stores[m]->total_selections() != 0) {
+                    sources[m] = bs.stores[m].get(); // owned by a unique_ptr: stable while banks_ grows
+                    selections = sources[m]->total_selections();
+                    records    = sources[m]->window().size();
+                    from       = bs.label;
                     break;
                 }
             }
             any = any || selections != 0;
             GGML_LOG_INFO("expert cache: model %zu %s seeds the plan from bank '%s': %zu records, %llu selections, weight %.3f\n",
-                m, members_[m].key.c_str(), from ? from : "(none)", records, (unsigned long long) selections,
+                m, members_[m].key.c_str(), from.empty() ? "(none)" : from.c_str(), records, (unsigned long long) selections,
                 (double) members_[m].weight);
         }
         if (!any) {
             GGML_LOG_INFO("expert cache: no bank of '%s' has a stored profile; starting cold\n", initial_bank_.c_str());
             return nullptr;
         }
+        assemble_joint_scores_locked(sources, scores, "seed");
         return scores.data();
     }
 
@@ -2151,34 +2159,78 @@ private:
             }
             return;
         }
-        out.assign(geo_.n_counts(), 0);
-        for (size_t m = 0; m < b.stores.size(); ++m) {
-            member_scores_locked(b, m, out);
-        }
+        assemble_joint_scores_locked(joint_sources_locked(b), out, nullptr);
     }
 
-    // Writes member m's weighted scores of bank b into its joint layers of `out` (zeros when the
-    // bank has no usable store for it). Returns the member's stored selections in that bank.
-    uint64_t member_scores_locked(const bank_state & b, size_t m, std::vector<uint64_t> & out) const {
-        const size_t begin = size_t(members_[m].offset)*geo_.n_experts;
-        const size_t n     = size_t(members_[m].geo.n_layers)*geo_.n_experts;
-        for (size_t i = 0; i < n && begin + i < out.size(); ++i) {
-            out[begin + i] = 0;
-        }
-        if (m >= b.stores.size() || !b.stores[m] || !b.usable[m]) {
-            return 0;
-        }
-        const std::vector<uint64_t> & part = b.stores[m]->scores();
-        const double w = members_[m].weight;
-        for (size_t i = 0; i < part.size() && i < n && begin + i < out.size(); ++i) {
-            if (w == 1.0) {
-                out[begin + i] = part[i];
-            } else {
-                const double v = double(part[i])*w;
-                out[begin + i] = v >= 1.8e19 ? UINT64_C(18000000000000000000) : (uint64_t) std::llround(v);
+    // The usable store of every member in bank b (null where there is none).
+    std::vector<const profile_store *> joint_sources_locked(const bank_state & b) const {
+        std::vector<const profile_store *> out(members_.size(), nullptr);
+        for (size_t m = 0; m < members_.size() && m < b.stores.size(); ++m) {
+            if (b.stores[m] && b.usable[m]) {
+                out[m] = b.stores[m].get();
             }
         }
-        return b.stores[m]->total_selections();
+        return out;
+    }
+
+    // Selections per record of a store: the half-life weighted mean of the record totals over the
+    // records its scores use (same window and weights as score_records).
+    static double selection_rate(const profile_store & store) {
+        const std::vector<profile_record> & records = store.window();
+        const scoring_params & sp = store.params().scoring;
+        const size_t window = sp.window > 0 ? (size_t) sp.window : records.size();
+        const size_t used   = std::min(window, records.size());
+        const size_t first  = records.size() - used;
+        double sum = 0.0, weights = 0.0;
+        for (size_t i = 0; i < used; ++i) {
+            const double w = std::exp2(-(double) (used - 1 - i)/sp.half_life_turns);
+            uint64_t total = 0;
+            for (uint64_t v : records[first + i].counts) {
+                total += v;
+            }
+            sum     += w*(double) total;
+            weights += w;
+        }
+        return weights > 0.0 ? sum/weights : 0.0;
+    }
+
+    // Joint scores. Each model's stored scores are normalized to a total of score_scale, so they
+    // are brought back to an absolute rate first: score x (selections per record) x weight. The
+    // greedy then ranks every (model, layer, expert) by expected selections per request x weight
+    // per byte. Only the ratios between the models matter, so every model is divided by the same
+    // sum of rate x weight: the joint total stays at score_scale, the range a single model's
+    // scores have, and nothing the planners sum or multiply by bytes can overflow uint64.
+    void assemble_joint_scores_locked(const std::vector<const profile_store *> & sources, std::vector<uint64_t> & out,
+            const char * what) const {
+        out.assign(geo_.n_counts(), 0);
+        std::vector<double> factor(members_.size(), 0.0), rate(members_.size(), 0.0);
+        double total = 0.0;
+        for (size_t m = 0; m < members_.size() && m < sources.size(); ++m) {
+            if (sources[m] == nullptr || sources[m]->total_selections() == 0) {
+                continue;
+            }
+            rate[m]   = selection_rate(*sources[m]);
+            factor[m] = rate[m]*(double) members_[m].weight;
+            total    += factor[m];
+        }
+        for (size_t m = 0; m < members_.size() && m < sources.size(); ++m) {
+            if (factor[m] <= 0.0 || total <= 0.0) {
+                continue;
+            }
+            const double f = factor[m]/total;
+            const std::vector<uint64_t> & part = sources[m]->scores();
+            const size_t begin = size_t(members_[m].offset)*geo_.n_experts;
+            const size_t n     = size_t(members_[m].geo.n_layers)*geo_.n_experts;
+            for (size_t i = 0; i < part.size() && i < n && begin + i < out.size(); ++i) {
+                out[begin + i] = (uint64_t) std::llround(double(part[i])*f);
+            }
+        }
+        if (what != nullptr) {
+            for (size_t m = 0; m < members_.size(); ++m) {
+                GGML_LOG_INFO("expert cache: plan '%s' model %zu %s: %.1f selections per record, weight %.3f, share of the score mass %.4f\n",
+                    what, m, members_[m].key.c_str(), rate[m], (double) members_[m].weight, total > 0.0 ? factor[m]/total : 0.0);
+            }
+        }
     }
 
     // True when no other member has a layer in one of member m's size classes.
@@ -2202,7 +2254,7 @@ private:
     // selections in this bank) keep their VRAM slices when the plan is installed, and their share
     // of the plan is ranked with the scores of their generation bank, so that the host tier (which
     // the plan also cuts) keeps what generation needs.
-    void keep_members_locked(const bank_state & b, std::vector<uint64_t> & scores, std::vector<uint8_t> & keep) const {
+    void keep_members_locked(const bank_state & b, std::vector<const profile_store *> & sources, std::vector<uint8_t> & keep) const {
         keep.assign(members_.size(), 0);
         for (size_t m = 0; m < members_.size(); ++m) {
             const bool silent = m >= b.stores.size() || !b.stores[m] || !b.usable[m] || b.stores[m]->total_selections() == 0;
@@ -2215,8 +2267,11 @@ private:
                 continue;
             }
             keep[m] = 1;
+            sources[m] = nullptr;
             for (const bank_state & other : banks_) {
-                if (!other.prompt && member_scores_locked(other, m, scores) != 0) {
+                if (!other.prompt && m < other.stores.size() && other.stores[m] && other.usable[m] &&
+                        other.stores[m]->total_selections() != 0) {
+                    sources[m] = other.stores[m].get();
                     break;
                 }
             }
