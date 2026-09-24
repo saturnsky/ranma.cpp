@@ -46,11 +46,23 @@ expert_validation validate_expert_params(const common_params & params) {
     const bool speculative = params.speculative.has_dft() || params.speculative.has_synth() ||
         std::any_of(params.speculative.types.begin(), params.speculative.types.end(),
             [](common_speculative_type t) { return t != COMMON_SPECULATIVE_TYPE_NONE; });
+    // The finite tier and the prefill swap were refused with speculative decoding because no run had
+    // checked them, not for a structural reason (docs/ranma/expert-cache-l2.md). With a draft model
+    // in the joint cache both are checked: the draft's experts are cache members with their own
+    // file backing, its selections feed only its own layers, and every install drains the device,
+    // which covers the draft context's work. Other speculative setups keep the refusal.
+    const bool joined_draft = expert_draft_joins(params) && !params.speculative.has_synth() &&
+        std::all_of(params.speculative.types.begin(), params.speculative.types.end(),
+            [](common_speculative_type t) {
+                return t == COMMON_SPECULATIVE_TYPE_NONE || t == COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE ||
+                    t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
+            });
+    const bool spec_unchecked = speculative && !joined_draft;
     if (params.expert_l2_mib > 0) {
         if (!ggml_cuda_expert::expert_os::supported()) { return expert_reject("finite L2 needs Windows unbuffered reads"); }
         if (params.n_parallel <= 0 || params.n_batch <= 0 || params.n_ubatch < 0) { return expert_reject("finite L2 needs positive batch/parallel bounds and a nonnegative ubatch"); }
         if (!params.mmproj.path.empty()) { return expert_reject("finite L2 with mmproj has no gate yet"); }
-        if (speculative) { return expert_reject("finite L2 with speculative decoding has no gate yet"); }
+        if (spec_unchecked) { return expert_reject("finite L2 with speculative decoding has no gate yet, except with a draft model in the joint cache"); }
         const int p = params.expert_l2_prefill_ring_mib >= 0 ? params.expert_l2_prefill_ring_mib : params.expert_l2_staging_mib;
         const int d = params.expert_l2_staging_mib;
         if (std::max(p, params.expert_prefill_swap ? d : p) > params.expert_l2_mib) { return expert_reject("configured L2 ring exceeds --expert-l2-mib; metadata and residents also need space"); }
@@ -62,7 +74,9 @@ expert_validation validate_expert_params(const common_params & params) {
         if (!active) { return expert_reject("--expert-prefill-swap needs an expert cache budget"); }
         if (params.expert_profile_dir.empty()) { return expert_reject("--expert-prefill-swap needs --expert-profile-dir"); }
         if (params.n_parallel != 1) { return expert_reject("--expert-prefill-swap needs -np 1"); }
-        if (!params.mmproj.path.empty() || speculative) { return expert_reject("--expert-prefill-swap with mmproj/speculative decoding has no gate yet"); }
+        if (!params.mmproj.path.empty() || spec_unchecked) {
+            return expert_reject("--expert-prefill-swap with mmproj/speculative decoding has no gate yet, except with a draft model in the joint cache");
+        }
     }
     if (!active && (!params.expert_profile_dir.empty() || params.expert_freeze || params.expert_profile_archive || params.expert_profile_reset)) {
         return expert_reject("expert profile options need an expert cache budget");

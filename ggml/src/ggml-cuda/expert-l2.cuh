@@ -99,7 +99,9 @@ public:
 
     // ---- the loader ------------------------------------------------------------------------------
     void set_backing(int layer, int kind, int file_index, const char * path, uint64_t offset);
-    bool open_files(std::string & reason);
+    // Opens the files not opened yet and checks the backing of the routed layers, or of the layers
+    // flagged in `layers` only (a joint cache whose later models are not loaded yet).
+    bool open_files(std::string & reason, const std::vector<uint8_t> * layers = nullptr);
     // False for an expert whose bytes the loader must skip.
     bool wanted(int layer, int expert) const;
 
