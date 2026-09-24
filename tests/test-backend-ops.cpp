@@ -5290,6 +5290,87 @@ struct test_mul_mat_id : public test_case {
     }
 };
 
+// GGML_OP_MUL_MAT_ID with a chosen overlap between the experts of the tokens, for the kernels that
+// group the (token, expert slot) pairs of a small batch by expert:
+//   same     - every token routes to the same experts, each in a different slot order
+//   disjoint - no expert is shared (as far as n_mats allows)
+//   partial  - each token shares about half of its experts with the previous token
+//   repeat   - a token lists the same expert in more than one slot, and shares them with the others
+enum test_mul_mat_id_routing {
+    MUL_MAT_ID_ROUTING_SAME,
+    MUL_MAT_ID_ROUTING_DISJOINT,
+    MUL_MAT_ID_ROUTING_PARTIAL,
+    MUL_MAT_ID_ROUTING_REPEAT,
+};
+
+static const char * test_mul_mat_id_routing_name(test_mul_mat_id_routing routing) {
+    switch (routing) {
+        case MUL_MAT_ID_ROUTING_SAME:     return "same";
+        case MUL_MAT_ID_ROUTING_DISJOINT: return "disjoint";
+        case MUL_MAT_ID_ROUTING_PARTIAL:  return "partial";
+        case MUL_MAT_ID_ROUTING_REPEAT:   return "repeat";
+    }
+    return "unknown";
+}
+
+struct test_mul_mat_id_routing_case : public test_mul_mat_id {
+    const test_mul_mat_id_routing routing;
+
+    std::string vars() override {
+        return test_mul_mat_id::vars() + ",routing=" + test_mul_mat_id_routing_name(routing);
+    }
+
+    test_mul_mat_id_routing_case(ggml_type type_a, int n_mats, int n_used, bool b, int64_t m, int64_t n, int64_t k,
+            test_mul_mat_id_routing routing)
+        : test_mul_mat_id(type_a, GGML_TYPE_F32, n_mats, n_used, b, m, n, k), routing(routing) {}
+
+    void init_routing_ids(ggml_context * ctx) {
+        std::random_device rd;
+        std::default_random_engine rng(rd());
+
+        std::vector<int32_t> perm(n_mats);
+        for (int i = 0; i < n_mats; i++) {
+            perm[i] = i;
+        }
+        std::shuffle(perm.begin(), perm.end(), rng);
+
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type != GGML_TYPE_I32 || ggml_is_view_op(t->op)) {
+                continue;
+            }
+            for (int64_t r = 0; r < ggml_nrows(t); r++) {
+                std::vector<int32_t> data(t->ne[0]);
+                for (int i = 0; i < t->ne[0]; i++) {
+                    data[i] = perm[i % n_mats]; // the slots past n_used are not read
+                }
+                for (int i = 0; i < n_used; i++) {
+                    int e = 0;
+                    switch (routing) {
+                        case MUL_MAT_ID_ROUTING_SAME:     e = (i + r) % n_used;                    break;
+                        case MUL_MAT_ID_ROUTING_DISJOINT: e = (r*n_used + i) % n_mats;             break;
+                        case MUL_MAT_ID_ROUTING_PARTIAL:  e = (r*std::max(1, n_used/2) + i) % n_mats; break;
+                        case MUL_MAT_ID_ROUTING_REPEAT:   e = (i/2 + r) % n_mats;                  break;
+                    }
+                    data[i] = perm[e];
+                }
+                if (routing != MUL_MAT_ID_ROUTING_REPEAT) {
+                    std::shuffle(data.begin(), data.begin() + n_used, rng);
+                }
+                ggml_backend_tensor_set(t, data.data(), r * t->nb[1], t->ne[0] * sizeof(int32_t));
+            }
+        }
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        init_mul_mat_id_tensors(ctx, n_mats, amax);
+        init_routing_ids(ctx);
+    }
+
+    void reinit_perf_iter(ggml_context * ctx) override {
+        init_routing_ids(ctx);
+    }
+};
+
 // GGML_OP_MUL_MAT_ID + GGML_OP_ADD or GGML_OP_MUL
 struct test_mul_mat_id_fusion : public test_case {
     const ggml_type type_a;
@@ -10273,6 +10354,74 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     test_cases.emplace_back(new test_mul_mat_id_fusion(GGML_TYPE_F16, GGML_TYPE_F32, 16, 16, false, 32, 32, 32, 3));
 
+    // MUL_MAT_ID at the mat-vec token counts with overlapping, disjoint and repeated experts, at the per-expert
+    // shapes and types of two real MoE models. Fewer experts than the models have: the expert count only bounds
+    // the ids, and the full tensors would take minutes to quantize per case.
+    {
+        struct routing_shape {
+            ggml_type type;
+            int       n_mats;
+            int       n_used;
+            bool      b;
+            int64_t   m;
+            int64_t   k;
+            int       n_max;
+        };
+        const routing_shape shapes[] = {
+            // 256 experts / 6 used, n_embd 4096, n_ff_exp 2048: gate/up (shared input) and down
+            { GGML_TYPE_IQ2_XS,  32,  6, true,  2048, 4096, 4 },
+            { GGML_TYPE_IQ3_XXS, 32,  6, true,  2048, 4096, 4 },
+            { GGML_TYPE_IQ3_S,   32,  6, true,  2048, 4096, 4 },
+            { GGML_TYPE_IQ3_XXS, 32,  6, false, 4096, 2048, 4 },
+            { GGML_TYPE_MXFP4,   32,  6, false, 4096, 2048, 5 },
+            // 512 experts / 10 used, n_embd 2560, n_ff_exp 640: gate/up and down
+            { GGML_TYPE_Q4_K,    64, 10, true,   640, 2560, 4 },
+            { GGML_TYPE_Q5_K,    64, 10, true,   640, 2560, 5 },
+            { GGML_TYPE_Q5_1,    64, 10, false, 2560,  640, 7 },
+            { GGML_TYPE_Q8_0,    64, 10, false, 2560,  640, 7 },
+            // 128 experts / 8 used, n_embd 2816, n_ff_exp 704: merged gate_up and down
+            { GGML_TYPE_Q4_K,    32,  8, true,  1408, 2816, 4 },
+            { GGML_TYPE_Q5_0,    32,  8, false, 2816,  704, 7 },
+        };
+        for (const routing_shape & s : shapes) {
+            for (int n = 2; n <= s.n_max; n++) {
+                for (test_mul_mat_id_routing routing : {MUL_MAT_ID_ROUTING_SAME, MUL_MAT_ID_ROUTING_DISJOINT,
+                                                        MUL_MAT_ID_ROUTING_PARTIAL, MUL_MAT_ID_ROUTING_REPEAT}) {
+                    test_cases.emplace_back(new test_mul_mat_id_routing_case(s.type, s.n_mats, s.n_used, s.b, s.m, n, s.k, routing));
+                }
+            }
+        }
+        // dense MUL_MAT at 1..4 columns, the matrices of a dense model with n_embd 5376 and n_ff 21504
+        for (int n = 1; n <= 4; n++) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32,  8192, n,  5376, {1, 1}, {1, 1})); // q
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32,  4096, n,  5376, {1, 1}, {1, 1})); // k, v
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32,  4096, n,  5376, {1, 1}, {1, 1})); // v
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32,  5376, n,  8192, {1, 1}, {1, 1})); // output
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, 21504, n,  5376, {1, 1}, {1, 1})); // gate, up
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32,  5376, n, 21504, {1, 1}, {1, 1})); // down
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32,  5376, n, 21504, {1, 1}, {1, 1})); // down
+        }
+        // row counts that end inside a row block and inside a block of row blocks
+        for (int64_t m : {1, 3, 37}) {
+            for (int n : {2, 4, 7}) {
+                for (test_mul_mat_id_routing routing : {MUL_MAT_ID_ROUTING_SAME, MUL_MAT_ID_ROUTING_REPEAT}) {
+                    test_cases.emplace_back(new test_mul_mat_id_routing_case(GGML_TYPE_Q4_0, 8, 4, false, m, n, 256, routing));
+                }
+            }
+        }
+        // the fused gate/up/GLU launch at the same gate/up shapes, random routing
+        for (ggml_type type : {GGML_TYPE_IQ2_XS, GGML_TYPE_Q4_K}) {
+            const bool    ds   = type == GGML_TYPE_IQ2_XS;
+            const int64_t rows = ds ? 2048 : 640;
+            const int64_t k    = ds ? 4096 : 2560;
+            for (int64_t n_tokens : {2, 3, 4}) {
+                test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, n_tokens, rows, k,
+                    /*use_id =*/ true, ds ? 32 : 64, ds ? 6 : 10, /*b =*/ true, /*with_bias =*/ false, /*with_gate =*/ true,
+                    false, {1, 1}));
+            }
+        }
+    }
+
     // gpt-oss issue with Vulkan mmq_id
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_MXFP4, GGML_TYPE_F32, 32, 2, false, 2880, 32, 2880));
     // more than 256 experts (hoisted row-id path): 512 as in Qwen3.8-Flash-Next,
@@ -11413,6 +11562,53 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
                 test_cases.emplace_back(new test_mul_mat_id(type_a, type_b, 128, 8, false, 768, bs, 2048));
                 test_cases.emplace_back(new test_mul_mat_id_fusion(type_a, type_b, 128, 8, false, 768, bs, 2048, 1));
             }
+        }
+    }
+
+    // MUL_MAT_ID at the mat-vec token counts, per-expert shapes and types of two MoE models, with random routing
+    // and with overlapping experts (every token on the same experts, about half shared with the previous token).
+    // The weights are in VRAM unless --host-weights is given.
+    {
+        struct routing_perf_shape {
+            ggml_type type;
+            int       n_mats;
+            int       n_used;
+            bool      b;
+            int64_t   m;
+            int64_t   k;
+        };
+        const routing_perf_shape shapes[] = {
+            // 128 experts / 8 used, n_embd 2816, n_ff_exp 704: merged gate_up (Q4_K), down (Q5_0 and Q8_0 layers)
+            { GGML_TYPE_Q4_K,    128, 8, true,  1408, 2816 },
+            { GGML_TYPE_Q5_0,    128, 8, false, 2816,  704 },
+            { GGML_TYPE_Q8_0,    128, 8, false, 2816,  704 },
+            // 256 experts / 6 used, n_embd 4096, n_ff_exp 2048 (64 experts here, the full tensors take too long to
+            // quantize): gate or up, down
+            { GGML_TYPE_IQ2_XS,  64,  6, true,  2048, 4096 },
+            { GGML_TYPE_IQ3_XXS, 64,  6, true,  2048, 4096 },
+            { GGML_TYPE_IQ3_XXS, 64,  6, false, 4096, 2048 },
+        };
+        for (const routing_perf_shape & s : shapes) {
+            for (int n : {1, 2, 3, 4}) {
+                test_cases.emplace_back(new test_mul_mat_id(s.type, GGML_TYPE_F32, s.n_mats, s.n_used, s.b, s.m, n, s.k));
+                if (n == 1) {
+                    continue;
+                }
+                for (test_mul_mat_id_routing routing : {MUL_MAT_ID_ROUTING_SAME, MUL_MAT_ID_ROUTING_PARTIAL}) {
+                    test_cases.emplace_back(new test_mul_mat_id_routing_case(s.type, s.n_mats, s.n_used, s.b, s.m, n, s.k, routing));
+                }
+            }
+        }
+
+        // dense MUL_MAT at 1..4 columns, the matrices of a dense model with n_embd 5376 and n_ff 21504
+        for (int n = 1; n <= 4; n++) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32,  8192, n,  5376, {1, 1}, {1, 1})); // q
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32,  4096, n,  5376, {1, 1}, {1, 1})); // k, v
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32,  4096, n,  5376, {1, 1}, {1, 1})); // v
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32,  5376, n,  8192, {1, 1}, {1, 1})); // output
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32, 21504, n,  5376, {1, 1}, {1, 1})); // gate, up
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q4_K, GGML_TYPE_F32,  5376, n, 21504, {1, 1}, {1, 1})); // down
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q6_K, GGML_TYPE_F32,  5376, n, 21504, {1, 1}, {1, 1})); // down
         }
     }
 

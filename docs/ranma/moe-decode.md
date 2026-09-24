@@ -277,3 +277,54 @@ evaluates the graph.
   order as a standalone launch, so the result is expected to be unchanged.
 - A kernel trace of one token should show the shared expert's own matmul and
   quantize launches gone for every folded layer.
+
+
+## Reading each distinct expert once in a multi-token launch
+
+### What it is
+
+A `MUL_MAT_ID` launch with two to four tokens - a speculative-decoding
+verification batch, or several server slots decoding together - stays on MMVQ
+below the MMQ crossover of the weight type. `mul_mat_vec_q_moe` gives every
+(token, expert slot) pair its own warp, so tokens that route to the same expert
+read that expert's weights once per token. With the expert read from host
+memory, every repeated read is another transfer over the PCIe link.
+
+### When it applies
+
+- HIP builds, `MUL_MAT_ID` through MMVQ with two or more tokens.
+- By default only when the weights are read from host memory: host-direct
+  mapped weights or the expert cache. Weights in VRAM keep `mul_mat_vec_q_moe`,
+  whose repeated reads are served by the GPU caches.
+- The MMVQ/MMQ crossover is unchanged; five or more tokens still take MMQ for
+  the types that switch there.
+
+### How it works
+
+The pairs are grouped by expert on the device, from the ids alone, so there is
+no host readback and a captured graph stays valid. The first pair of a group
+loads each weight block once and dots it with the inputs of every pair of the
+group; the other pairs of the group exit. Each output keeps the lane layout, the
+K order, the warp reduction and the epilogue of `mul_mat_vec_q_moe`, so the
+result is bit-identical. The fused gate/up/GLU, biases and scale tensors are
+supported, and with the expert cache the grid alternates host and VRAM experts
+as the one-token launch does.
+
+### Options
+
+| Name | Kind | Default | Effect |
+| --- | --- | --- | --- |
+| `GGML_CUDA_MMVQ_ID_DEDUP` | env | `1` | `1` uses the grouped kernel for weights read from host memory, `2` also for weights in VRAM, `0` keeps `mul_mat_vec_q_moe`. |
+
+### Limits
+
+- HIP only.
+- In VRAM the grouped kernel pays off only when the tokens share experts; with
+  mostly distinct experts it can be slower, which is why `2` is not the default.
+- A fused gate launch with five or more tokens keeps the old kernel.
+
+### How to verify it
+
+`llama-perplexity -b B -ub B` for B = 2..4 with `GGML_CUDA_MMVQ_ID_DEDUP=0` and
+unset must print identical values; `test-backend-ops -o MUL_MAT_ID` covers the
+routing cases (same, disjoint, partial and repeated experts).
