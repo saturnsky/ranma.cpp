@@ -315,17 +315,25 @@ void l2_tier::set_backing(int layer, int kind, int file_index, const char * path
     if (layer < 0 || layer >= geo_.n_layers || kind < 0 || kind >= geometry::n_kinds) {
         return;
     }
-    if ((size_t) file_index >= paths_.size()) {
-        paths_.resize((size_t) file_index + 1);
+    // Files are numbered by the tier, by path: the loader's index counts the files of one model,
+    // and the models of a joint cache each start at 0.
+    GGML_UNUSED(file_index);
+    const std::string name = path ? path : "";
+    size_t index = 0;
+    while (index < paths_.size() && paths_[index] != name) {
+        ++index;
     }
-    paths_[(size_t) file_index] = path ? path : "";
-    backing_[(size_t) layer][kind] = backing{file_index, offset, size_t(offset % expert_os::io_alignment)};
+    if (index == paths_.size()) {
+        paths_.push_back(name);
+    }
+    backing_[(size_t) layer][kind] = backing{(int) index, offset, size_t(offset % expert_os::io_alignment)};
 }
 
-bool l2_tier::open_files(std::string & reason) {
-    files_.assign(paths_.size(), nullptr);
+bool l2_tier::open_files(std::string & reason, const std::vector<uint8_t> * layers) {
+    // Files opened earlier stay open: a model that joins later adds its own files.
+    files_.resize(paths_.size(), nullptr);
     for (size_t i = 0; i < paths_.size(); ++i) {
-        if (paths_[i].empty()) {
+        if (paths_[i].empty() || files_[i] != nullptr) {
             continue;
         }
         files_[i] = expert_os::open_unbuffered(paths_[i].c_str());
@@ -336,7 +344,7 @@ bool l2_tier::open_files(std::string & reason) {
     }
     for (int layer = 0; layer < geo_.n_layers; ++layer) {
         const int cls = geo_.layer_class[layer];
-        if (cls < 0) {
+        if (cls < 0 || (layers != nullptr && ((size_t) layer >= layers->size() || !(*layers)[(size_t) layer]))) {
             continue;
         }
         for (int kind = 0; kind < geometry::n_kinds; ++kind) {
@@ -570,6 +578,10 @@ bool l2_tier::read_slice(int layer, int kind, int expert, void * dst, std::strin
 
 bool l2_tier::verify_slice(int layer, int kind, int expert, const void * data, std::string & reason) {
     const backing & b = backing_[(size_t) layer][kind];
+    if (b.file < 0 || (size_t) b.file >= paths_.size()) {
+        reason = "layer " + std::to_string(layer) + " kind " + std::to_string(kind) + " has no file behind it";
+        return false;
+    }
     const size_t bytes = geo_.class_bytes[geo_.layer_class[layer]][kind];
     const uint64_t offset = b.offset + uint64_t(expert)*bytes;
     verify_buffer_.resize(bytes);
@@ -598,6 +610,10 @@ bool l2_tier::read_raw(int layer, int kind, int expert, void * dst, std::string 
         return false;
     }
     const backing & b = backing_[(size_t) layer][kind];
+    if (b.file < 0 || (size_t) b.file >= files_.size() || files_[(size_t) b.file] == nullptr) {
+        reason = "layer " + std::to_string(layer) + " kind " + std::to_string(kind) + " has no open file behind it";
+        return false;
+    }
     const size_t slice = geo_.class_bytes[cls][kind];
     expert_os::read_op op;
     op.file   = files_[(size_t) b.file];
