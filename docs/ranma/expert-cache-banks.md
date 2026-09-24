@@ -121,8 +121,10 @@ cache needs the host-direct path, which is off by default and has no CLI flag
 
 The validator refuses `--expert-prefill-swap` before the model loads when it cannot work: without an
 expert cache budget, without a profile directory, with `-np` greater than 1, with a multimodal
-projector, or with speculative decoding of any kind. The swap installs a plan inside a request, so
-it needs a server with exactly one sequence and no second decode path.
+projector, or with speculative decoding other than a draft model in the joint cache. The swap installs
+a plan inside a request, so it needs a server with exactly one sequence; a draft context on the same
+device is drained by the install like the target's (`expert-cache-joint.md`: the draft keeps its VRAM
+slices across the swap).
 
 `llama-bench` drives the same policy object: its depth fill and its prompt test feed the prefill bank
 and its generation test the decode bank, and `--expert-prefill-swap` is an option of its warm mode.

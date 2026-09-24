@@ -99,6 +99,7 @@ struct member_state {
     bool  loaded   = false;  // its load finished (finalize)
     bool  released = false;
     bool  dropped  = false;  // exclusive only: its context did not match; its slots stay unused
+    bool  tier_ready = false; // its files are open and its backing is checked (SSD tier)
     ggml_context * ctx = nullptr;
     ggml_backend_buffer_t exclusive_buffer = nullptr; // owned by the model
     std::vector<gguf_context *> gguf;                 // declared metadata, freed once bound
@@ -123,6 +124,9 @@ struct plan_state {
     // The SSD tier cuts the host tier from the same scores, but only at install time, because the
     // host capacity depends on the ring class the plan turns out to carry.
     std::vector<uint64_t> scores;
+    // [member] joint cache: the model does not run in this bank's phase (a draft model during
+    // prompt processing), so the plan leaves its VRAM slices as they are when it is installed
+    std::vector<uint8_t> keep;
 };
 
 // Defined below the controller: the exclusive buffer type needs the controller instance.
@@ -279,12 +283,7 @@ public:
         first.weight   = config->model_weight > 0.0f ? config->model_weight : 1.0f;
         first.accepted = true;
         members_.push_back(std::move(first));
-        if (config->n_join != 0 && cfg_.l2_bytes != 0) {
-            // The SSD tier numbers the files of one model; a second model's files are not wired.
-            GGML_LOG_WARN("expert cache: a finite L2 is not implemented for a joint cache; the %u joining model(s) are not cached\n",
-                config->n_join);
-        }
-        for (uint32_t i = 0; i < config->n_join && config->join_paths != nullptr && cfg_.l2_bytes == 0; ++i) {
+        for (uint32_t i = 0; i < config->n_join && config->join_paths != nullptr; ++i) {
             const char * path   = config->join_paths[i];
             const float  weight = config->join_weights != nullptr && config->join_weights[i] > 0.0f ? config->join_weights[i] : 1.0f;
             if (members_.size() >= max_members) {
@@ -401,6 +400,11 @@ public:
             const int m = join_context_locked(ctx, buft, identity);
             if (m < 0) {
                 return nullptr;
+            }
+            if (tier_) {
+                // the loader of the joining model adds files and backing the worker reads; nothing
+                // computes while a model loads, and the worker restarts when the load is final
+                tier_->stop_worker();
             }
             ggml_backend_buffer_t buffer = exclusive_buffer_create(ctx, buft);
             if (buffer == nullptr) {
@@ -758,6 +762,10 @@ public:
         if (cfg_.log_mask & GGML_EXPERT_LOG_L2) { report_round_locked(b.label, b.commits, *record, delta, save_ms); }
         std::vector<uint64_t> scores;
         joint_scores_locked(b, scores);
+        std::vector<uint8_t> keep;
+        if (joint_ && b.prompt) {
+            keep_members_locked(b, scores, keep);
+        }
         placement_inputs in;
         in.geo              = &geo_;
         in.counts           = b.total_selections() != 0 ? scores.data() : nullptr;
@@ -770,6 +778,7 @@ public:
         plan.bank     = bank;
         plan.selected = std::move(next.selected);
         plan.stats    = next.stats;
+        plan.keep     = std::move(keep);
         if (tier_ && b.total_selections() != 0) {
             plan.scores = scores;
         }
@@ -799,15 +808,33 @@ public:
             GGML_LOG_WARN("expert cache: plan %u is stale or unknown; not installed\n", id);
             return false;
         }
-        const plan_state & plan = it->second;
-        if (banks_[plan.bank].latest_plan != id) {
-            GGML_LOG_WARN("expert cache: plan %u of bank '%s' is stale; not installed\n", id, banks_[plan.bank].label.c_str());
+        const plan_state & stored = it->second;
+        if (banks_[stored.bank].latest_plan != id) {
+            GGML_LOG_WARN("expert cache: plan %u of bank '%s' is stale; not installed\n", id, banks_[stored.bank].label.c_str());
             return false;
         }
         if (cfg_.freeze || cfg_.policy != GGML_EXPERT_POLICY_ADAPTIVE) {
             GGML_LOG_INFO("expert cache: frozen; plan %u not installed\n", id);
             return false;
         }
+        // A model that does not run in the plan's phase keeps the VRAM slices it has now. Its size
+        // classes are its own (keep_members_locked checks that), so the class capacities still hold.
+        plan_state patched;
+        bool kept = false;
+        for (size_t m = 0; m < stored.keep.size() && m < members_.size(); ++m) {
+            if (!stored.keep[m]) {
+                continue;
+            }
+            if (!kept) {
+                patched = stored;
+                kept    = true;
+            }
+            const member_state & mb = members_[m];
+            for (int l = mb.offset; l < mb.offset + mb.geo.n_layers && l < geo_.n_layers; ++l) {
+                patched.selected[(size_t) l] = l1_->selected()[(size_t) l];
+            }
+        }
+        const plan_state & plan = kept ? patched : stored;
         // Installing what is already in the arena costs nothing: no drain, no copies, one line.
         if (!tier_ && plan.selected == l1_->selected()) {
             finish_plan_locked(id);
@@ -1017,6 +1044,17 @@ public:
 
     void layer_done(ggml_backend_cuda_context & ctx, const ggml_tensor * src0) {
         tier_layer_done(ctx, src0);
+    }
+
+    // The member whose joint layer range holds `layer`; a layer past the joint geometry counts as
+    // the first model's.
+    int member_of_layer(int layer) const {
+        for (size_t m = 0; m < members_.size(); ++m) {
+            if (layer >= members_[m].offset && layer < members_[m].offset + members_[m].geo.n_layers) {
+                return (int) m;
+            }
+        }
+        return 0;
     }
 
     // ---- the SSD tier -------------------------------------------------------------------------
@@ -1242,6 +1280,20 @@ private:
         // the device must see the loader's writes to the mapped host arena
         CUDA_CHECK(cudaDeviceSynchronize());
         std::string reason;
+        if (tier_) {
+            // the joined model's files: open them and check its backing like at the first load,
+            // then let the worker (stopped when the model joined) serve every model again
+            const std::vector<uint8_t> layers = member_layers_locked(true);
+            if (!tier_->open_files(reason, &layers)) {
+                abort_locked(("SSD tier: " + reason).c_str());
+            }
+            verify_tier_backing_locked(&layers);
+            for (member_state & m : members_) {
+                m.tier_ready = m.tier_ready || (m.bound && !m.dropped);
+            }
+            tier_->start_worker(); // no-op when it runs
+            report_tier_plan_locked("after a model joined");
+        }
         if (!l1_->verify_current_assignment(reason)) {
             abort_locked(("exclusive assignment is inconsistent: " + reason).c_str());
         }
@@ -1447,15 +1499,35 @@ private:
         return out;
     }
 
+    // The joint layers of the bound members that are not dropped; with `newly_joined` only those whose
+    // files the SSD tier has not opened yet.
+    std::vector<uint8_t> member_layers_locked(bool newly_joined) const {
+        std::vector<uint8_t> mask((size_t) geo_.n_layers, 0);
+        for (const member_state & m : members_) {
+            if (!m.bound || m.dropped || (newly_joined && m.tier_ready)) {
+                continue;
+            }
+            for (int l = m.offset; l < m.offset + m.geo.n_layers && l < geo_.n_layers; ++l) {
+                mask[(size_t) l] = 1;
+            }
+        }
+        return mask;
+    }
+
     bool start_tier_locked() {
         if (!tier_->map()) {
             abort_locked("SSD tier ring registration failed");
         }
+        // Models that join later have no backing yet; their files are opened when they load.
+        const std::vector<uint8_t> layers = member_layers_locked(false);
         std::string reason;
-        if (!tier_->open_files(reason)) {
+        if (!tier_->open_files(reason, &layers)) {
             abort_locked(("SSD tier: " + reason).c_str());
         }
-        verify_tier_backing_locked();
+        verify_tier_backing_locked(&layers);
+        for (member_state & m : members_) {
+            m.tier_ready = m.bound && !m.dropped;
+        }
         l2_tier * tier = tier_.get();
         l1_->attach_addresses([tier](int layer, int kind) { return tier->addresses(layer, kind); });
         tier_->set_homes(l1_->host_slots(), l1_->locations(), host_geometry_locked());
@@ -1467,23 +1539,35 @@ private:
     // loader's. One host resident expert per routed layer and kind is read back from the file and
     // compared with the bytes the loader put in the arena. Always on: it is a few slices and it is
     // the only check that the tier and the loader read the same offsets.
-    void verify_tier_backing_locked() {
+    void verify_tier_backing_locked(const std::vector<uint8_t> * layers) {
         const std::vector<std::vector<int32_t>> & gpu_table  = l1_->host_slots();
         const std::vector<std::vector<int32_t>> & host_table = l1_->arena_slots();
-        std::vector<uint8_t> from_file;
-        size_t checked = 0;
+        std::vector<uint8_t> from_file, loaded_copy;
+        size_t checked = 0, checked_host = 0, checked_vram = 0, unchecked = 0;
         for (int layer = 0; layer < geo_.n_layers; ++layer) {
             const int cls = geo_.layer_class[layer];
-            if (cls < 0) {
+            if (cls < 0 || (layers != nullptr && !(*layers)[(size_t) layer])) {
                 continue;
             }
+            // A host resident is compared where the loader wrote it; a layer without one (a joined
+            // model whose whole host share went to the file) is compared against a VRAM resident,
+            // read back. Only a layer with no loaded expert at all has nothing to compare with.
             int expert = -1;
             for (int candidate = 0; candidate < geo_.n_experts && expert < 0; ++candidate) {
                 if (gpu_table[layer][candidate] < 0 && host_table[layer][candidate] >= 0) {
                     expert = candidate;
                 }
             }
+            bool in_vram = false;
+            for (int candidate = 0; candidate < geo_.n_experts && expert < 0; ++candidate) {
+                if (gpu_table[layer][candidate] >= 0) {
+                    expert  = candidate;
+                    in_vram = true;
+                }
+            }
             if (expert < 0) {
+                ++unchecked;
+                GGML_LOG_WARN("expert cache: SSD tier backing of layer %d cannot be checked: no expert of it was loaded\n", layer);
                 continue;
             }
             for (int kind = 0; kind < geometry::n_kinds; ++kind) {
@@ -1493,15 +1577,26 @@ private:
                 if (!tier_->read_slice(layer, kind, expert, from_file.data(), why)) {
                     abort_locked(("SSD tier backing check: " + why).c_str());
                 }
-                const void * arena = host_->slice(cls, kind, host_table[layer][expert]);
-                if (arena == nullptr || memcmp(from_file.data(), arena, stride) != 0) {
+                const void * loaded = nullptr;
+                if (in_vram) {
+                    loaded_copy.assign(stride, 0);
+                    if (l1_->read_slice(layer, kind, gpu_table[layer][expert], loaded_copy.data())) {
+                        loaded = loaded_copy.data();
+                    }
+                } else {
+                    loaded = host_->slice(cls, kind, host_table[layer][expert]);
+                }
+                if (loaded == nullptr || memcmp(from_file.data(), loaded, stride) != 0) {
                     GGML_ABORT("expert cache: the SSD tier reads layer %d kind %d expert %d from the wrong "
                                "place in the file", layer, kind, expert);
                 }
                 ++checked;
+                (in_vram ? checked_vram : checked_host) += 1;
             }
         }
-        GGML_LOG_INFO("expert cache: SSD tier backing checked on %zu slices against the loaded weights\n", checked);
+        GGML_LOG_INFO("expert cache: SSD tier backing checked on %zu slices against the loaded weights "
+                      "(%zu host residents, %zu VRAM residents), %zu routed layers without a loaded expert\n",
+            checked, checked_host, checked_vram, unchecked);
     }
 
     void vram_table_locked(const std::vector<std::vector<int32_t>> & selected,
@@ -1890,6 +1985,11 @@ private:
         for (int l = 0; l < geo_.n_layers; ++l) {
             const int cls = geo_.layer_class[l];
             if (cls < 0) { continue; }
+            // a joined model that has not loaded yet (or was dropped) has no bytes and no file backing
+            if (joint_) {
+                const member_state & mb = members_[(size_t) member_of_layer(l)];
+                if (!mb.loaded || mb.dropped) { continue; }
+            }
             for (int e = 0; e < geo_.n_experts; ++e) for (int k = 0; k < geometry::n_kinds; ++k) {
                 const int gpu = l1_->host_slots()[l][e];
                 const void * home = l1_->host_address(l, k, e);
@@ -1962,6 +2062,9 @@ private:
         if (initial_bank_.empty() || profile_dir_.empty()) {
             return nullptr;
         }
+        if (joint_) {
+            return seed_joint_counts_locked(scores);
+        }
         for (size_t pos = 0; pos <= initial_bank_.size(); ) {
             const size_t sep = std::min(initial_bank_.find(',', pos), initial_bank_.size());
             const std::string label = initial_bank_.substr(pos, sep - pos);
@@ -1992,6 +2095,49 @@ private:
         return nullptr;
     }
 
+    // Joint cache: each model is seeded from the first bank of the preference list that has stored
+    // records for it, so a draft model that only runs in generation is seeded from its generation
+    // bank while the target is seeded from the prompt bank when the prefill swap is on.
+    const uint64_t * seed_joint_counts_locked(std::vector<uint64_t> & scores) {
+        std::vector<std::string> labels;
+        for (size_t pos = 0; pos <= initial_bank_.size(); ) {
+            const size_t sep = std::min(initial_bank_.find(',', pos), initial_bank_.size());
+            const std::string label = initial_bank_.substr(pos, sep - pos);
+            pos = sep + 1;
+            if (!label.empty()) {
+                labels.push_back(label);
+            }
+        }
+        scores.assign(geo_.n_counts(), 0);
+        bool any = false;
+        for (size_t m = 0; m < members_.size(); ++m) {
+            const char * from = nullptr;
+            uint64_t selections = 0;
+            size_t records = 0;
+            for (const std::string & label : labels) {
+                ggml_expert_bank_id bank = GGML_EXPERT_BANK_NONE;
+                if (!open_bank_locked(label.c_str(), false, &bank)) {
+                    continue;
+                }
+                selections = member_scores_locked(banks_[bank], m, scores);
+                if (selections != 0) {
+                    from    = banks_[bank].label.c_str();
+                    records = banks_[bank].stores[m]->window().size();
+                    break;
+                }
+            }
+            any = any || selections != 0;
+            GGML_LOG_INFO("expert cache: model %zu %s seeds the plan from bank '%s': %zu records, %llu selections, weight %.3f\n",
+                m, members_[m].key.c_str(), from ? from : "(none)", records, (unsigned long long) selections,
+                (double) members_[m].weight);
+        }
+        if (!any) {
+            GGML_LOG_INFO("expert cache: no bank of '%s' has a stored profile; starting cold\n", initial_bank_.c_str());
+            return nullptr;
+        }
+        return scores.data();
+    }
+
     // The scores of a bank over the joint layers: each model's own half-life scores at its layers,
     // times its weight (the relative cost of reading one of its bytes from host memory). The
     // greedy then ranks every (model, layer, expert) by weighted frequency per byte. A cache of one
@@ -2007,18 +2153,71 @@ private:
         }
         out.assign(geo_.n_counts(), 0);
         for (size_t m = 0; m < b.stores.size(); ++m) {
-            if (!b.stores[m] || !b.usable[m]) {
+            member_scores_locked(b, m, out);
+        }
+    }
+
+    // Writes member m's weighted scores of bank b into its joint layers of `out` (zeros when the
+    // bank has no usable store for it). Returns the member's stored selections in that bank.
+    uint64_t member_scores_locked(const bank_state & b, size_t m, std::vector<uint64_t> & out) const {
+        const size_t begin = size_t(members_[m].offset)*geo_.n_experts;
+        const size_t n     = size_t(members_[m].geo.n_layers)*geo_.n_experts;
+        for (size_t i = 0; i < n && begin + i < out.size(); ++i) {
+            out[begin + i] = 0;
+        }
+        if (m >= b.stores.size() || !b.stores[m] || !b.usable[m]) {
+            return 0;
+        }
+        const std::vector<uint64_t> & part = b.stores[m]->scores();
+        const double w = members_[m].weight;
+        for (size_t i = 0; i < part.size() && i < n && begin + i < out.size(); ++i) {
+            if (w == 1.0) {
+                out[begin + i] = part[i];
+            } else {
+                const double v = double(part[i])*w;
+                out[begin + i] = v >= 1.8e19 ? UINT64_C(18000000000000000000) : (uint64_t) std::llround(v);
+            }
+        }
+        return b.stores[m]->total_selections();
+    }
+
+    // True when no other member has a layer in one of member m's size classes.
+    bool member_classes_own_locked(size_t m) const {
+        const member_state & mb = members_[m];
+        for (int l = 0; l < geo_.n_layers; ++l) {
+            if (l >= mb.offset && l < mb.offset + mb.geo.n_layers) {
                 continue;
             }
-            const std::vector<uint64_t> & part = b.stores[m]->scores();
-            const size_t begin = size_t(members_[m].offset)*geo_.n_experts;
-            const double w = members_[m].weight;
-            for (size_t i = 0; i < part.size() && begin + i < out.size(); ++i) {
-                if (w == 1.0) {
-                    out[begin + i] = part[i];
-                } else {
-                    const double v = double(part[i])*w;
-                    out[begin + i] = v >= 1.8e19 ? UINT64_C(18000000000000000000) : (uint64_t) std::llround(v);
+            const int cls = geo_.layer_class[l];
+            for (int k = mb.offset; cls >= 0 && k < mb.offset + mb.geo.n_layers; ++k) {
+                if (geo_.layer_class[k] == cls) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    // A prompt bank of a joint cache: the models that never route in prompt processing (no stored
+    // selections in this bank) keep their VRAM slices when the plan is installed, and their share
+    // of the plan is ranked with the scores of their generation bank, so that the host tier (which
+    // the plan also cuts) keeps what generation needs.
+    void keep_members_locked(const bank_state & b, std::vector<uint64_t> & scores, std::vector<uint8_t> & keep) const {
+        keep.assign(members_.size(), 0);
+        for (size_t m = 0; m < members_.size(); ++m) {
+            const bool silent = m >= b.stores.size() || !b.stores[m] || !b.usable[m] || b.stores[m]->total_selections() == 0;
+            if (!silent || !members_[m].bound || members_[m].dropped) {
+                continue;
+            }
+            if (!member_classes_own_locked(m)) {
+                GGML_LOG_WARN("expert cache: model %s shares a size class with another model; the '%s' plan re-plans it\n",
+                    members_[m].key.c_str(), b.label.c_str());
+                continue;
+            }
+            keep[m] = 1;
+            for (const bank_state & other : banks_) {
+                if (!other.prompt && member_scores_locked(other, m, scores) != 0) {
+                    break;
                 }
             }
         }
