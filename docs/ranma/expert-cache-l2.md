@@ -173,7 +173,8 @@ without a CLI flag (`host-direct-moe.md`). Do not combine cache placement with `
 `llama-bench` accepts the same host tier options.
 
 The validator refuses a finite tier with a multimodal projector and with speculative decoding: those
-combinations have no correctness check yet, not a structural problem. More than one server slot is
+combinations have no correctness check yet, not a structural problem. A draft model in the joint
+cache (`expert-cache-joint.md`) is the exception. More than one server slot is
 accepted by the tier; the prompt swap keeps its single-slot rule.
 
 | Environment switch | Default | Effect |
@@ -208,9 +209,9 @@ samples count the wait for the up slices only; `staged_wait_ms` adds up the gate
 
 ## Limits and fallbacks
 
-- **One model.** The tier numbers the files of one model, so a joint cache (`expert-cache-joint.md`)
-  with a finite host budget caches the target only; the server refuses a finite L2 with speculative
-  decoding in any case.
+- **Several models.** In a joint cache (`expert-cache-joint.md`) each model's file-resident experts
+  are read from its own GGUF; the tier numbers files by path. A model that joins later opens its
+  files and has its backing checked when its load ends.
 - **Windows and HIP only**, for the unbuffered read queue and the address reservation. The validator
   refuses the option elsewhere before the model loads.
 - **The up reads of a layer are not overlapped.** The staged service hides the gate and down reads
@@ -227,8 +228,8 @@ samples count the wait for the up slices only; `staged_wait_ms` adds up the gate
   both change nothing until the ring is at least as large as that set.
 - **The prompt swap's boundary install reads from the SSD** with a finite tier, so the swap costs
   noticeably more per request than it does with everything resident (`expert-cache-banks.md`).
-- **No correctness check yet** for a finite tier with a multimodal projector or speculative decoding;
-  the validator refuses both.
+- **No correctness check yet** for a finite tier with a multimodal projector or speculative decoding
+  other than a draft model in the joint cache; the validator refuses those.
 - **A lazily mapped model file slows the unbuffered reads.** A read-only mapping of a shard makes
   unbuffered reads of the same file markedly slower on this platform, which is why the loader maps
   only the shards that hold lazy tensors when ordinary mmap loading is off. A shard that holds both
