@@ -1422,6 +1422,12 @@ bool llama_context::set_adapter_cvec(
 }
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+    // ranma expert cache: the token-routed layers' experts are known now, before the graph is built
+    if (expert_hint_state >= 0 && ubatch.token != nullptr && ubatch.embd == nullptr &&
+            (gtype == LLM_GRAPH_TYPE_DEFAULT || gtype == LLM_GRAPH_TYPE_DECODER)) {
+        expert_route_hint(ubatch.token, (int32_t) ubatch.n_tokens);
+    }
+
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
@@ -4096,6 +4102,71 @@ bool llama_expert_plan_install(llama_context * ctx, ggml_expert_plan_id plan) {
 void llama_expert_set_profiled_seq(llama_context * ctx, llama_seq_id seq_id, ggml_expert_bank_id bank) {
     ctx->expert_profiled_seq  = seq_id;
     ctx->expert_profiled_bank = bank;
+}
+
+void llama_expert_route_hint(llama_context * ctx, const llama_token * tokens, int32_t n_tokens) {
+    ctx->expert_route_hint(tokens, n_tokens);
+}
+
+// Largest ubatch a hint is computed for: the hints serve generation and verification batches.
+static constexpr int32_t expert_hint_max_rows = 64;
+
+void llama_context::expert_route_hint(const llama_token * tokens, int32_t n_tokens) {
+    if (expert_hint_state < 0 || expert_iface == nullptr || expert_backend == nullptr || expert_iface->route_hint == nullptr ||
+            tokens == nullptr || n_tokens <= 0 || n_tokens > expert_hint_max_rows) {
+        return;
+    }
+    if (expert_hint_state == 0) {
+        expert_hint_state = -1;
+        // an empty hint asks whether the cache uses hints at all (off: nothing else happens)
+        if (!expert_iface->route_hint(expert_backend, nullptr, 0)) {
+            return;
+        }
+        const int32_t n_layer = (int32_t) std::min<size_t>(model.hparams.n_layer(), model.layers.size());
+        for (int32_t il = 0; il < n_layer; ++il) {
+            const ggml_tensor * t = model.layers[il].ffn_gate_tid2eid;
+            if (t == nullptr || t->type != GGML_TYPE_I32 || t->buffer == nullptr || !ggml_is_contiguous(t) ||
+                    ggml_nrows(t) != t->ne[1]) {
+                continue;
+            }
+            if (!expert_hint_layers.empty() && (t->ne[0] != expert_hint_used || t->ne[1] != expert_hint_vocab)) {
+                continue;
+            }
+            expert_hint_used  = (int32_t) t->ne[0];
+            expert_hint_vocab = (int32_t) t->ne[1];
+            std::vector<int32_t> table((size_t) ggml_nelements(t));
+            ggml_backend_tensor_get(t, table.data(), 0, ggml_nbytes(t));
+            expert_hint_layers.push_back(il);
+            expert_hint_tables.push_back(std::move(table));
+        }
+        if (expert_hint_layers.empty()) {
+            return;
+        }
+        expert_hint_state = 1;
+        LLAMA_LOG_INFO("%s: %zu layers route by token id; their experts are hinted to the expert cache before each small ubatch\n",
+            __func__, expert_hint_layers.size());
+    }
+    const size_t n_layers = expert_hint_layers.size();
+    expert_hint_ids.resize(n_layers*(size_t) n_tokens*(size_t) expert_hint_used);
+    std::vector<ggml_expert_route_hint> hints(n_layers);
+    for (size_t i = 0; i < n_layers; ++i) {
+        int32_t * ids = expert_hint_ids.data() + i*(size_t) n_tokens*(size_t) expert_hint_used;
+        int32_t n = 0;
+        for (int32_t r = 0; r < n_tokens; ++r) {
+            const llama_token tok = tokens[r];
+            if (tok < 0 || tok >= expert_hint_vocab) {
+                continue;   // the graph rejects it; nothing to hint
+            }
+            const int32_t * row = expert_hint_tables[i].data() + (size_t) tok*(size_t) expert_hint_used;
+            for (int32_t j = 0; j < expert_hint_used; ++j) {
+                ids[n++] = row[j];
+            }
+        }
+        hints[i] = { expert_hint_layers[i], n_tokens, n, ids };
+    }
+    if (!expert_iface->route_hint(expert_backend, hints.data(), (int32_t) hints.size())) {
+        expert_hint_state = -1;
+    }
 }
 
 float * llama_get_logits(llama_context * ctx) {

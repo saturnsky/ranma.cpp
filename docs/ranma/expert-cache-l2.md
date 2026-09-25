@@ -92,6 +92,46 @@ in the file: captured graphs hold its two kernels, so the alternative would be a
 graph. With an all-clear serve bitmap the two kernels answer themselves and cost two small launches
 per routed layer.
 
+### Early routes (layers routed by token id)
+
+Some models route their first layers by the input token id alone: DeepSeek V4 gathers the selected
+experts of its hash layers from a `[n_expert_used, n_vocab]` table (`ffn_gate_tid2eid`). The loader
+declares such layers in `ggml_expert_config::early_route_layers`; `llama_decode` passes their
+experts to the cache (`ggml_expert_iface::route_hint`) for every token ubatch of at most the decode
+row bound, before the graph is built, and the server does it right after sampling
+(`llama_expert_route_hint`), before the rest of its loop and a draft model's decode. What the cache
+does with a hint is chosen by `RANMA_EXPERT_HASH_EARLY` (default `0`: the hint is refused and
+nothing changes):
+
+- `ssd`: the tier worker serves the hinted demand at once, lowest layer first, as one read batch
+  into the storage class ring, with the ordinary ledger rules except that nothing is leased to a
+  generation (a slot read early is reusable at once and the most recently used; a hit on a slot a
+  pending generation holds keeps that lease). The layer's generation then finds the experts in the
+  ring. A hint whose layer published since the hint is dropped (`early_late`). While the batch reads
+  the later layers, a published generation that needs no read is answered at once
+  (`early_inline`). The reads count once in `reads`/`ssd_bytes`; the generation's hits on them
+  count in `early_hits`, not in `ring_hits`.
+- `vram`: each early layer takes `RANMA_EXPERT_HASH_STAGE_SLOTS` VRAM slots of its size class
+  (default 6, taken from the static capacity at load and logged), placed after the exchange spares
+  and outside every plan. For a hint, the hinted experts that are host residents are copied
+  into them on a side stream with the copy engine, and the layer's slot table points at them, so the
+  matmuls read VRAM. Order: a kernel on the compute stream stores the layer's staging generation;
+  the side stream waits for an event of the compute stream (every earlier graph has finished with
+  the slots), removes the table entries of the slots it reuses (only where the table still names
+  that slot), copies, points the table at the slots and stores the generation as done. A kernel
+  before the layer's matmuls waits until done reaches the generation. A table entry always names a
+  slot that holds exactly that expert's bytes, and an install that rewrites the table only removes
+  entries. Needs owned host storage: exclusive mode or a finite host tier.
+- `both`: the two together.
+
+`expert_metrics` lines: the `l2` line carries `early_*` counters and `early_layer_decode_wait_ms`
+(the decode wait of the declared early layers, also with the switch off); a `hash_stage` line per
+bank commit carries the staging counters (copies, bytes, kept, over the slot count, host time of the
+hints) and per layer the selections read from a staging slot (`hits`), those without a VRAM slot
+(`host`, host or file) and the launches whose wait found the staging unfinished (`waits`).
+`RANMA_EXPERT_VERIFY` also compares every staged slice with its host bytes after each hint, and
+`RANMA_EXPERT_L2_VERIFY` checks the early reads like every other read.
+
 ### Storage classes (the class layout)
 
 A storage class is a size class (the experts of the layers whose three tensors have one type and
@@ -286,6 +326,8 @@ accepted by the tier; the prompt swap keeps its single-slot rule.
 | `RANMA_EXPERT_L2_STAGED` | 1 | Staged service: 0 is off, 1 covers the ubatches with more rows than the decode bound, N > 1 the ubatches of at least N rows. |
 | `RANMA_EXPERT_L2_STAGED_DRAIN` | 0 | 1 completes every read of a kind before the next kind is issued (a diagnostic; the queue then drains at each kind). |
 | `RANMA_EXPERT_L2_RING_FACTOR` | 1 | Each storage class ring is this many times its prompt floor, as far as the budget allows; a real number of at least 1, 1 = the floors. Not applied without a stored profile. `--expert-l2-staging-mib` overrides it. |
+| `RANMA_EXPERT_HASH_EARLY` | 0 | Layers routed by token id ("Early routes"): `ssd` reads their file-tier experts when the tokens are known, `vram` stages their host-resident experts in VRAM slots, `both`; 0 changes nothing. |
+| `RANMA_EXPERT_HASH_STAGE_SLOTS` | 6 | `vram`/`both`: staging slots per early layer (1..32), taken from the static VRAM capacity. |
 
 All of them are read in one controller function, through the same validating parser.
 `RANMA_EXPERT_TRACE=8` adds `expert_metrics` JSON lines with cumulative reads, ring hits, SSD payload

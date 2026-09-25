@@ -225,6 +225,12 @@ bool l2_tier::allocate(int device) {
     GGML_ASSERT(clock_khz_ > 0 && steady_khz_ > 0);
     pending_.resize(geo_.n_layers); wait_seen_.assign(geo_.n_layers, 0);
     staged_layer_.assign(geo_.n_layers, 0); stage_seen_.assign(geo_.n_layers, 0);
+    seen_.assign(geo_.n_layers, 0);
+    if (early_layer_.size() != (size_t) geo_.n_layers) { early_layer_.assign(geo_.n_layers, 0); }
+    if (cfg_.early) {
+        early_mark_.assign((size_t) geo_.n_layers*(size_t) geo_.n_experts, 0);
+        early_list_.assign(geo_.n_layers, {});
+    }
     for (int l = 0; l < geo_.n_layers; ++l) {
         if (geo_.layer_class[l] >= 0) { first_layer_ = l; break; }
     }
@@ -559,6 +565,8 @@ void l2_tier::set_homes(const std::vector<std::vector<int32_t>> & vram,
     } else {
         ledger_.discard();
     }
+    // an install may relabel or empty the ring slots an early read filled
+    early_clear_all();
     publish_tables();
     if (verify_) { verify_addresses(-1, {}); }
 }
@@ -965,8 +973,14 @@ void l2_tier::service_layer(int layer, uint32_t seq, const std::vector<int> & id
         if (class_layout()) { cledger_.set_done(other, done); } else { ledger_.set_done(other, done); }
     }
     auto homed = [this](int l, int e) { return wanted(l, e); };
-    const l2_service service = class_layout() ? cledger_.service(layer, ids, seq, homed) :
-        ledger_.service(layer, ids, seq, homed);
+    l2_service service;
+    if (cfg_.early) {
+        // a slot an early read filled for this demand is not a ring hit: its read was counted
+        auto quiet = [this](int l, int e) { return early_marked(l, e); };
+        service = class_layout() ? cledger_.service(layer, ids, seq, homed, quiet) : ledger_.service(layer, ids, seq, homed, quiet);
+    } else {
+        service = class_layout() ? cledger_.service(layer, ids, seq, homed) : ledger_.service(layer, ids, seq, homed);
+    }
     if (!service.ok) {
         GGML_ABORT("expert cache: the SSD tier cannot serve layer %d: %s", layer, service.reason.c_str());
     }
@@ -974,8 +988,23 @@ void l2_tier::service_layer(int layer, uint32_t seq, const std::vector<int> & id
         for (int kind = 0; kind < geometry::n_kinds; ++kind) {
             maps_host_[((size_t) old.layer*geometry::n_kinds + kind)*geo_.n_experts + old.expert] = 0;
         }
+        early_evicted(old.layer, old.expert);
     }
     counters_.ring_hits += (uint64_t) service.hits;
+    if (cfg_.early && !early_list_[(size_t) layer].empty()) {
+        // this service consumed the layer's early reads: the demanded ones were hits, the rest wasted
+        counters_.early_hits += (uint64_t) service.early_hits;
+        std::vector<bool> asked((size_t) geo_.n_experts, false);
+        for (int e : ids) {
+            if (e >= 0 && e < geo_.n_experts) { asked[(size_t) e] = true; }
+        }
+        for (int e : early_list_[(size_t) layer]) {
+            uint8_t & mark = early_mark_[(size_t) layer*(size_t) geo_.n_experts + (size_t) e];
+            if (mark && !asked[(size_t) e]) { ++counters_.early_unused; }
+            mark = 0;
+        }
+        early_list_[(size_t) layer].clear();
+    }
     std::string reason;
     if (staged() && item.rows >= uint64_t(cfg_.staged_min_rows)) {
         serve_staged(layer, seq, service.reads);
@@ -1084,7 +1113,24 @@ void l2_tier::verify_addresses(int demanded_layer, const std::vector<int> & ids)
     }
 }
 
-void l2_tier::worker_loop(std::vector<uint32_t> seen) {
+void l2_tier::handle_publish(int layer, uint32_t seq) {
+    l2_mailbox * mail = static_cast<l2_mailbox *>(mail_host_);
+    collect_wait(layer);   // the previous sample, before this one overwrites it
+    collect_stage(layer);
+    if (mail[layer].invalid) {
+        GGML_ABORT("expert cache: invalid router id at layer %d", layer);
+    }
+    if (expert_os::load_acquire(&mail[layer].ready) != seq) {
+        service_layer(layer, seq, demanded_ids(layer));
+        expert_os::store_release(&mail[layer].ready, seq);
+        ++counters_.generations;
+    } else {
+        account_layer(layer, seq, demanded_ids(layer));
+    }
+    seen_[(size_t) layer] = seq;
+}
+
+void l2_tier::worker_loop() {
     std::string pin_error;
     if (!expert_os::pin_current_thread(cfg_.worker_cpu, pin_error)) {
         GGML_LOG_WARN("expert cache: SSD worker pin failed: %s\n", pin_error.c_str());
@@ -1100,26 +1146,29 @@ void l2_tier::worker_loop(std::vector<uint32_t> seen) {
                 continue;
             }
             const uint32_t seq = expert_os::load_acquire(&mail[layer].published);
-            if (seq != seen[(size_t) layer]) {
+            if (seq != seen_[(size_t) layer]) {
                 std::lock_guard<std::mutex> lock(io_mutex_);
-                collect_wait(layer);   // the previous sample, before this one overwrites it
-                collect_stage(layer);
-                if (mail[layer].invalid) {
-                    GGML_ABORT("expert cache: invalid router id at layer %d", layer);
-                }
-                if (expert_os::load_acquire(&mail[layer].ready) != seq) {
-                    service_layer(layer, seq, demanded_ids(layer));
-                    expert_os::store_release(&mail[layer].ready, seq);
-                    ++counters_.generations;
-                } else {
-                    account_layer(layer, seq, demanded_ids(layer));
-                }
-                seen[(size_t) layer] = seq;
+                handle_publish(layer, seq);
                 work = true;
             }
             if (expert_os::load_acquire(&mail[layer].wait_generation) != wait_seen_[layer]) {
                 std::lock_guard<std::mutex> lock(io_mutex_);
                 collect_wait(layer);
+            }
+        }
+        // Early demands come after every published generation: a generation never waits for a
+        // read it does not need.
+        if (!work && early_pending_.load(std::memory_order_acquire)) {
+            std::vector<l2_early_layer> job;
+            {
+                std::lock_guard<std::mutex> lock(early_mutex_);
+                job.swap(early_job_);
+                early_pending_.store(false, std::memory_order_release);
+            }
+            if (!job.empty()) {
+                std::lock_guard<std::mutex> lock(io_mutex_);
+                serve_early(std::move(job));
+                work = true;
             }
         }
         if (!work) {
@@ -1137,12 +1186,17 @@ void l2_tier::start_worker() {
     }
     // Capture before the new thread can miss the first publish while it is being scheduled.
     const l2_mailbox * mail = static_cast<const l2_mailbox *>(mail_host_);
-    std::vector<uint32_t> seen((size_t) geo_.n_layers);
     for (int layer = 0; layer < geo_.n_layers; ++layer) {
-        seen[(size_t) layer] = expert_os::load_acquire(&mail[layer].published);
+        seen_[(size_t) layer] = expert_os::load_acquire(&mail[layer].published);
+    }
+    {
+        // a demand posted before the stop belongs to a plan that may be gone
+        std::lock_guard<std::mutex> lock(early_mutex_);
+        early_job_.clear();
+        early_pending_.store(false, std::memory_order_release);
     }
     stop_.store(false);
-    worker_ = std::thread([this, seen = std::move(seen)]() mutable { worker_loop(std::move(seen)); });
+    worker_ = std::thread([this]() { worker_loop(); });
 }
 
 void l2_tier::stop_worker() {
@@ -1154,6 +1208,157 @@ void l2_tier::stop_worker() {
     if (mail_host_) {
         std::lock_guard<std::mutex> lock(io_mutex_);
         for (int l = 0; l < geo_.n_layers; ++l) { collect_wait(l); collect_stage(l); }
+    }
+}
+
+// ---- early reads ------------------------------------------------------------------------------------
+
+void l2_tier::set_early_layers(const std::vector<uint8_t> & layers) {
+    early_layer_.assign(geo_.n_layers, 0);
+    for (int l = 0; l < geo_.n_layers && l < (int) layers.size(); ++l) {
+        early_layer_[(size_t) l] = layers[(size_t) l] && geo_.layer_class[l] >= 0 ? 1 : 0;
+    }
+}
+
+uint32_t l2_tier::published(int layer) const {
+    if (mail_host_ == nullptr || layer < 0 || layer >= geo_.n_layers) { return 0; }
+    return expert_os::load_acquire(&static_cast<const l2_mailbox *>(mail_host_)[layer].published);
+}
+
+void l2_tier::post_early(std::vector<l2_early_layer> layers) {
+    if (!cfg_.early || !mailbox_active_ || !any_ssd_ || layers.empty()) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(early_mutex_);
+    for (l2_early_layer & in : layers) {
+        if (in.layer < 0 || in.layer >= geo_.n_layers || geo_.layer_class[in.layer] < 0 || in.ids.empty()) { continue; }
+        l2_early_layer * same = nullptr;
+        for (l2_early_layer & have : early_job_) { same = have.layer == in.layer ? &have : same; }
+        if (same == nullptr) {
+            early_job_.push_back(std::move(in));
+        } else if (same->published == in.published) {
+            same->ids.insert(same->ids.end(), in.ids.begin(), in.ids.end());   // for the same generation
+        } else {
+            *same = std::move(in);
+        }
+    }
+    std::sort(early_job_.begin(), early_job_.end(),
+        [](const l2_early_layer & a, const l2_early_layer & b) { return a.layer < b.layer; });
+    early_pending_.store(!early_job_.empty(), std::memory_order_release);
+}
+
+void l2_tier::early_evicted(int layer, int expert) {
+    if (!early_marked(layer, expert)) { return; }
+    early_mark_[(size_t) layer*(size_t) geo_.n_experts + (size_t) expert] = 0;
+    ++counters_.early_lost;
+}
+
+void l2_tier::early_clear_all() {
+    for (int l = 0; l < (int) early_list_.size(); ++l) {
+        for (int e : early_list_[(size_t) l]) {
+            uint8_t & mark = early_mark_[(size_t) l*(size_t) geo_.n_experts + (size_t) e];
+            counters_.early_lost += mark ? 1 : 0;
+            mark = 0;
+        }
+        early_list_[(size_t) l].clear();
+    }
+}
+
+// Serves posted early demands, lowest layer first, as one read batch. Each layer's addresses are
+// published as soon as its last read is in place, and while the later layers are still being read,
+// every published generation that needs no read (typically a layer served early) is answered at once.
+// The reads are ordinary demand reads that happen sooner: counted in ssd_reads/ssd_bytes, checked
+// under RANMA_EXPERT_L2_VERIFY; the generation that later hits them does not count them as ring hits
+// again.
+void l2_tier::serve_early(std::vector<l2_early_layer> job) {
+    ++counters_.early_jobs;
+    for (int other = 0; other < geo_.n_layers; ++other) {
+        const uint32_t done = expert_os::load_acquire(&static_cast<l2_mailbox *>(mail_host_)[other].done);
+        if (class_layout()) { cledger_.set_done(other, done); } else { ledger_.set_done(other, done); }
+    }
+    auto homed = [this](int l, int e) { return wanted(l, e); };
+    struct span { int layer; size_t end; };
+    std::vector<span> spans;
+    std::vector<l2_read> reads;
+    for (const l2_early_layer & in : job) {
+        const int layer = in.layer;
+        if (published(layer) != in.published) {
+            ++counters_.early_late;   // its generation is out; the ordinary service reads it
+            continue;
+        }
+        const uint32_t now = class_layout() ? cledger_.done(layer) : ledger_.done(layer);
+        const l2_service service = class_layout() ? cledger_.service(layer, in.ids, now, homed, l2_no_quiet(), true) :
+            ledger_.service(layer, in.ids, now, homed, l2_no_quiet(), true);
+        if (!service.ok) {
+            // no reusable ring slot right now: the ordinary service will read it
+            if (!early_warned_) {
+                GGML_LOG_WARN("expert cache: an early read of layer %d was skipped: %s\n", layer, service.reason.c_str());
+                early_warned_ = true;
+            }
+            ++counters_.early_late;
+            continue;
+        }
+        for (const l2_eviction & old : service.evicted) {
+            for (int kind = 0; kind < geometry::n_kinds; ++kind) {
+                maps_host_[((size_t) old.layer*geometry::n_kinds + kind)*geo_.n_experts + old.expert] = 0;
+            }
+            early_evicted(old.layer, old.expert);
+        }
+        counters_.early_already += (uint64_t) service.hits;
+        for (const l2_read & r : service.reads) {
+            if (r.kind == 0) {
+                uint8_t & mark = early_mark_[(size_t) layer*(size_t) geo_.n_experts + (size_t) r.expert];
+                if (!mark) { early_list_[(size_t) layer].push_back(r.expert); }
+                mark = 1;
+            }
+            counters_.early_bytes += geo_.class_bytes[geo_.layer_class[layer]][r.kind];
+            ++counters_.early_reads;
+            reads.push_back(r);
+        }
+        ++counters_.early_layers;
+        spans.push_back({layer, reads.size()});
+    }
+    // The addresses go out before the reads complete: no kernel reads them before the worker has
+    // served the layer's generation, and that waits for the layer's reads (`busy`). A slot that was
+    // evicted for them was reusable, so no running generation reads it either.
+    std::vector<uint8_t> busy((size_t) geo_.n_layers, 0);
+    for (const span & sp : spans) {
+        publish_layer(sp.layer);
+        busy[(size_t) sp.layer] = 1;
+    }
+    std::atomic_thread_fence(std::memory_order_release);
+    if (verify_) { verify_addresses(-1, {}); }
+    size_t completed_spans = 0;
+    auto progress = [&](size_t count) {
+        bool any = false;
+        for (; completed_spans < spans.size() && spans[completed_spans].end <= count; ++completed_spans) {
+            busy[(size_t) spans[completed_spans].layer] = 0;
+            any = true;
+        }
+        if (any && completed_spans < spans.size()) { serve_ready(busy); }
+        return true;
+    };
+    std::string reason;
+    if (!reads.empty() && !run_reads(reads, reason, false, progress)) {
+        GGML_ABORT("expert cache: the SSD tier failed an early read: %s", reason.c_str());
+    }
+    std::atomic_thread_fence(std::memory_order_release);
+}
+
+void l2_tier::serve_ready(const std::vector<uint8_t> & busy) {
+    const l2_mailbox * mail = static_cast<const l2_mailbox *>(mail_host_);
+    for (int layer = 0; layer < geo_.n_layers; ++layer) {
+        if (geo_.layer_class[layer] < 0 || busy[(size_t) layer]) { continue; }
+        const uint32_t seq = expert_os::load_acquire(&mail[layer].published);
+        if (seq == seen_[(size_t) layer]) { continue; }
+        bool resident = true;
+        for (int e : demanded_ids(layer)) {
+            resident = resident && (wanted(layer, e) ||
+                (class_layout() ? cledger_.slot_of(layer, e) : ledger_.slot_of(layer, e)) >= 0);
+        }
+        if (!resident) { continue; }   // it needs a read: after this batch
+        handle_publish(layer, seq);
+        ++counters_.early_inline;
     }
 }
 
@@ -1218,6 +1423,10 @@ void l2_tier::collect_wait(int layer) {
     counters_.wait_ticks += item.wait_ticks;
     counters_.steady_ticks += item.steady_ticks;
     (item.prompt ? counters_.prompt_wait_ticks : counters_.decode_wait_ticks) += item.steady_ticks;
+    if (!item.prompt && layer < (int) early_layer_.size() && early_layer_[(size_t) layer]) {
+        counters_.early_layer_wait_ticks += item.steady_ticks;
+        ++counters_.early_layer_samples;
+    }
     ++counters_.measured_layers;
     if (cfg_.log_mask & GGML_EXPERT_LOG_L2) { samples_.push_back(item); }
     if (counters_.measured_layers % 64 == 0) { report_counters("periodic"); }
@@ -1258,6 +1467,16 @@ void l2_tier::report_counters(const char * what) {
         << ",\"staged_wait_ms\":" << (steady_khz_ > 0 ? double(counters_.staged_wait_ticks)/steady_khz_ : 0)
         << ",\"repartitions\":" << counters_.repartitions << ",\"ring_slots\":" << ring_count()
         << ",\"layout\":\"" << (class_layout() ? "class" : "ring") << '"';
+    if (std::find(early_layer_.begin(), early_layer_.end(), uint8_t(1)) != early_layer_.end()) {
+        out << ",\"early\":" << (cfg_.early ? 1 : 0)
+            << ",\"early_layer_decode_wait_ms\":" << (steady_khz_ > 0 ? double(counters_.early_layer_wait_ticks)/steady_khz_ : 0)
+            << ",\"early_layer_samples\":" << counters_.early_layer_samples
+            << ",\"early_jobs\":" << counters_.early_jobs << ",\"early_layers\":" << counters_.early_layers
+            << ",\"early_late\":" << counters_.early_late << ",\"early_reads\":" << counters_.early_reads
+            << ",\"early_bytes\":" << counters_.early_bytes << ",\"early_already\":" << counters_.early_already
+            << ",\"early_hits\":" << counters_.early_hits << ",\"early_unused\":" << counters_.early_unused
+            << ",\"early_lost\":" << counters_.early_lost << ",\"early_inline\":" << counters_.early_inline;
+    }
     if (class_layout()) {
         out << ",\"class_ring_slots\":[";
         for (int s = 0; s < storage_.storages(); ++s) { out << (s ? "," : "") << storage_.ring_slots[s]; }
