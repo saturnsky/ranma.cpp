@@ -183,6 +183,36 @@ size_t l2_tier::metadata_bytes() const {
     return expert_os::align_up_io(mail) + expert_os::align_up_io(maps) + 2*expert_os::align_up_io(demand) + bounce;
 }
 
+void l2_tier::set_storage(const class_storage & storage) {
+    GGML_ASSERT(class_layout() && !mailbox_active_);
+    storage_ = storage;
+    bool ok = storage_.valid() && storage_.storage_of.size() == geo_.class_bytes.size() &&
+        storage_.floor.size() == storage_.members.size();
+    for (int s = 0; ok && s < storage_.storages(); ++s) {
+        for (int kind = 0; kind < geometry::n_kinds; ++kind) {
+            // a read of the covering sectors must fit, and every slot must stay sector aligned
+            ok = ok && storage_.pitch[s][kind] % expert_os::io_alignment == 0;
+            for (int c : storage_.members[s]) {
+                ok = ok && storage_.pitch[s][kind] >= geo_.class_bytes[c][kind] + expert_os::io_alignment - 1 +
+                    arena_tail_bytes(geo_, c, kind);
+            }
+        }
+        ok = ok && storage_.ring_slots[s] >= storage_.floor[s];
+    }
+    sized_ = ok;
+}
+
+int l2_tier::install_read_slots() const {
+    if (!class_layout()) {
+        return std::min({cfg_.queue_depth, ring_count(), decode_slots_});
+    }
+    int slots = cfg_.queue_depth;
+    for (int s = 0; s < storage_.storages(); ++s) {
+        if (storage_.ring_slots[s] > 0) { slots = std::min(slots, storage_.ring_slots[s]); }
+    }
+    return std::max(slots, 1);
+}
+
 bool l2_tier::allocate(int device) {
     if (!sized_) {
         GGML_LOG_ERROR("expert cache: the SSD tier could not size its ring\n");
@@ -199,7 +229,8 @@ bool l2_tier::allocate(int device) {
         if (geo_.layer_class[l] >= 0) { first_layer_ = l; break; }
     }
 
-    for (int kind = 0; kind < geometry::n_kinds; ++kind) {
+    // The class layout keeps its ring in the host arenas, which the controller allocates.
+    for (int kind = 0; kind < geometry::n_kinds && !class_layout(); ++kind) {
         const size_t bytes = (size_t) prompt_slots_*ring_pitch_[kind];
         std::optional<expert_os::reservation> res = expert_os::reserve(bytes);
         if (!res || !expert_os::commit(*res, 0, bytes)) {
@@ -262,14 +293,43 @@ bool l2_tier::allocate(int device) {
         return false;
     }
 
-    ledger_.reset(geo_.n_layers, geo_.n_experts, prompt_slots_, prompt_slots_, geometry::n_kinds);
     prompt_ring_ = true;
-    GGML_LOG_INFO("expert cache: SSD tier ring %d slots (%zu MiB, prompt) / %d slots (%zu MiB, decode), "
-                  "metadata and bounce %zu KiB, queue depth %d\n",
-        prompt_slots_, ring_bytes(prompt_slots_)/(1024*1024),
-        decode_slots_, ring_bytes(decode_slots_)/(1024*1024),
-        metadata_bytes()/1024, cfg_.queue_depth);
-    if (!size_note_.empty()) {
+    if (class_layout()) {
+        std::vector<int> layer_storage((size_t) geo_.n_layers, -1), slots;
+        for (int l = 0; l < geo_.n_layers; ++l) {
+            if (geo_.layer_class[l] >= 0) { layer_storage[(size_t) l] = storage_.storage_of[geo_.layer_class[l]]; }
+        }
+        for (int s = 0; s < storage_.storages(); ++s) { slots.push_back(storage_.slots(s)); }
+        cledger_.reset(geo_.n_layers, geo_.n_experts, layer_storage, slots, geometry::n_kinds);
+        for (int c = 0; c < (int) geo_.class_bytes.size(); ++c) {
+            for (int i = 0; i < storage_.resident_slots[c]; ++i) {
+                GGML_ASSERT(cledger_.set_resident(storage_.storage_of[c], storage_.resident_slot(c, i), -1, -1));
+            }
+        }
+        for (int s = 0; s < storage_.storages(); ++s) {
+            for (int i = 0; i < storage_.ring_slots[s]; ++i) { GGML_ASSERT(cledger_.make_ring(s, storage_.ring_base[s] + i)); }
+            cledger_.set_floor(s, storage_.floor[s]);
+            std::string members;
+            for (int c : storage_.members[s]) { members += (members.empty() ? "" : ",") + std::to_string(c); }
+            GGML_LOG_INFO("expert cache: SSD tier storage class %d (size classes %s): pitch %zu/%zu/%zu KiB, "
+                          "%d resident slots, ring %d slots / %zu MiB (floor %d)\n",
+                s, members.c_str(), storage_.pitch[s][0]/1024, storage_.pitch[s][1]/1024, storage_.pitch[s][2]/1024,
+                storage_.ring_base[s], storage_.ring_slots[s],
+                size_t(storage_.ring_slots[s])*storage_.stride(s)/(1024*1024), storage_.floor[s]);
+        }
+        GGML_LOG_INFO("expert cache: SSD tier class layout: ring %d slots (%zu MiB) in the host arenas, least recently "
+                      "used per storage class, ring factor %g, metadata and bounce %zu KiB, queue depth %d\n",
+            cledger_.ring_total(), storage_.ring_bytes()/(1024*1024), cfg_.ring_factor, metadata_bytes()/1024,
+            cfg_.queue_depth);
+    } else {
+        ledger_.reset(geo_.n_layers, geo_.n_experts, prompt_slots_, prompt_slots_, geometry::n_kinds);
+        GGML_LOG_INFO("expert cache: SSD tier ring %d slots (%zu MiB, prompt) / %d slots (%zu MiB, decode), "
+                      "metadata and bounce %zu KiB, queue depth %d\n",
+            prompt_slots_, ring_bytes(prompt_slots_)/(1024*1024),
+            decode_slots_, ring_bytes(decode_slots_)/(1024*1024),
+            metadata_bytes()/1024, cfg_.queue_depth);
+    }
+    if (!size_note_.empty() && !class_layout()) {
         GGML_LOG_INFO("expert cache: %s\n", size_note_.c_str());
     }
     if (staged()) {
@@ -285,7 +345,8 @@ bool l2_tier::map() {
         return true;
     }
     ggml_cuda_set_device(device_);
-    for (int kind = 0; kind < geometry::n_kinds; ++kind) {
+    // The class layout's ring is part of the host arenas, which are registered with the residents.
+    for (int kind = 0; kind < geometry::n_kinds && !class_layout(); ++kind) {
         const size_t bytes = ring_res_[kind].bytes;
         // Mapped, not coarse grained: the worker refills a slot while the GPU runs, and coarse
         // grained memory is only coherent at kernel boundaries. Phase C measures whether this
@@ -389,9 +450,25 @@ uint64_t l2_tier::address_of(int layer, int kind, int expert) const {
         return 0;   // the VRAM slot table answers this one
     }
     const expert_location home = homes_[layer][expert];
+    if (class_layout()) {
+        if (!mapped_) {
+            return 0;   // no device aliases yet; publish_tables publishes zeros until then
+        }
+        // Every host resident is served from here: its payload sits at slot + shift, which the
+        // host slot table cannot express.
+        if (home.storage == expert_storage::host) {
+            return uint64_t(reinterpret_cast<uintptr_t>(location_address(layer, kind, home, true)));
+        }
+        const int slot = cledger_.slot_of(layer, expert);
+        if (!cledger_.owns(slot, layer, expert)) {
+            return 0;
+        }
+        return uint64_t(reinterpret_cast<uintptr_t>(
+            static_cast<char *>(storage_slot(layer, kind, slot, true)) + backing_[layer][kind].shift));
+    }
     if (home.storage == expert_storage::host) { return 0; } // The host slot table answers.
     if (home.storage == expert_storage::lent) {
-        return uint64_t(reinterpret_cast<uintptr_t>(location_address(cls, kind, home, true)));
+        return uint64_t(reinterpret_cast<uintptr_t>(location_address(layer, kind, home, true)));
     }
     const int ring = ledger_.slot_of(layer, expert);
     if (!ledger_.owns(ring, layer, expert)) {
@@ -404,7 +481,8 @@ uint64_t l2_tier::address_of(int layer, int kind, int expert) const {
 const uint64_t * l2_tier::addresses(int layer, int kind) const {
     // Nothing is in the file, so the host slot table answers every miss and the kernels take
     // exactly the path they took without a tier.
-    if ((!mailbox_active_ && !any_lent_) || maps_device_ == nullptr || layer < 0 || layer >= geo_.n_layers) {
+    if ((!mailbox_active_ && !any_lent_ && !class_layout()) || maps_device_ == nullptr || layer < 0 ||
+            layer >= geo_.n_layers) {
         return nullptr;
     }
     return maps_device_ + ((size_t) layer*geometry::n_kinds + (size_t) kind)*(size_t) geo_.n_experts;
@@ -441,12 +519,42 @@ void l2_tier::set_homes(const std::vector<std::vector<int32_t>> & vram,
     vram_ = vram;
     homes_ = host;
     host_geo_ = host_geo;
-    ledger_.discard();
+    if (class_layout()) {
+        // The resident roles mirror the plan; the rings start empty, as with the ring layout.
+        cledger_.clear_residents();
+        for (int layer = 0; layer < geo_.n_layers && layer < (int) homes_.size(); ++layer) {
+            const int cls = geo_.layer_class[layer];
+            if (cls < 0) { continue; }
+            for (int expert = 0; expert < geo_.n_experts; ++expert) {
+                const expert_location at = homes_[layer][expert];
+                if (at.storage == expert_storage::file) { continue; }
+                GGML_ASSERT(at.storage == expert_storage::host && at.slot >= 0 && at.slot < storage_.resident_slots[cls]);
+                GGML_ASSERT(cledger_.set_resident(storage_.storage_of[cls], storage_.resident_slot(cls, at.slot), layer, expert));
+            }
+        }
+        cledger_.discard();
+    } else {
+        ledger_.discard();
+    }
     publish_tables();
     if (verify_) { verify_addresses(-1, {}); }
 }
 
-void * l2_tier::location_address(int cls, int kind, expert_location at, bool device) const {
+void l2_tier::refresh_addresses() {
+    GGML_ASSERT(!worker_running());
+    std::lock_guard<std::mutex> lock(io_mutex_);
+    publish_tables();
+    if (verify_) { verify_addresses(-1, {}); }
+}
+
+void * l2_tier::location_address(int layer, int kind, expert_location at, bool device) const {
+    const int cls = geo_.layer_class[layer];
+    if (class_layout()) {
+        if (at.storage != expert_storage::host) { return nullptr; }
+        GGML_ASSERT(cls >= 0 && at.slot >= 0 && at.slot < storage_.resident_slots[cls]);
+        return static_cast<char *>(storage_slot(layer, kind, storage_.resident_slot(cls, at.slot), device)) +
+            backing_[(size_t) layer][kind].shift;
+    }
     if (at.storage == expert_storage::host) {
         const auto & bases = device ? host_geo_.device_base : host_geo_.host_base;
         return static_cast<char *>(bases[cls][kind]) + size_t(at.slot)*geo_.class_bytes[cls][kind];
@@ -459,18 +567,30 @@ void * l2_tier::location_address(int cls, int kind, expert_location at, bool dev
 }
 
 void * l2_tier::host_address(int layer, int kind, int expert) const {
-    return location_address(geo_.layer_class[layer], kind, homes_[layer][expert]);
+    return location_address(layer, kind, homes_[layer][expert]);
 }
 
-void l2_tier::finish_write(int cls, int kind, expert_location at) {
-    if (at.storage != expert_storage::lent) { return; }
+void l2_tier::finish_write(int layer, int kind, expert_location at) {
+    const int cls = geo_.layer_class[layer];
     const size_t bytes = geo_.class_bytes[cls][kind];
-    memset(static_cast<char *>(location_address(cls, kind, at)) + bytes, 0, ring_pitch_[kind] - bytes);
+    if (class_layout()) {
+        // The slot's previous occupant may have sat at another sector shift, so its bytes can
+        // reach past this payload.
+        if (at.storage != expert_storage::host) { return; }
+        const size_t shift = backing_[(size_t) layer][kind].shift;
+        const size_t pitch = storage_.pitch[storage_.storage_of[cls]][kind];
+        memset(static_cast<char *>(location_address(layer, kind, at)) + bytes, 0, pitch - shift - bytes);
+        return;
+    }
+    if (at.storage != expert_storage::lent) { return; }
+    memset(static_cast<char *>(location_address(layer, kind, at)) + bytes, 0, ring_pitch_[kind] - bytes);
 }
 
 bool l2_tier::set_prompt_ring(bool prompt) {
-    const int slots = prompt ? prompt_slots_ : decode_slots_;
     prompt_ring_ = prompt;
+    // The class layout keeps its rings at their allocated size in both phases and lends nothing.
+    if (class_layout()) { return false; }
+    const int slots = prompt ? prompt_slots_ : decode_slots_;
     if (slots == ledger_.ring_count()) { return false; }
     std::lock_guard<std::mutex> lock(io_mutex_);
     GGML_ASSERT(ledger_.set_ring_count(slots));
@@ -480,12 +600,43 @@ bool l2_tier::set_prompt_ring(bool prompt) {
 
 // ---- reads -------------------------------------------------------------------------------------------
 
-bool l2_tier::read_install(const std::vector<l2_read> & reads, std::string & reason) {
+bool l2_tier::read_install(std::vector<l2_read> & reads, std::string & reason) {
     GGML_ASSERT(!worker_running());
-    for (const auto & read : reads) {
-        GGML_ASSERT(read.slot >= 0 && read.slot < install_read_slots());
+    if (!class_layout()) {
+        for (const auto & read : reads) {
+            GGML_ASSERT(!read.direct && read.slot >= 0 && read.slot < install_read_slots());
+        }
+        ledger_.discard();
+        return run_reads(reads, reason, true);
     }
-    ledger_.discard();
+    // A slice for a host slot is read straight into it; one on its way to VRAM into a ring slot of
+    // its class, one slot per (layer, expert) of the batch for all kinds.
+    cledger_.discard();
+    std::vector<l2_eviction> evicted;
+    std::vector<std::array<int, 3>> scratch;   // layer, expert, storage slot
+    for (l2_read & read : reads) {
+        const int cls = geo_.layer_class[read.layer];
+        GGML_ASSERT(cls >= 0);
+        if (read.direct) {
+            GGML_ASSERT(read.slot >= 0 && read.slot < storage_.resident_slots[cls]);
+            read.slot = storage_.resident_slot(cls, read.slot);
+            continue;
+        }
+        int slot = -1;
+        for (const auto & item : scratch) {
+            if (item[0] == read.layer && item[1] == read.expert) { slot = item[2]; }
+        }
+        if (slot < 0) {
+            slot = cledger_.take_free(storage_.storage_of[cls], evicted);
+            if (slot < 0) {
+                reason = "no ring slot of storage class " + std::to_string(storage_.storage_of[cls]) +
+                    " for an install read of layer " + std::to_string(read.layer);
+                return false;
+            }
+            scratch.push_back({read.layer, read.expert, slot});
+        }
+        read.slot = slot;
+    }
     return run_reads(reads, reason, true);
 }
 
@@ -509,8 +660,9 @@ bool l2_tier::run_reads(const std::vector<l2_read> & reads, std::string & reason
         expert_os::read_op op;
         op.file   = files_[(size_t) b.file];
         op.offset = offset - b.shift;
-        op.dst    = ring_host(read.kind, read.slot);
+        op.dst    = read_slot(read);
         op.bytes  = expert_os::align_up_io(slice + b.shift);
+        GGML_ASSERT(op.bytes <= read_pitch(read));
         ops.push_back(op);
     }
     if (!queue_->submit(ops.data(), ops.size())) {
@@ -527,8 +679,7 @@ bool l2_tier::run_reads(const std::vector<l2_read> & reads, std::string & reason
             return false;
         }
         // MMQ loads complete K tiles past the final row, starting at the tensor's sector shift.
-        memset(static_cast<char *>(ring_host(reads[i].kind, reads[i].slot)) + need,
-            0, ring_pitch_[reads[i].kind] - need);
+        memset(static_cast<char *>(read_slot(reads[i])) + need, 0, read_pitch(reads[i]) - need);
         (install ? counters_.install_ssd_bytes : counters_.ssd_bytes) += geo_.class_bytes[cls][reads[i].kind];
         ++(install ? counters_.install_ssd_reads : counters_.ssd_reads);
         return true;
@@ -536,7 +687,7 @@ bool l2_tier::run_reads(const std::vector<l2_read> & reads, std::string & reason
     auto check = [&](size_t i) {
         const l2_read & read = reads[i];
         return !verify_ || verify_slice(read.layer, read.kind, read.expert,
-            static_cast<char *>(ring_host(read.kind, read.slot)) + backing_[read.layer][read.kind].shift, reason);
+            static_cast<char *>(read_slot(read)) + backing_[read.layer][read.kind].shift, reason);
     };
     if (progress) {
         // Each completed prefix is finished and checked before its reader hears of it; the queue
@@ -674,9 +825,12 @@ void l2_tier::service_layer(int layer, uint32_t seq, const std::vector<int> & id
     auto & item = pending_[layer];
     const auto before_bytes = counters_.ssd_bytes;
     for (int other = 0; other < geo_.n_layers; ++other) {
-        ledger_.set_done(other, expert_os::load_acquire(&static_cast<l2_mailbox *>(mail_host_)[other].done));
+        const uint32_t done = expert_os::load_acquire(&static_cast<l2_mailbox *>(mail_host_)[other].done);
+        if (class_layout()) { cledger_.set_done(other, done); } else { ledger_.set_done(other, done); }
     }
-    const l2_service service = ledger_.service(layer, ids, seq, [this](int l, int e) { return wanted(l, e); });
+    auto homed = [this](int l, int e) { return wanted(l, e); };
+    const l2_service service = class_layout() ? cledger_.service(layer, ids, seq, homed) :
+        ledger_.service(layer, ids, seq, homed);
     if (!service.ok) {
         GGML_ABORT("expert cache: the SSD tier cannot serve layer %d: %s", layer, service.reason.c_str());
     }
@@ -785,8 +939,8 @@ void l2_tier::verify_addresses(int demanded_layer, const std::vector<int> & ids)
         if (wanted(demanded_layer, expert)) {
             continue;
         }
-        const int slot = ledger_.slot_of(demanded_layer, expert);
-        if (!ledger_.owns(slot, demanded_layer, expert)) {
+        const int slot = class_layout() ? cledger_.slot_of(demanded_layer, expert) : ledger_.slot_of(demanded_layer, expert);
+        if (!(class_layout() ? cledger_.owns(slot, demanded_layer, expert) : ledger_.owns(slot, demanded_layer, expert))) {
             ++counters_.verify_bad;
             GGML_ABORT("expert cache: demanded layer %d expert %d has no owned ring slot",
                 demanded_layer, expert);
@@ -964,7 +1118,14 @@ void l2_tier::report_counters(const char * what) {
         << ",\"verify_bad\":" << counters_.verify_bad << ",\"owner_checks\":" << counters_.owner_checks
         << ",\"staged_generations\":" << counters_.staged_generations
         << ",\"staged_wait_ms\":" << (steady_khz_ > 0 ? double(counters_.staged_wait_ticks)/steady_khz_ : 0)
-        << ",\"repartitions\":" << counters_.repartitions << ",\"ring_slots\":" << ledger_.ring_count()
+        << ",\"repartitions\":" << counters_.repartitions << ",\"ring_slots\":" << ring_count()
+        << ",\"layout\":\"" << (class_layout() ? "class" : "ring") << '"';
+    if (class_layout()) {
+        out << ",\"class_ring_slots\":[";
+        for (int s = 0; s < storage_.storages(); ++s) { out << (s ? "," : "") << storage_.ring_slots[s]; }
+        out << ']';
+    }
+    out
         << ",\"samples\":[";
     bool comma = false;
     for (const auto & item : samples_) {

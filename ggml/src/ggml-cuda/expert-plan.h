@@ -346,6 +346,12 @@ struct tier_inputs {
     const std::vector<size_t> * slot_pitch = nullptr;           // [class] bytes one host slot costs
     size_t budget_bytes = 0;                                    // for host slices; ring and tables are gone
     const std::vector<int> * fixed_capacities = nullptr;        // re-plan against allocated capacities
+    // [class] the most file residents one layer of the class may keep, or null for no limit. The
+    // SSD tier's ring of a storage class holds every file resident of one layer at once, so a plan
+    // may not leave more of one layer in the file than that ring has slots. A layer above its
+    // limit gets its best file experts back from the weakest host residents of layers of the same
+    // class that are below it; the per-class counts do not change.
+    const std::vector<int> * file_cap = nullptr;
 };
 
 struct tier_plan {
@@ -458,11 +464,51 @@ inline tier_plan plan_host_tier(const tier_inputs & in) {
     }
 
     std::vector<int> used(classes, 0);
-    for (const tier_candidate & c : candidates) {
+    std::vector<uint8_t> picked(candidates.size(), 0);
+    for (size_t i = 0; i < candidates.size(); ++i) {
+        const tier_candidate & c = candidates[i];
         if (used[c.cls] < out.capacities[c.cls]) {
-            out.selected[c.layer].push_back(c.expert);
+            picked[i] = 1;
             ++used[c.cls];
         } else if (c.mandatory) { out.reason = "host capacity excludes a mandatory L1 resident"; return out; }
+    }
+    if (in.file_cap != nullptr) {
+        if (in.file_cap->size() != classes) { out.reason = "file cap dimensions"; return out; }
+        // file residents per layer: the candidates not picked; a VRAM resident is never one (an
+        // inclusive one is a mandatory pick)
+        std::vector<int> file(geo.n_layers, 0);
+        for (size_t i = 0; i < candidates.size(); ++i) { file[candidates[i].layer] += picked[i] ? 0 : 1; }
+        for (size_t cls = 0; cls < classes; ++cls) {
+            const int cap = (*in.file_cap)[cls];
+            if (cap < 0) { continue; }
+            while (true) {
+                int over = -1;
+                for (int l = 0; l < geo.n_layers; ++l) {
+                    if (geo.layer_class[l] == int(cls) && file[l] > cap && (over < 0 || file[l] > file[over])) { over = l; }
+                }
+                if (over < 0) { break; }
+                // the best file expert of that layer, the weakest host resident of a layer with room
+                size_t in_i = candidates.size(), out_i = candidates.size();
+                for (size_t i = 0; i < candidates.size() && in_i == candidates.size(); ++i) {
+                    if (!picked[i] && candidates[i].layer == over) { in_i = i; }
+                }
+                for (size_t i = candidates.size(); i-- > 0 && out_i == candidates.size();) {
+                    const tier_candidate & c = candidates[i];
+                    if (picked[i] && !c.mandatory && c.cls == int(cls) && c.layer != over && file[c.layer] < cap) { out_i = i; }
+                }
+                if (in_i == candidates.size() || out_i == candidates.size()) {
+                    out.reason = "layer " + std::to_string(over) + " keeps " + std::to_string(file[over]) +
+                        " experts in the file, more than the " + std::to_string(cap) +
+                        " ring slots of its storage class, and no layer of its class can take a file resident in exchange";
+                    return out;
+                }
+                picked[in_i] = 1; picked[out_i] = 0;
+                --file[over]; ++file[candidates[out_i].layer];
+            }
+        }
+    }
+    for (size_t i = 0; i < candidates.size(); ++i) {
+        if (picked[i]) { out.selected[candidates[i].layer].push_back(candidates[i].expert); }
     }
     for (int layer = 0; layer < geo.n_layers; ++layer) {
         std::sort(out.selected[layer].begin(), out.selected[layer].end());
