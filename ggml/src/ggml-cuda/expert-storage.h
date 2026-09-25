@@ -45,6 +45,7 @@ struct class_storage {
     std::vector<std::array<size_t, 3>> tail;        // [storage class][kind] zeroed bytes past the last slot
     std::vector<int> resident_base, resident_slots; // [geometry class] its resident slot range, spares included
     std::vector<int> ring_base, ring_slots, floor;  // [storage class] the ring range and its prompt floor
+    double factor = 1.0;                            // the ring factor the rings got, 0 = an explicit total
 
     int storages() const { return (int) members.size(); }
     bool valid() const { return !members.empty() && ring_slots.size() == members.size(); }
