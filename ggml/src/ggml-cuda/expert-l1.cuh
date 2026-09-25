@@ -125,6 +125,9 @@ public:
 
     size_t device_bytes() const { return allocated_bytes_; }
     const std::vector<int> & capacities() const { return capacities_; }
+    // Arena slots per class: the static capacity and the exchange spares. Every slot index of the
+    // class is below this.
+    std::vector<int> slot_counts() const;
     // Mirror of the device table that maps an expert to its VRAM slot, or -1.
     const std::vector<std::vector<int32_t>> & host_slots() const { return host_slots_; }
     // Exclusive mode: mirror of the device table that maps an expert to its host arena slot.
