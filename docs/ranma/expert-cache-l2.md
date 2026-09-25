@@ -96,10 +96,12 @@ per routed layer.
 
 A storage class is a size class (the experts of the layers whose three tensors have one type and
 shape), or several of them merged. Each storage class has one host arena per kind; its slots are the
-host residents of its size classes, one contiguous range per size class, followed by the storage
-class's staging ring. Every slot has the same pitch, so a slot can hold a resident or a ring occupant
-without moving its bytes (the install transaction will use this; today the ranges are fixed at
-allocation). The arenas are registered once, coarse grained, like the host arena without a tier.
+host residents of its size classes, at load one contiguous range per size class, followed by the
+storage class's staging ring. Every slot has the same pitch, so a slot can hold a resident or a ring
+occupant without moving its bytes, and the install transaction relabels slots between the two roles
+("Placement and the install transaction"): after the first install a size class's host slots are
+spread over the arena. The arenas are registered once, coarse grained, like the host arena without a
+tier.
 
 Merge rule: a size class of at most two layers is merged into the nearest storage class of at least
 its stride when the prompt floor bytes it saves exceed the padding every expert of the affected
@@ -120,8 +122,7 @@ ring is its own least recently used list with the pins and leases described abov
 relabel operations are the install transaction's building blocks and are covered by the CPU tests:
 a resident becomes a ring occupant of the same expert in place (the ring grows, no read), a ring slot
 becomes a resident (the ring shrinks; a read only when the slot does not hold that expert), and no
-ring shrinks below its floor. Install reads of experts promoted from the file into a host slot go
-straight into that slot; a promotion to VRAM is read into a ring slot of its class and copied.
+ring shrinks below its floor. The install transaction (`expert-l2-relabel.h`) is built from them.
 
 ### Addresses and padding
 
@@ -169,16 +170,21 @@ under the plan that seeds the load, never more than `min(E, U * n_ubatch)`. The 
 growing the rings from zero until the host cut under them keeps no layer above its ring. Without a
 stored profile every storage class's floor is `min(E, U * n_ubatch)`.
 
-The ring of a storage class is `RANMA_EXPERT_L2_RING_FACTOR` (default 1) times its floor, rounded up
-and at most the class's layers x E slots. A class ring is shared by all layers of the class during
-decode, so a ring above the floor gives each layer's reusable experts more room to survive until
-that layer comes round again, at the price of host residents. Measured on DS4F (exclusive, L1 16 GiB,
-roleplay profile): factor 2 against 1 was -1.6 % decode at L2 24 GiB and -1.4 % at 40 GiB in domain
-(fewer host residents, more SSD reads) and +1.7 % out of domain (coding at L2 24 GiB). The minimum budget stays the floors: when the budget above that minimum cannot hold
+The ring of a storage class seeded from a stored profile is `RANMA_EXPERT_L2_RING_FACTOR` times its
+floor (default 1, the floors), rounded up and at most the class's layers x E slots. A factor above 1
+gives each layer's reusable experts more room to survive in the shared class ring until that layer
+comes round again, but every extra ring slot is a host resident less. Measured on DS4F (exclusive,
+L1 16 GiB, no speculative decoding, replies identical): factor 2 helps only out of domain (roleplay
+profile, coding requests, L2 24 GiB: 14.00 -> 14.23 t/s, +1.7 %; factor 3 +1.2 %) and costs in domain
+(roleplay, L2 24 GiB: 20.12 -> 19.79 t/s, -1.6 %; L2 40 GiB: 25.15 -> 24.79, -1.4 %), where the host
+residents it removes cost more SSD reads than the ring hits it adds (478863 -> 545988 reads at
+24 GiB). The CPU replay had predicted a gain in domain as well. The minimum budget stays the floors: when the budget above that minimum cannot hold
 the full factor, every class keeps its floor plus the same fraction of what it wanted above it (one
 log line); the factor never refuses a budget. A larger ring leaves fewer host residents, so a class
 whose layers then keep more experts in the file than its ring grows to that count (the floors are
-used when that no longer fits).
+used when that no longer fits). Without a stored profile the factor is not applied: the floors are
+then already the most one layer can demand (`min(E, U * n_ubatch)`, 7.0 GiB of rings for DS4F;
+factor 2 would take 14 GiB), and one log line says so.
 
 `--expert-l2-staging-mib` overrides the factor. It is the total over the classes: the classes get their floors and the rest in
 proportion to the bytes each leaves in the file; a total below the floors is raised with one log line.
@@ -215,6 +221,40 @@ a source in the file a small reader gives it the batched read and the ring addre
 the device drains and the worker stops; ordered copies preserve every source until its last use;
 tables are published only after the copies finish.
 
+**Install by relabel.** The SSD tier runs the transaction's host and file moves itself (`l2_tier::install_relabel`, planned by the pure
+`expert-l2-relabel.h`) and the ring contents survive the install. A host slot of the plan
+(`expert_location::slot`) is a logical slot; the tier maps each one to a storage slot of its storage
+class, and the install changes that map instead of moving bytes:
+
+- A host resident that leaves for the file stays where it is: its slot joins the ring with the
+  expert as a cold (least recently used) occupant. A later demand is a ring hit, a later promotion a
+  relabel.
+- A promotion from the file that the ring holds takes that ring slot as its home: no read, no copy.
+  A promotion to VRAM of a ring occupant is copied from its ring slot without a read.
+- Any other promotion from the file takes an empty ring slot, or else the least recently used one
+  that no generation leases, and is read straight into it; for a host promotion that slot becomes the
+  home, for a VRAM promotion the slice is then copied up. A demotion from VRAM to a host slot is
+  copied back into such a ring slot, which becomes the home. The slot a host resident promoted to
+  VRAM leaves joins the ring empty once its copy is queued.
+- Each ring keeps its size: every host slot that changes gives its storage slot to the ring and
+  takes one from it, and the number of host slots per size class is fixed. The transaction checks
+  this and that every home holds the plan's expert.
+
+Nothing computes during the install: the device is drained, the worker stopped, and the done
+generation of every layer is refreshed first, so no ring slot is leased; a leased slot would be
+skipped, and a leased occupant is never relabeled (the install stops instead). Moves from the file
+run in read batches: all reads of a batch go out together into distinct slots, then the batch's
+copies to VRAM, and the copy stream is synchronized before the next batch's reads; no slot is read
+into or copied from twice in one batch. The address table, the serve bitmap and the VRAM tables are
+published after every read and copy has completed. A prompt/decode plan switch of the prefill swap is
+the same transaction: the class layout has no lent slots and one ring size, so nothing else changes
+at a switch.
+
+The install line reports the moves from the file split into `relabel` (host promotions from the
+ring), `ring-copy` (VRAM promotions from the ring) and `read`, and the ring occupants kept across the
+install; the `install` metric adds `read_bytes` (bytes actually read; `ssd_bytes` still counts every
+move from the file), `relabel_bytes`, `ring_copy_bytes`, `ring_kept` and `demoted_to_ring`.
+
 ## Options
 
 Use `--load-mode none`, `GGML_CUDA_HOST_DIRECT=1` and `GGML_CUDA_HOST_DIRECT_MAX_BATCH=512`: the
@@ -245,7 +285,7 @@ accepted by the tier; the prompt swap keeps its single-slot rule.
 | `RANMA_EXPERT_L2_VERIFY` | the `RANMA_EXPERT_VERIFY` value | Independent buffered payload and ownership checks. |
 | `RANMA_EXPERT_L2_STAGED` | 1 | Staged service: 0 is off, 1 covers the ubatches with more rows than the decode bound, N > 1 the ubatches of at least N rows. |
 | `RANMA_EXPERT_L2_STAGED_DRAIN` | 0 | 1 completes every read of a kind before the next kind is issued (a diagnostic; the queue then drains at each kind). |
-| `RANMA_EXPERT_L2_RING_FACTOR` | 1 | Each storage class ring is this many times its prompt floor, as far as the budget allows; a real number of at least 1, 1 = the floors. `--expert-l2-staging-mib` overrides it. |
+| `RANMA_EXPERT_L2_RING_FACTOR` | 1 | Each storage class ring is this many times its prompt floor, as far as the budget allows; a real number of at least 1, 1 = the floors. Not applied without a stored profile. `--expert-l2-staging-mib` overrides it. |
 
 All of them are read in one controller function, through the same validating parser.
 `RANMA_EXPERT_TRACE=8` adds `expert_metrics` JSON lines with cumulative reads, ring hits, SSD payload
@@ -268,7 +308,8 @@ samples count the wait for the up slices only; `staged_wait_ms` adds up the gate
 - The SSD reads share the host I/O bandwidth with the GPU's reads of host memory, so the reads that
   overlap a multiplication slow it somewhat.
 - One worker thread, spinning on the mailbox, pinned to one logical CPU.
-- At install: file reads for every slice promoted from the file, in addition to the copies.
+- At install: file reads for every slice promoted from the file, in addition to the copies. With the
+  class layout's relabel install only for the promotions that the rings do not hold.
 
 ## Limits and fallbacks
 
@@ -285,14 +326,19 @@ samples count the wait for the up slices only; `staged_wait_ms` adds up the gate
   it keeps the single wait.
 - **Rings per storage class cost more than one shared ring.** Each storage class holds its own worst
   layer's file residents, so the floors together are larger than one ring for the whole model (DS4F:
-  about 4.0..5.2 GiB at L2 40..24 GiB against 2.8 GiB, est.), and without a stored profile each floor is `min(E, U * n_ubatch)` slots. The
+  about 4.0..5.2 GiB at L2 40..24 GiB against 2.8 GiB, est.), a factor above 1 multiplies that as far
+  as the budget allows, and without a stored profile each floor is `min(E, U * n_ubatch)` slots. The
   ring sizes are fixed at load: there is no sizing by measured reuse and no resizing at install.
 - **The ring is sized for the worst possible distinct demand of one ubatch**, so a large ubatch
   reserves a large ring. When the ring is smaller than what one prompt ubatch reads from the file,
   and a prompt reads that set in layer order once per ubatch, a slice has been rotated out by the
   time it is wanted again, so ring reuse during prompt processing is close to zero.
 - **The prompt swap's boundary install reads from the SSD** with a finite tier, so the swap costs
-  noticeably more per request than it does with everything resident (`expert-cache-banks.md`).
+  noticeably more per request than it does with everything resident (`expert-cache-banks.md`). The
+  class layout reads only the promotions its rings do not hold.
+- **Demoted residents go first.** A resident that the install moves to the file joins its ring as the
+  least recently used occupant, so the reads of the same install evict it before older occupants
+  (after the empty slots). Whether another order keeps more useful experts is not measured.
 - **No correctness check yet** for a finite tier with a multimodal projector or speculative decoding
   other than a draft model in the joint cache; the validator refuses those.
 - **A lazily mapped model file slows the unbuffered reads.** A read-only mapping of a shard makes
@@ -304,10 +350,14 @@ samples count the wait for the up slices only; `staged_wait_ms` adds up the gate
 
 - `test-expert-l2` replays the ledger on the CPU: demand resolution, pinning and lease extension,
   round-robin eviction of the fixture ring, ring growth and shrinkage, and deliberately invalid
-  assignments. For the class layout it covers the pitch and shift arithmetic, the merge rule, slot
-  placement, floors and the ring split, the host cut's per-layer file cap, and the class ledger: roles,
-  per-class service against a slow least recently used reference, both relabels with leases and
-  floors, transient install slots, and an install as relabels.
+  assignments. For the class layout it covers the
+  pitch and shift arithmetic, the merge rule, slot placement, floors and the ring split, the host
+  cut's per-layer file cap, and the class ledger: roles, per-class service against a slow least recently used reference,
+  both relabels with leases and floors, transient install slots, and an install as relabels. The
+  relabel install transaction is replayed on a byte model of the arenas and VRAM: demotions kept in
+  the ring, promotions from the ring without a read, VRAM promotions and demotions, leased slots
+  skipped and never relabeled, read batches that never reuse a slot, a prompt/decode switch back and
+  forth without reads, and random plans and demands for both modes and several ring sizes.
 - `test-expert-os` covers the OS wrapper: the reservation, the commit of the host arena and the
   unbuffered read queue.
 - `test-expert-plan` covers the four-location transaction, including promotions out of the file.
