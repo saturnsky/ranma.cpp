@@ -52,7 +52,10 @@ struct l2_read {
     int layer  = 0;
     int kind   = 0;
     int expert = 0;
-    int slot   = 0;   // ring slot
+    int slot   = 0;   // ring slot; with the class layout a slot of the layer's storage class
+    // Install only, class layout: `slot` is the host resident slot of the layer's size class that
+    // the slice is read into directly, not a staging slot.
+    bool direct = false;
 };
 
 struct l2_eviction {

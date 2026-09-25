@@ -6,9 +6,11 @@
 
 #include "common.cuh"
 #include "expert-geometry.h"
+#include "expert-l2-class-ledger.h"
 #include "expert-l2-ledger.h"
 #include "expert-location.h"
 #include "expert-os.h"
+#include "expert-storage.h"
 
 #include <atomic>
 #include <array>
@@ -33,6 +35,14 @@ struct l2_config {
     int64_t read_wait_ms      = 30000; // Existing CPU I/O queue deadline, never a GPU wait limit.
     bool   phase_rings        = false;   // a smaller ring during generation, lending its tail slots
     bool   verify             = false;
+    // The class layout: the staging ring lives in the per storage class host arenas, next to the
+    // residents and at their pitch, and every host resident is served through the address table.
+    // False is the separate uniform-pitch ring with lent tail slots. The controller always sets it;
+    // the default here keeps direct users (the fixtures) on the ring layout.
+    bool   class_layout       = false;
+    // Class layout: each storage class ring is this many times its floor, as far as the budget
+    // allows (RANMA_EXPERT_L2_RING_FACTOR). 1 = the floors.
+    double ring_factor        = 1.0;
     uint32_t log_mask         = 0;
     // Staged service: ubatches of at least this many rows publish their file reads one kind at a
     // time, in the order the graph multiplies them, so the kernels of a kind wait only for that
@@ -66,7 +76,8 @@ struct l2_counters {
     uint64_t staged_generations = 0, staged_wait_ticks = 0;
 };
 
-// Class arena addresses. Lent residents use the common location map.
+// Class arena addresses. Lent residents use the common location map. With the class layout the
+// index is the storage class and the address is that of slot 0 of the arena.
 struct l2_host_geometry {
     std::vector<std::array<void *, 3>> device_base;  // [class][kind] device alias of the arena
     std::vector<std::array<void *, 3>> host_base;    // [class][kind] host address of the arena
@@ -88,9 +99,19 @@ public:
     size_t ring_bytes(int slots) const { return size_t(slots)*ring_stride(); }
     size_t metadata_bytes() const;
     // Bytes the budget must hold before a single expert can be resident.
-    size_t fixed_bytes() const { return ring_bytes(prompt_slots_) + metadata_bytes(); }
+    size_t fixed_bytes() const { return ring_total_bytes() + metadata_bytes(); }
+    // The ring as allocated: the prompt ring, or with the class layout every class ring.
+    size_t ring_total_bytes() const { return class_layout() ? storage_.ring_bytes() : ring_bytes(prompt_slots_); }
     bool   sized() const { return sized_; }
     const std::string & size_note() const { return size_note_; }
+
+    // ---- the class layout ------------------------------------------------------------------------
+    bool class_layout() const { return cfg_.class_layout; }
+    double ring_factor() const { return cfg_.ring_factor; }
+    // The storage classes, their pitches, resident ranges, rings and floors. Before allocate().
+    void set_storage(const class_storage & storage);
+    const class_storage & storage() const { return storage_; }
+    const l2_class_ledger & class_ledger() const { return cledger_; }
 
     // ---- allocation -----------------------------------------------------------------------------
     bool allocate(int device);
@@ -110,14 +131,19 @@ public:
                    const expert_locations & host, const l2_host_geometry & host_geo);
     // The ring class that travels with an installed plan. Returns true when the size changed.
     bool set_prompt_ring(bool prompt);
-    int  ring_count() const { return ledger_.ring_count(); }
+    int  ring_count() const { return class_layout() ? cledger_.ring_total() : ledger_.ring_count(); }
     // Whether the current plan leaves any expert in the file. Recomputed with every plan; the
     // mailbox kernels run either way and cost nothing when no routed expert needs the worker.
     bool any_ssd() const { return any_ssd_; }
     const expert_locations & locations() const { return homes_; }
+    // The payload address of a slice of `layer` at a host or lent location.
     void * host_address(int layer, int kind, int expert) const;
-    void * location_address(int cls, int kind, expert_location at, bool device = false) const;
-    void finish_write(int cls, int kind, expert_location at);
+    void * location_address(int layer, int kind, expert_location at, bool device = false) const;
+    // Clears the bytes after a slice written to `at`, which MMQ reads as the tail of the slice.
+    void finish_write(int layer, int kind, expert_location at);
+    // Publishes the address table again, e.g. after a joined model set the sector shifts of its
+    // tensors. The worker must be stopped.
+    void refresh_addresses();
     bool verify_resident(int layer, int kind, int expert, const void * data, std::string & reason) {
         return verify_slice(layer, kind, expert, data, reason);
     }
@@ -127,10 +153,14 @@ public:
     bool read_slice(int layer, int kind, int expert, void * dst, std::string & reason);
 
     // The common active prefix is never a lent source or destination. Install discards its tags.
-    int install_read_slots() const { return std::min({cfg_.queue_depth, ring_count(), decode_slots_}); }
-    bool read_install(const std::vector<l2_read> & reads, std::string & reason);
+    // With the class layout a batch takes at most one ring slot per move from each class ring.
+    int install_read_slots() const;
+    // Reads a batch of install slices. With the class layout a `direct` read goes straight into its
+    // host resident slot, every other read into a ring slot of its storage class that this picks,
+    // and `slot` comes back as the storage slot read into.
+    bool read_install(std::vector<l2_read> & reads, std::string & reason);
     const void * read_address(const l2_read & read) const {
-        return static_cast<char *>(ring_host(read.kind, read.slot)) + backing_[read.layer][read.kind].shift;
+        return static_cast<char *>(read_slot(read)) + backing_[read.layer][read.kind].shift;
     }
 
     // ---- the hot path ------------------------------------------------------------------------------
@@ -170,6 +200,20 @@ private:
     uint64_t address_of(int layer, int kind, int expert) const;
     void * ring_host(int kind, int slot) const {
         return static_cast<char *>(ring_host_base_[kind]) + size_t(slot)*ring_pitch_[kind];
+    }
+    // Class layout: slot `slot` of the storage class of `layer` (slot start, not payload).
+    void * storage_slot(int layer, int kind, int slot, bool device = false) const {
+        const int s = storage_.storage_of[geo_.layer_class[layer]];
+        const auto & bases = device ? host_geo_.device_base : host_geo_.host_base;
+        return static_cast<char *>(bases[s][kind]) + size_t(slot)*storage_.pitch[s][kind];
+    }
+    // Where a read of either layout lands, and the pitch of that slot.
+    void * read_slot(const l2_read & read) const {
+        return class_layout() ? storage_slot(read.layer, read.kind, read.slot) : ring_host(read.kind, read.slot);
+    }
+    size_t read_pitch(const l2_read & read) const {
+        return class_layout() ? storage_.pitch[storage_.storage_of[geo_.layer_class[read.layer]]][read.kind] :
+            ring_pitch_[read.kind];
     }
     bool   verify_slice(int layer, int kind, int expert, const void * data, std::string & reason);
     bool   read_raw(int layer, int kind, int expert, void * dst, std::string & reason);
@@ -229,6 +273,8 @@ private:
     bool mailbox_active_ = false; // true once the mailbox exists; graphs capture its nodes
 
     l2_ledger ledger_;
+    class_storage   storage_;   // class layout only
+    l2_class_ledger cledger_;   // class layout only
     std::mutex io_mutex_;
     std::unique_ptr<expert_os::read_queue> queue_;
     std::vector<std::unique_ptr<std::ifstream>> verify_files_;

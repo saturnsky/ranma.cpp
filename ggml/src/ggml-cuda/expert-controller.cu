@@ -9,6 +9,7 @@
 #include "expert-plan.h"
 #include "expert-profiler.cuh"
 #include "expert-profile-store.h"
+#include "expert-storage.h"
 
 #include "ggml-alloc.h"
 #include "ggml-backend-impl.h"
@@ -200,6 +201,22 @@ static l2_config l2_debug_config(const ggml_expert_config & cfg, bool verify_all
     const int64_t staged = number("RANMA_EXPERT_L2_STAGED", l2_staged_default ? 1 : 0, 0, INT32_MAX);
     out.staged_min_rows = staged == 1 ? int64_t(std::max<uint64_t>(out.decode_rows, 1)) + 1 : staged;
     out.staged_drain = number("RANMA_EXPERT_L2_STAGED_DRAIN", 0, 0, 1) != 0;
+    // The staging ring lives in the per storage class host arenas, next to the residents and at
+    // their pitch.
+    out.class_layout = true;
+    // Class layout: each storage class ring is this many times its floor, as far as the budget
+    // allows; 1 = the floors. A real number of at least 1.
+    if (const char * text = getenv("RANMA_EXPERT_L2_RING_FACTOR"); text != nullptr && *text != '\0') {
+        char * end = nullptr;
+        errno = 0;
+        const double value = strtod(text, &end);
+        if (errno || end == text || *end || !(value >= 1.0) || !(value <= 1024.0)) {
+            GGML_LOG_WARN("expert cache: ignoring invalid RANMA_EXPERT_L2_RING_FACTOR='%s'\n", text);
+        } else {
+            out.ring_factor = value;
+            GGML_LOG_INFO("expert cache: RANMA_EXPERT_L2_RING_FACTOR sets %g\n", value);
+        }
+    }
     return out;
 }
 
@@ -1296,6 +1313,9 @@ private:
             for (member_state & m : members_) {
                 m.tier_ready = m.tier_ready || (m.bound && !m.dropped);
             }
+            // the joined model's tensors have their sector shifts now, and with the class layout
+            // its host residents are addressed at them
+            if (!tier_->worker_running()) { tier_->refresh_addresses(); }
             tier_->start_worker(); // no-op when it runs
             report_tier_plan_locked("after a model joined");
         }
@@ -1368,6 +1388,7 @@ private:
         in.counts = scores.empty() ? nullptr : scores.data();
         in.vram = &tier_vram_;
         in.slot_pitch = &host_pitch_;
+        in.file_cap = file_cap_.empty() ? nullptr : &file_cap_;
         return in;
     }
 
@@ -1379,6 +1400,10 @@ private:
             tier_.reset();
             disable_locked("the SSD tier could not size its staging ring");
             return false;
+        }
+        file_cap_.clear();
+        if (tier_->class_layout()) {
+            return size_class_tier_locked(selected, host_capacities);
         }
         const size_t fixed = tier_->fixed_bytes() + spare_bytes_locked() + arena_tail_total(geo_);
         const auto minimum = minimum_host_budget(geo_, capacities_, fixed, cfg_.mode == GGML_EXPERT_MODE_INCLUSIVE);
@@ -1415,6 +1440,171 @@ private:
             cfg_.l2_bytes/(1024*1024), tier_->ring_bytes(tier_->prompt_slots())/(1024*1024),
             tier_->metadata_bytes()/(1024*1024), base.resident_bytes/(1024*1024),
             base.ssd_slices, base.ssd_bytes/(1024*1024));
+        return true;
+    }
+
+    // The class layout: the storage classes, their rings and the host cut, from the plan that seeds
+    // the load. The ring of a storage class is its prompt floor: the most file residents one of its
+    // layers keeps under the seed plan, bounded by what one ubatch can demand (the bound itself
+    // without a stored profile). The floor is found by growing the rings from zero until the cut
+    // under them keeps no layer above its ring. An explicit ring size is the total over the classes;
+    // what it adds above the floors is split by the bytes each class leaves in the file. Both phases
+    // use the same rings. Later plans are held to the rings (tier_inputs::file_cap).
+    bool size_class_tier_locked(const std::vector<std::vector<int32_t>> & selected, std::vector<int> & host_capacities) {
+        const size_t classes = geo_.class_bytes.size();
+        const bool inclusive = cfg_.mode == GGML_EXPERT_MODE_INCLUSIVE;
+        std::vector<std::array<size_t, 3>> tails(classes);
+        for (size_t c = 0; c < classes; ++c) {
+            for (int k = 0; k < geometry::n_kinds; ++k) { tails[c][k] = arena_tail_bytes(geo_, (int) c, k); }
+        }
+        const int bound = storage_demand_bound(geo_.n_experts, cfg_.l2_experts_used, cfg_.l2_prefill_rows);
+        class_storage st = plan_storage_classes(geo_, tails, expert_os::io_alignment, bound);
+        if (!st.valid() || bound <= 0) {
+            tier_.reset();
+            disable_locked("the SSD tier could not lay out its storage classes");
+            return false;
+        }
+        const int n = st.storages();
+        host_pitch_.assign(classes, 0);
+        for (size_t c = 0; c < classes; ++c) { host_pitch_[c] = st.class_pitch((int) c); }
+        vram_table_locked(selected, tier_vram_);
+        size_t spares = 0;
+        for (size_t c = 0; c < classes; ++c) { spares += size_t(cfg_.spare_slots)*host_pitch_[c]; }
+        const size_t base_fixed = tier_->metadata_bytes() + spares + st.tail_bytes();
+        auto ring_bytes = [&](const std::vector<int> & ring) {
+            size_t bytes = 0;
+            for (int s = 0; s < n; ++s) { bytes += size_t(ring[s])*st.stride(s); }
+            return bytes;
+        };
+        auto ring_text = [&](const std::vector<int> & ring) {
+            std::string text;
+            for (int s = 0; s < n; ++s) { text += (s ? "," : "") + std::to_string(ring[s]); }
+            return text;
+        };
+        // refuses the load when the budget cannot hold this ring
+        auto require = [&](const std::vector<int> & ring) {
+            const size_t fixed = base_fixed + ring_bytes(ring);
+            const auto minimum = minimum_host_budget(geo_, capacities_, fixed, inclusive);
+            if (!minimum.valid || cfg_.l2_bytes < minimum.bytes) {
+                GGML_ABORT("expert cache: L2 budget %zu bytes is below minimum %zu bytes (L1 payload upper bound %zu bytes, "
+                           "ring/metadata/padding/spares %zu bytes, of which ring %zu bytes = slots %s of the storage classes); "
+                           "uncached loading refused",
+                    cfg_.l2_bytes, minimum.bytes, minimum.l1_payload, fixed, ring_bytes(ring), ring_text(ring).c_str());
+            }
+        };
+        auto cut = [&](const std::vector<int> & ring) {
+            tier_inputs in = tier_inputs_locked(tier_scores_);
+            in.budget_bytes = cfg_.l2_bytes - base_fixed - ring_bytes(ring);
+            return plan_host_tier(in);
+        };
+        std::vector<int> ring(n, bound);
+        tier_plan base;
+        if (!tier_scores_.empty()) {
+            std::fill(ring.begin(), ring.end(), 0);
+            for (int round = 0; round < 1024; ++round) {
+                require(ring);
+                base = cut(ring);
+                if (!base.valid) { disable_locked(base.reason.c_str()); return false; }
+                const std::vector<int> need = storage_floors(geo_, st, &tier_vram_, &base.selected, bound);
+                bool grew = false;
+                for (int s = 0; s < n; ++s) {
+                    if (need[s] > ring[s]) { ring[s] = need[s]; grew = true; }
+                }
+                if (!grew) { break; }
+            }
+        }
+        const std::vector<int> floors = ring;
+        const double factor = tier_->ring_factor();
+        std::string note;
+        const size_t requested = cfg_.l2_prefill_ring_bytes;
+        if (requested != 0) {
+            require(ring);
+            if (!base.valid) { base = cut(ring); }
+            if (!base.valid) { disable_locked(base.reason.c_str()); return false; }
+            std::vector<uint64_t> demand(n, 0);
+            std::vector<int> limit(n, 0);
+            for (int l = 0; l < geo_.n_layers; ++l) {
+                const int c = geo_.layer_class[l];
+                if (c < 0) { continue; }
+                const int s = st.storage_of[c];
+                limit[s] += geo_.n_experts;
+                int resident = 0;
+                for (int e = 0; e < geo_.n_experts; ++e) {
+                    resident += tier_vram_[l][e] >= 0 || std::binary_search(base.selected[l].begin(), base.selected[l].end(), e) ? 1 : 0;
+                }
+                demand[s] += uint64_t(geo_.n_experts - resident)*geo_.class_total_bytes(c);
+            }
+            ring = split_ring(st, floors, demand, limit, requested);
+            if (ring_bytes(floors) > requested) {
+                note = "the requested ring of " + std::to_string(requested/(1024*1024)) + " MiB was raised to its floors";
+            }
+        } else if (factor > 1.0) {
+            // factor x floor per class, as far as the budget left above the minimum (the floors) allows
+            std::vector<int> limit(n, 0);
+            for (int c = 0; c < (int) classes; ++c) { limit[st.storage_of[c]] += geo_.class_layers[c]*geo_.n_experts; }
+            const std::vector<int> want = factor_rings(floors, factor, limit);
+            require(floors);   // the minimum stays the floors; the factor never refuses a budget
+            const auto minimum = minimum_host_budget(geo_, capacities_, base_fixed + ring_bytes(floors), inclusive);
+            ring = shrink_rings(st, floors, want, cfg_.l2_bytes - minimum.bytes);
+            // A larger ring leaves fewer host residents, so a layer can keep more of its experts in
+            // the file than it did at the floors; such a ring grows to that count while it fits.
+            for (int round = 0; round < 1024; ++round) {
+                const tier_plan grown = cut(ring);
+                if (!grown.valid) { break; }
+                const std::vector<int> need = storage_floors(geo_, st, &tier_vram_, &grown.selected, bound);
+                bool grew = false;
+                std::vector<int> next = ring;
+                for (int s = 0; s < n; ++s) {
+                    if (need[s] > next[s]) { next[s] = need[s]; grew = true; }
+                }
+                if (!grew) { break; }
+                if (cfg_.l2_bytes < minimum_host_budget(geo_, capacities_, base_fixed + ring_bytes(next), inclusive).bytes) {
+                    ring = floors;
+                    note = "the rings above their floors did not fit with the file residents they add, the floors are used";
+                    break;
+                }
+                ring = next;
+            }
+            bool short_of_want = false;
+            for (int s = 0; s < n; ++s) { short_of_want = short_of_want || ring[s] < want[s]; }
+            if (short_of_want && note.empty()) {
+                char text[64];
+                snprintf(text, sizeof(text), "%g", factor);
+                note = "the budget gives the rings " + ring_text(ring) + " slots instead of " + ring_text(want) +
+                    " (factor " + text + " of the floors), shrunk toward the floors in proportion";
+            }
+        }
+        if (cfg_.l2_phase_rings && cfg_.l2_decode_ring_bytes != cfg_.l2_prefill_ring_bytes) {
+            note += std::string(note.empty() ? "" : "; ") + "the class layout keeps one ring size in both phases, the decode ring size is not used";
+        }
+        file_cap_.assign(classes, 0);
+        for (size_t c = 0; c < classes; ++c) { file_cap_[c] = ring[st.storage_of[c]]; }
+        require(ring);
+        base = cut(ring);
+        if (!base.valid) { disable_locked(base.reason.c_str()); return false; }
+        host_capacities_base_ = base.capacities;
+        host_capacities       = host_capacities_base_;
+        lent_capacities_.assign(classes, 0);
+        lent_starts_.assign(classes, 0);
+        std::vector<int> residents(classes);
+        for (size_t c = 0; c < classes; ++c) { residents[c] = host_capacities_base_[c] + cfg_.spare_slots; }
+        if (!st.place(residents, ring)) { disable_locked("the SSD tier could not place its storage slots"); return false; }
+        st.floor = floors;
+        tier_->set_storage(st);
+        if (!tier_->sized()) {
+            tier_.reset();
+            disable_locked("the SSD tier refused its storage class layout");
+            return false;
+        }
+        GGML_LOG_INFO("expert cache: SSD tier budget %zu MiB (class layout): ring %zu MiB (slots %s, floors %s, "
+                      "factor %g%s, per ubatch bound %d%s), tables %zu MiB, spares %zu MiB, host residents %zu MiB, "
+                      "%zu slices / %zu MiB left in the file\n",
+            cfg_.l2_bytes/(1024*1024), st.ring_bytes()/(1024*1024), ring_text(ring).c_str(), ring_text(floors).c_str(),
+            factor, requested != 0 ? " not used, explicit total" : "", bound, tier_scores_.empty() ? ", no seed profile" : "", tier_->metadata_bytes()/(1024*1024),
+            spares/(1024*1024), base.resident_bytes/(1024*1024), base.ssd_slices, base.ssd_bytes/(1024*1024));
+        if (!note.empty()) {
+            GGML_LOG_INFO("expert cache: %s\n", note.c_str());
+        }
         return true;
     }
 
@@ -1479,10 +1669,11 @@ private:
         }
         tier_->set_homes(gpu, l1_->locations(), host_geometry_locked());
         l2_tier * tier = tier_.get();
-        l1_->attach_locations([tier](int cls, int kind, expert_location at) { return tier->location_address(cls, kind, at); });
+        l1_->attach_locations([tier](int layer, int kind, expert_location at) { return tier->location_address(layer, kind, at); });
         l1_arena::tier_reader reader;
-        reader.read    = [tier](const std::vector<l2_read> & reads, std::string & why) { return tier->read_install(reads, why); };
+        reader.read    = [tier](std::vector<l2_read> & reads, std::string & why) { return tier->read_install(reads, why); };
         reader.address = [tier](const l2_read & read) { return tier->read_address(read); };
+        reader.direct_host = tier_->class_layout();
         // Constant across a repartition: install_read_slots is also bounded by the decode ring,
         // which is the smaller of the two ring sizes.
         reader.slots   = tier_->install_read_slots();
@@ -1492,6 +1683,18 @@ private:
 
     l2_host_geometry host_geometry_locked() const {
         l2_host_geometry out;
+        if (host_->class_layout()) {
+            const int storages = tier_->storage().storages();
+            out.device_base.assign(storages, {nullptr, nullptr, nullptr});
+            out.host_base.assign(storages, {nullptr, nullptr, nullptr});
+            for (int s = 0; s < storages; ++s) {
+                for (int kind = 0; kind < geometry::n_kinds; ++kind) {
+                    out.device_base[s][kind] = host_->storage_base(s, kind, true);
+                    out.host_base[s][kind]   = host_->storage_base(s, kind, false);
+                }
+            }
+            return out;
+        }
         const size_t classes = geo_.class_bytes.size();
         out.device_base.assign(classes, {nullptr, nullptr, nullptr});
         out.host_base.assign(classes, {nullptr, nullptr, nullptr});
@@ -1589,7 +1792,7 @@ private:
                         loaded = loaded_copy.data();
                     }
                 } else {
-                    loaded = host_->slice(cls, kind, host_table[layer][expert]);
+                    loaded = tier_->host_address(layer, kind, expert);
                 }
                 if (loaded == nullptr || memcmp(from_file.data(), loaded, stride) != 0) {
                     GGML_ABORT("expert cache: the SSD tier reads layer %d kind %d expert %d from the wrong "
@@ -1647,7 +1850,7 @@ private:
         if (!l1_->execute(tx)) { abort_locked("the install mover refused a move"); }
         std::string reason;
         for (const auto & move : tx.moves) for (int k = 0; k < geometry::n_kinds; ++k) {
-            tier_->finish_write(move.cls, k, move.to);
+            tier_->finish_write(move.layer, k, move.to);
         }
         // The old lent sources stay readable until every move has completed.
         const bool repartition = tier_->set_prompt_ring(prompt);
@@ -1719,13 +1922,33 @@ private:
                 }
             }
         }
-        const int    slots  = tier_->prompt_slots();
-        const size_t ring   = tier_->ring_bytes(slots);
+        const bool   classes = tier_->class_layout();
+        const int    slots  = classes ? tier_->ring_count() : tier_->prompt_slots();
+        const size_t ring   = tier_->ring_total_bytes();
         const size_t meta   = tier_->metadata_bytes();
-        const size_t pad    = arena_tail_total(geo_);
-        const size_t spare  = spare_bytes_locked();
+        const size_t pad    = classes ? tier_->storage().tail_bytes() : arena_tail_total(geo_);
+        const size_t spare  = classes ? host_spare_bytes_locked() : spare_bytes_locked();
         const size_t tables = table_bytes_locked(true);
-        const size_t accounted = payload + ring + meta + pad + spare;
+        // class layout: every resident slot costs the storage pitch; what it holds beyond the
+        // payload (sector room, MMQ tail, and slots the cut left empty) is `slot_padding`
+        size_t slot_padding = 0;
+        std::string storage_text;
+        if (classes) {
+            const class_storage & st = tier_->storage();
+            size_t reserved = 0;
+            for (size_t c = 0; c < host_capacities_base_.size(); ++c) { reserved += size_t(host_capacities_base_[c])*host_pitch_[c]; }
+            slot_padding = reserved - std::min(reserved, payload);
+            storage_text = ",\"layout\":\"class\",\"storage_classes\":[";
+            for (int s = 0; s < st.storages(); ++s) {
+                std::string members;
+                for (int c : st.members[s]) { members += (members.empty() ? "" : ",") + std::to_string(c); }
+                storage_text += std::string(s ? "," : "") + "{\"classes\":[" + members + "],\"pitch\":[" +
+                    std::to_string(st.pitch[s][0]) + "," + std::to_string(st.pitch[s][1]) + "," + std::to_string(st.pitch[s][2]) +
+                    "],\"ring_slots\":" + std::to_string(st.ring_slots[s]) + ",\"floor\":" + std::to_string(st.floor[s]) + "}";
+            }
+            storage_text += "],\"slot_padding\":" + std::to_string(slot_padding);
+        }
+        const size_t accounted = payload + slot_padding + ring + meta + pad + spare;
         // Written as an `expert_metrics` record and not gated by the log mask: it is a default
         // level line, and llama-bench's log callback only lets that prefix through.
         GGML_LOG_INFO("expert_metrics {\"kind\":\"budget\",\"phase\":\"%s\",\"l2_budget\":%zu,"
@@ -1733,13 +1956,13 @@ private:
                       "\"ring\":%zu,\"ring_slots\":%d,\"ring_pitch\":[%zu,%zu,%zu],"
                       "\"lent_slices\":%zu,\"lent_payload\":%zu,\"metadata\":%zu,\"padding\":%zu,"
                       "\"spare\":%zu,\"vram_tables\":%zu,\"file_slices\":%zu,\"file_bytes\":%zu,"
-                      "\"remainder\":%lld}\n",
+                      "\"remainder\":%lld%s}\n",
             prompt ? "prompt" : "decode", cfg_.l2_bytes, payload, placed,
             host_->host_bytes(), ring, slots,
             tier_->slot_pitch(0), tier_->slot_pitch(1), tier_->slot_pitch(2),
             lent, lent_bytes, meta, pad, spare, tables,
             host_plan.ssd_slices, host_plan.ssd_bytes,
-            (long long) cfg_.l2_bytes - (long long) accounted);
+            (long long) cfg_.l2_bytes - (long long) accounted, storage_text.c_str());
     }
 
     const char * mode_name() const { return cfg_.mode == GGML_EXPERT_MODE_INCLUSIVE ? "inclusive" : "exclusive"; }
@@ -1833,6 +2056,14 @@ private:
         return bytes;
     }
 
+    // The host arena's spare slots; with the class layout at the storage pitch.
+    size_t host_spare_bytes_locked() const {
+        if (!tier_ || !tier_->class_layout()) { return spare_bytes_locked(); }
+        size_t bytes = 0;
+        for (size_t cls = 0; cls < host_pitch_.size(); ++cls) { bytes += size_t(cfg_.spare_slots)*host_pitch_[cls]; }
+        return bytes;
+    }
+
     // Owned host storage keeps a second slot table, for the host arena.
     size_t table_bytes_locked(bool owns_host) const {
         return (owns_host ? 2 : 1)*geo_.n_counts()*sizeof(int32_t);
@@ -1922,7 +2153,8 @@ private:
             return false;
         }
         host_.reset(new host_arena(geo_));
-        if (!host_->allocate(host_capacities, cfg_.spare_slots, device_)) {
+        if (!host_->allocate(host_capacities, cfg_.spare_slots, device_,
+                tier_ && tier_->class_layout() ? &tier_->storage() : nullptr)) {
             host_.reset();
             l1_.reset();
             profiler_.reset();
@@ -2365,6 +2597,7 @@ private:
     std::vector<size_t> host_pitch_;
     std::vector<int>    host_capacities_base_;
     std::vector<int>    lent_capacities_, lent_starts_;
+    std::vector<int>    file_cap_;   // class layout: [class] the ring slots of its storage class
     std::vector<uint64_t> tier_scores_;
     std::vector<std::vector<int32_t>> tier_vram_;
     ggml_backend_buffer_t exclusive_buffer_ = nullptr; // owned by the model, not by the controller

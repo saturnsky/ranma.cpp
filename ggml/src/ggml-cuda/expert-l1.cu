@@ -214,7 +214,7 @@ void * l1_arena::host_address(int layer, int kind, int expert) const {
         return static_cast<char *>(geo_.tensors[layer][kind]->data) + size_t(expert)*geo_.class_bytes[cls][kind];
     }
     const expert_location home = homes_[layer][expert];
-    if (resolve_) { return resolve_(cls, kind, home); }
+    if (resolve_) { return resolve_(layer, kind, home); }
     return home.storage == expert_storage::host ? host_->slice(cls, kind, home.slot) : nullptr;
 }
 
@@ -353,13 +353,14 @@ l1_transaction l1_arena::stage(const expert_slot_table & selected, bool retain) 
 // Where a slice of a move lives outside the VRAM arena. A tier resolves host and lent slots; a
 // two-tier arena reads its own host arena; without a host arena the tensor still owns the bytes.
 void * l1_arena::slice_address(int layer, int cls, int kind, expert_location at, int expert) const {
-    if (resolve_) { return resolve_(cls, kind, at); }
+    if (resolve_) { return resolve_(layer, kind, at); }
     if (host_)    { return host_->slice(cls, kind, at.slot); }
     return host_address(layer, kind, expert);
 }
 
-// Reads a batch of file-resident experts into ring slots and copies them to their destinations.
-// Returns the number of moves consumed, or 0 on a refusal.
+// Reads a batch of file-resident experts into ring slots and copies them to their destinations. A
+// tier that reads host promotions in place leaves nothing to copy for them. Returns the number of
+// moves consumed, or 0 on a refusal.
 size_t l1_arena::move_from_file(const install_transaction & tx, size_t first) {
     if (!tier_.read || !tier_.address || tier_.slots <= 0 || !sync_copies()) { return 0; }
     std::vector<l2_read> reads;
@@ -367,22 +368,28 @@ size_t l1_arena::move_from_file(const install_transaction & tx, size_t first) {
     while (first + count < tx.moves.size() && count < size_t(tier_.slots) &&
             tx.moves[first + count].from.storage == expert_storage::file) {
         const auto & item = tx.moves[first + count];
-        for (int k = 0; k < geometry::n_kinds; ++k) { reads.push_back({item.layer, k, item.expert, int(count)}); }
+        const bool direct = tier_.direct_host && item.to.storage == expert_storage::host;
+        for (int k = 0; k < geometry::n_kinds; ++k) {
+            l2_read read = {item.layer, k, item.expert, direct ? item.to.slot : int(count)};
+            read.direct = direct;
+            reads.push_back(read);
+        }
         ++count;
     }
     std::string reason;
     if (!tier_.read(reads, reason)) {
         GGML_ABORT("expert cache: install read failed: %s", reason.c_str());
     }
-    for (const l2_read & read : reads) {
-        const auto & item = tx.moves[first + read.slot];
+    for (size_t i = 0; i < reads.size(); ++i) {
+        const l2_read & read = reads[i];
+        const auto & item = tx.moves[first + i/geometry::n_kinds];
         const void * src = tier_.address(read);
         if (item.to.storage == expert_storage::vram) {
             if (!write_gpu_slice(item.cls, read.kind, item.to.slot, src, false)) { return 0; }
         } else {
             void * dst = slice_address(item.layer, item.cls, read.kind, item.to, item.expert);
             if (dst == nullptr) { return 0; }
-            memcpy(dst, src, geo_.class_bytes[item.cls][read.kind]);
+            if (dst != src) { memcpy(dst, src, geo_.class_bytes[item.cls][read.kind]); }
         }
     }
     // A ring slot may be refilled by the next batch, so every copy out of it completes first.
