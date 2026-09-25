@@ -69,6 +69,16 @@ struct l2_service {
     std::vector<l2_eviction> evicted;
     int hits   = 0;   // experts already in a ring slot
     int misses = 0;   // experts that needed a read
+    int early_hits = 0;   // ring hits on slots an early read filled for this demand (not in `hits`)
+};
+
+// Early service (the route of a layer is known before its generation is published): the demand is
+// served into the ring as usual, but nothing is leased to a generation. A hit keeps its lease and
+// only becomes the most recently used slot; a miss takes its slot with `seq` = the layer's done
+// counter, so the slot is reusable at once and the ledger never waits for a generation that may
+// not come. The real service of the layer later hits these slots and leases them.
+struct l2_no_quiet {
+    bool operator()(int, int) const { return false; }
 };
 
 class l2_ledger {
@@ -123,8 +133,11 @@ public:
     // `homed(layer, expert)` is true when the expert already lives in the VRAM or host
     // arena, so it needs no ring slot. Experts repeat across the top-k of several rows; the caller
     // may pass duplicates.
-    template <typename Homed>
-    l2_service service(int layer, const std::vector<int> & ids, uint32_t seq, Homed homed) {
+    // `quiet(layer, expert)`: a hit on that expert was filled by an early read for this demand; it
+    // counts in early_hits instead of hits. `early`: see l2_no_quiet.
+    template <typename Homed, typename Quiet = l2_no_quiet>
+    l2_service service(int layer, const std::vector<int> & ids, uint32_t seq, Homed homed, Quiet quiet = Quiet(),
+            bool early = false) {
         l2_service out;
         std::vector<bool> asked((size_t) experts_, false);
         std::vector<int>  wanted;
@@ -154,8 +167,10 @@ public:
             }
             int slot = map_[(size_t) layer][(size_t) expert];
             if (slot >= 0) {
-                ++out.hits;
-                owners_[(size_t) slot].seq = seq;   // extend the lease to this generation
+                ++(quiet(layer, expert) ? out.early_hits : out.hits);
+                if (!early) {
+                    owners_[(size_t) slot].seq = seq;   // extend the lease to this generation
+                }
                 continue;
             }
             slot = acquire(layer, expert, seq, pinned, out.evicted);
