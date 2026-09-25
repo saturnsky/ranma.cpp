@@ -38,9 +38,22 @@ host_arena::~host_arena() {
     }
 }
 
-bool host_arena::allocate(const std::vector<int> & capacities, int spare_slots, int device) {
+bool host_arena::allocate(const std::vector<int> & capacities, int spare_slots, int device,
+        const class_storage * storage) {
     if (allocated() || capacities.size() != geo_.class_bytes.size() || geo_.n_layers <= 0 || spare_slots < 0) {
         return false;
+    }
+    if (storage != nullptr) {
+        if (!storage->valid() || storage->resident_slots.size() != capacities.size()) {
+            return false;
+        }
+        for (size_t cls = 0; cls < capacities.size(); ++cls) {
+            if (storage->resident_slots[cls] != capacities[cls] + spare_slots) {
+                return false;
+            }
+        }
+        class_layout_ = true;
+        storage_      = *storage;
     }
     device_      = device;
     spare_slots_ = spare_slots;
@@ -48,14 +61,16 @@ bool host_arena::allocate(const std::vector<int> & capacities, int spare_slots, 
     ggml_cuda_set_device(device_);
     CUDA_CHECK(cudaStreamCreateWithFlags(&copy_stream_, cudaStreamNonBlocking));
 
-    class_res_.assign(capacities.size(), {});
-    class_host_.assign(capacities.size(), {nullptr, nullptr, nullptr});
-    class_device_.assign(capacities.size(), {nullptr, nullptr, nullptr});
-    class_registered_.assign(capacities.size(), {false, false, false});
-    for (size_t cls = 0; cls < capacities.size(); ++cls) {
+    const size_t arenas = class_layout_ ? (size_t) storage_.storages() : capacities.size();
+    class_res_.assign(arenas, {});
+    class_host_.assign(arenas, {nullptr, nullptr, nullptr});
+    class_device_.assign(arenas, {nullptr, nullptr, nullptr});
+    class_registered_.assign(arenas, {false, false, false});
+    for (size_t cls = 0; cls < arenas; ++cls) {
         for (int kind = 0; kind < geometry::n_kinds; ++kind) {
-            const size_t bytes = size_t(capacities[cls] + spare_slots)*geo_.class_bytes[cls][kind] +
-                arena_tail_bytes(geo_, (int) cls, kind);
+            const size_t bytes = class_layout_ ?
+                size_t(storage_.slots((int) cls))*storage_.pitch[cls][kind] + storage_.tail[cls][kind] :
+                size_t(capacities[cls] + spare_slots)*geo_.class_bytes[cls][kind] + arena_tail_bytes(geo_, (int) cls, kind);
             std::optional<expert_os::reservation> res = expert_os::reserve(bytes);
             if (!res || !expert_os::commit(*res, 0, bytes)) {
                 if (res) {
@@ -64,7 +79,8 @@ bool host_arena::allocate(const std::vector<int> & capacities, int spare_slots, 
                 return false;
             }
             // The tail and the spare slots must read as zeros until something owns them: MMQ reads
-            // past the last row of the last slot, see arena_tail_bytes in expert-l1.cuh.
+            // past the last row of the last slot, see arena_tail_bytes in expert-l1.cuh. With the
+            // class layout every slot also reads as zeros after its payload.
             memset(res->base, 0, bytes);
             class_res_[cls][kind]  = *res;
             class_host_[cls][kind] = res->base;
@@ -130,14 +146,29 @@ void * host_arena::slice(int cls, int kind, int slot) const {
         return nullptr;
     }
     if (slot >= capacities_[cls] + spare_slots_) { return nullptr; }
+    if (class_layout_) {
+        const int s = storage_.storage_of[cls];
+        return static_cast<char *>(class_host_[s][kind]) + size_t(storage_.resident_slot(cls, slot))*storage_.pitch[s][kind];
+    }
     return static_cast<char *>(class_host_[cls][kind]) + size_t(slot)*geo_.class_bytes[cls][kind];
 }
 
 const void * host_arena::device_data(int cls, int kind) const {
-    if (!mapped_ || cls < 0 || (size_t) cls >= class_device_.size() || kind < 0 || kind >= geometry::n_kinds) {
+    if (!mapped_ || cls < 0 || (size_t) cls >= capacities_.size() || kind < 0 || kind >= geometry::n_kinds) {
         return nullptr;
     }
+    if (class_layout_) {
+        const int s = storage_.storage_of[cls];
+        return static_cast<const char *>(class_device_[s][kind]) + size_t(storage_.resident_base[cls])*storage_.pitch[s][kind];
+    }
     return class_device_[cls][kind];
+}
+
+void * host_arena::storage_base(int storage, int kind, bool device) const {
+    if (!class_layout_ || storage < 0 || storage >= storage_.storages() || kind < 0 || kind >= geometry::n_kinds) {
+        return nullptr;
+    }
+    return device ? class_device_[storage][kind] : class_host_[storage][kind];
 }
 
 const int32_t * host_arena::device_slots(int layer) const {
