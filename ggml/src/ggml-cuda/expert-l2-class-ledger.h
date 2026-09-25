@@ -131,10 +131,12 @@ public:
 
     // Grow: a resident slot joins the ring in place. Its expert, if any, becomes a ring occupant
     // without a read; `cold` puts the slot at the least recently used end, so it goes first.
-    bool relabel_to_ring(int s, int slot, bool cold) {
+    // Without `keep` the slot joins empty (its expert now lives elsewhere).
+    bool relabel_to_ring(int s, int slot, bool cold, bool keep = true) {
         if (!valid_slot(s, slot) || owners_[(size_t) s][(size_t) slot].role != slot_role::resident) { return false; }
         owner & o = owners_[(size_t) s][(size_t) slot];
         o.role = slot_role::ring;
+        if (!keep) { o.layer = -1; o.expert = -1; o.seq = 0; }
         if (o.layer >= 0) {
             // a resident is never also a ring occupant; drop a stale copy all the same
             const int other = map_[(size_t) o.layer][(size_t) o.expert];
@@ -192,13 +194,44 @@ public:
         return out;
     }
 
+    // A ring slot that becomes a spare resident (a resident slot without an expert); its occupant
+    // is evicted. Refused like relabel_to_resident.
+    l2_relabel relabel_to_spare(int s, int slot) {
+        l2_relabel out;
+        if (!valid_slot(s, slot) || owners_[(size_t) s][(size_t) slot].role != slot_role::ring) {
+            out.reason = "not a ring slot";
+            return out;
+        }
+        owner & o = owners_[(size_t) s][(size_t) slot];
+        if (!reusable(o)) {
+            out.reason = "ring slot " + std::to_string(slot) + " is still leased";
+            return out;
+        }
+        if (ring_count_[(size_t) s] - 1 < floor_[(size_t) s]) {
+            out.reason = "the ring of storage class " + std::to_string(s) + " would fall below its floor of " +
+                std::to_string(floor_[(size_t) s]) + " slots";
+            return out;
+        }
+        if (o.layer >= 0) {
+            out.evicted.push_back({o.layer, o.expert, slot});
+            map_[(size_t) o.layer][(size_t) o.expert] = -1;
+        }
+        unlink(s, slot);
+        --ring_count_[(size_t) s];
+        o = owner();
+        o.role = slot_role::resident;
+        out.ok = true;
+        return out;
+    }
+
     // A ring slot for a transient read (a file promotion on its way to VRAM): the least recently
     // used one that no generation leases, emptied and moved to the most recently used end, so the
-    // slots taken one after another are distinct. -1 when every ring slot is leased.
-    int take_free(int s, std::vector<l2_eviction> & evicted) {
+    // slots taken one after another are distinct. Slots flagged in `busy` are skipped too. -1 when
+    // no ring slot is left.
+    int take_free(int s, std::vector<l2_eviction> & evicted, const std::vector<uint8_t> * busy = nullptr) {
         for (int slot = head_[(size_t) s]; slot >= 0; slot = next_[(size_t) s][(size_t) slot]) {
             owner & o = owners_[(size_t) s][(size_t) slot];
-            if (!reusable(o)) { continue; }
+            if (!reusable(o) || (busy != nullptr && (*busy)[(size_t) slot])) { continue; }
             if (o.layer >= 0) {
                 evicted.push_back({o.layer, o.expert, slot});
                 map_[(size_t) o.layer][(size_t) o.expert] = -1;
@@ -208,6 +241,30 @@ public:
             return slot;
         }
         return -1;
+    }
+
+    // Moves every empty ring slot to the least recently used end, in list order, so the next
+    // slots taken evict nothing.
+    void sink_empty() {
+        for (int s = 0; s < storages(); ++s) {
+            std::vector<int> empty_slots;
+            for (int slot = head_[(size_t) s]; slot >= 0; slot = next_[(size_t) s][(size_t) slot]) {
+                if (owners_[(size_t) s][(size_t) slot].layer < 0) { empty_slots.push_back(slot); }
+            }
+            for (size_t i = empty_slots.size(); i-- > 0;) {
+                unlink(s, empty_slots[i]);
+                link_head(s, empty_slots[i]);
+            }
+        }
+    }
+
+    // Ring slots of a class that hold an expert.
+    int ring_occupants(int s) const {
+        int n = 0;
+        for (int slot = head_[(size_t) s]; slot >= 0; slot = next_[(size_t) s][(size_t) slot]) {
+            n += owners_[(size_t) s][(size_t) slot].layer >= 0 ? 1 : 0;
+        }
+        return n;
     }
 
     // Empties every ring and lists each ring's slots in index order again.

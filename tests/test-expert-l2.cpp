@@ -1,6 +1,7 @@
 // ranma: the staging ring ledger of the expert cache SSD tier (expert-l2-ledger.h), and for the
 // class layout the storage classes (expert-storage.h), the per-class slot ledger
-// (expert-l2-class-ledger.h) and the host cut's per-layer file cap (expert-plan.h).
+// (expert-l2-class-ledger.h), the host cut's per-layer file cap (expert-plan.h) and the relabel
+// install transaction (expert-l2-relabel.h).
 //
 // Everything the ring decides is here: which expert gets which slot, when a slot may be reused,
 // how repeated demands retain slots and what a ring resize does. A mock read queue stands in
@@ -8,6 +9,7 @@
 
 #include "expert-l2-class-ledger.h"
 #include "expert-l2-ledger.h"
+#include "expert-l2-relabel.h"
 #include "expert-plan.h"
 #include "expert-storage.h"
 
@@ -533,6 +535,340 @@ static int class_ledger_tests() {
     return 0;
 }
 
+// ---- the relabel install transaction (expert-l2-relabel.h) ------------------------------------------
+
+namespace {
+
+// Four layers in three size classes (layers 0 and 2, layer 1, layer 3); classes 1 and 2 share storage
+// class 1. The arenas and the VRAM arena are modelled as "which expert's bytes are in this slot", so
+// every step of a transaction can be replayed and checked: a copy reads the bytes its source holds,
+// a relabel only renames bytes that are already there.
+struct relabel_world {
+    static constexpr int layers = 4, experts = 12;
+    geometry geo;
+    std::vector<int> storage_of = {0, 1, 1};
+    std::vector<int> vram_caps, host_caps, rings;
+    int spare = 1;
+    bool inclusive = false;
+    l2_class_ledger ledger;
+    std::vector<std::vector<int>> home_slot;
+    std::vector<std::vector<int>> content;   // [storage class][slot] expert key or -1
+    std::vector<std::vector<int>> vram;      // [size class][slot] expert key or -1
+    expert_slot_table gpu;
+    expert_locations host;
+    std::vector<std::vector<int>> spares;
+    install_layout layout;
+    std::vector<uint32_t> seq;
+    std::string error;
+
+    relabel_world(std::vector<int> ring, bool incl, std::vector<int> vcaps = {6, 3, 3}, std::vector<int> hcaps = {8, 4, 3},
+            int vram_spares = 1)
+            : vram_caps(vcaps), host_caps(hcaps), rings(ring), inclusive(incl) {
+        geo.n_layers = layers; geo.n_experts = experts;
+        geo.layer_class = {0, 1, 0, 2};
+        geo.class_bytes = {{100, 100, 100}, {200, 200, 200}, {150, 150, 150}};
+        geo.class_layers = {2, 1, 1};
+        spare = incl ? 0 : vram_spares;
+        std::vector<int> slots = {0, 0};
+        home_slot.assign(3, {});
+        for (int c = 0; c < 3; ++c) {
+            for (int i = 0; i < host_caps[c] + spare; ++i) { home_slot[c].push_back(slots[storage_of[c]]++); }
+        }
+        const std::vector<int> ring_base = slots;
+        for (int s = 0; s < 2; ++s) { slots[s] += rings[s]; }
+        ledger.reset(layers, experts, {0, 1, 0, 1}, slots, 3);
+        for (int c = 0; c < 3; ++c) for (int slot : home_slot[c]) { ledger.set_resident(storage_of[c], slot, -1, -1); }
+        for (int s = 0; s < 2; ++s) {
+            for (int i = 0; i < rings[s]; ++i) { ledger.make_ring(s, ring_base[s] + i); }
+        }
+        content.assign(2, {});
+        for (int s = 0; s < 2; ++s) { content[s].assign((size_t) slots[s], -1); }
+        vram.assign(3, {});
+        spares.assign(3, {});
+        layout.gpu = vram_caps; layout.host = host_caps;
+        for (int c = 0; c < 3; ++c) {
+            layout.gpu[c] += spare; layout.host[c] += spare;
+            vram[c].assign((size_t) layout.gpu[c], -1);
+            for (int i = 0; i < spare; ++i) { spares[c].push_back(vram_caps[c] + i); }
+        }
+        layout.lent_begin.assign(3, 0); layout.lent_count.assign(3, 0);
+        seq.assign(layers, 0u);
+    }
+
+    // The VRAM and host selections of a plan: per size class the best scores, VRAM first.
+    void choose(const std::vector<uint64_t> & score, expert_slot_table & gs, expert_slot_table & hs) const {
+        gs.assign(layers, {}); hs.assign(layers, {});
+        for (int c = 0; c < 3; ++c) {
+            std::vector<std::pair<uint64_t, int>> order;
+            for (int l = 0; l < layers; ++l) {
+                if (geo.layer_class[l] != c) { continue; }
+                for (int e = 0; e < experts; ++e) { order.push_back({score[(size_t) (l*experts + e)], l*experts + e}); }
+            }
+            std::sort(order.begin(), order.end(), [](auto a, auto b) { return a.first != b.first ? a.first > b.first : a.second < b.second; });
+            for (size_t i = 0; i < order.size(); ++i) {
+                const int l = order[i].second/experts, e = order[i].second%experts;
+                if ((int) i < vram_caps[c]) {
+                    gs[l].push_back(e);
+                    if (inclusive) { hs[l].push_back(e); }
+                } else if ((int) i < host_caps[c] + (inclusive ? 0 : vram_caps[c])) {
+                    hs[l].push_back(e);
+                }
+            }
+        }
+        for (auto & row : gs) { std::sort(row.begin(), row.end()); }
+        for (auto & row : hs) { std::sort(row.begin(), row.end()); }
+    }
+
+    // The load: every selected expert written to its first home, as the loader does.
+    void load(const std::vector<uint64_t> & score) {
+        expert_slot_table gs, hs;
+        choose(score, gs, hs);
+        gpu.assign(layers, std::vector<int32_t>(experts, -1));
+        host.assign(layers, std::vector<expert_location>(experts));
+        std::vector<int> ng(3, 0), nh(3, 0);
+        for (int l = 0; l < layers; ++l) {
+            const int c = geo.layer_class[l];
+            for (int e : gs[l]) { gpu[l][e] = ng[c]; vram[c][(size_t) ng[c]++] = l*experts + e; }
+            for (int e : hs[l]) {
+                host[l][e] = {expert_storage::host, nh[c]};
+                ledger.set_resident(storage_of[c], home_slot[c][(size_t) nh[c]], l, e);
+                content[storage_of[c]][(size_t) home_slot[c][(size_t) nh[c]++]] = l*experts + e;
+            }
+        }
+    }
+
+    bool fail(const std::string & why) { error = why; return false; }
+
+    // Reads the file experts of `ids` that have no home into the ring, like the worker; without
+    // `done` the generation stays leased.
+    bool serve(int layer, const std::vector<int> & ids, bool done = true) {
+        const uint32_t g = ++seq[(size_t) layer];
+        auto homed = [&](int l, int e) { return gpu[l][e] >= 0 || host[l][e].resident(); };
+        const l2_service got = ledger.service(layer, ids, g, homed);
+        if (!got.ok) { return fail(got.reason); }
+        for (const l2_read & r : got.reads) { content[(size_t) ledger.storage_of(r.layer)][(size_t) r.slot] = r.layer*experts + r.expert; }
+        if (done) { ledger.set_done(layer, g); }
+        return true;
+    }
+
+    // One install: plan_install, then the relabel plan replayed on the byte model.
+    bool install(const std::vector<uint64_t> & score, l2_install_plan & plan) {
+        expert_slot_table gs, hs;
+        choose(score, gs, hs);
+        const install_transaction tx = plan_install(geo, gs, hs, gpu, host, vram_caps, layout, layout, spares,
+            {inclusive, spare}, true, true);
+        if (!tx.valid) { return fail("plan_install: " + tx.reason); }
+        std::vector<int> ring_before = {ledger.ring_count(0), ledger.ring_count(1)};
+        plan = plan_relabel_install(ledger, home_slot, geo.layer_class, storage_of, host, tx.host, tx.moves);
+        if (!plan.ok) { return fail("relabel: " + plan.reason); }
+        if (plan.relabeled + plan.ring_copies + plan.reads != tx.ssd_slices) { return fail("file moves not all accounted"); }
+        // replay, and check that no slot is used twice inside a read batch
+        std::set<std::pair<int, int>> batch_slots;
+        int batch = -2;
+        for (size_t k = 0; k < tx.moves.size(); ++k) {
+            const install_move & m = tx.moves[k];
+            const l2_install_step & st = plan.steps[k];
+            const int s = storage_of[m.cls], key = m.layer*experts + m.expert;
+            if (m.from.storage == expert_storage::file) {
+                if (st.batch != batch) { batch = st.batch; batch_slots.clear(); }
+                const int slot = m.to.storage == expert_storage::host ? st.dst : st.src;
+                if (!batch_slots.insert({s, slot}).second) { return fail("a slot used twice in one read batch"); }
+                if (st.read) { content[s][(size_t) slot] = key; }
+                if (content[s][(size_t) slot] != key) { return fail("a relabel or ring copy of a slot that does not hold the expert"); }
+                if (m.to.storage == expert_storage::vram) { vram[m.cls][(size_t) m.to.slot] = key; }
+            } else {
+                batch = -2;
+                if (m.from.storage == expert_storage::host) {
+                    if (content[s][(size_t) st.src] != key) { return fail("a copy to VRAM from a slot that does not hold the expert"); }
+                    vram[m.cls][(size_t) m.to.slot] = key;
+                } else {
+                    if (vram[m.cls][(size_t) m.from.slot] != key) { return fail("VRAM model"); }
+                    content[s][(size_t) st.dst] = key;
+                }
+            }
+        }
+        gpu = tx.gpu_slots; host = tx.host; spares = tx.gpu_spares;
+        if (ledger.ring_count(0) != ring_before[0] || ledger.ring_count(1) != ring_before[1]) { return fail("ring size changed"); }
+        return check();
+    }
+
+    // Every home and every ring occupant holds its own bytes; residents mirror the plan.
+    bool check() {
+        std::string why;
+        if (!ledger.check(why)) { return fail(why); }
+        for (int l = 0; l < layers; ++l) {
+            const int c = geo.layer_class[l], s = storage_of[c];
+            for (int e = 0; e < experts; ++e) {
+                const int key = l*experts + e;
+                if (gpu[l][e] >= 0 && vram[c][(size_t) gpu[l][e]] != key) { return fail("VRAM home"); }
+                if (host[l][e].resident()) {
+                    const int slot = home_slot[c][(size_t) host[l][e].slot];
+                    int ol = -1, oe = -1;
+                    if (content[s][(size_t) slot] != key || ledger.role_of(s, slot) != slot_role::resident ||
+                            !ledger.occupant(s, slot, ol, oe) || ol != l || oe != e) { return fail("host home"); }
+                }
+                const int ring = ledger.slot_of(l, e);
+                if (ring >= 0 && content[s][(size_t) ring] != key) { return fail("ring occupant bytes"); }
+            }
+        }
+        for (int c = 0; c < 3; ++c) {
+            std::set<int> distinct(home_slot[c].begin(), home_slot[c].end());
+            if (distinct.size() != home_slot[c].size()) { return fail("two host slots share a storage slot"); }
+        }
+        return true;
+    }
+};
+
+// Scores 1000 - 10*key, so each class ranks its experts by layer and id: class 0 puts layer 0
+// experts 0..5 in VRAM (1000..950) and layer 0 experts 6..11 (940..890) and layer 2 experts 0, 1
+// (760, 750) in the host tier; class 1 (layer 1) VRAM 0..2 (880..860), host 3..6 (850..820); class 2
+// (layer 3) VRAM 0..2 (640..620), host 3..5 (610..590). `set` overrides single keys.
+std::vector<uint64_t> scores(std::initializer_list<std::pair<int, int>> set) {
+    std::vector<uint64_t> score((size_t) relabel_world::layers*relabel_world::experts);
+    for (size_t i = 0; i < score.size(); ++i) { score[i] = 1000 - 10*i; }
+    for (const auto & item : set) { score[(size_t) item.first] = (uint64_t) item.second; }
+    return score;
+}
+
+} // namespace
+
+static int relabel_install_tests() {
+    const int E = relabel_world::experts;
+    auto homed_in = [](relabel_world & w) { return [&w](int l, int e) { return w.gpu[l][e] >= 0 || w.host[l][e].resident(); }; };
+    // ---- demotions stay in the ring, promotions from the ring are not read ------------------------
+    {
+        relabel_world w({6, 5}, false);
+        w.load(scores({}));
+        l2_install_plan plan;
+        // layer 2 file experts 10 and 11 are demanded, then a plan makes them host residents
+        CHECK(w.serve(2, {10, 11}));
+        const int before_10 = w.ledger.slot_of(2, 10);
+        CHECK(before_10 >= 0 && w.ledger.slot_of(2, 11) >= 0);
+        CHECK(w.install(scores({{2*E + 10, 945}, {2*E + 11, 944}}), plan));
+        CHECK(plan.relabeled == 2 && plan.reads == 0 && plan.ring_copies == 0 && plan.demoted == 2);
+        CHECK(w.host[2][10].resident() && w.home_slot[0][(size_t) w.host[2][10].slot] == before_10);
+        // the two residents they displaced (layer 2 experts 0 and 1) stay in the ring, nothing moved
+        CHECK(!w.host[2][0].resident() && w.ledger.slot_of(2, 0) >= 0 && w.ledger.slot_of(2, 1) >= 0);
+        CHECK(w.ledger.ring_count(0) == 6 && w.ledger.ring_count(1) == 5);
+        const uint32_t g = ++w.seq[2];
+        auto hit = w.ledger.service(2, {0}, g, homed_in(w));
+        CHECK(hit.ok && hit.hits == 1 && hit.misses == 0);
+        w.ledger.set_done(2, g);
+        // the old plan back: relabels only, 10 and 11 stay in the ring
+        CHECK(w.install(scores({}), plan));
+        CHECK(plan.relabeled == 2 && plan.reads == 0 && plan.demoted == 2);
+        CHECK(w.ledger.slot_of(2, 10) >= 0 && w.ledger.slot_of(2, 11) >= 0);
+        printf("PASS: relabel install: demoted residents stay in the ring, promotions from the ring are not read\n");
+    }
+    // ---- promotions not in the ring are read into a ring slot that becomes their home -------------
+    {
+        relabel_world w({6, 5}, false);
+        w.load(scores({}));
+        l2_install_plan plan;
+        CHECK(w.install(scores({{2*E + 10, 945}, {1*E + 11, 855}, {3*E + 11, 615}}), plan));
+        CHECK(plan.relabeled == 0 && plan.reads == 3 && plan.demoted == 3 && plan.batches == 1);
+        // the reads took empty ring slots: the demoted residents are all still in the ring
+        CHECK(w.ledger.slot_of(2, 1) >= 0 && w.ledger.slot_of(1, 6) >= 0 && w.ledger.slot_of(3, 5) >= 0);
+        CHECK(w.ledger.ring_count(0) == 6 && w.ledger.ring_count(1) == 5);
+        printf("PASS: relabel install: other promotions are read straight into their new home, rings keep their size\n");
+    }
+    // ---- VRAM changes: host -> VRAM frees the home, VRAM -> host copies into a ring slot -----------
+    {
+        relabel_world w({6, 5}, false);
+        w.load(scores({}));
+        l2_install_plan plan;
+        CHECK(w.install(scores({{0*E + 6, 1001}}), plan));
+        CHECK(w.gpu[0][6] >= 0 && w.gpu[0][5] < 0 && w.host[0][5].resident() && plan.reads == 0);
+        // a file expert served into the ring and then promoted to VRAM is copied from its ring slot
+        CHECK(w.serve(2, {11}));
+        CHECK(w.install(scores({{2*E + 11, 1002}, {0*E + 6, 1001}}), plan));
+        CHECK(w.gpu[2][11] >= 0 && plan.ring_copies == 1 && plan.reads == 0 && plan.demoted == 1);
+        printf("PASS: relabel install: VRAM promotions and demotions through the ring, a ring occupant is copied, not read\n");
+    }
+    // ---- leases: a leased ring slot is never taken or relabeled -----------------------------------
+    {
+        relabel_world w({6, 5}, false);
+        w.load(scores({}));
+        l2_install_plan plan;
+        CHECK(w.serve(2, {10, 11}, false));   // generation not done: leased
+        const int s10 = w.ledger.slot_of(2, 10), s11 = w.ledger.slot_of(2, 11);
+        CHECK(w.install(scores({{2*E + 7, 945}, {2*E + 8, 944}, {2*E + 9, 943}}), plan));
+        CHECK(plan.reads == 3);
+        for (const auto & st : plan.steps) { CHECK(st.dst != s10 && st.dst != s11 && st.src != s10 && st.src != s11); }
+        CHECK(w.ledger.slot_of(2, 10) == s10 && w.ledger.slot_of(2, 11) == s11);
+        relabel_world v({6, 5}, false);
+        v.load(scores({}));
+        CHECK(v.serve(2, {10}, false));
+        CHECK(!v.install(scores({{2*E + 10, 945}}), plan) && v.error.find("leased") != std::string::npos);
+        printf("PASS: relabel install: leased ring slots are skipped, a leased occupant is never relabeled\n");
+    }
+    // ---- a small ring splits the file moves into read batches, no slot used twice in one ---------
+    {
+        relabel_world w({1, 1}, false, {6, 3, 3}, {8, 4, 3}, 4);
+        w.load(scores({}));
+        l2_install_plan plan;
+        // four file experts of class 0 promoted to VRAM in one rotation batch, the four they replace
+        // drop to the file: all four reads need the one ring slot
+        CHECK(w.install(scores({{2*E + 8, 1010}, {2*E + 9, 1009}, {2*E + 10, 1008}, {2*E + 11, 1007},
+                                {0*E + 2, 0}, {0*E + 3, 0}, {0*E + 4, 0}, {0*E + 5, 0}}), plan));
+        CHECK(plan.reads == 4 && plan.batches == 4 && plan.demoted == 0);
+        printf("PASS: relabel install: a one-slot ring reads in %d batches without reusing a slot inside one\n", plan.batches);
+    }
+    // ---- prompt/decode switch: two plans alternating, only relabels ------------------------------
+    {
+        relabel_world w({6, 5}, false);
+        const auto prompt = scores({});
+        const auto decode = scores({{2*E + 10, 945}, {2*E + 11, 944}, {1*E + 11, 855}, {3*E + 11, 615}});
+        w.load(prompt);
+        // generation demands the decode plan's host experts before that plan is installed
+        CHECK(w.serve(2, {10, 11}) && w.serve(1, {11}) && w.serve(3, {11}));
+        size_t reads = 0;
+        for (int round = 0; round < 6; ++round) {
+            l2_install_plan plan;
+            CHECK(w.install(round % 2 == 0 ? decode : prompt, plan));
+            reads += plan.reads;
+            CHECK(plan.relabeled == 4 && plan.demoted == 4);
+        }
+        CHECK(reads == 0 && w.ledger.ring_count(0) == 6 && w.ledger.ring_count(1) == 5);
+        printf("PASS: relabel install: a prompt/decode switch back and forth relabels only, nothing is read\n");
+    }
+    // ---- random plans and demands, both movers, several ring sizes ---------------------------------
+    for (int inclusive = 0; inclusive < 2; ++inclusive) {
+        for (int ring : {1, 3, 8}) {
+            relabel_world w({ring, ring}, inclusive != 0, inclusive ? std::vector<int>{4, 2, 2} : std::vector<int>{6, 3, 3},
+                inclusive ? std::vector<int>{10, 5, 4} : std::vector<int>{8, 4, 3}, 1 + ring%3);
+            uint32_t rng = 99u + 7u*(uint32_t) ring + 1000u*(uint32_t) inclusive;
+            auto next = [&]() { rng = rng*1664525u + 1013904223u; return rng >> 8; };
+            std::vector<uint64_t> score((size_t) relabel_world::layers*E);
+            for (auto & v : score) { v = next()%64; }
+            w.load(score);
+            size_t reads = 0, from_ring = 0, installs = 0;
+            for (int step = 0; step < 400; ++step) {
+                if (next()%4 == 0) {
+                    // a new plan that keeps part of the old ranking
+                    for (auto & v : score) { if (next()%3 == 0) { v = next()%64; } }
+                    l2_install_plan plan;
+                    if (!w.install(score, plan)) { fprintf(stderr, "step %d: %s\n", step, w.error.c_str()); CHECK(false); }
+                    reads += plan.reads; from_ring += plan.relabeled + plan.ring_copies; ++installs;
+                    continue;
+                }
+                const int layer = int(next()%relabel_world::layers);
+                std::vector<int> ids;
+                for (int e = 0; e < E && (int) ids.size() < ring; ++e) {
+                    if (w.gpu[layer][e] < 0 && !w.host[layer][e].resident() && next()%3 == 0) { ids.push_back(e); }
+                }
+                if (!w.serve(layer, ids)) { fprintf(stderr, "serve: %s\n", w.error.c_str()); CHECK(false); }
+                CHECK(w.check());
+            }
+            CHECK(installs > 50 && reads + from_ring > 0);
+            printf("  %s ring %d: %zu installs, %zu file moves read, %zu served from the ring\n",
+                inclusive ? "inclusive" : "exclusive", ring, installs, reads, from_ring);
+        }
+    }
+    printf("PASS: relabel install: random plans and demands keep homes, ring occupants and ring sizes consistent\n");
+    return 0;
+}
+
 int main() {
     constexpr size_t mib = 1024*1024, stride = 4*mib;
     auto plan = plan_l2_ring(512, 8, 512, 1, stride, 0, 0, true);
@@ -701,6 +1037,7 @@ int main() {
     CHECK(storage_tests() == 0);
     CHECK(file_cap_tests() == 0);
     CHECK(class_ledger_tests() == 0);
+    CHECK(relabel_install_tests() == 0);
     printf("OK\n");
     return 0;
 }
