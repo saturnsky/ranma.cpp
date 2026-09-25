@@ -4248,6 +4248,10 @@ private:
 
             common_sampler_accept(slot.smpl.get(), id, true);
 
+            // the next target decode starts with this token: the expert cache can fetch the
+            // experts of the token-routed layers while the rest of this iteration runs
+            llama_expert_route_hint(slot.ctx_tgt, &id, 1);
+
             // here we have synchronized the llama_context (due to the sampling above), so we can do time measurement
             const int64_t t_now = ggml_time_us();
 
@@ -4397,6 +4401,9 @@ private:
             slot.prompt.tokens.insert({ids.begin(), ids.end() - 1});
 
             slot.sampled = ids.back(); // last accepted token
+
+            // the next verification batch starts with this token (the draft follows later)
+            llama_expert_route_hint(slot.ctx_tgt, &slot.sampled, 1);
             SLT_DBG(slot, "add accepted tokens: sampled=%d, ids.size=%zu, n_draft=%zu\n", slot.sampled, ids.size(), n_draft);
 
             slot.mem.seq_rm(slot.id, slot.prompt.tokens.pos_next(), -1);

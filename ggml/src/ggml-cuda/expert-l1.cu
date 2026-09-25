@@ -65,8 +65,10 @@ l1_arena::~l1_arena() {
     }
 }
 
-bool l1_arena::allocate(const std::vector<int> & capacities, int device, int spare_slots) {
-    if (allocated() || capacities.size() != geo_.class_bytes.size() || geo_.n_layers <= 0 || spare_slots < 0) {
+bool l1_arena::allocate(const std::vector<int> & capacities, int device, int spare_slots,
+        const std::vector<int> * stage_slots) {
+    if (allocated() || capacities.size() != geo_.class_bytes.size() || geo_.n_layers <= 0 || spare_slots < 0 ||
+            (stage_slots != nullptr && stage_slots->size() != capacities.size())) {
         return false;
     }
     device_      = device;
@@ -76,9 +78,10 @@ bool l1_arena::allocate(const std::vector<int> & capacities, int device, int spa
     capacities_ = capacities;
     class_data_.assign(capacities.size(), {nullptr, nullptr, nullptr});
     for (size_t c = 0; c < capacities.size(); ++c) {
-        if (capacities[c] == 0 && spare_slots == 0) { continue; }
+        const int stage = stage_slots != nullptr ? std::max((*stage_slots)[c], 0) : 0;
+        if (capacities[c] == 0 && spare_slots == 0 && stage == 0) { continue; }
         for (int k = 0; k < geometry::n_kinds; ++k) {
-            const size_t bytes = size_t(capacities[c] + spare_slots)*geo_.class_bytes[c][k] +
+            const size_t bytes = size_t(capacities[c] + spare_slots + stage)*geo_.class_bytes[c][k] +
                 arena_tail_bytes(geo_, (int) c, k);
             if (cudaMalloc(&class_data_[c][k], bytes) != cudaSuccess) {
                 (void) cudaGetLastError();
