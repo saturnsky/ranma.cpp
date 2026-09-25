@@ -95,9 +95,9 @@ nothing on the hot path. This is the only direct measurement of what a plan is w
 processing.
 
 **Which bank is the prompt bank.** `bank_open` takes a `prompt_bank` flag. The backend stores it and
-compares no label string: the flag decides which staging ring an install carries with a finite host
-tier (`expert-cache-l2.md`). The policy opens `decode` with the flag clear and `prefill` with it
-set.
+compares no label string: the flag marks the plans of that bank as prompt plans, which a joint cache
+installs without moving the models that have no records in the bank (`expert-cache-joint.md`). The
+policy opens `decode` with the flag clear and `prefill` with it set.
 
 **Freeze refuses installs in the policy.** `--expert-freeze` returns from the policy's install before
 it reaches the backend, so a frozen run never installs a plan; banks are still marked, committed and

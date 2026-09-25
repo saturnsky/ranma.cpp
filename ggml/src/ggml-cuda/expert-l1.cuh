@@ -85,6 +85,7 @@ public:
     const std::vector<std::vector<int>> & gpu_spares() const { return gpu_spares_; }
     const expert_locations & locations() const { return homes_; }
     const install_layout & layout() const { return layout_; }
+    // (layer, kind, location) -> payload address of a host or lent slice
     using location_resolver = std::function<void *(int, int, expert_location)>;
     void attach_locations(location_resolver resolver) { resolve_ = std::move(resolver); }
     void * host_address(int layer, int kind, int expert) const;
@@ -92,9 +93,12 @@ public:
     // What the mover needs from the SSD tier to move a slice whose source is the file. Empty
     // without a tier, and then a transaction may not contain such a move.
     struct tier_reader {
-        std::function<bool(const std::vector<l2_read> &, std::string &)> read;
+        // may rewrite the slots of the reads; `address` takes the rewritten reads
+        std::function<bool(std::vector<l2_read> &, std::string &)> read;
         std::function<const void *(const l2_read &)> address;
         int slots = 0;   // ring slots one batch may use
+        // the tier reads a slice promoted to a host slot straight into that slot
+        bool direct_host = false;
     };
     void attach_tier_reader(tier_reader reader) { tier_ = std::move(reader); }
 
