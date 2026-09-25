@@ -72,6 +72,17 @@ struct llama_context {
     // outputs of a finished compute are drained by synchronize() inside the install itself.
     std::atomic<int> expert_n_compute_in_flight { 0 };
 
+    // ranma expert cache: route hints for the layers the model routes by token id. The token ->
+    // expert tables are copied to the host at the first hint; state 0 = not tried yet, 1 = hints
+    // are sent, -1 = the model or the cache does not use them.
+    int                               expert_hint_state = 0;
+    int32_t                           expert_hint_used  = 0;
+    int32_t                           expert_hint_vocab = 0;
+    std::vector<int32_t>              expert_hint_layers;
+    std::vector<std::vector<int32_t>> expert_hint_tables;   // [i] n_used x n_vocab
+    std::vector<int32_t>              expert_hint_ids;
+    void expert_route_hint(const llama_token * tokens, int32_t n_tokens);
+
     // Raises the counter for the lifetime of one encode/decode call, on every return path.
     struct expert_compute_guard {
         std::atomic<int> & counter;

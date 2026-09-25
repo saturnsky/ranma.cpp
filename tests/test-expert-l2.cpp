@@ -7,6 +7,7 @@
 // how repeated demands retain slots and what a ring resize does. A mock read queue stands in
 // for the disk and a fake mailbox for the GPU, so this test needs neither.
 
+#include "expert-hash-early.h"
 #include "expert-l2-class-ledger.h"
 #include "expert-l2-ledger.h"
 #include "expert-l2-relabel.h"
@@ -869,6 +870,211 @@ static int relabel_install_tests() {
     return 0;
 }
 
+// Early routes: the early service of both ledgers (a demand served before its generation is
+// published), the hint helpers and the VRAM staging slot plan (expert-hash-early.h).
+static int early_tests() {
+    auto none = [](int, int) { return false; };
+    std::string why;
+    // ---- class ledger: early misses are read into reusable slots, the real service hits them ------
+    {
+        l2_class_ledger ledger = make_class_ledger();
+        ledger.set_done(0, 4);
+        // early: slot leased to the done counter, so it is reusable at once
+        auto early = ledger.service(0, {1, 2, 1}, ledger.done(0), none, l2_no_quiet(), true);
+        CHECK(early.ok && early.misses == 2 && early.hits == 0 && early.reads.size() == 6 && early.early_hits == 0);
+        const int s1 = ledger.slot_of(0, 1), s2 = ledger.slot_of(0, 2);
+        CHECK(s1 >= 0 && s2 >= 0 && s1 != s2);
+        // the real generation 5: both are early hits, not ring hits
+        std::set<int> marked = {1, 2};
+        auto quiet = [&](int l, int e) { return l == 0 && marked.count(e) != 0; };
+        auto real = ledger.service(0, {2, 1, 3}, 5, none, quiet);
+        CHECK(real.ok && real.early_hits == 2 && real.hits == 0 && real.misses == 1 && real.reads.size() == 3);
+        // now leased to generation 5: another layer of class 0 cannot take them while 5 runs
+        // the early slots are leased to generation 5 now: layer 2 of the same class finds one free slot
+        auto other = ledger.service(2, {7, 8}, 1, none);
+        CHECK(!other.ok);
+        CHECK(ledger.slot_of(0, 1) == s1 && ledger.slot_of(0, 2) == s2 && ledger.check(why));
+        printf("PASS: class ledger early service: reusable early slots, early hits outside the ring hit count\n");
+    }
+    // ---- class ledger: an early hit never shortens the lease of a pending generation ------------
+    {
+        l2_class_ledger ledger = make_class_ledger();
+        ledger.set_done(0, 4);
+        ledger.set_done(2, 0);
+        // generation 5 of layer 0 holds expert 3 (not finished: done 4)
+        CHECK(ledger.service(0, {3}, 5, none).ok);
+        const int held = ledger.slot_of(0, 3);
+        // an early demand for the same expert only refreshes it
+        auto early = ledger.service(0, {3}, ledger.done(0), none, l2_no_quiet(), true);
+        CHECK(early.ok && early.hits == 1 && early.misses == 0 && early.reads.empty());
+        // the three other ring slots go to layer 2; a fourth expert finds no reusable slot, because
+        // the held slot is still leased to generation 5
+        CHECK(ledger.service(2, {7, 8, 9}, 1, none).ok);
+        auto full = ledger.service(2, {10}, 2, none);
+        CHECK(!full.ok && ledger.slot_of(0, 3) == held);
+        ledger.set_done(0, 5);
+        auto after = ledger.service(2, {10}, 2, none);
+        CHECK(after.ok && after.misses == 1 && ledger.check(why));
+        printf("PASS: class ledger early hit keeps the lease of the generation that holds the slot\n");
+    }
+    // ---- ring ledger: the same rules -------------------------------------------------------------
+    {
+        l2_ledger ledger;
+        ledger.reset(4, 16, 2, 2, 3);
+        ledger.set_done(0, 7);
+        CHECK(ledger.service(0, {1}, 8, [](int, int) { return false; }).ok);   // leased to 8
+        auto early = ledger.service(0, {1, 2}, ledger.done(0), [](int, int) { return false; }, l2_no_quiet(), true);
+        CHECK(early.ok && early.hits == 1 && early.misses == 1);
+        // expert 2's slot is reusable at once, expert 1's is not
+        auto next = ledger.service(1, {5}, 1, [](int, int) { return false; });
+        CHECK(next.ok && next.evicted.size() == 1 && next.evicted[0].expert == 2);
+        CHECK(!ledger.service(1, {6}, 1, [](int, int) { return false; }).ok);
+        ledger.set_done(0, 8);
+        auto quiet_hit = ledger.service(0, {1}, 9, [](int, int) { return false; }, [](int, int e) { return e == 1; });
+        CHECK(quiet_hit.ok && quiet_hit.early_hits == 1 && quiet_hit.hits == 0);
+        printf("PASS: ring ledger early service: no lease on early misses, early hits keep leases\n");
+    }
+    // ---- hint helpers and the staging plan ---------------------------------------------------------
+    {
+        hash_early_mode m;
+        CHECK(parse_hash_early(nullptr, m) && !m.any());
+        CHECK(parse_hash_early("0", m) && !m.any() && parse_hash_early("off", m) && !m.any());
+        CHECK(parse_hash_early("ssd", m) && m.ssd && !m.vram && std::string(hash_early_name(m)) == "ssd");
+        CHECK(parse_hash_early("vram", m) && !m.ssd && m.vram);
+        CHECK(parse_hash_early("both", m) && m.ssd && m.vram && std::string(hash_early_name(m)) == "both");
+        CHECK(!parse_hash_early("1", m) && !m.any() && !parse_hash_early("SSD", m));
+        const int32_t ids[] = {5, 3, 5, -1, 16, 7, 3, 15};
+        CHECK((hint_distinct_ids(ids, 8, 16) == std::vector<int>{5, 3, 7, 15}));
+        CHECK(hint_distinct_ids(nullptr, 3, 16).empty() && hint_distinct_ids(ids, 0, 16).empty());
+
+        std::vector<int32_t> owners(3, -1);
+        stage_plan p = plan_stage(owners, {5, 6});
+        CHECK(p.changed() && p.clears.empty() && p.keeps.empty() && p.over == 0);
+        CHECK((p.copies == std::vector<std::pair<int, int>>{{5, 0}, {6, 1}}) && (owners == std::vector<int32_t>{5, 6, -1}));
+        // unchanged: nothing to do but the entries
+        p = plan_stage(owners, {6, 5});
+        CHECK(!p.changed() && (p.keeps == std::vector<std::pair<int, int>>{{6, 1}, {5, 0}}));
+        // a new expert takes the free slot before any slot of an expert no longer wanted
+        p = plan_stage(owners, {6, 7});
+        CHECK(p.clears.empty() && (p.copies == std::vector<std::pair<int, int>>{{7, 2}}) && p.keeps.size() == 1);
+        CHECK((owners == std::vector<int32_t>{5, 6, 7}));
+        // full: the unwanted owners' slots are reused, their entries cleared first; the rest is over
+        p = plan_stage(owners, {8, 7, 9, 10});
+        CHECK((p.keeps == std::vector<std::pair<int, int>>{{7, 2}}));
+        CHECK((p.clears == std::vector<std::pair<int, int>>{{5, 0}, {6, 1}}));
+        CHECK((p.copies == std::vector<std::pair<int, int>>{{8, 0}, {9, 1}}) && p.over == 1);
+        CHECK((owners == std::vector<int32_t>{8, 9, 7}));
+        // duplicates take one slot
+        {
+            std::vector<int32_t> dup(3, -1);
+            const stage_plan d = plan_stage(dup, {4, 4, 5, 4});
+            CHECK(d.copies.size() == 2 && (dup == std::vector<int32_t>{4, 5, -1}) && d.over == 0);
+            const stage_plan k = plan_stage(dup, {5, 5});
+            CHECK(!k.changed() && k.keeps.size() == 1);
+        }
+        // nothing wanted: nothing changes, the staged experts stay (their entries stay valid)
+        p = plan_stage(owners, {});
+        CHECK(!p.changed() && p.keeps.empty() && (owners == std::vector<int32_t>{8, 9, 7}));
+        // random plans: every wanted expert (up to the slot count) ends staged, each slot once, and a
+        // slot changes owner only through a copy (with a clear when it had one)
+        uint32_t rng = 12345;
+        auto next = [&]() { rng = rng*1664525u + 1013904223u; return rng >> 8; };
+        std::vector<int32_t> own(6, -1);
+        for (int round = 0; round < 5000; ++round) {
+            std::vector<int32_t> before = own;
+            const int n = int(next()%10);
+            std::vector<int32_t> raw;
+            for (int i = 0; i < n; ++i) { raw.push_back(int32_t(next()%12)); }
+            const std::vector<int> wanted = hint_distinct_ids(raw.data(), (int) raw.size(), 12);
+            const stage_plan q = plan_stage(own, wanted);
+            CHECK(q.keeps.size() + q.copies.size() + (size_t) q.over == wanted.size());
+            CHECK(q.keeps.size() + q.copies.size() <= own.size());
+            std::set<int> slots;
+            for (const auto & k : q.keeps)  { CHECK(before[(size_t) k.second] == k.first && slots.insert(k.second).second); }
+            for (const auto & c : q.copies) { CHECK(own[(size_t) c.second] == c.first && slots.insert(c.second).second); }
+            for (const auto & c : q.clears) {
+                CHECK(before[(size_t) c.second] == c.first);
+                bool reused = false;
+                for (const auto & k : q.copies) { reused = reused || k.second == c.second; }
+                CHECK(reused);
+            }
+            for (size_t k = 0; k < own.size(); ++k) {
+                bool copied = false;
+                for (const auto & c : q.copies) { copied = copied || c.second == (int) k; }
+                if (!copied) { CHECK(own[k] == before[k]); }
+                if (copied && before[k] >= 0) {
+                    bool cleared = false;
+                    for (const auto & c : q.clears) { cleared = cleared || c.second == (int) k; }
+                    CHECK(cleared);
+                }
+            }
+            std::set<int32_t> distinct;
+            for (int32_t e : own) { CHECK(e < 0 || distinct.insert(e).second); }
+        }
+        printf("PASS: early-route switch parsing, distinct hint ids and the staging slot plan\n");
+    }
+    // ---- staging owners and the slot table across installs ----------------------------------------
+    {
+        // host model of one layer's table: a plan's clears (only where the table still names the slot),
+        // then its keeps and copies; an install republishes the table from the plan (no staging entry)
+        constexpr int experts = 12, first = 4, slots = 3;
+        auto apply = [&](std::vector<int32_t> & table, const stage_plan & p) {
+            for (const auto & c : p.clears) { if (table[(size_t) c.first] == first + c.second) { table[(size_t) c.first] = -1; } }
+            for (const auto & c : p.keeps)  { table[(size_t) c.first] = first + c.second; }
+            for (const auto & c : p.copies) { table[(size_t) c.first] = first + c.second; }
+        };
+        auto install = [&](std::vector<int32_t> & table, int static_expert) {
+            table.assign(experts, -1);
+            table[(size_t) static_expert] = 0;
+        };
+        std::string why;
+        // the failure seen on the model: staged {5, 6, 7}, an install, then a hint naming only 5 and 8
+        {
+            std::vector<int32_t> table(experts, -1), owners(slots, -1);
+            apply(table, plan_stage(owners, {5, 6, 7}));
+            CHECK(stage_table_check(owners, table, first, why));
+            install(table, 1);
+            std::vector<int32_t> stale = owners;
+            apply(table, plan_stage(stale, {5, 8}));   // without forgetting: 6 and 7 stay owners, unmapped
+            CHECK(!stage_table_check(stale, table, first, why));
+            install(table, 1);
+            stage_forget(owners);
+            apply(table, plan_stage(owners, {5, 8}));
+            CHECK(stage_table_check(owners, table, first, why));
+            CHECK(table[5] >= first && table[8] >= first && table[6] == -1 && table[7] == -1);
+        }
+        // an install that makes a staged expert static: after forgetting, the static entry stays
+        {
+            std::vector<int32_t> table(experts, -1), owners(slots, -1);
+            apply(table, plan_stage(owners, {2, 3}));
+            install(table, 3);
+            stage_forget(owners);
+            CHECK(stage_table_check(owners, table, first, why));
+            apply(table, plan_stage(owners, {2}));     // the controller never stages a static expert
+            CHECK(stage_table_check(owners, table, first, why) && table[3] == 0);
+        }
+        // random hints with installs in between keep the invariant
+        uint32_t rng = 777;
+        auto next = [&]() { rng = rng*1664525u + 1013904223u; return rng >> 8; };
+        std::vector<int32_t> table(experts, -1), owners(slots, -1);
+        for (int round = 0; round < 5000; ++round) {
+            if (next()%7 == 0) {
+                install(table, int(next()%experts));
+                stage_forget(owners);
+            }
+            std::vector<int32_t> raw;
+            for (int i = 0; i < 4; ++i) {
+                const int e = int(next()%experts);
+                if (table[(size_t) e] < 0 || table[(size_t) e] >= first) { raw.push_back(e); }   // host residents only
+            }
+            apply(table, plan_stage(owners, hint_distinct_ids(raw.data(), (int) raw.size(), experts)));
+            CHECK(stage_table_check(owners, table, first, why));
+        }
+        printf("PASS: staging owners and slot table stay consistent across installs (an install forgets the staging)\n");
+    }
+    return 0;
+}
+
 int main() {
     constexpr size_t mib = 1024*1024, stride = 4*mib;
     auto plan = plan_l2_ring(512, 8, 512, 1, stride, 0, 0, true);
@@ -1038,6 +1244,7 @@ int main() {
     CHECK(file_cap_tests() == 0);
     CHECK(class_ledger_tests() == 0);
     CHECK(relabel_install_tests() == 0);
+    CHECK(early_tests() == 0);
     printf("OK\n");
     return 0;
 }
