@@ -13,10 +13,17 @@
 //
 // Addresses never change after allocate(); only slot contents and the tables do, and only while
 // nothing computes.
+//
+// With a finite host tier in the class layout (expert-storage.h) there is one arena per storage
+// class and kind instead: the resident slots of its size classes and the SSD tier's staging ring,
+// all at the storage pitch. The payload of a slot starts at the sector shift of its tensor, which
+// only the tier knows, so the tier serves every such resident through its address table and slice()
+// returns the start of the slot.
 
 #include "common.cuh"
 #include "expert-geometry.h"
 #include "expert-os.h"
+#include "expert-storage.h"
 
 #include <array>
 #include <cstdint>
@@ -33,8 +40,11 @@ public:
     host_arena & operator=(const host_arena &) = delete;
 
     // Exactly once. capacities[class] is the number of experts of that class that live here, and
-    // spare_slots more slots per class are kept free for the exchange rotation.
-    bool allocate(const std::vector<int> & capacities, int spare_slots, int device);
+    // spare_slots more slots per class are kept free for the exchange rotation. With `storage` the
+    // arenas follow the class layout; its resident ranges must be the capacities plus the spares.
+    bool allocate(const std::vector<int> & capacities, int spare_slots, int device,
+                  const class_storage * storage = nullptr);
+    bool class_layout() const { return class_layout_; }
     bool allocated() const { return !class_host_.empty(); }
 
     // Registers the arenas as coarse-grained mapped memory and resolves the device aliases. Called
@@ -46,10 +56,15 @@ public:
     size_t device_bytes() const { return table_bytes_; }
     const std::vector<int> & capacities() const { return capacities_; }
 
-    // Host address of one slice. Valid from allocate() on.
+    // Host address of one slice (with the class layout the start of its slot). Valid from
+    // allocate() on.
     void * slice(int cls, int kind, int slot) const;
-    // Device alias of the arena base of a class and kind, or null before map().
+    // Device alias of the arena base of a class and kind (with the class layout the first resident
+    // slot of the class), or null before map().
     const void * device_data(int cls, int kind) const;
+    // Class layout: slot 0 of the arena of a storage class and kind; the device alias is null
+    // before map().
+    void * storage_base(int storage, int kind, bool device) const;
     // Device table of a layer: expert id -> host slot or -1.
     const int32_t * device_slots(int layer) const;
 
@@ -65,7 +80,10 @@ private:
     int    spare_slots_ = 0;
     cudaStream_t copy_stream_ = nullptr;
     std::vector<int> capacities_;
-    std::vector<std::array<expert_os::reservation, 3>> class_res_;    // [class][kind]
+    bool          class_layout_ = false;
+    class_storage storage_;
+    // [class][kind]; with the class layout [storage class][kind]
+    std::vector<std::array<expert_os::reservation, 3>> class_res_;
     std::vector<std::array<void *, 3>> class_host_;                   // [class][kind] host base
     std::vector<std::array<void *, 3>> class_device_;                 // [class][kind] device alias
     std::vector<std::array<bool,   3>> class_registered_;
