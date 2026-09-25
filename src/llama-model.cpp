@@ -1564,6 +1564,14 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             }
             ggml_expert_config config = *params.expert_config;
             config.l2_experts_used = int32_t(hparams.n_expert_used_max());
+            // Layers routed by a token-id table (the graph gathers the selected experts with
+            // get_rows on the input tokens): their selections are known before the graph runs.
+            std::vector<int32_t> early_layers;
+            for (uint32_t il = 0; il < hparams.dsv4_hash_layer_count && il < hparams.n_layer(); ++il) {
+                early_layers.push_back((int32_t) il);
+            }
+            config.early_route_layers   = early_layers.empty() ? nullptr : early_layers.data();
+            config.n_early_route_layers = (uint32_t) early_layers.size();
             if (iface->configure(&config)) {
                 pimpl->expert_iface = iface;
             } else {
