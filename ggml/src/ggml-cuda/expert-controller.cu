@@ -3,6 +3,8 @@
 #if defined(GGML_USE_HIP)
 
 #include "expert-geometry.h"
+#include "expert-hash-early.h"
+#include "expert-hash-stage.cuh"
 #include "expert-host.cuh"
 #include "expert-l2.cuh"
 #include "expert-os.h"
@@ -294,6 +296,7 @@ public:
         if (verify_all_) {
             GGML_LOG_INFO("expert cache: RANMA_EXPERT_VERIFY set, every install is verified against the host weights\n");
         }
+        configure_hash_early_locked(config);
         clear_members_locked();
         member_state first;
         first.path     = config->model_path ? config->model_path : "";
@@ -609,15 +612,22 @@ public:
             return false;
         }
         capacities_ = initial.capacities;
+        if (carve_stage_locked()) {
+            // the static plan keeps the capacity the staging slots leave it
+            placement_inputs fixed = in;
+            fixed.fixed_capacities = &capacities_;
+            initial = plan_placement(fixed);
+        }
 
         if (!allocate_profiler_locked()) { return false; }
         l1_.reset(new l1_arena(geo_));
-        if (!l1_->allocate(capacities_, device_)) {
+        if (!l1_->allocate(capacities_, device_, 0, stage_class_slots_.empty() ? nullptr : &stage_class_slots_)) {
             l1_.reset();
             profiler_.reset();
             disable_locked("arena allocation failed");
             return false;
         }
+        allocate_stage_locked();
         l1_install_stats stats;
         if (!l1_->install(initial.selected, /*retain=*/false, stats)) {
             disable_locked("initial install failed");
@@ -676,6 +686,7 @@ public:
         n_banks_.store(0, std::memory_order_release);
         // the worker must stop before the arenas it reads into go away
         tier_.reset();
+        free_stage_locked();
         l1_.reset();
         host_.reset();
         profiler_.reset();
@@ -737,6 +748,13 @@ public:
         std::vector<uint64_t> delta;
         if (!profiler_->read_bank(bank, delta, /*zero_after=*/true)) {
             return false;
+        }
+        if (stage_dev_ != nullptr) {
+            // the device is synchronized by the read-back above
+            log_stage_counters_locked(b.label);
+        }
+        if (tier_ && !early_decl_.empty() && !b.prompt) {
+            log_early_counters_locked(b.label);
         }
         uint64_t total = 0;
         for (uint64_t v : delta) {
@@ -870,6 +888,9 @@ public:
         // The caller synchronized its context; the device-wide drain covers every stream that could
         // still read the arena or the tables.
         CUDA_CHECK(cudaDeviceSynchronize());
+        // the install republishes the slot tables: the staging entries go, and the staging forgets its
+        // experts (the next hint copies again; an install is rare next to the hints)
+        for (std::vector<int32_t> & owners : stage_owner_) { stage_forget(owners); }
         if (tier_) {
             return install_tier_locked(id, plan, /*seed =*/ false);
         }
@@ -1023,6 +1044,67 @@ public:
         return true;
     }
 
+    // ---- early routes (expert-hash-early.h) ------------------------------------------------------
+
+    // The experts that the next graph on `backend` selects in early-route layers. Called by the
+    // compute thread before it builds or launches that graph; never waits for the device.
+    bool route_hint(ggml_backend_t backend, const ggml_expert_route_hint * hints, int32_t n_hints) {
+        if (!hash_mode_.any() || early_decl_.empty()) {
+            return false;
+        }
+        if (state_ != state_t::installed || backend == nullptr || !ggml_backend_is_cuda(backend) || hints == nullptr ||
+                n_hints <= 0) {
+            return true;
+        }
+        if (!(hash_mode_.ssd && tier_ && tier_->early()) && stage_dev_ == nullptr) {
+            return false;   // installed, and neither an SSD tier to read early nor staging slots
+        }
+        ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+        if (cuda_ctx->device != device_ || member_of(cuda_ctx) != 0) {
+            return true;   // only the model that declared the layers
+        }
+        // generation and verification batches; prompt ubatches have the staged tier service
+        const int rows = hints[0].rows;
+        if (rows <= 0 || (uint64_t) rows > std::max<uint64_t>(cfg_.l2_decode_rows, 1)) {
+            return true;
+        }
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (state_ != state_t::installed) {
+            return true;
+        }
+        const std::vector<uint8_t> early = early_joint_locked();
+        const int offset = members_.empty() ? 0 : members_[0].offset;
+        std::vector<std::pair<int, std::vector<int>>> layers;
+        for (int32_t i = 0; i < n_hints; ++i) {
+            const ggml_expert_route_hint & h = hints[i];
+            const int joint = offset + h.layer;
+            if (h.layer < 0 || joint >= geo_.n_layers || !early[(size_t) joint]) {
+                continue;
+            }
+            layers.push_back({joint, hint_distinct_ids(h.ids, h.n_ids, geo_.n_experts)});
+        }
+        std::sort(layers.begin(), layers.end(),
+            [](const std::pair<int, std::vector<int>> & a, const std::pair<int, std::vector<int>> & b) { return a.first < b.first; });
+        if (layers.empty()) {
+            return true;
+        }
+        if (hash_mode_.ssd && tier_ && tier_->early()) {
+            std::vector<l2_early_layer> job;
+            for (const auto & l : layers) {
+                l2_early_layer item;
+                item.layer     = l.first;
+                item.published = tier_->published(l.first);
+                item.ids       = l.second;
+                job.push_back(std::move(item));
+            }
+            tier_->post_early(std::move(job));
+        }
+        if (stage_dev_ != nullptr) {
+            stage_hint_locked(*cuda_ctx, layers);
+        }
+        return true;
+    }
+
     void profile_ids(ggml_backend_cuda_context & ctx, const ggml_tensor * ids) {
         if (state_ != state_t::installed || ids == nullptr || ctx.device != device_) {
             return;
@@ -1049,6 +1131,16 @@ public:
         }
         if (member < 0 || joint < 0 || joint >= geo_.n_layers || geo_.layer_class[joint] < 0) {
             return;
+        }
+        if (stage_dev_ != nullptr && stage_index_[(size_t) joint] >= 0) {
+            // VRAM staging of an early-route layer: its matmuls read the table only after the
+            // staging of this graph's hint (if any) is final
+            const int idx = stage_index_[(size_t) joint];
+            const ggml_cuda_kernel_launch_params wait_launch(dim3(1), dim3(64), 0, ctx.stream());
+            ggml_cuda_kernel_launch(stage_wait_kernel, wait_launch, stage_dev_ + idx, (const int32_t *) ids->data,
+                (int) ids->ne[1], (int) ids->ne[0], (int) (ids->nb[1]/sizeof(int32_t)), geo_.n_experts,
+                (const int32_t *) l1_->lookup((int) joint, 0).slots, stage_first_[(size_t) joint],
+                stage_first_[(size_t) joint] + stage_slots_);
         }
         if (profiler_) {
         launch_profile_ids((const int32_t *) ids->data, (int) ids->ne[1], (int) (ids->nb[1]/sizeof(int32_t)), (int) ids->ne[0],
@@ -1395,7 +1487,9 @@ private:
     // Sizes the ring out of the host budget and cuts the rest three ways. `host_capacities` comes in
     // as the two-tier capacity (everything that is not in VRAM) and goes out as the finite one.
     bool size_tier_locked(const std::vector<std::vector<int32_t>> & selected, std::vector<int> & host_capacities) {
-        tier_.reset(new l2_tier(geo_, l2_debug_config(cfg_, verify_all_)));
+        l2_config tier_cfg = l2_debug_config(cfg_, verify_all_);
+        tier_cfg.early = hash_mode_.ssd && !early_decl_.empty();
+        tier_.reset(new l2_tier(geo_, tier_cfg));
         if (!tier_->sized()) {
             tier_.reset();
             disable_locked("the SSD tier could not size its staging ring");
@@ -1748,6 +1842,7 @@ private:
         l2_tier * tier = tier_.get();
         l1_->attach_addresses([tier](int layer, int kind) { return tier->addresses(layer, kind); });
         tier_->set_homes(l1_->host_slots(), l1_->locations(), host_geometry_locked());
+        tier_->set_early_layers(early_joint_locked());
         tier_->start_worker();
         return true;
     }
@@ -2125,6 +2220,361 @@ private:
         profiler_.reset(); disable_locked("profiler allocation failed"); return false;
     }
 
+    // ---- early routes (expert-hash-early.h, expert-hash-stage.cuh) --------------------------------
+
+    // RANMA_EXPERT_HASH_EARLY = 0 (default) | ssd | vram | both, read once per process, and the
+    // early-route layers the first model declares. 0 changes nothing: route_hint answers false, no
+    // slot is carved, no kernel is added.
+    void configure_hash_early_locked(const ggml_expert_config * config) {
+        hash_mode_ = hash_early_mode();
+        early_decl_.clear();
+        stage_slots_ = 0;
+        for (uint32_t i = 0; config->early_route_layers != nullptr && i < config->n_early_route_layers; ++i) {
+            if (config->early_route_layers[i] >= 0) {
+                early_decl_.push_back(config->early_route_layers[i]);
+            }
+        }
+        const char * env = getenv("RANMA_EXPERT_HASH_EARLY");
+        if (env != nullptr && env[0] != '\0') {
+            hash_early_mode mode;
+            if (parse_hash_early(env, mode)) {
+                hash_mode_ = mode;
+            } else {
+                GGML_LOG_WARN("expert cache: ignoring invalid RANMA_EXPERT_HASH_EARLY='%s', expected 0, ssd, vram or both\n", env);
+            }
+        }
+        if (!hash_mode_.any()) {
+            return;
+        }
+        if (early_decl_.empty()) {
+            GGML_LOG_INFO("expert cache: RANMA_EXPERT_HASH_EARLY=%s: the model routes no layer by token id; nothing to do\n",
+                hash_early_name(hash_mode_));
+            hash_mode_ = hash_early_mode();
+            return;
+        }
+        if (hash_mode_.vram) {
+            stage_slots_ = 6;
+            if (const char * text = getenv("RANMA_EXPERT_HASH_STAGE_SLOTS"); text != nullptr && text[0] != '\0') {
+                char * end = nullptr;
+                errno = 0;
+                const long n = strtol(text, &end, 10);
+                if (errno == 0 && end != text && *end == '\0' && n >= 1 && n <= stage_max_list) {
+                    stage_slots_ = (int) n;
+                } else {
+                    GGML_LOG_WARN("expert cache: ignoring invalid RANMA_EXPERT_HASH_STAGE_SLOTS='%s', expected 1..%d\n",
+                        text, stage_max_list);
+                }
+            }
+            const char * why = nullptr;
+            if (cfg_.policy == GGML_EXPERT_POLICY_OFF || cfg_.l1_bytes == 0) {
+                why = "the cache has no VRAM budget";
+            } else if (cfg_.mode != GGML_EXPERT_MODE_EXCLUSIVE && cfg_.l2_bytes == 0) {
+                why = "it needs owned host storage (exclusive mode or a finite host tier)";
+            } else if (early_decl_.size() > 8) {
+                why = "more than 8 early-route layers";
+            }
+            if (why != nullptr) {
+                GGML_LOG_WARN("expert cache: RANMA_EXPERT_HASH_EARLY=%s: VRAM staging off: %s\n", hash_early_name(hash_mode_), why);
+                hash_mode_.vram = false;
+                stage_slots_ = 0;
+            }
+        }
+        std::string layers;
+        for (int32_t l : early_decl_) {
+            layers += (layers.empty() ? "" : ",") + std::to_string(l);
+        }
+        const std::string staging = hash_mode_.vram ? std::to_string(stage_slots_) + " slots per layer" : std::string("off");
+        GGML_LOG_INFO("expert cache: RANMA_EXPERT_HASH_EARLY=%s: early-route layers %s; early SSD reads %s, VRAM staging %s\n",
+            env, layers.c_str(), hash_mode_.ssd ? "on (finite host tier only)" : "off", staging.c_str());
+    }
+
+    // [joint layer] 1 for the early-route layers of the first model that the cache routes.
+    std::vector<uint8_t> early_joint_locked() const {
+        std::vector<uint8_t> out((size_t) std::max(geo_.n_layers, 0), 0);
+        if (early_decl_.empty() || members_.empty()) {
+            return out;
+        }
+        const int offset = members_[0].offset;
+        const int n = joint_ ? members_[0].geo.n_layers : geo_.n_layers;
+        for (int32_t l : early_decl_) {
+            const int joint = offset + l;
+            if (l < n && joint < geo_.n_layers && geo_.layer_class[joint] >= 0) {
+                out[(size_t) joint] = 1;
+            }
+        }
+        return out;
+    }
+
+    // Load time, right after the load-time plan froze the capacities: every early-route layer takes
+    // stage_slots_ slots of its size class for its VRAM staging. The static plans keep the rest; the
+    // slots sit after the spares in the arena and belong to no plan. Returns true when capacities_
+    // changed.
+    bool carve_stage_locked() {
+        stage_class_slots_.clear();
+        stage_first_.assign((size_t) geo_.n_layers, -1);
+        stage_index_.assign((size_t) geo_.n_layers, -1);
+        stage_layer_.clear();
+        if (!hash_mode_.vram || stage_slots_ <= 0) {
+            return false;
+        }
+        const std::vector<uint8_t> early = early_joint_locked();
+        std::vector<int> per_class(geo_.class_bytes.size(), 0);
+        size_t bytes = 0;
+        for (int l = 0; l < geo_.n_layers; ++l) {
+            if (!early[(size_t) l]) {
+                continue;
+            }
+            const int cls = geo_.layer_class[l];
+            if (capacities_[(size_t) cls] - per_class[(size_t) cls] < stage_slots_) {
+                GGML_LOG_WARN("expert cache: VRAM staging: size class %d has fewer than %d static slots left; layer %d is not staged\n",
+                    cls, stage_slots_, l);
+                continue;
+            }
+            stage_index_[(size_t) l] = (int) stage_layer_.size();
+            stage_layer_.push_back(l);
+            per_class[(size_t) cls] += stage_slots_;
+            bytes += size_t(stage_slots_)*geo_.class_total_bytes(cls);
+        }
+        if (stage_layer_.empty()) {
+            hash_mode_.vram = false;
+            return false;
+        }
+        for (size_t cls = 0; cls < per_class.size(); ++cls) {
+            capacities_[cls] -= per_class[cls];
+        }
+        stage_class_slots_ = per_class;
+        GGML_LOG_INFO("expert cache: VRAM staging of early-route layers: %d slots x %zu layers = %.1f MiB taken from the "
+                      "static VRAM capacity\n", stage_slots_, stage_layer_.size(), double(bytes)/(1024.0*1024.0));
+        return true;
+    }
+
+    // After the arena exists, before any graph capture.
+    void allocate_stage_locked() {
+        if (stage_layer_.empty() || !l1_) {
+            return;
+        }
+        std::vector<int> next(geo_.class_bytes.size(), 0);
+        for (int l : stage_layer_) {
+            const int cls = geo_.layer_class[l];
+            stage_first_[(size_t) l] = l1_->stage_base(cls) + next[(size_t) cls];
+            next[(size_t) cls] += stage_slots_;
+        }
+        const size_t n = stage_layer_.size();
+        if (cudaMalloc((void **) &stage_dev_, n*sizeof(stage_state)) != cudaSuccess) {
+            (void) cudaGetLastError();
+            stage_dev_ = nullptr;
+            GGML_LOG_WARN("expert cache: VRAM staging state allocation failed; staging off (its slots stay unused)\n");
+            hash_mode_.vram = false;
+            return;
+        }
+        CUDA_CHECK(cudaMemset(stage_dev_, 0, n*sizeof(stage_state)));
+        CUDA_CHECK(cudaStreamCreateWithFlags(&stage_stream_, cudaStreamNonBlocking));
+        CUDA_CHECK(cudaEventCreateWithFlags(&stage_event_, cudaEventDisableTiming));
+        CUDA_CHECK(cudaEventCreateWithFlags(&stage_done_, cudaEventDisableTiming));
+        CUDA_CHECK(cudaDeviceSynchronize());
+        stage_owner_.assign(n, std::vector<int32_t>((size_t) stage_slots_, -1));
+        stage_gen_.assign(n, 0);
+        stage_last_.assign(n, stage_state{});
+        stage_hints_ = stage_issues_ = stage_copies_ = stage_bytes_ = stage_kept_ = stage_over_ = stage_verified_ = 0;
+        stage_us_ = 0.0;
+    }
+
+    void free_stage_locked() {
+        if (stage_stream_ != nullptr) {
+            (void) cudaStreamSynchronize(stage_stream_);
+            (void) cudaStreamDestroy(stage_stream_);
+            stage_stream_ = nullptr;
+        }
+        if (stage_event_ != nullptr) {
+            (void) cudaEventDestroy(stage_event_);
+            stage_event_ = nullptr;
+        }
+        if (stage_done_ != nullptr) {
+            (void) cudaEventDestroy(stage_done_);
+            stage_done_ = nullptr;
+        }
+        if (stage_dev_ != nullptr) {
+            (void) cudaFree(stage_dev_);
+            stage_dev_ = nullptr;
+        }
+        stage_class_slots_.clear();
+        stage_first_.clear();
+        stage_index_.clear();
+        stage_layer_.clear();
+        stage_owner_.clear();
+        stage_gen_.clear();
+        stage_last_.clear();
+    }
+
+    // One hint's VRAM staging (see expert-hash-stage.cuh): the hinted experts of each staged layer
+    // that live in host memory go to the layer's staging slots.
+    void stage_hint_locked(ggml_backend_cuda_context & ctx, const std::vector<std::pair<int, std::vector<int>>> & layers) {
+        const auto t0 = std::chrono::steady_clock::now();
+        ++stage_hints_;
+        struct work {
+            int idx, layer;
+            stage_plan plan;
+        };
+        std::vector<work> works;
+        const std::vector<std::vector<int32_t>> & vram = l1_->host_slots();
+        const expert_locations & homes = l1_->locations();
+        for (const auto & l : layers) {
+            const int idx = stage_index_[(size_t) l.first];
+            if (idx < 0) {
+                continue;
+            }
+            std::vector<int> wanted;
+            for (int e : l.second) {
+                if (vram[(size_t) l.first][(size_t) e] < 0 && (size_t) l.first < homes.size() &&
+                        homes[(size_t) l.first][(size_t) e].storage == expert_storage::host) {
+                    wanted.push_back(e);
+                }
+            }
+            stage_plan plan = plan_stage(stage_owner_[(size_t) idx], wanted);
+            stage_over_ += (uint64_t) plan.over;
+            stage_kept_ += (uint64_t) plan.keeps.size();
+            if (!plan.changed()) {
+                continue;
+            }
+            works.push_back({idx, l.first, std::move(plan)});
+        }
+        if (works.empty()) {
+            return;
+        }
+        ggml_cuda_set_device(device_);
+        const cudaStream_t cs = ctx.stream();
+        stage_targets targets;
+        for (const work & w : works) {
+            targets.index[targets.n] = w.idx;
+            targets.value[targets.n] = ++stage_gen_[(size_t) w.idx];
+            ++targets.n;
+        }
+        const ggml_cuda_kernel_launch_params one(dim3(1), dim3(stage_max_list), 0, cs);
+        ggml_cuda_kernel_launch(stage_target_kernel, one, stage_dev_, targets);
+        // nothing below may start before every graph launched so far has finished with the slots
+        CUDA_CHECK(cudaEventRecord(stage_event_, cs));
+        CUDA_CHECK(cudaStreamWaitEvent(stage_stream_, stage_event_, 0));
+        const ggml_cuda_kernel_launch_params side(dim3(1), dim3(stage_max_list), 0, stage_stream_);
+        for (size_t i = 0; i < works.size(); ++i) {
+            const work & w = works[i];
+            const int cls = geo_.layer_class[w.layer];
+            const int first = stage_first_[(size_t) w.layer];
+            int32_t * table = const_cast<int32_t *>(l1_->lookup(w.layer, 0).slots);
+            if (!w.plan.clears.empty()) {
+                stage_list clears;
+                for (const auto & c : w.plan.clears) {
+                    clears.expert[clears.n] = c.first;
+                    clears.slot[clears.n]   = first + c.second;
+                    ++clears.n;
+                }
+                ggml_cuda_kernel_launch(stage_clear_kernel, side, table, clears);
+            }
+            for (const auto & c : w.plan.copies) {
+                for (int kind = 0; kind < geometry::n_kinds; ++kind) {
+                    const void * src = l1_->host_address(w.layer, kind, c.first);
+                    GGML_ASSERT(src != nullptr);
+                    const size_t bytes = geo_.class_bytes[(size_t) cls][kind];
+                    CUDA_CHECK(cudaMemcpyAsync(l1_->gpu_slice_address(cls, kind, first + c.second), src, bytes,
+                        cudaMemcpyHostToDevice, stage_stream_));
+                    stage_bytes_ += bytes;
+                }
+            }
+            stage_copies_ += (uint64_t) w.plan.copies.size();
+            stage_list sets;
+            for (const auto & c : w.plan.keeps) {
+                sets.expert[sets.n] = c.first;
+                sets.slot[sets.n]   = first + c.second;
+                ++sets.n;
+            }
+            for (const auto & c : w.plan.copies) {
+                sets.expert[sets.n] = c.first;
+                sets.slot[sets.n]   = first + c.second;
+                ++sets.n;
+            }
+            ggml_cuda_kernel_launch(stage_publish_kernel, side, table, sets, stage_dev_ + w.idx, targets.value[i]);
+        }
+        // A submit point for the side stream: without it the runtime may hold the queued commands on
+        // the host while the graph's wait kernel spins for them (seen in the fixture as a hang).
+        CUDA_CHECK(cudaEventRecord(stage_done_, stage_stream_));
+        ++stage_issues_;
+        if (verify_all_) {
+            verify_stage_locked();
+        }
+        stage_us_ += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
+    }
+
+    // RANMA_EXPERT_VERIFY: after the staging is done, every staging slot the table names holds exactly
+    // its expert's host bytes, and the table names every slot the host believes it does.
+    void verify_stage_locked() {
+        CUDA_CHECK(cudaStreamSynchronize(stage_stream_));
+        std::vector<char> back;
+        for (size_t idx = 0; idx < stage_layer_.size(); ++idx) {
+            const int layer = stage_layer_[idx];
+            const int cls = geo_.layer_class[layer];
+            std::vector<int32_t> table((size_t) geo_.n_experts);
+            CUDA_CHECK(cudaMemcpy(table.data(), l1_->lookup(layer, 0).slots, table.size()*sizeof(int32_t), cudaMemcpyDeviceToHost));
+            std::string why;
+            if (!stage_table_check(stage_owner_[idx], table, stage_first_[(size_t) layer], why)) {
+                GGML_ABORT("expert cache: VRAM staging of layer %d: %s", layer, why.c_str());
+            }
+            for (int k = 0; k < stage_slots_; ++k) {
+                const int e = stage_owner_[idx][(size_t) k];
+                const int slot = stage_first_[(size_t) layer] + k;
+                if (e < 0) {
+                    continue;
+                }
+                for (int kind = 0; kind < geometry::n_kinds; ++kind) {
+                    const size_t bytes = geo_.class_bytes[(size_t) cls][kind];
+                    back.resize(bytes);
+                    CUDA_CHECK(cudaMemcpy(back.data(), l1_->gpu_slice_address(cls, kind, slot), bytes, cudaMemcpyDeviceToHost));
+                    if (memcmp(back.data(), l1_->host_address(layer, kind, e), bytes) != 0) {
+                        GGML_ABORT("expert cache: VRAM staging of layer %d expert %d kind %d differs from its host bytes", layer, e, kind);
+                    }
+                    ++stage_verified_;
+                }
+            }
+        }
+    }
+
+    // Per generation bank commit, for a model that declares early-route layers (also with the switch
+    // off, for the comparison): the decode wait of those layers and the early read counters, cumulative.
+    void log_early_counters_locked(const std::string & label) {
+        const l2_counters c = tier_->counters_snapshot();
+        const double khz = tier_->steady_khz() > 0 ? tier_->steady_khz() : 1.0;
+        GGML_LOG_INFO("expert_metrics {\"kind\":\"hash_early\",\"bank\":\"%s\",\"mode\":\"%s\",\"decode_tokens\":%llu,"
+                      "\"decode_wait_ms\":%.3f,\"early_layer_decode_wait_ms\":%.3f,\"early_layer_samples\":%llu,"
+                      "\"reads\":%llu,\"ssd_bytes\":%llu,\"ring_hits\":%llu,\"early_jobs\":%llu,\"early_layers\":%llu,"
+                      "\"early_late\":%llu,\"early_reads\":%llu,\"early_bytes\":%llu,\"early_already\":%llu,"
+                      "\"early_hits\":%llu,\"early_unused\":%llu,\"early_lost\":%llu,\"early_inline\":%llu,\"verify_bad\":%llu}\n",
+            label.c_str(), hash_early_name(hash_mode_), (unsigned long long) c.decode_tokens,
+            double(c.decode_wait_ticks)/khz, double(c.early_layer_wait_ticks)/khz, (unsigned long long) c.early_layer_samples,
+            (unsigned long long) c.ssd_reads, (unsigned long long) c.ssd_bytes, (unsigned long long) c.ring_hits,
+            (unsigned long long) c.early_jobs, (unsigned long long) c.early_layers, (unsigned long long) c.early_late,
+            (unsigned long long) c.early_reads, (unsigned long long) c.early_bytes, (unsigned long long) c.early_already,
+            (unsigned long long) c.early_hits, (unsigned long long) c.early_unused, (unsigned long long) c.early_lost,
+            (unsigned long long) c.early_inline, (unsigned long long) c.verify_bad);
+    }
+
+    // Per bank commit (the device is synchronized): the staging counters since the last commit.
+    void log_stage_counters_locked(const std::string & label) {
+        std::vector<stage_state> now(stage_layer_.size());
+        CUDA_CHECK(cudaMemcpy(now.data(), stage_dev_, now.size()*sizeof(stage_state), cudaMemcpyDeviceToHost));
+        std::string layers;
+        for (size_t i = 0; i < now.size(); ++i) {
+            const stage_state & a = now[i];
+            const stage_state & b = stage_last_[i];
+            layers += std::string(i ? "," : "") + "{\"layer\":" + std::to_string(stage_layer_[i]) +
+                ",\"hits\":" + std::to_string(a.hits - b.hits) + ",\"host\":" + std::to_string(a.host - b.host) +
+                ",\"waits\":" + std::to_string(a.waits - b.waits) + ",\"launches\":" + std::to_string(a.launches - b.launches) + "}";
+        }
+        GGML_LOG_INFO("expert_metrics {\"kind\":\"hash_stage\",\"bank\":\"%s\",\"slots\":%d,\"hints\":%llu,\"issues\":%llu,"
+                      "\"copies\":%llu,\"bytes\":%llu,\"kept\":%llu,\"over\":%llu,\"verified\":%llu,\"host_us\":%.1f,\"layers\":[%s]}\n",
+            label.c_str(), stage_slots_, (unsigned long long) stage_hints_, (unsigned long long) stage_issues_,
+            (unsigned long long) stage_copies_, (unsigned long long) stage_bytes_, (unsigned long long) stage_kept_,
+            (unsigned long long) stage_over_, (unsigned long long) stage_verified_, stage_us_, layers.c_str());
+        stage_last_ = now;
+    }
+
     // Exclusive: the whole budget is planned and allocated before the loader writes, so that every
     // slice can be written straight to its final home (design section 6).
     // Anything that fails here leaves the cache disabled and the model loading uncached.
@@ -2155,6 +2605,13 @@ private:
             return false;
         }
         capacities_ = initial.capacities;
+        if (carve_stage_locked()) {
+            // the static plan keeps the capacity the staging slots leave it; the host capacities below
+            // count the carved experts too
+            placement_inputs fixed = in;
+            fixed.fixed_capacities = &capacities_;
+            initial = plan_placement(fixed);
+        }
 
         std::vector<int> host_capacities(geo_.class_bytes.size(), 0);
         for (int cls = 0; cls < (int) geo_.class_bytes.size(); ++cls) {
@@ -2187,12 +2644,13 @@ private:
 
         if (!allocate_profiler_locked()) { return false; }
         l1_.reset(new l1_arena(geo_));
-        if (!l1_->allocate(capacities_, device_, cfg_.spare_slots)) {
+        if (!l1_->allocate(capacities_, device_, cfg_.spare_slots, stage_class_slots_.empty() ? nullptr : &stage_class_slots_)) {
             l1_.reset();
             profiler_.reset();
             disable_locked("arena allocation failed");
             return false;
         }
+        allocate_stage_locked();
         host_.reset(new host_arena(geo_));
         if (!host_->allocate(host_capacities, cfg_.spare_slots, device_,
                 tier_ && tier_->class_layout() ? &tier_->storage() : nullptr)) {
@@ -2632,6 +3090,24 @@ private:
     bool verify_all_ = false;
     std::vector<int> capacities_;
     std::unique_ptr<profiler> profiler_;
+    // early routes (expert-hash-early.h)
+    hash_early_mode hash_mode_;                // RANMA_EXPERT_HASH_EARLY
+    std::vector<int32_t> early_decl_;          // the first model's early-route layers (its own indices)
+    int  stage_slots_ = 0;                     // VRAM staging slots per early layer
+    std::vector<int> stage_class_slots_;       // [class] staging slots after the spares; empty = none
+    std::vector<int> stage_first_;             // [joint layer] arena slot of its first staging slot, -1
+    std::vector<int> stage_index_;             // [joint layer] index into stage_dev_, -1
+    std::vector<int> stage_layer_;             // [index] joint layer
+    std::vector<std::vector<int32_t>> stage_owner_;  // [index][slot] the expert a staging slot holds, -1
+    std::vector<uint32_t> stage_gen_;          // [index] the last staging generation issued
+    stage_state * stage_dev_ = nullptr;        // [index] VRAM
+    cudaStream_t  stage_stream_ = nullptr;
+    cudaEvent_t   stage_event_  = nullptr;     // compute stream -> side stream
+    cudaEvent_t   stage_done_   = nullptr;     // recorded after each hint's side-stream work (a submit point)
+    uint64_t stage_hints_ = 0, stage_issues_ = 0, stage_copies_ = 0, stage_bytes_ = 0, stage_kept_ = 0;
+    uint64_t stage_over_ = 0, stage_verified_ = 0;
+    double   stage_us_ = 0.0;                  // host time of the hints that issued staging work
+    std::vector<stage_state> stage_last_;      // [index] device counters at the previous commit
     std::unique_ptr<l1_arena> l1_;
     std::unique_ptr<host_arena> host_;
     std::unique_ptr<l2_tier> tier_;
@@ -2920,6 +3396,10 @@ static bool iface_attach_backend(ggml_backend_t backend, ggml_context * weights)
     return instance().attach_backend(backend, weights);
 }
 
+static bool iface_route_hint(ggml_backend_t backend, const ggml_expert_route_hint * hints, int32_t n_hints) {
+    return instance().route_hint(backend, hints, n_hints);
+}
+
 static const ggml_expert_iface g_expert_iface = {
     /* .abi_version      = */ GGML_EXPERT_ABI_VERSION,
     /* .configure        = */ iface_configure,
@@ -2938,6 +3418,7 @@ static const ggml_expert_iface g_expert_iface = {
     /* .set_backing      = */ iface_set_backing,
     /* .memory           = */ iface_memory,
     /* .attach_backend   = */ iface_attach_backend,
+    /* .route_hint       = */ iface_route_hint,
 };
 
 const ggml_expert_iface * ggml_backend_cuda_expert_iface(void) {
