@@ -651,7 +651,9 @@ inline install_transaction plan_install(const geometry & geo,
         const expert_slot_table & previous_gpu, const expert_locations & previous_host,
         const std::vector<int> & capacities, const install_layout & before, const install_layout & after,
         const std::vector<std::vector<int>> & gpu_spares, mover_capability mover,
-        bool has_file, bool retain = true) {
+        bool has_file, bool retain = true, bool unequal = false) {
+    // `unequal` (exclusive movers only): the exchange need not pair every promotion with a demotion,
+    // and a class may end with fewer VRAM residents than its capacity (see the exchange below).
     install_transaction out;
     auto fail = [&](const char * text) { out.valid = false; out.reason = text; return out; };
     if (!verify_assignment(previous_gpu, previous_host, geo.layer_class, before, gpu_spares,
@@ -687,7 +689,7 @@ inline install_transaction plan_install(const geometry & geo,
     for (size_t c = 0; c < classes; ++c) {
         if (capacities[c] < 0 || after.gpu[c] != before.gpu[c] || capacities[c] > after.gpu[c] ||
                 after.host[c] < 0 || after.lent_begin[c] < 0 || after.lent_count[c] < 0 ||
-                count_g[c] > capacities[c] || (!mover.has_host_master && count_g[c] != capacities[c]) ||
+                count_g[c] > capacities[c] || (!mover.has_host_master && !unequal && count_g[c] != capacities[c]) ||
                 count_h[c] > after.host[c] + after.lent_count[c]) { return fail("selection exceeds capacity"); }
         for (int s = 0; s < after.host[c]; ++s) { pool[c].push_back({expert_storage::host, s}); }
         for (int s = 0; s < after.lent_count[c]; ++s) { pool[c].push_back({expert_storage::lent, after.lent_begin[c] + s}); }
@@ -766,6 +768,44 @@ inline install_transaction plan_install(const geometry & geo,
                 emit(item.first, item.second, 0, out.host[item.first][item.second], {expert_storage::vram, int(slot)});
                 out.gpu_slots[item.first][item.second] = int(slot); gpu_taken[slot++] = true;
             }
+        } else if (unequal) {
+            // Exclusive, unequal exchange: a demotion needs a free host slot (or goes to the file) and
+            // frees its VRAM slot; a promotion needs a free VRAM slot and frees its host source. Each
+            // batch first runs the demotions that find a host destination, then the promotions that
+            // find a free VRAM slot, so the counts of the two sides may differ.
+            std::vector<bool> busy(before.gpu[c], false);
+            for (auto item : outgoing) { busy[previous_gpu[item.first][item.second]] = true; }
+            size_t pi = 0, di = 0;
+            for (int batch = 0; pi < incoming.size() || di < outgoing.size(); ++batch) {
+                bool progress = false;
+                for (; di < outgoing.size(); ++di, progress = true) {
+                    const auto item = outgoing[di];
+                    const int g = previous_gpu[item.first][item.second];
+                    if (want_h[item.first][item.second]) {
+                        if (!fill_host(item.first, item.second, batch, {expert_storage::vram, g})) { break; }
+                    } else if (!has_file) {
+                        return fail("demotion has no destination");
+                    }
+                    busy[g] = false;
+                }
+                size_t slot = 0;
+                for (; pi < incoming.size(); ++pi, progress = true) {
+                    while (slot < gpu_taken.size() && (gpu_taken[slot] || busy[slot])) { ++slot; }
+                    if (slot == gpu_taken.size()) { break; }
+                    const auto item = incoming[pi];
+                    const auto source = previous_host[item.first][item.second];
+                    if (!source.resident() && !has_file) { return fail("promotion has no source"); }
+                    emit(item.first, item.second, batch, source, {expert_storage::vram, int(slot)});
+                    out.gpu_slots[item.first][item.second] = int(slot); gpu_taken[slot] = true;
+                    release_source(item.first, item.second);
+                }
+                if (!progress) { return fail("exclusive exchange has no free slot"); }
+            }
+            out.gpu_spares[c].clear();
+            for (size_t s = 0; s < gpu_taken.size() && out.gpu_spares[c].size() < size_t(mover.spare_slots); ++s) {
+                if (!gpu_taken[s] && !busy[s]) { out.gpu_spares[c].push_back(int(s)); }
+            }
+            if (out.gpu_spares[c].size() != size_t(mover.spare_slots)) { return fail("exclusive exchange leaves no spare slot"); }
         } else {
             if (incoming.size() != outgoing.size() || (!incoming.empty() &&
                     (mover.spare_slots == 0 || gpu_spares[c].size() < size_t(mover.spare_slots)))) {
