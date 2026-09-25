@@ -52,6 +52,9 @@ struct l2_config {
     // kind's slices while the next kind is still being read. 0 = one wait per layer for everything.
     int64_t staged_min_rows   = 0;
     bool    staged_drain      = false;   // complete every read of a kind before issuing the next kind
+    // Early reads (RANMA_EXPERT_HASH_EARLY ssd|both): the demand of a layer whose route is known before
+    // its generation (post_early) is read into the ring by the worker as soon as it is posted.
+    bool    early             = false;
 };
 
 // Whether the staged service is on when RANMA_EXPERT_L2_STAGED is not set. On, it covers the
@@ -78,6 +81,22 @@ struct l2_counters {
     uint64_t verify_bad    = 0;
     uint64_t owner_checks  = 0;
     uint64_t staged_generations = 0, staged_wait_ticks = 0;
+    // Early reads (post_early). Hinted layers served early / skipped because the layer's generation was
+    // already published; slices read and their bytes (also in ssd_reads / ssd_bytes); hinted experts
+    // already in the ring; experts read early that the layer's next service found in the ring (not in
+    // ring_hits), that it did not demand, or that were evicted before it; generations served while an
+    // early batch was still reading; the decode wait of the declared early layers (in every mode).
+    uint64_t early_jobs = 0, early_layers = 0, early_late = 0, early_reads = 0, early_bytes = 0;
+    uint64_t early_already = 0, early_hits = 0, early_unused = 0, early_lost = 0, early_inline = 0;
+    uint64_t early_layer_wait_ticks = 0, early_layer_samples = 0;
+};
+
+// One posted early demand: per layer the hinted expert ids and the layer's published counter when
+// the hint was made (a layer that published since then is already being served).
+struct l2_early_layer {
+    int layer = -1;
+    uint32_t published = 0;
+    std::vector<int> ids;
 };
 
 // One relabel install (class layout). Slices are (layer, expert) pairs, bytes all three kinds.
@@ -195,11 +214,29 @@ public:
     void wait_kind(int layer, int kind, cudaStream_t stream);
     void mark_done(int layer, cudaStream_t stream);
 
+    // ---- early reads -------------------------------------------------------------------------------
+    // The layers whose route the model declares known before the graph (their decode waits are
+    // counted separately in every mode).
+    void set_early_layers(const std::vector<uint8_t> & layers);
+    bool early() const { return cfg_.early; }
+    // Posts the demand of hinted layers; the worker reads their file-tier experts into the ring before
+    // it would have to, and serves them as hits when the generations arrive. Replaces a posted demand
+    // the worker has not taken yet, or joins it when it is for the same generations. Never blocks on I/O.
+    void post_early(std::vector<l2_early_layer> layers);
+    // The published counter of a layer as the host sees it now.
+    uint32_t published(int layer) const;
+
     void start_worker();
     void stop_worker();
     bool worker_running() const { return running_.load(std::memory_order_relaxed); }
 
     const l2_counters & counters() const { return counters_; }
+    // A consistent copy while the worker runs (taken between two services).
+    l2_counters counters_snapshot() {
+        std::lock_guard<std::mutex> lock(io_mutex_);
+        return counters_;
+    }
+    double steady_khz() const { return steady_khz_; }
     void report(const char * what);
     void set_phase(bool prompt) { phase_.store(prompt ? 0 : 1); }
     double wait_ms() const { return steady_khz_ > 0 ? double(counters_.steady_ticks)/steady_khz_ : 0; }
@@ -246,7 +283,18 @@ private:
     // rest are still in flight.
     bool   run_reads(const std::vector<l2_read> & reads, std::string & reason, bool install = false,
                      const std::function<bool(size_t)> & progress = nullptr);
-    void   worker_loop(std::vector<uint32_t> seen);
+    void   worker_loop();
+    // The worker's handling of a published generation of `layer` (under io_mutex_).
+    void   handle_publish(int layer, uint32_t seq);
+    void   serve_early(std::vector<l2_early_layer> job);
+    // While an early batch reads: serves the published generations that need no read, except those
+    // of layers whose early reads are still in flight (`busy`).
+    void   serve_ready(const std::vector<uint8_t> & busy);
+    bool   early_marked(int layer, int expert) const {
+        return !early_mark_.empty() && early_mark_[(size_t) layer*(size_t) geo_.n_experts + (size_t) expert] != 0;
+    }
+    void   early_evicted(int layer, int expert);
+    void   early_clear_all();
     void   collect_wait(int layer);
     void   collect_stage(int layer);
     void   report_counters(const char * what);
@@ -320,6 +368,15 @@ private:
     std::vector<uint32_t> wait_seen_;
     std::vector<uint8_t>  staged_layer_;   // compute thread: the last route of the layer was staged
     std::vector<uint32_t> stage_seen_;     // worker: the stage wait ticks of each layer already counted
+    std::vector<uint32_t> seen_;           // worker: the last published generation handled per layer
+    // early reads
+    std::vector<uint8_t> early_layer_;     // [layer] declared early layer
+    std::vector<uint8_t> early_mark_;      // [layer*n_experts + expert] read early, not yet served (io_mutex_)
+    std::vector<std::vector<int>> early_list_;   // [layer] the marked experts (io_mutex_)
+    std::mutex early_mutex_;               // guards early_job_
+    std::vector<l2_early_layer> early_job_;
+    std::atomic<bool> early_pending_{ false };
+    bool early_warned_ = false;
 };
 
 } // namespace ggml_cuda_expert
