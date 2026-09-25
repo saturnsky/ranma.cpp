@@ -287,8 +287,12 @@ public:
 
     // The demand of one layer, served from the ring of its storage class. `homed(layer, expert)` is
     // true for an expert with a VRAM or host home. The caller may pass duplicates.
-    template <typename Homed>
-    l2_service service(int layer, const std::vector<int> & ids, uint32_t seq, Homed homed) {
+    // `quiet(layer, expert)`: a hit on that expert was filled by an early read for this demand; it
+    // counts in early_hits instead of hits. `early`: the early service (expert-l2-ledger.h,
+    // l2_no_quiet): hits keep their lease, misses take `seq`, the layer's done counter.
+    template <typename Homed, typename Quiet = l2_no_quiet>
+    l2_service service(int layer, const std::vector<int> & ids, uint32_t seq, Homed homed, Quiet quiet = Quiet(),
+            bool early = false) {
         l2_service out;
         const int s = layer >= 0 && layer < layers_ ? storage_of(layer) : -1;
         if (s < 0) {
@@ -322,8 +326,10 @@ public:
             }
             int slot = map_[(size_t) layer][(size_t) expert];
             if (slot >= 0) {
-                ++out.hits;
-                owners_[(size_t) s][(size_t) slot].seq = seq;   // extend the lease to this generation
+                ++(quiet(layer, expert) ? out.early_hits : out.hits);
+                if (!early) {
+                    owners_[(size_t) s][(size_t) slot].seq = seq;   // extend the lease to this generation
+                }
                 touch(s, slot);
                 continue;
             }

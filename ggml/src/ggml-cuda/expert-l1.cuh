@@ -68,7 +68,12 @@ public:
 
     // Exactly once. capacities[class] slots per class, plus `spare_slots` free slots per class that
     // the exclusive exchange rotates through (0 for inclusive mode); the tables start empty (-1).
-    bool allocate(const std::vector<int> & capacities, int device, int spare_slots = 0);
+    // `stage_slots[class]` more slots follow the spares: the VRAM staging of early-route layers
+    // (expert-hash-stage.cuh). No plan, install or slot count below ever includes them.
+    bool allocate(const std::vector<int> & capacities, int device, int spare_slots = 0,
+                  const std::vector<int> * stage_slots = nullptr);
+    // The first staging slot of a class (after the static capacity and the spares).
+    int stage_base(int cls) const { return capacities_[(size_t) cls] + spare_slots_; }
     bool allocated() const { return !layer_slots_.empty(); }
 
     // Exclusive mode and every finite tier: this arena and `host` together own the routed expert
