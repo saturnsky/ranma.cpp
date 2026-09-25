@@ -319,6 +319,12 @@ bool l1_arena::publish_tables(const std::vector<std::vector<int32_t>> & slots) {
 }
 
 
+std::vector<int> l1_arena::slot_counts() const {
+    std::vector<int> out = capacities_;
+    for (int & n : out) { n += spare_slots_; }
+    return out;
+}
+
 l1_transaction l1_arena::stage(const expert_slot_table & selected, bool retain) const {
     l1_transaction tx;
     if (!allocated() || selected.size() != size_t(geo_.n_layers)) { return tx; }
