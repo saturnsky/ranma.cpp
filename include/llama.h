@@ -1069,6 +1069,11 @@ extern "C" {
     // any other seq_id < 0 or GGML_EXPERT_BANK_NONE records nothing
 #define LLAMA_EXPERT_ALL_ROWS (-2)
     LLAMA_API void llama_expert_set_profiled_seq(struct llama_context * ctx, llama_seq_id seq_id, ggml_expert_bank_id bank);
+    // The next decode of this context will process these input tokens (one row each). For the
+    // layers the model routes by token id, the selected experts follow from the tokens alone, and
+    // the cache may start fetching them now. Cheap, never waits for the device; a wrong guess only
+    // costs the fetch. llama_decode also does this itself for every small token ubatch.
+    LLAMA_API void llama_expert_route_hint(struct llama_context * ctx, const llama_token * tokens, int32_t n_tokens);
 
     // Token logits obtained from the last call to llama_decode()
     // The logits for which llama_batch.logits[i] != 0 are stored contiguously

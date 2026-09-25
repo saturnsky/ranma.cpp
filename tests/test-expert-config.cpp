@@ -104,6 +104,12 @@ int main() {
     CHECK(cfg.random_seed == 73 && cfg.l2_worker_cpu == 2 && cfg.l2_prefill_rows == 128);
     p.n_ubatch = 0; p.n_batch = 1024;
     CHECK(expert_config_from_params(p).l2_prefill_rows == 1024);
+    // ABI 7: the model loader's token-routed layers; none unless the loader declares them
+    {
+        const auto rc = expert_config_from_params(p);
+        CHECK(rc.abi_version == GGML_EXPERT_ABI_VERSION && rc.abi_version == 7 && rc.early_route_layers == nullptr &&
+              rc.n_early_route_layers == 0);
+    }
     bench_expert_options o; o.supplied = true;
     auto off = o.config();
     CHECK(off.l1_bytes == 0 && off.policy == GGML_EXPERT_POLICY_OFF && off.profile_dir[0] == 0 && off.spare_slots == 0);
