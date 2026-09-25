@@ -8,7 +8,9 @@
 using namespace ggml_cuda_expert;
 #define CHECK(x) do { if (!(x)) { fprintf(stderr, "FAIL line %d: %s\n", __LINE__, #x); return 1; } } while (0)
 
-static int replay(bool inclusive, bool finite) {
+// `unequal` (exclusive only): the unequal exchange, with one VRAM resident fewer than the capacity in
+// every other round and class, so promotions and demotions do not pair up.
+static int replay(bool inclusive, bool finite, bool unequal = false) {
     geometry geo;
     geo.n_layers = 5; geo.n_experts = 8;
     geo.layer_class = {-1, 0, 1, 0, 1}; geo.class_layers = {2, 2};
@@ -43,15 +45,16 @@ static int replay(bool inclusive, bool finite) {
         expert_slot_table gs(5), hs(5);
         for (int c = 0; c < 2; ++c) {
             int selected_h = 0;
-            const int nh = finite ? next.host[c] + next.lent_count[c] - 1 : 16 - (inclusive ? 0 : caps[c]);
+            const int n_g = unequal ? caps[c] - (round + c)%2 : caps[c];
+            const int nh = finite ? next.host[c] + next.lent_count[c] - 1 : 16 - (inclusive ? 0 : n_g);
             for (int i = 0; i < 16; ++i) {
                 const int id = (i + round*5 + c*3)%16;
                 const int l = 1 + c + 2*(id/8), e = id%8;
-                if (i < caps[c]) { gs[l].push_back(e); }
-                if ((inclusive || i >= caps[c]) && selected_h++ < nh) { hs[l].push_back(e); }
+                if (i < n_g) { gs[l].push_back(e); }
+                if ((inclusive || i >= n_g) && selected_h++ < nh) { hs[l].push_back(e); }
             }
         }
-        const auto tx = plan_install(geo, gs, hs, gpu, host, caps, layout, next, spares, mover, finite);
+        const auto tx = plan_install(geo, gs, hs, gpu, host, caps, layout, next, spares, mover, finite, true, unequal);
         if (!tx.valid) { fprintf(stderr, "round %d inclusive %d finite %d: %s\n", round, inclusive, finite, tx.reason.c_str()); }
         CHECK(tx.valid);
         for (const auto & m : tx.moves) {
@@ -106,13 +109,15 @@ static int replay(bool inclusive, bool finite) {
     }
     CHECK(inclusive ? d2h == 0 : d2h > 0);
     CHECK(finite ? ssd > 0 && lent_reads > 0 && lent_writes > 0 : ssd == 0 && lent_reads == 0 && lent_writes == 0);
-    printf("PASS: %s %s, 40 ordered payload replays and rejected invariant violations\n", inclusive ? "inclusive" : "exclusive", finite ? "three-tier/grow/shrink" : "two-tier");
+    printf("PASS: %s %s%s, 40 ordered payload replays and rejected invariant violations\n", inclusive ? "inclusive" : "exclusive",
+        finite ? "three-tier/grow/shrink" : "two-tier", unequal ? ", unequal exchange" : "");
     return 0;
 }
 
 int main() {
     CHECK(replay(true, false) == 0); CHECK(replay(false, false) == 0);
     CHECK(replay(true, true) == 0); CHECK(replay(false, true) == 0);
+    CHECK(replay(false, false, true) == 0); CHECK(replay(false, true, true) == 0);
     for (int bits = 0; bits < 16; ++bits) {
         CHECK(plan_uses_prompt_ring(bits&1, bits&2, bits&4, bits&8) == !((bits&1) && (bits&2) && (bits&4) && !(bits&8)));
     }
