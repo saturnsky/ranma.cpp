@@ -23,7 +23,7 @@
 extern "C" {
 #endif
 
-#define GGML_EXPERT_ABI_VERSION      6
+#define GGML_EXPERT_ABI_VERSION      7
 #define GGML_EXPERT_IFACE_PROC_NAME  "ggml_backend_expert_iface"
 
 #define GGML_EXPERT_BANK_NONE        0xFFFFFFFFu
@@ -90,6 +90,24 @@ struct ggml_expert_config {
     uint32_t     n_join;              // number of models that join after this one (first config only)
     const char * const * join_paths;  // [n_join] first GGUF file of each; splits follow split.count
     const float * join_weights;       // [n_join] multipliers, NULL = 1 each
+
+
+    // Layers of this model whose router selection is a pure function of the input token id, so the
+    // caller can name the selected experts before the graph is computed (route_hint). Declared by
+    // the model loader; only the first model's declaration is used. The environment variable
+    // RANMA_EXPERT_HASH_EARLY (0, ssd, vram or both) decides what the cache does with the hints.
+    const int32_t * early_route_layers; // [n_early_route_layers] the model's own layer indices
+    uint32_t n_early_route_layers;
+};
+
+// The experts one layer of the next graph will select, known before the graph is built. `ids`
+// holds n_ids expert ids (all rows of the ubatch, duplicates allowed); `layer` is the model's own
+// layer index. `rows` is the row count of the ubatch the hint is for.
+struct ggml_expert_route_hint {
+    int32_t         layer;
+    int32_t         rows;
+    int32_t         n_ids;
+    const int32_t * ids;
 };
 
 // Numbers only; the caller attaches them to the record a bank commit writes.
@@ -155,6 +173,12 @@ struct ggml_expert_iface {
     // selections of its graphs are counted for that model only; selections of a backend that was
     // never attached are not profiled. Call once per context, before its first compute.
     bool (*attach_backend)(ggml_backend_t backend, struct ggml_context * weights);
+
+    // The experts of layers declared in early_route_layers that the next graph computed on
+    // `backend` will select. Called before the graph is built or launched, and only then; it never
+    // waits for the device. Returns false when the cache does not use hints for this model (the
+    // caller may stop computing them); true otherwise, whether or not this hint was used.
+    bool (*route_hint)(ggml_backend_t backend, const struct ggml_expert_route_hint * hints, int32_t n_hints);
 };
 
 typedef const struct ggml_expert_iface * (*ggml_backend_expert_iface_t)(void);
