@@ -8,6 +8,7 @@
 #include "expert-geometry.h"
 #include "expert-l2-class-ledger.h"
 #include "expert-l2-ledger.h"
+#include "expert-l2-relabel.h"
 #include "expert-location.h"
 #include "expert-os.h"
 #include "expert-storage.h"
@@ -24,6 +25,8 @@
 #include <vector>
 
 namespace ggml_cuda_expert {
+
+class l1_arena;
 
 struct l2_config {
     size_t prefill_ring_bytes = 0;   // 0 = automatic
@@ -64,6 +67,7 @@ struct l2_counters {
     uint64_t ssd_reads     = 0;
     uint64_t ring_hits     = 0;
     uint64_t install_ssd_bytes = 0, install_ssd_reads = 0;
+    uint64_t install_relabel_bytes = 0, install_ring_copy_bytes = 0;   // install moves from the file served by the ring
     uint64_t wait_ticks = 0, steady_ticks = 0, measured_layers = 0;
     uint64_t distinct = 0, vram_bytes = 0, host_bytes = 0, file_bytes = 0;
     uint64_t prompt_ubatches = 0, decode_ubatches = 0, decode_tokens = 0;
@@ -74,6 +78,16 @@ struct l2_counters {
     uint64_t verify_bad    = 0;
     uint64_t owner_checks  = 0;
     uint64_t staged_generations = 0, staged_wait_ticks = 0;
+};
+
+// One relabel install (class layout). Slices are (layer, expert) pairs, bytes all three kinds.
+struct l2_install_stats {
+    size_t relabel_slices = 0, relabel_bytes = 0;       // host promotions that took the ring slot holding them
+    size_t ring_copy_slices = 0, ring_copy_bytes = 0;   // VRAM promotions copied from a ring occupant
+    size_t read_slices = 0, read_bytes = 0;             // moves from the file that were read
+    size_t demoted = 0;                                 // residents that stayed in their slot as ring occupants
+    size_t ring_before = 0, ring_kept = 0, ring_after = 0;   // ring occupants before, of those still there, after
+    int    batches = 0;
 };
 
 // Class arena addresses. Lent residents use the common location map. With the class layout the
@@ -127,8 +141,10 @@ public:
     bool wanted(int layer, int expert) const;
 
     // ---- plans -----------------------------------------------------------------------------------
+    // `keep_ring`: the install transaction already relabeled the slots (class layout); the ledger
+    // must match `host` and the rings keep their contents. Otherwise the rings start empty.
     void set_homes(const std::vector<std::vector<int32_t>> & vram,
-                   const expert_locations & host, const l2_host_geometry & host_geo);
+                   const expert_locations & host, const l2_host_geometry & host_geo, bool keep_ring = false);
     // The ring class that travels with an installed plan. Returns true when the size changed.
     bool set_prompt_ring(bool prompt);
     int  ring_count() const { return class_layout() ? cledger_.ring_total() : ledger_.ring_count(); }
@@ -155,6 +171,13 @@ public:
     // The common active prefix is never a lent source or destination. Install discards its tags.
     // With the class layout a batch takes at most one ring slot per move from each class ring.
     int install_read_slots() const;
+    // Class layout: installs run through install_relabel.
+    bool relabel_installs() const { return class_layout(); }
+    // Runs the moves of `tx` (host locations `before` -> tx.host) by relabeling slots: reads only the
+    // file promotions the rings do not hold, straight into their final slot, copies to and from VRAM
+    // through `l1`. The worker must be stopped and the device idle. Publish with set_homes(..., true).
+    bool install_relabel(const install_transaction & tx, const expert_locations & before, l1_arena & l1,
+                         l2_install_stats & stats, std::string & reason);
     // Reads a batch of install slices. With the class layout a `direct` read goes straight into its
     // host resident slot, every other read into a ring slot of its storage class that this picks,
     // and `slot` comes back as the storage slot read into.
@@ -275,6 +298,7 @@ private:
     l2_ledger ledger_;
     class_storage   storage_;   // class layout only
     l2_class_ledger cledger_;   // class layout only
+    std::vector<std::vector<int>> home_slot_;   // class layout: [size class][host slot] storage slot
     std::mutex io_mutex_;
     std::unique_ptr<expert_os::read_queue> queue_;
     std::vector<std::unique_ptr<std::ifstream>> verify_files_;
