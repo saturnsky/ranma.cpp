@@ -301,9 +301,12 @@ bool l2_tier::allocate(int device) {
         }
         for (int s = 0; s < storage_.storages(); ++s) { slots.push_back(storage_.slots(s)); }
         cledger_.reset(geo_.n_layers, geo_.n_experts, layer_storage, slots, geometry::n_kinds);
+        // Host slot i of a size class starts in its resident range; relabel installs remap it.
+        home_slot_.assign(geo_.class_bytes.size(), {});
         for (int c = 0; c < (int) geo_.class_bytes.size(); ++c) {
             for (int i = 0; i < storage_.resident_slots[c]; ++i) {
-                GGML_ASSERT(cledger_.set_resident(storage_.storage_of[c], storage_.resident_slot(c, i), -1, -1));
+                home_slot_[c].push_back(storage_.resident_slot(c, i));
+                GGML_ASSERT(cledger_.set_resident(storage_.storage_of[c], home_slot_[c][i], -1, -1));
             }
         }
         for (int s = 0; s < storage_.storages(); ++s) {
@@ -317,10 +320,13 @@ bool l2_tier::allocate(int device) {
                 storage_.ring_base[s], storage_.ring_slots[s],
                 size_t(storage_.ring_slots[s])*storage_.stride(s)/(1024*1024), storage_.floor[s]);
         }
+        char factor[48];
+        if (storage_.factor > 0.0) { snprintf(factor, sizeof(factor), "ring factor %g", storage_.factor); }
+        else { snprintf(factor, sizeof(factor), "explicit ring size"); }
         GGML_LOG_INFO("expert cache: SSD tier class layout: ring %d slots (%zu MiB) in the host arenas, least recently "
-                      "used per storage class, ring factor %g, metadata and bounce %zu KiB, queue depth %d\n",
-            cledger_.ring_total(), storage_.ring_bytes()/(1024*1024), cfg_.ring_factor, metadata_bytes()/1024,
-            cfg_.queue_depth);
+                      "used per storage class, %s, installs relabel slots and keep the rings, metadata and bounce %zu KiB, queue depth %d\n",
+            cledger_.ring_total(), storage_.ring_bytes()/(1024*1024), factor,
+            metadata_bytes()/1024, cfg_.queue_depth);
     } else {
         ledger_.reset(geo_.n_layers, geo_.n_experts, prompt_slots_, prompt_slots_, geometry::n_kinds);
         GGML_LOG_INFO("expert cache: SSD tier ring %d slots (%zu MiB, prompt) / %d slots (%zu MiB, decode), "
@@ -514,12 +520,29 @@ void l2_tier::publish_tables() {
 }
 
 void l2_tier::set_homes(const std::vector<std::vector<int32_t>> & vram,
-        const expert_locations & host, const l2_host_geometry & host_geo) {
+        const expert_locations & host, const l2_host_geometry & host_geo, bool keep_ring) {
     std::lock_guard<std::mutex> lock(io_mutex_);
     vram_ = vram;
     homes_ = host;
     host_geo_ = host_geo;
-    if (class_layout()) {
+    if (class_layout() && keep_ring) {
+        // install_relabel already made the resident slots match the plan
+        GGML_ASSERT(relabel_installs());
+        for (int layer = 0; layer < geo_.n_layers && layer < (int) homes_.size(); ++layer) {
+            const int cls = geo_.layer_class[layer];
+            if (cls < 0) { continue; }
+            for (int expert = 0; expert < geo_.n_experts; ++expert) {
+                const expert_location at = homes_[layer][expert];
+                if (at.storage == expert_storage::file) { continue; }
+                GGML_ASSERT(at.storage == expert_storage::host && at.slot >= 0 && at.slot < storage_.resident_slots[cls]);
+                const int s = storage_.storage_of[cls], slot = home_slot_[cls][at.slot];
+                int l = -1, e = -1;
+                if (cledger_.role_of(s, slot) != slot_role::resident || !cledger_.occupant(s, slot, l, e) || l != layer || e != expert) {
+                    GGML_ABORT("expert cache: the SSD tier's slot of layer %d expert %d does not hold it after the install", layer, expert);
+                }
+            }
+        }
+    } else if (class_layout()) {
         // The resident roles mirror the plan; the rings start empty, as with the ring layout.
         cledger_.clear_residents();
         for (int layer = 0; layer < geo_.n_layers && layer < (int) homes_.size(); ++layer) {
@@ -529,7 +552,7 @@ void l2_tier::set_homes(const std::vector<std::vector<int32_t>> & vram,
                 const expert_location at = homes_[layer][expert];
                 if (at.storage == expert_storage::file) { continue; }
                 GGML_ASSERT(at.storage == expert_storage::host && at.slot >= 0 && at.slot < storage_.resident_slots[cls]);
-                GGML_ASSERT(cledger_.set_resident(storage_.storage_of[cls], storage_.resident_slot(cls, at.slot), layer, expert));
+                GGML_ASSERT(cledger_.set_resident(storage_.storage_of[cls], home_slot_[cls][at.slot], layer, expert));
             }
         }
         cledger_.discard();
@@ -552,7 +575,7 @@ void * l2_tier::location_address(int layer, int kind, expert_location at, bool d
     if (class_layout()) {
         if (at.storage != expert_storage::host) { return nullptr; }
         GGML_ASSERT(cls >= 0 && at.slot >= 0 && at.slot < storage_.resident_slots[cls]);
-        return static_cast<char *>(storage_slot(layer, kind, storage_.resident_slot(cls, at.slot), device)) +
+        return static_cast<char *>(storage_slot(layer, kind, home_slot_[cls][at.slot], device)) +
             backing_[(size_t) layer][kind].shift;
     }
     if (at.storage == expert_storage::host) {
@@ -619,7 +642,7 @@ bool l2_tier::read_install(std::vector<l2_read> & reads, std::string & reason) {
         GGML_ASSERT(cls >= 0);
         if (read.direct) {
             GGML_ASSERT(read.slot >= 0 && read.slot < storage_.resident_slots[cls]);
-            read.slot = storage_.resident_slot(cls, read.slot);
+            read.slot = home_slot_[cls][read.slot];
             continue;
         }
         int slot = -1;
@@ -638,6 +661,119 @@ bool l2_tier::read_install(std::vector<l2_read> & reads, std::string & reason) {
         read.slot = slot;
     }
     return run_reads(reads, reason, true);
+}
+
+bool l2_tier::install_relabel(const install_transaction & tx, const expert_locations & before, l1_arena & l1,
+        l2_install_stats & stats, std::string & reason) {
+    GGML_ASSERT(relabel_installs() && !worker_running() && mapped_);
+    std::lock_guard<std::mutex> lock(io_mutex_);
+    stats = {};
+    // The device is idle, so every generation it published is done and no ring slot is leased.
+    for (int layer = 0; layer < geo_.n_layers; ++layer) {
+        cledger_.set_done(layer, expert_os::load_acquire(&static_cast<const l2_mailbox *>(mail_host_)[layer].done));
+    }
+    std::vector<std::array<int, 2>> occupants;
+    for (int s = 0; s < storage_.storages(); ++s) {
+        for (int slot : cledger_.order(s)) {
+            int l = -1, e = -1;
+            if (cledger_.occupant(s, slot, l, e)) { occupants.push_back({l, e}); }
+        }
+    }
+    stats.ring_before = occupants.size();
+    const l2_install_plan plan = plan_relabel_install(cledger_, home_slot_, geo_.layer_class, storage_.storage_of,
+        before, tx.host, tx.moves);
+    if (!plan.ok) {
+        reason = plan.reason;
+        return false;
+    }
+    auto payload = [&](int layer, int kind, int slot) {
+        return static_cast<char *>(storage_slot(layer, kind, slot)) + backing_[(size_t) layer][kind].shift;
+    };
+    std::vector<size_t> copied_back;   // moves from VRAM, their tails are cleared once the copies are done
+    for (size_t k = 0; k < tx.moves.size();) {
+        const install_move & m = tx.moves[k];
+        if (m.from.storage == expert_storage::file) {
+            // one read batch: every read goes out together, then the batch's copies to VRAM
+            size_t end = k;
+            std::vector<l2_read> reads;
+            while (end < tx.moves.size() && tx.moves[end].from.storage == expert_storage::file &&
+                    plan.steps[end].batch == plan.steps[k].batch) {
+                const install_move & mv = tx.moves[end];
+                const l2_install_step & step = plan.steps[end];
+                const size_t bytes = geo_.class_total_bytes(mv.cls);
+                if (step.read) {
+                    const int slot = mv.to.storage == expert_storage::host ? step.dst : step.src;
+                    for (int kind = 0; kind < geometry::n_kinds; ++kind) { reads.push_back({mv.layer, kind, mv.expert, slot}); }
+                    ++stats.read_slices; stats.read_bytes += bytes;
+                } else if (step.relabel) {
+                    ++stats.relabel_slices; stats.relabel_bytes += bytes;
+                } else {
+                    ++stats.ring_copy_slices; stats.ring_copy_bytes += bytes;
+                }
+                ++end;
+            }
+            // copies out of these slots, queued by earlier moves, complete before a read lands
+            if (!l1.sync_copies() || !run_reads(reads, reason, true)) {
+                return false;
+            }
+            for (size_t j = k; j < end; ++j) {
+                const install_move & mv = tx.moves[j];
+                const l2_install_step & step = plan.steps[j];
+                for (int kind = 0; kind < geometry::n_kinds; ++kind) {
+                    const int slot = mv.to.storage == expert_storage::host ? step.dst : step.src;
+                    if (verify_ && !step.read && !verify_slice(mv.layer, kind, mv.expert, payload(mv.layer, kind, slot), reason)) {
+                        return false;
+                    }
+                    if (mv.to.storage == expert_storage::vram &&
+                            !l1.write_gpu_slice(mv.cls, kind, mv.to.slot, payload(mv.layer, kind, step.src), false)) {
+                        reason = "a copy to VRAM was refused";
+                        return false;
+                    }
+                }
+            }
+            k = end;
+            continue;
+        }
+        const l2_install_step & step = plan.steps[k];
+        for (int kind = 0; kind < geometry::n_kinds; ++kind) {
+            const bool ok = m.from.storage == expert_storage::host ?
+                l1.write_gpu_slice(m.cls, kind, m.to.slot, payload(m.layer, kind, step.src), false) :
+                l1.read_gpu_slice(m.cls, kind, m.from.slot, payload(m.layer, kind, step.dst));
+            if (!ok) {
+                reason = "a copy between VRAM and the host was refused";
+                return false;
+            }
+        }
+        if (m.from.storage == expert_storage::vram) { copied_back.push_back(k); }
+        ++k;
+    }
+    if (!l1.sync_copies()) {
+        reason = "the copy stream failed";
+        return false;
+    }
+    for (size_t k : copied_back) {
+        const install_move & m = tx.moves[k];
+        const int s = storage_.storage_of[m.cls];
+        for (int kind = 0; kind < geometry::n_kinds; ++kind) {
+            // the slot's previous occupant may have sat at another sector shift
+            const size_t shift = backing_[(size_t) m.layer][kind].shift, bytes = geo_.class_bytes[m.cls][kind];
+            char * data = payload(m.layer, kind, plan.steps[k].dst);
+            memset(data + bytes, 0, storage_.pitch[s][kind] - shift - bytes);
+            if (verify_ && !verify_slice(m.layer, kind, m.expert, data, reason)) {
+                return false;
+            }
+        }
+    }
+    counters_.install_relabel_bytes   += stats.relabel_bytes;
+    counters_.install_ring_copy_bytes += stats.ring_copy_bytes;
+    stats.demoted = plan.demoted;
+    stats.batches = plan.batches;
+    for (const auto & item : occupants) {
+        const int slot = cledger_.slot_of(item[0], item[1]);
+        stats.ring_kept += slot >= 0 && cledger_.owns(slot, item[0], item[1]) ? 1 : 0;
+    }
+    for (int s = 0; s < storage_.storages(); ++s) { stats.ring_after += (size_t) cledger_.ring_occupants(s); }
+    return true;
 }
 
 bool l2_tier::run_reads(const std::vector<l2_read> & reads, std::string & reason, bool install,
@@ -1114,6 +1250,8 @@ void l2_tier::report_counters(const char * what) {
         << ",\"ssd_bytes\":" << counters_.ssd_bytes << ",\"reads\":" << counters_.ssd_reads
         << ",\"ring_hits\":" << counters_.ring_hits << ",\"service_ms\":" << counters_.service_ms
         << ",\"install_ssd_bytes\":" << counters_.install_ssd_bytes << ",\"install_ssd_reads\":" << counters_.install_ssd_reads
+        << ",\"install_relabel_bytes\":" << counters_.install_relabel_bytes
+        << ",\"install_ring_copy_bytes\":" << counters_.install_ring_copy_bytes
         << ",\"verify_fills\":" << counters_.verify_fills << ",\"verify_bytes\":" << counters_.verify_bytes
         << ",\"verify_bad\":" << counters_.verify_bad << ",\"owner_checks\":" << counters_.owner_checks
         << ",\"staged_generations\":" << counters_.staged_generations
