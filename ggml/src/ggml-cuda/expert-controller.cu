@@ -1514,8 +1514,16 @@ private:
             }
         }
         const std::vector<int> floors = ring;
-        const double factor = tier_->ring_factor();
+        // Without a stored profile the floors are the per ubatch bound, already the most one layer
+        // can demand; the factor applies only to floors that come from a seed plan.
+        const bool seeded = !tier_scores_.empty();
+        const double factor = seeded ? tier_->ring_factor() : 1.0;
         std::string note;
+        if (!seeded && tier_->ring_factor() > 1.0 && cfg_.l2_prefill_ring_bytes == 0) {
+            char text[64];
+            snprintf(text, sizeof(text), "%g", tier_->ring_factor());
+            note = std::string("no seed profile: the floors are the per ubatch bound, the ring factor ") + text + " is not applied";
+        }
         const size_t requested = cfg_.l2_prefill_ring_bytes;
         if (requested != 0) {
             require(ring);
@@ -1590,6 +1598,7 @@ private:
         for (size_t c = 0; c < classes; ++c) { residents[c] = host_capacities_base_[c] + cfg_.spare_slots; }
         if (!st.place(residents, ring)) { disable_locked("the SSD tier could not place its storage slots"); return false; }
         st.floor = floors;
+        st.factor = requested != 0 ? 0.0 : factor;
         tier_->set_storage(st);
         if (!tier_->sized()) {
             tier_.reset();
@@ -1847,16 +1856,30 @@ private:
             capacities_, l1_->layout(), layout, l1_->gpu_spares(),
             {cfg_.mode == GGML_EXPERT_MODE_INCLUSIVE, cfg_.spare_slots}, true);
         if (!tx.valid) { abort_locked(("install transaction: " + tx.reason).c_str()); }
-        if (!l1_->execute(tx)) { abort_locked("the install mover refused a move"); }
         std::string reason;
-        for (const auto & move : tx.moves) for (int k = 0; k < geometry::n_kinds; ++k) {
-            tier_->finish_write(move.layer, k, move.to);
+        // Class layout: the moves run as relabels of the storage slots (the rings keep their
+        // contents); the separate ring of direct tier users goes through the mover.
+        const bool relabel = tier_->relabel_installs();
+        l2_install_stats moved;
+        if (relabel) {
+            if (!tier_->install_relabel(tx, l1_->locations(), *l1_, moved, reason)) {
+                abort_locked(("install relabel: " + reason).c_str());
+            }
+        } else {
+            if (!l1_->execute(tx)) { abort_locked("the install mover refused a move"); }
+            for (const auto & move : tx.moves) for (int k = 0; k < geometry::n_kinds; ++k) {
+                tier_->finish_write(move.layer, k, move.to);
+            }
+            moved.read_slices = tx.ssd_slices;
+            moved.read_bytes  = tx.ssd_bytes;
         }
-        // The old lent sources stay readable until every move has completed.
-        const bool repartition = tier_->set_prompt_ring(prompt);
+        // The old lent sources stay readable until every move has completed. The class layout has
+        // no lent slots and one ring size: a prompt/decode switch is an install like any other.
+        const bool repartition = !tier_->class_layout() && tier_->set_prompt_ring(prompt);
         if (!l1_->assign_tier(tx.gpu_slots, tx.host, layout, plan.selected, tx.gpu_spares) ||
                 !l1_->verify_current_assignment(reason)) { abort_locked(("install assignment: " + reason).c_str()); }
-        tier_->set_homes(tx.gpu_slots, tx.host, host_geometry_locked());
+        // the tables are published after every read and copy of the transaction completed
+        tier_->set_homes(tx.gpu_slots, tx.host, host_geometry_locked(), relabel);
         const size_t host_total = host_->host_bytes() + tier_->host_bytes();
         GGML_ASSERT(host_total <= cfg_.l2_bytes);
         if (repartition) {
@@ -1866,16 +1889,34 @@ private:
         tier_->start_worker();
         log_budget_split_locked(host_plan, prompt);
         const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        std::string relabel_text;
+        if (relabel) {
+            char text[256];
+            snprintf(text, sizeof(text), " relabel=%zu slices / %zu MiB ring-copy=%zu slices / %zu MiB read=%zu slices / %zu MiB "
+                     "ring kept %zu/%zu occupants (%zu after, %zu residents demoted into the rings, %d read batches)",
+                moved.relabel_slices, moved.relabel_bytes/(1024*1024), moved.ring_copy_slices, moved.ring_copy_bytes/(1024*1024),
+                moved.read_slices, moved.read_bytes/(1024*1024), moved.ring_kept, moved.ring_before, moved.ring_after,
+                moved.demoted, moved.batches);
+            relabel_text = text;
+        }
         GGML_LOG_INFO("expert cache: installed plan %u of bank '%s': mode=%s-l2 ring=%s%s retained=%zu/%zu "
-                      "h2d=%zu slices / %zu MiB d2h=%zu slices / %zu MiB ssd=%zu slices / %zu MiB in %.1f ms\n",
+                      "h2d=%zu slices / %zu MiB d2h=%zu slices / %zu MiB ssd=%zu slices / %zu MiB%s in %.1f ms\n",
             id, banks_[plan.bank].label.c_str(), cfg_.mode == GGML_EXPERT_MODE_INCLUSIVE ? "inclusive" : "exclusive",
             prompt ? "prompt" : "decode", repartition ? " (changed)" : "", tx.retained_gpu, tx.retained_host,
             tx.h2d_slices, tx.h2d_bytes/(1024*1024), tx.d2h_slices, tx.d2h_bytes/(1024*1024),
-            tx.ssd_slices, tx.ssd_bytes/(1024*1024), ms);
+            tx.ssd_slices, tx.ssd_bytes/(1024*1024), relabel_text.c_str(), ms);
         if (cfg_.log_mask & GGML_EXPERT_LOG_L2) {
+            // ssd_bytes: every move from the file, as before; read_bytes: what was actually read
+            // (equal to ssd_bytes without relabel installs)
             GGML_LOG_INFO("expert_metrics {\"kind\":\"install\",\"bank\":\"%s\",\"plan\":%u,\"install_ms\":%.6f,"
-                          "\"h2d_bytes\":%zu,\"d2h_bytes\":%zu,\"ssd_bytes\":%zu,\"ring_before\":%d,\"ring_after\":%d}\n",
-                banks_[plan.bank].label.c_str(), id, ms, tx.h2d_bytes, tx.d2h_bytes, tx.ssd_bytes, ring_before, tier_->ring_count());
+                          "\"h2d_bytes\":%zu,\"d2h_bytes\":%zu,\"ssd_bytes\":%zu,\"ring_before\":%d,\"ring_after\":%d,"
+                          "\"relabel\":%d,\"read_slices\":%zu,\"read_bytes\":%zu,\"relabel_slices\":%zu,\"relabel_bytes\":%zu,"
+                          "\"ring_copy_slices\":%zu,\"ring_copy_bytes\":%zu,\"ring_occupants_before\":%zu,\"ring_kept\":%zu,"
+                          "\"ring_occupants_after\":%zu,\"demoted_to_ring\":%zu,\"read_batches\":%d}\n",
+                banks_[plan.bank].label.c_str(), id, ms, tx.h2d_bytes, tx.d2h_bytes, tx.ssd_bytes, ring_before, tier_->ring_count(),
+                relabel ? 1 : 0, moved.read_slices, moved.read_bytes, moved.relabel_slices, moved.relabel_bytes,
+                moved.ring_copy_slices, moved.ring_copy_bytes, moved.ring_before, moved.ring_kept, moved.ring_after,
+                moved.demoted, moved.batches);
         }
         finish_plan_locked(id); verify_all_locked();
         if (joint_) { log_members_locked("after install"); }
