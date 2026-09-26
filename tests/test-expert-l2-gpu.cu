@@ -1,4 +1,5 @@
-// Standalone HIP fixture: real mailbox publication, ring reads and MMQ padding.
+// Standalone HIP fixture: real mailbox publication, ring reads and MMQ padding, and the VRAM
+// size-class redraw on HIP virtual memory.
 #include "expert-l2.cu"
 #include "expert-os-win32.cpp"
 #include "expert-l1.cu"
@@ -11,6 +12,7 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <numeric>
 
 void ggml_cuda_set_device(int d) { CUDA_CHECK(hipSetDevice(d)); }
 int ggml_cuda_get_device() { int d = 0; CUDA_CHECK(hipGetDevice(&d)); return d; }
@@ -548,6 +550,262 @@ static int stage_test() {
     return 0;
 }
 
+// ---- size-class redraw on HIP virtual memory (expert-redraw.h, l1_arena::resize) ------------------
+//
+// Two size classes with odd slice sizes (slots straddle the 256 KiB handles) and staging slots per
+// class with their own bytes. A sequence of redraws runs
+// the controller's steps at the arena level (evacuation, the install with a retiring range, resize,
+// the install in the new capacities) through the real mover. After every redraw: every VRAM
+// resident (inclusive) or every expert through its one home (exclusive) equals its source, a graph
+// captured before the first redraw replays and reads the same bytes through the same base
+// addresses, the staging slots are untouched, and the assignment invariants hold. One
+// redraw takes a class to zero static slots (its floor), and the classes swap capacity repeatedly.
+
+static __global__ void redraw_gather(const char * arena, const int32_t * slots, const char * host, const int32_t * host_slots,
+        size_t stride, char * out) {
+    const int e = blockIdx.x;
+    const int32_t s = slots[e];
+    const char * src = s >= 0 ? arena + size_t(s)*stride : (host != nullptr && host_slots != nullptr && host_slots[e] >= 0 ?
+        host + size_t(host_slots[e])*stride : nullptr);
+    for (size_t i = threadIdx.x; i < stride; i += blockDim.x) { out[size_t(e)*stride + i] = src ? src[i] : char(0); }
+}
+
+static char redraw_byte(int layer, int kind, int expert, size_t i) {
+    return char(((layer*37 + kind*11 + expert*5 + int(i % 241)) & 0x7f) | 1);
+}
+
+static int redraw_test(bool exclusive) {
+    constexpr int layers = 3, experts = 12;
+    geometry geo;
+    geo.n_layers = layers; geo.n_experts = experts;
+    geo.layer_class = {0, 0, 1}; geo.class_layers = {2, 1};
+    geo.class_bytes = {{70*1024 + 64, 70*1024 + 64, 90*1024 + 128}, {50*1024, 50*1024, 110*1024 + 256}};
+    geo.nb2.resize(layers); geo.tensors.resize(layers);
+    ggml_tensor tensors[layers][3] = {};
+    std::vector<char> values[layers][3];
+    for (int l = 0; l < layers; ++l) for (int k = 0; k < 3; ++k) {
+        const size_t stride = geo.class_bytes[geo.layer_class[l]][k];
+        values[l][k].resize(experts*stride);
+        for (int e = 0; e < experts; ++e) for (size_t i = 0; i < stride; ++i) { values[l][k][e*stride + i] = redraw_byte(l, k, e, i); }
+        auto & t = tensors[l][k]; t.type = GGML_TYPE_F32; t.ne[0] = 32; t.ne[1] = 1; t.ne[2] = experts; t.ne[3] = 1;
+        t.data = values[l][k].data(); geo.tensors[l][k] = &t; geo.nb2[l][k] = stride;
+    }
+    const int spares = exclusive ? 2 : 0;
+    const std::vector<int> stage = {2, 2};
+    host_arena host(geo);
+    l1_arena gpu(geo);
+    gpu.enable_vmm({24, 12}, 256*1024);
+    CHECK(gpu.allocate({10, 6}, 0, spares, &stage));
+    if (!gpu.vmm()) { printf("FAIL: no VMM arena: %s\n", gpu.vmm_reason().c_str()); return 1; }
+    auto pattern = [](int cls, int kind, int slot, size_t i) { return char(0x80 | ((cls*29 + kind*3 + slot*7 + int(i % 199)) & 0x7f)); };
+    auto fill_slot = [&](int cls, int slot) {
+        for (int k = 0; k < 3; ++k) {
+            std::vector<char> b(geo.class_bytes[cls][k]);
+            for (size_t i = 0; i < b.size(); ++i) { b[i] = pattern(cls, k, slot, i); }
+            if (!gpu.write_gpu_slice(cls, k, slot, b.data(), false) || !gpu.sync_copies()) { return false; }
+        }
+        return true;
+    };
+    auto slot_intact = [&](int cls, int slot) {
+        for (int k = 0; k < 3; ++k) {
+            std::vector<char> b(geo.class_bytes[cls][k]);
+            if (!gpu.read_gpu_slice(cls, k, slot, b.data()) || !gpu.sync_copies()) { return false; }
+            for (size_t i = 0; i < b.size(); ++i) { if (b[i] != pattern(cls, k, slot, i)) { return false; } }
+        }
+        return true;
+    };
+    for (int c = 0; c < 2; ++c) {
+        for (int i = 0; i < stage[c]; ++i) { CHECK(fill_slot(c, gpu.stage_base(c) + i)); }
+    }
+    // the initial plan
+    expert_slot_table sel = {{0, 1, 2, 3, 4}, {0, 1, 2, 3, 4}, {0, 1, 2, 3, 4, 5}};
+    auto complement = [&](const expert_slot_table & s) {
+        expert_slot_table out(layers);
+        for (int l = 0; l < layers; ++l) for (int e = 0; e < experts; ++e) {
+            if (!std::binary_search(s[l].begin(), s[l].end(), e)) { out[l].push_back(e); }
+        }
+        return out;
+    };
+    const std::vector<int> host_caps = {2*experts, experts};
+    if (exclusive) {
+        CHECK(host.allocate(host_caps, 0, 0));
+        gpu.attach_host(&host, spares);
+        expert_slot_table g(layers, std::vector<int32_t>(experts, -1)), h = g;
+        std::vector<int> ng = {0, 0}, nh = {0, 0};
+        for (int l = 0; l < layers; ++l) {
+            const int c = geo.layer_class[l];
+            for (int e = 0; e < experts; ++e) {
+                if (std::binary_search(sel[l].begin(), sel[l].end(), e)) { g[l][e] = ng[c]++; } else { h[l][e] = nh[c]++; }
+            }
+        }
+        install_layout lay; lay.gpu = gpu.slot_counts(); lay.host = host_caps; lay.lent_begin = {0, 0}; lay.lent_count = {0, 0};
+        CHECK(gpu.assign_tier(g, host_locations(h), lay, sel, {{10, 11}, {6, 7}}));
+        for (int l = 0; l < layers; ++l) for (int k = 0; k < 3; ++k) {
+            CHECK(gpu.logical_io(l, k, values[l][k].data(), 0, values[l][k].size(), true));
+        }
+        CHECK(host.map());
+    } else {
+        l1_install_stats st;
+        CHECK(gpu.install(sel, true, st));
+    }
+    // one graph over every (layer, kind), captured before any redraw
+    hipStream_t stream; CUDA_CHECK(hipStreamCreate(&stream));
+    size_t out_bytes = 0;
+    std::vector<size_t> out_off;
+    for (int l = 0; l < layers; ++l) for (int k = 0; k < 3; ++k) {
+        out_off.push_back(out_bytes); out_bytes += experts*geo.class_bytes[geo.layer_class[l]][k];
+    }
+    char * out = nullptr; CUDA_CHECK(hipMalloc(&out, out_bytes));
+    hipGraph_t graph = nullptr; hipGraphExec_t exec = nullptr;
+    CUDA_CHECK(hipStreamBeginCapture(stream, hipStreamCaptureModeGlobal));
+    for (int l = 0; l < layers; ++l) for (int k = 0; k < 3; ++k) {
+        const ggml_cuda_expert_lookup lk = gpu.lookup(l, k);
+        redraw_gather<<<experts, 256, 0, stream>>>((const char *) lk.data, lk.slots, (const char *) lk.host_data, lk.host_slots,
+            geo.class_bytes[geo.layer_class[l]][k], out + out_off[l*3 + k]);
+    }
+    CUDA_CHECK(hipStreamEndCapture(stream, &graph));
+    CUDA_CHECK(hipGraphInstantiate(&exec, graph, nullptr, nullptr, 0));
+    std::vector<char> back(out_bytes);
+    auto check_all = [&](const char * when) {
+        std::string reason;
+        if (!gpu.verify_current_assignment(reason)) { printf("FAIL %s: assignment: %s\n", when, reason.c_str()); return false; }
+        CUDA_CHECK(hipGraphLaunch(exec, stream)); CUDA_CHECK(hipStreamSynchronize(stream));
+        CUDA_CHECK(hipMemcpy(back.data(), out, out_bytes, hipMemcpyDeviceToHost));
+        size_t resident = 0;
+        for (int l = 0; l < layers; ++l) for (int k = 0; k < 3; ++k) {
+            const size_t stride = geo.class_bytes[geo.layer_class[l]][k];
+            for (int e = 0; e < experts; ++e) {
+                const char * got = back.data() + out_off[l*3 + k] + e*stride;
+                const bool in_vram = gpu.host_slots()[l][e] >= 0;
+                resident += in_vram && k == 0;
+                if (in_vram || exclusive) {
+                    if (memcmp(got, values[l][k].data() + e*stride, stride) != 0) {
+                        printf("FAIL %s: layer %d kind %d expert %d (slot %d) differs from its source\n", when, l, k, e, gpu.host_slots()[l][e]);
+                        return false;
+                    }
+                } else {
+                    for (size_t i = 0; i < stride; ++i) { if (got[i] != 0) { printf("FAIL %s: miss not zero\n", when); return false; } }
+                }
+            }
+            if (exclusive) {
+                std::vector<char> io(values[l][k].size());
+                if (!gpu.logical_io(l, k, io.data(), 0, io.size(), false) || io != values[l][k]) {
+                    printf("FAIL %s: logical read of layer %d kind %d\n", when, l, k); return false;
+                }
+            }
+        }
+        size_t want = 0;
+        for (const auto & v : sel) { want += v.size(); }
+        if (resident != want) { printf("FAIL %s: %zu VRAM residents, the plan has %zu\n", when, resident, want); return false; }
+        if (!exclusive && gpu.verify_resident(0) != long(want)) { printf("FAIL %s: verify_resident\n", when); return false; }
+        for (int c = 0; c < 2; ++c) {
+            for (int i = 0; i < stage[c]; ++i) {
+                if (!slot_intact(c, gpu.stage_base(c) + i)) { printf("FAIL %s: staging slot %d of class %d\n", when, i, c); return false; }
+            }
+            // the zeroed tail past the top slot, where MMQ reads past the last row
+            for (int k = 0; k < 3; ++k) {
+                std::vector<char> tail(arena_tail_bytes(geo, c, k), char(1));
+                CUDA_CHECK(hipMemcpy(tail.data(), gpu.gpu_slice_address(c, k, gpu.slot_counts()[c]), tail.size(), hipMemcpyDeviceToHost));
+                for (char x : tail) { if (x != 0) { printf("FAIL %s: tail of class %d kind %d not zero\n", when, c, k); return false; } }
+            }
+        }
+        return true;
+    };
+    CHECK(check_all("before the first redraw"));
+    const size_t mapped0 = gpu.device_bytes();
+    uint64_t rng = exclusive ? 99 : 7;
+    auto rnd = [&](int n) { rng = rng*6364136223846793005ULL + 1442695040888963407ULL; return int((rng >> 33) % uint64_t(n)); };
+    // a selection of `count` experts per class that keeps a random part of the current one
+    auto choose = [&](int cls, int count) {
+        std::vector<int> ls;
+        for (int l = 0; l < layers; ++l) { if (geo.layer_class[l] == cls) { ls.push_back(l); } }
+        expert_slot_table part(layers);
+        for (size_t i = 0; i < ls.size(); ++i) {
+            const int n = count/int(ls.size()) + (int(i) < count % int(ls.size()) ? 1 : 0);
+            std::vector<int> order(experts);
+            std::iota(order.begin(), order.end(), 0);
+            for (int j = experts - 1; j > 0; --j) { std::swap(order[j], order[rnd(j + 1)]); }
+            // current residents first half of the time, so that some kept ones sit high
+            std::stable_partition(order.begin(), order.end(), [&](int e) {
+                return rnd(2) == 0 && std::binary_search(sel[ls[i]].begin(), sel[ls[i]].end(), e); });
+            part[ls[i]].assign(order.begin(), order.begin() + n);
+            std::sort(part[ls[i]].begin(), part[ls[i]].end());
+        }
+        return part;
+    };
+    const std::vector<std::vector<int>> splits = {{6, 10}, {12, 0}, {8, 8}, {4, 12}, {16, 2}, {10, 6}, {3, 11}, {14, 4}};
+    size_t swaps = 0, moved = 0, created = 0, replaced = 0;
+    for (size_t r = 0; r < splits.size(); ++r) {
+        const std::vector<int> caps_old = gpu.capacities(), slots_old = gpu.slot_counts(), caps_new = splits[r];
+        std::vector<int> caps1(2), limit(2), slots_new(2);
+        for (int c = 0; c < 2; ++c) {
+            caps1[c] = std::min(caps_old[c], caps_new[c]);
+            limit[c] = caps1[c] + slots_old[c] - caps_old[c];
+            slots_new[c] = caps_new[c] + slots_old[c] - caps_old[c];
+        }
+        expert_slot_table next(layers);
+        for (int c = 0; c < 2; ++c) {
+            const expert_slot_table part = choose(c, caps_new[c]);
+            for (int l = 0; l < layers; ++l) { if (geo.layer_class[l] == c) { next[l] = part[l]; } }
+        }
+        expert_slot_table step1 = sel;
+        for (int l = 0; l < layers; ++l) { if (caps_new[geo.layer_class[l]] < caps_old[geo.layer_class[l]]) { step1[l] = next[l]; } }
+        // 1. evacuation
+        std::vector<std::vector<uint8_t>> other(2);
+        for (int c = 0; c < 2; ++c) {
+            other[c].assign(slots_old[c], 0);
+            if (exclusive) { for (int s : gpu.gpu_spares()[c]) { other[c][s] = 1; } }
+        }
+        const evac_plan ev = plan_evacuation(geo.layer_class, experts, gpu.host_slots(), step1, other, slots_old, limit);
+        if (!ev.valid) { printf("FAIL redraw %zu: %s\n", r, ev.reason.c_str()); return 1; }
+        double ms = 0.0;
+        CHECK(gpu.evacuate(ev.ops, ms));
+        for (const auto & op : ev.ops) { swaps += op.victim_layer >= 0; }
+        // 2. the install with the retiring range
+        gpu.set_static_capacities(caps1);
+        gpu.set_retire(limit);
+        gpu.set_unequal(exclusive);
+        auto install = [&](const expert_slot_table & s, const std::vector<int> & slots_after) {
+            if (exclusive) {
+                install_layout before = gpu.layout(), after = before;
+                after.gpu = slots_after;
+                const install_transaction tx = plan_install(geo, s, complement(s), gpu.host_slots(), gpu.locations(),
+                    gpu.capacities(), before, after, gpu.gpu_spares(), {false, spares}, false, true, /*unequal =*/ true);
+                if (!tx.valid) { printf("FAIL redraw %zu: %s\n", r, tx.reason.c_str()); return false; }
+                return gpu.execute(tx) && gpu.assign_tier(tx.gpu_slots, tx.host, after, s, tx.gpu_spares);
+            }
+            GGML_UNUSED(slots_after);
+            l1_install_stats st;
+            return gpu.install(s, true, st);
+        };
+        CHECK(install(step1, limit));
+        gpu.set_retire({});
+        sel = step1;
+        CHECK(check_all("after the shrink install"));
+        // 3. the handles
+        l1_arena::resize_stats rs;
+        std::string why;
+        if (!gpu.resize(slots_new, rs, why)) { printf("FAIL redraw %zu: resize: %s\n", r, why.c_str()); return 1; }
+        moved += rs.handles_moved; created += rs.handles_created; replaced += rs.units_replaced;
+        gpu.set_static_capacities(caps_new);
+        CHECK(gpu.slot_counts() == slots_new);
+        CHECK(check_all("after the resize"));
+        // 4. the install in the new capacities
+        CHECK(install(next, slots_new));
+        gpu.set_unequal(false);
+        sel = next;
+        CHECK(check_all("after the redraw"));
+    }
+    // the backed bytes track the split within a granule per (class, kind)
+    CHECK(gpu.device_bytes() != 0 && mapped0 != 0);
+    CUDA_CHECK(hipGraphExecDestroy(exec)); CUDA_CHECK(hipGraphDestroy(graph));
+    CUDA_CHECK(hipFree(out)); CUDA_CHECK(hipStreamDestroy(stream));
+    printf("PASS: %s L1 redraw on VMM: %zu redraws (one to a zero static class), %zu swaps, %zu handles moved, %zu created, "
+           "%zu partial units replaced; every slice equals its source, the graph captured before replays across them, "
+           "staging slots intact\n", exclusive ? "exclusive" : "inclusive", splits.size(), swaps, moved, created, replaced);
+    return 0;
+}
+
 int main(int argc, char ** argv) {
     if (argc != 2) { return 2; }
     setvbuf(stdout, nullptr, _IONBF, 0);
@@ -559,6 +817,8 @@ int main(int argc, char ** argv) {
     CHECK(mover_test(false) == 0);
     CHECK(finite_inclusive_test() == 0);
     CHECK(stage_test() == 0);
+    CHECK(redraw_test(false) == 0);
+    CHECK(redraw_test(true) == 0);
     CHECK(early_ssd_test(argv[1]) == 0);
     constexpr int K = 640, M = 2560, N = 14, J = 16, experts = 17, selected = 4;
     constexpr size_t slice = size_t(K/32)*24*M, shift = 4064, tail = 288;
