@@ -110,9 +110,11 @@ struct common_expert {
             frozen ? ", frozen (profile only)" : "");
     }
 
-    // A context of another model that shares the cache (a draft model). Its routed layers only run
-    // in the block decodes of generation, so every row it computes during generation feeds the
-    // generation bank, and nothing is counted outside generation.
+    // A context of another model that shares the cache (a draft model). Every row it computes during
+    // generation feeds the generation bank, and nothing is counted outside generation. A block
+    // drafter routes only there; an MTP head also routes in the catch-up decodes of prompt
+    // processing, which are not counted, so its prompt bank stays empty and a prompt plan keeps its
+    // VRAM slices (docs/ranma/expert-cache-joint.md).
     void join(llama_context * other) {
         if (!active() || other == nullptr || !be->available(other)) {
             return;

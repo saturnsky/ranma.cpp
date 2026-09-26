@@ -1611,8 +1611,13 @@ private:
             ep.freeze       = params_base.expert_freeze;
 
             expert.init(ctx_tgt, ep);
-            // a separate draft model in the same cache (--expert-cache-draft on)
-            if (model_dft != nullptr && model_dft != model_tgt && ctx_dft != nullptr && llama_expert_available(ctx_dft)) {
+            // a separate draft model in the same cache (--expert-cache-draft on), or an MTP context
+            // on the target's own weights: its NextN block is one more routed layer of the cache
+            // (RANMA_MTP_EXPERT_JOIN=0 leaves the own-weights MTP context out of the profile)
+            const char * join_env = getenv("RANMA_MTP_EXPERT_JOIN");
+            const bool   join_own = join_env == nullptr || strcmp(join_env, "0") != 0;
+            if (ctx_dft != nullptr && ctx_dft != ctx_tgt && llama_expert_available(ctx_dft) &&
+                (join_own || (model_dft != nullptr && model_dft != model_tgt))) {
                 expert.join(ctx_dft);
             }
         }

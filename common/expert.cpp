@@ -50,14 +50,34 @@ expert_validation validate_expert_params(const common_params & params) {
     // checked them, not for a structural reason (docs/ranma/expert-cache-l2.md). With a draft model
     // in the joint cache both are checked: the draft's experts are cache members with their own
     // file backing, its selections feed only its own layers, and every install drains the device,
-    // which covers the draft context's work. Other speculative setups keep the refusal.
+    // which covers the draft context's work. An MTP head loaded from its own file (-md) is such a
+    // draft: it reads no tensor of the target (the target's hidden rows reach it as input data) and
+    // keeps its own KV cache. Unlike a block drafter it also routes while a prompt is processed (the
+    // catch-up decodes of every prompt ubatch), which runs under the prompt plan and ring with at
+    // most n_ubatch rows; during generation its decodes stay within the decode bound. An MTP
+    // context on the target's own weights (no -md) is accepted as well (below); other speculative
+    // setups keep the refusal.
     const bool joined_draft = expert_draft_joins(params) && !params.speculative.has_synth() &&
         std::all_of(params.speculative.types.begin(), params.speculative.types.end(),
             [](common_speculative_type t) {
                 return t == COMMON_SPECULATIVE_TYPE_NONE || t == COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE ||
-                    t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
+                    t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK ||
+                    t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP;
             });
-    const bool spec_unchecked = speculative && !joined_draft;
+    // An MTP head kept out of the cache (--expert-cache-draft off) with every layer on the GPU and no
+    // tensor overrides reads no host or file expert, so the finite tier and the prefill swap never
+    // see its work: it is checked as well (the pre-joint-cache placement, measured on DS4F).
+    const bool resident_mtp = params.speculative.has_dft() && !params.speculative.has_synth() &&
+        !expert_draft_joins(params) && params.speculative.draft.tensor_buft_overrides.empty() &&
+        (params.speculative.draft.n_gpu_layers <= -2 || params.speculative.draft.n_gpu_layers >= 999) &&
+        std::all_of(params.speculative.types.begin(), params.speculative.types.end(),
+            [](common_speculative_type t) { return t == COMMON_SPECULATIVE_TYPE_NONE || t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP; });
+    // An MTP context on the target's own weights (draft-mtp without -md): its NextN block is one more
+    // routed layer of the target's own cache (blk.<n_layer>), not a second model.
+    const bool own_mtp = !params.speculative.has_dft() && !params.speculative.has_synth() &&
+        std::all_of(params.speculative.types.begin(), params.speculative.types.end(),
+            [](common_speculative_type t) { return t == COMMON_SPECULATIVE_TYPE_NONE || t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP; });
+    const bool spec_unchecked = speculative && !joined_draft && !resident_mtp && !own_mtp;
     if (params.expert_l2_mib > 0) {
         if (!ggml_cuda_expert::expert_os::supported()) { return expert_reject("finite L2 needs Windows unbuffered reads"); }
         if (params.n_parallel <= 0 || params.n_batch <= 0 || params.n_ubatch < 0) { return expert_reject("finite L2 needs positive batch/parallel bounds and a nonnegative ubatch"); }
