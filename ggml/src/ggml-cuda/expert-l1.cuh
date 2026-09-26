@@ -5,15 +5,22 @@
 // -1). The kernels read the table and the arena base through ggml_cuda_expert_lookup. Arena and
 // table addresses never change after allocate(), because captured graphs hold them; only the slot
 // contents and the tables are rewritten, and only by install() while nothing computes.
+//
+// With enable_vmm() (a redraw condition set, HIP only) an arena is a reserved virtual address
+// range backed by physical handles instead of one allocation: resize() maps or unmaps handles at the
+// top of a class's slot range, so the class split can be redrawn (expert-redraw.h) while every base
+// address, and with it every captured graph, stays valid.
 
 #include "common.cuh"
 #include "expert-geometry.h"
 #include "expert-host.cuh"
 #include "expert-l2-ledger.h"
 #include "expert-plan.h"
+#include "expert-redraw.h"
 
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -72,8 +79,41 @@ public:
     // (expert-hash-stage.cuh). No plan, install or slot count below ever includes them.
     bool allocate(const std::vector<int> & capacities, int device, int spare_slots = 0,
                   const std::vector<int> * stage_slots = nullptr);
-    // The first staging slot of a class (after the static capacity and the spares).
-    int stage_base(int cls) const { return capacities_[(size_t) cls] + spare_slots_; }
+    // The first staging slot of a class (after the static capacity and the spares). A VMM arena keeps
+    // its staging slots at a fixed index above the largest slot range the class can grow to.
+    int stage_base(int cls) const {
+        if (!vmm_stage_base_.empty()) { return vmm_stage_base_[(size_t) cls]; }
+        return capacities_[(size_t) cls] + spare_slots_;
+    }
+
+    // Before allocate(): back the arenas with HIP virtual memory, so that resize() can move capacity
+    // between classes. `max_static[class]` bounds the static capacity a class may grow to (the address
+    // range reserved), `handle_bytes` is the size of the physical handles. allocate() falls back to
+    // plain allocations when the device or the build has no virtual memory management; vmm() tells.
+    void enable_vmm(const std::vector<int> & max_static, size_t handle_bytes);
+    bool vmm() const;
+    const std::string & vmm_reason() const { return vmm_reason_; }
+    size_t vmm_reserved_bytes() const;
+
+    // Size-class redraw (expert-redraw.h), while nothing computes:
+    //   - set_static_capacities: the static capacity the next plans and installs are bound to;
+    //   - set_retire: the slot count per class the next install leaves (slots at and above it retire;
+    //     empty = none), set_unequal: an exclusive mover runs the unequal exchange (expert-plan.h);
+    //   - evacuate: moves kept residents down (and swaps them with dropped ones), all kinds, VRAM to VRAM;
+    //   - resize: the new slot count per class; shrinking classes first, their top handles are
+    //     unmapped and mapped again at the top of the growing classes; the new slots and the tails are
+    //     zeroed. Every static home and spare of a shrinking class must be below its new count.
+    struct resize_stats {
+        size_t handles_moved = 0, handles_created = 0, handles_released = 0, units_replaced = 0;
+        size_t copied_bytes = 0, zeroed_bytes = 0, mapped_before = 0, mapped_after = 0;
+        double ms = 0.0;
+    };
+    void set_static_capacities(const std::vector<int> & capacities);
+    void set_retire(const std::vector<int> & limit) { retire_ = limit; }
+    void set_unequal(bool on) { unequal_ = on; }
+    bool evacuate(const std::vector<evac_op> & ops, double & ms);
+    bool resize(const std::vector<int> & slots, resize_stats & stats, std::string & why);
+    struct vmm_state;   // expert-l1.cu
     bool allocated() const { return !layer_slots_.empty(); }
 
     // Exclusive mode and every finite tier: this arena and `host` together own the routed expert
@@ -130,8 +170,8 @@ public:
 
     size_t device_bytes() const { return allocated_bytes_; }
     const std::vector<int> & capacities() const { return capacities_; }
-    // Arena slots per class: the static capacity and the exchange spares. Every slot index of the
-    // class is below this.
+    // Arena slots per class: the static capacity and the exchange spares (after a redraw: what
+    // resize() made it). Every slot index of the class is below this.
     std::vector<int> slot_counts() const;
     // Mirror of the device table that maps an expert to its VRAM slot, or -1.
     const std::vector<std::vector<int32_t>> & host_slots() const { return host_slots_; }
@@ -174,6 +214,10 @@ public:
     // Reads one VRAM slot back into `dst`, which must hold the class/kind stride. Verification only.
     bool read_slice(int layer, int kind, int slot, void * dst) const;
 
+    // Reads every device table back ([layer][expert]; -1 rows for layers outside the cache). The device
+    // tables can differ from the host mirror: the VRAM staging of early-route layers points at its own slots.
+    bool read_device_tables(std::vector<std::vector<int32_t>> & out) const;
+
 private:
     bool publish_tables(const std::vector<std::vector<int32_t>> & slots);
     char * gpu_slice(int cls, int kind, int slot) const {
@@ -184,6 +228,15 @@ private:
     int device_ = -1;
     cudaStream_t copy_stream_ = nullptr;
     std::vector<int> capacities_;
+    // size-class redraw
+    std::unique_ptr<vmm_state> vmm_;
+    std::string vmm_reason_;
+    std::vector<int> vmm_stage_base_;                  // [class] fixed first staging slot of a VMM arena
+    std::vector<int> slots_;                           // [class] slot counts once a redraw owns them
+    std::vector<int> retire_;                          // [class] slot count the next install leaves
+    bool unequal_ = false;
+    bool allocate_vmm(const std::vector<int> & capacities, int spare_slots, const std::vector<int> * stage_slots);
+    void free_vmm();
     std::vector<std::array<void *, 3>> class_data_;    // [class][kind]
     std::vector<int32_t *> layer_slots_;               // [layer] device tables
     std::vector<std::vector<int32_t>> host_slots_;     // [layer][expert] mirror of the device tables
