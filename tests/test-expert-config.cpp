@@ -47,6 +47,56 @@ int main() {
         p.speculative.draft.n_max = 7; p.n_parallel = 3;
         CHECK(expert_config_from_params(p).l2_decode_rows == 24);
     }
+    // A draft model in the joint cache lifts the finite-tier and prefill-swap refusal: a block drafter
+    // and an MTP head loaded from its own file. An MTP context on the target's own weights (no draft
+    // file) is accepted too; a block drafter without a file, a draft kept out of the cache and a mixed
+    // speculative setup keep it.
+    for (common_speculative_type t : {COMMON_SPECULATIVE_TYPE_DRAFT_MTP, COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK}) {
+        p = common_params(); p.fit_params = false;
+        p.expert_cache_mode = "exclusive"; p.expert_l1_mib = 3070; p.expert_l2_mib = 32768; p.n_parallel = 1;
+        p.expert_profile_dir = "profile";
+        p.speculative.types = {t}; p.speculative.draft.n_max = 1;
+        CHECK(!expert_draft_joins(p));
+        if (t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP) {
+            CHECK(validate_expert_params(p).ok == os);
+            p.speculative.types = {t, COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE}; CHECK(!validate_expert_params(p).ok);
+            p.speculative.types = {t};
+        } else {
+            CHECK(!validate_expert_params(p).ok);
+            if (os) { CHECK(validate_expert_params(p).reason.find("no gate yet") != std::string::npos); }
+        }
+        p.speculative.draft.mparams.path = "draft.gguf";
+        CHECK(expert_draft_joins(p) && validate_expert_params(p).ok == os);
+        CHECK(expert_config_from_params(p).l2_decode_rows == 2);
+        p.expert_prefill_swap = true; CHECK(validate_expert_params(p).ok == os);
+        p.expert_l2_mib = -1; CHECK(validate_expert_params(p).ok == os); p.expert_l2_mib = 32768;
+        p.expert_cache_draft = false; CHECK(!expert_draft_joins(p) && !validate_expert_params(p).ok);
+        if (os) { CHECK(validate_expert_params(p).reason.find("no gate yet") != std::string::npos); }
+        p.expert_prefill_swap = false; CHECK(!validate_expert_params(p).ok);
+        p.expert_cache_draft = true; p.speculative.types = {t, COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE};
+        CHECK(!validate_expert_params(p).ok);
+    }
+    // An MTP head kept out of the cache (--expert-cache-draft off) passes the gate only with every
+    // layer on the GPU and no draft tensor overrides; a block drafter kept out does not.
+    {
+        p = common_params(); p.fit_params = false;
+        p.expert_cache_mode = "exclusive"; p.expert_l1_mib = 3070; p.expert_l2_mib = 32768; p.n_parallel = 1;
+        p.expert_profile_dir = "profile";
+        p.speculative.types = {COMMON_SPECULATIVE_TYPE_DRAFT_MTP}; p.speculative.draft.n_max = 1;
+        p.speculative.draft.mparams.path = "mtp.gguf"; p.expert_cache_draft = false;
+        CHECK(!expert_draft_joins(p) && !validate_expert_params(p).ok);   // layers left to the default
+        p.speculative.draft.n_gpu_layers = 999; CHECK(validate_expert_params(p).ok == os);
+        p.expert_prefill_swap = true; CHECK(validate_expert_params(p).ok == os); p.expert_prefill_swap = false;
+        p.speculative.draft.n_gpu_layers = -2; CHECK(validate_expert_params(p).ok == os);
+        p.speculative.draft.n_gpu_layers = 40; CHECK(!validate_expert_params(p).ok);
+        p.speculative.draft.n_gpu_layers = 999;
+        p.speculative.draft.tensor_buft_overrides.push_back({"exps", nullptr});
+        CHECK(!validate_expert_params(p).ok);
+        p.speculative.draft.tensor_buft_overrides.clear();
+        p.speculative.types = {COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK}; CHECK(!validate_expert_params(p).ok);
+        p.speculative.types = {COMMON_SPECULATIVE_TYPE_DRAFT_MTP, COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE};
+        CHECK(!validate_expert_params(p).ok);
+    }
     p = common_params(); p.fit_params = false;
     p.expert_l1_mib = 3070;
     CHECK(validate_expert_params(p).ok); // Profile is optional even without finite L2.
