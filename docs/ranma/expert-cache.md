@@ -37,7 +37,8 @@ The cache is inclusive by default: each VRAM resident also keeps its host copy, 
 stays complete. `--expert-cache-mode exclusive` gives every routed expert exactly one home instead
 and takes the budget back out of host memory (`expert-cache-exclusive.md`). `--expert-l2-mib` bounds
 the host memory the cache may use in either mode and leaves the rest of the experts in the GGUF
-file, read on demand (`expert-cache-l2.md`).
+file, read on demand (`expert-cache-l2.md`). The VRAM capacity of each size class is fixed at load
+unless the optional redraw moves it at a plan install (`expert-cache-l1-redraw.md`).
 
 This is a fork feature of the HIP build. It is not compiled into the CUDA backend; the options are
 accepted there and do nothing.
@@ -141,6 +142,7 @@ with `--expert-freeze` it leaves the placement unchanged and only records the pr
 | Environment switch | Default | Effect |
 |---|---|---|
 | `RANMA_EXPERT_TRACE=<mask>` | 0 | Bit mask of log lines: 1 install, 2 profile, 4 prompt processing, 8 host tier and per-commit round lines. |
+| `RANMA_EXPERT_L1_REDRAW_BENEFIT`, `RANMA_EXPERT_L1_REDRAW_MOVE` | not set | Setting either turns on the redraw of the VRAM size-class split at plan installs (`expert-cache-l1-redraw.md`). |
 | `RANMA_EXPERT_VERIFY=1` | off | After every install, read every resident slice back and compare it with its source. Slow; for correctness checks, not for serving. |
 
 Both are read once at startup.
