@@ -10,6 +10,7 @@
 #include "expert-os.h"
 #include "expert-plan.h"
 #include "expert-profiler.cuh"
+#include "expert-redraw.h"
 #include "expert-profile-store.h"
 #include "expert-storage.h"
 
@@ -130,6 +131,9 @@ struct plan_state {
     // [member] joint cache: the model does not run in this bank's phase (a draft model during
     // prompt processing), so the plan leaves its VRAM slices as they are when it is installed
     std::vector<uint8_t> keep;
+    // the size-class split the plan was made for (expert-redraw.h): a plan of an older one is placed
+    // again from its scores before it is installed
+    uint32_t epoch = 0;
 };
 
 // Defined below the controller: the exclusive buffer type needs the controller instance.
@@ -222,6 +226,19 @@ static l2_config l2_debug_config(const ggml_expert_config & cfg, bool verify_all
     return out;
 }
 
+// RANMA_EXPERT_L1_REDRAW_BENEFIT and RANMA_EXPERT_L1_REDRAW_MOVE, read once per process.
+static const redraw_params & redraw_env() {
+    static const redraw_params params = [] {
+        std::string warnings;
+        const redraw_params p = redraw_params_from([](const char * name) { return (const char *) getenv(name); }, warnings);
+        if (!warnings.empty()) {
+            GGML_LOG_WARN("expert cache: L1 redraw: %s\n", warnings.c_str());
+        }
+        return p;
+    }();
+    return params;
+}
+
 class controller {
 public:
     // ---- lifecycle -------------------------------------------------------------------------
@@ -297,6 +314,7 @@ public:
             GGML_LOG_INFO("expert cache: RANMA_EXPERT_VERIFY set, every install is verified against the host weights\n");
         }
         configure_hash_early_locked(config);
+        redraw_ = redraw_env();
         clear_members_locked();
         member_state first;
         first.path     = config->model_path ? config->model_path : "";
@@ -621,12 +639,14 @@ public:
 
         if (!allocate_profiler_locked()) { return false; }
         l1_.reset(new l1_arena(geo_));
+        redraw_prepare_locked();
         if (!l1_->allocate(capacities_, device_, 0, stage_class_slots_.empty() ? nullptr : &stage_class_slots_)) {
             l1_.reset();
             profiler_.reset();
             disable_locked("arena allocation failed");
             return false;
         }
+        redraw_started_locked(counts == nullptr);
         allocate_stage_locked();
         l1_install_stats stats;
         if (!l1_->install(initial.selected, /*retain=*/false, stats)) {
@@ -700,6 +720,11 @@ public:
         device_ = -1;
         disabled_reason_ = "";
         capacities_.clear();
+        redraw_on_ = false;
+        redraw_gate_ = redraw_gate();
+        redraw_epoch_ = 0;
+        redraw_max_static_.clear();
+        redraw_unequal_ = false;
     }
 
     bool status(ggml_expert_status * out) {
@@ -819,7 +844,8 @@ public:
         plan.selected = std::move(next.selected);
         plan.stats    = next.stats;
         plan.keep     = std::move(keep);
-        if (tier_ && b.total_selections() != 0) {
+        plan.epoch    = redraw_epoch_;
+        if ((tier_ || redraw_on_) && b.total_selections() != 0) {
             plan.scores = scores;
         }
         const ggml_expert_plan_id id = next_plan_id_++;
@@ -848,15 +874,22 @@ public:
             GGML_LOG_WARN("expert cache: plan %u is stale or unknown; not installed\n", id);
             return false;
         }
-        const plan_state & stored = it->second;
-        if (banks_[stored.bank].latest_plan != id) {
-            GGML_LOG_WARN("expert cache: plan %u of bank '%s' is stale; not installed\n", id, banks_[stored.bank].label.c_str());
+        const plan_state & committed = it->second;
+        if (banks_[committed.bank].latest_plan != id) {
+            GGML_LOG_WARN("expert cache: plan %u of bank '%s' is stale; not installed\n", id, banks_[committed.bank].label.c_str());
             return false;
         }
         if (cfg_.freeze || cfg_.policy != GGML_EXPERT_POLICY_ADAPTIVE) {
             GGML_LOG_INFO("expert cache: frozen; plan %u not installed\n", id);
             return false;
         }
+        // a plan committed before a size-class redraw is placed again in the current capacities
+        plan_state replaced;
+        if (committed.epoch != redraw_epoch_) {
+            replaced = committed;
+            replan_locked(replaced);
+        }
+        const plan_state & stored = committed.epoch != redraw_epoch_ ? replaced : committed;
         // A model that does not run in the plan's phase keeps the VRAM slices it has now. Its size
         // classes are its own (keep_members_locked checks that), so the class capacities still hold.
         plan_state patched;
@@ -875,8 +908,13 @@ public:
             }
         }
         const plan_state & plan = kept ? patched : stored;
+        // The size-class redraw's gate: one decision per generation install (expert-redraw.h).
+        std::vector<int> redraw_to;
+        if (redraw_on_ && !banks_[plan.bank].prompt) {
+            redraw_to = redraw_evaluate_locked(id, plan);
+        }
         // Installing what is already in the arena costs nothing: no drain, no copies, one line.
-        if (!tier_ && plan.selected == l1_->selected()) {
+        if (redraw_to.empty() && !tier_ && plan.selected == l1_->selected()) {
             finish_plan_locked(id);
             if (cfg_.log_mask & GGML_EXPERT_LOG_INSTALL) {
                 GGML_LOG_INFO("expert cache: plan %u of bank '%s' is already installed; nothing to do\n",
@@ -891,9 +929,21 @@ public:
         // the install republishes the slot tables: the staging entries go, and the staging forgets its
         // experts (the next hint copies again; an install is rare next to the hints)
         for (std::vector<int32_t> & owners : stage_owner_) { stage_forget(owners); }
+        if (!redraw_to.empty()) {
+            return redraw_locked(id, plan, redraw_to);
+        }
+        return install_once_locked(id, plan);
+    }
+
+    bool install_once_locked(ggml_expert_plan_id id, const plan_state & plan) {
         if (tier_) {
             return install_tier_locked(id, plan, /*seed =*/ false);
         }
+        return install_plain_locked(id, plan);
+    }
+
+    // An install without the SSD tier.
+    bool install_plain_locked(ggml_expert_plan_id id, const plan_state & plan) {
         l1_install_stats stats;
         if (!l1_->install(plan.selected, cfg_.delta_install, stats)) {
             disable_locked("install failed");
@@ -1416,6 +1466,10 @@ private:
         }
         verify_all_locked();
         log_members_locked("after a model joined");
+        if (redraw_on_) {
+            // the class mix changed: the next installs may redraw on their first proposal
+            redraw_mark_fresh(redraw_gate_, redraw_);
+        }
         return true;
     }
 
@@ -1470,6 +1524,268 @@ private:
             }
         }
         installed_plan_ = id;
+    }
+
+    // ---- size-class redraw of the VRAM tier (expert-redraw.h) -------------------------------------
+
+    void set_capacities_locked(const std::vector<int> & caps) {
+        capacities_ = caps;
+        l1_->set_static_capacities(caps);
+    }
+
+    // A plan committed before a redraw: the same scores placed in the current capacities.
+    void replan_locked(plan_state & plan) const {
+        placement_inputs in;
+        in.geo              = &geo_;
+        in.counts           = plan.scores.empty() ? nullptr : plan.scores.data();
+        in.budget_bytes     = SIZE_MAX;
+        in.exclusive        = l1_ && l1_->owns_host_storage();
+        in.fixed_capacities = &capacities_;
+        placement next = plan_placement(in);
+        plan.selected = std::move(next.selected);
+        plan.stats    = next.stats;
+        plan.epoch    = redraw_epoch_;
+    }
+
+    // Before the arena is allocated: with a redraw condition set and a mode the redraw supports,
+    // the arena is built on HIP virtual memory, with address ranges for the largest static capacity
+    // each class can reach within the current static bytes.
+    void redraw_prepare_locked() {
+        redraw_on_ = false;
+        redraw_max_static_.clear();
+        if (!redraw_.enabled) {
+            return;
+        }
+        const char * why = nullptr;
+        if (cfg_.policy != GGML_EXPERT_POLICY_ADAPTIVE || cfg_.freeze) {
+            why = "no plan installs (frozen or not adaptive)";
+        } else if (cfg_.mode == GGML_EXPERT_MODE_EXCLUSIVE && cfg_.l2_bytes == 0) {
+            why = "exclusive mode with an unlimited host tier keeps one host arena per class that the L1 split sizes; "
+                  "the redraw needs a finite L2 or inclusive mode";
+        }
+        if (why != nullptr) {
+            GGML_LOG_WARN("expert cache: L1 redraw requested but off: %s\n", why);
+            return;
+        }
+        const size_t budget = redraw_static_bytes(geo_, capacities_);
+        redraw_max_static_.assign(geo_.class_bytes.size(), 0);
+        for (size_t c = 0; c < redraw_max_static_.size(); ++c) {
+            const size_t bytes = geo_.class_total_bytes((int) c);
+            const size_t n = bytes == 0 ? 0 : budget/bytes;
+            redraw_max_static_[c] = (int) std::min<size_t>(n, size_t(geo_.class_layers[c])*size_t(geo_.n_experts));
+        }
+        l1_->enable_vmm(redraw_max_static_, redraw_.handle_bytes);
+    }
+
+    static std::string split_text(const std::vector<int> & v) {
+        std::string out;
+        for (size_t c = 0; c < v.size(); ++c) { out += (c ? "," : "") + std::to_string(v[c]); }
+        return out;
+    }
+
+    void redraw_started_locked(bool cold) {
+        redraw_gate_ = redraw_gate();
+        if (!redraw_.enabled || redraw_max_static_.empty()) {
+            return;
+        }
+        if (!l1_->vmm()) {
+            GGML_LOG_WARN("expert cache: L1 redraw requested but off: no VMM arena (%s)\n", l1_->vmm_reason().c_str());
+            return;
+        }
+        redraw_on_ = true;
+        if (cold) {
+            redraw_mark_fresh(redraw_gate_, redraw_);
+        }
+        char move[32], benefit[32];
+        snprintf(move, sizeof(move), redraw_.move_pct > 0.0 ? "> %g %%" : "not set", redraw_.move_pct);
+        snprintf(benefit, sizeof(benefit), redraw_.benefit > 0.0 ? "> %g x cost" : "not set", redraw_.benefit);
+        GGML_LOG_INFO("expert cache: L1 redraw on: VMM class arenas, %zu MiB handles, %.1f GiB of address range for static "
+                      "capacities up to %s (now %s); gate: move %s of the L1 budget, benefit over %d tokens %s, %d consecutive "
+                      "proposals (none in the first installs after a cold load or member join)%s, hold-off %d installs, at most "
+                      "%zu MiB per install\n",
+            redraw_.handle_bytes >> 20, double(l1_->vmm_reserved_bytes())/double(size_t(1) << 30),
+            split_text(redraw_max_static_).c_str(), split_text(capacities_).c_str(), move, redraw_.horizon, benefit,
+            redraw_.confirm, cold ? ", cold load" : "", redraw_.holdoff, redraw_.cap_bytes >> 20);
+    }
+
+    // [class] the static capacity a redraw may give a class: at most every expert of the class and
+    // what its address range holds; with a finite inclusive tier the host cut must still hold the
+    // class's VRAM slots (the host plan's mandatory masters); with a finite exclusive tier a layer
+    // may keep no more experts in the file than its storage class ring holds, so the class keeps at
+    // least all experts less its host cut less a full ring per layer.
+    void redraw_bounds_locked(std::vector<int> & lo, std::vector<int> & hi) const {
+        const size_t classes = geo_.class_bytes.size();
+        lo.assign(classes, 0);
+        hi.assign(classes, 0);
+        for (size_t c = 0; c < classes; ++c) {
+            hi[c] = std::min(redraw_max_static_[c], geo_.class_layers[c]*geo_.n_experts);
+            if (tier_ && c < host_capacities_base_.size()) {
+                const int cut = host_capacities_base_[c];
+                if (cfg_.mode == GGML_EXPERT_MODE_INCLUSIVE) {
+                    hi[c] = std::min(hi[c], cut);
+                } else if (c < file_cap_.size()) {
+                    lo[c] = std::max(0, geo_.class_layers[c]*(geo_.n_experts - file_cap_[c]) - cut);
+                }
+            }
+            lo[c] = std::min(lo[c], capacities_[c]);
+            hi[c] = std::max(hi[c], capacities_[c]);
+        }
+    }
+
+    // The gate for the plan about to be installed; the new static capacities when it fires, else empty.
+    std::vector<int> redraw_evaluate_locked(ggml_expert_plan_id id, const plan_state & plan) {
+        const std::vector<int> now = capacities_;
+        const size_t budget = redraw_static_bytes(geo_, now);
+        std::vector<int> lo, hi;
+        redraw_bounds_locked(lo, hi);
+        const bool owned = l1_->owns_host_storage();
+        const uint64_t * counts = plan.scores.empty() ? nullptr : plan.scores.data();
+        std::vector<int> proposed = redraw_capacities(geo_, counts, budget, owned, now, lo, hi);
+        proposed = redraw_limit(geo_, now, proposed, redraw_.cap_bytes, budget);
+        placement_inputs in;
+        in.geo              = &geo_;
+        in.counts           = counts;
+        in.budget_bytes     = SIZE_MAX;
+        in.exclusive        = owned;
+        in.fixed_capacities = &proposed;
+        const placement next = plan_placement(in);
+        const expert_slot_table & gpu = l1_->host_slots();
+        const expert_locations & homes = l1_->locations();
+        const bool file_tier = tier_ != nullptr;
+        auto in_file = [&](int l, int e) {
+            return file_tier && gpu[(size_t) l][(size_t) e] < 0 && (size_t) l < homes.size() &&
+                homes[(size_t) l][(size_t) e].storage == expert_storage::file;
+        };
+        const size_t l1_budget = cfg_.l1_bytes != 0 ? cfg_.l1_bytes : redraw_static_bytes(geo_, l1_->slot_counts());
+        const redraw_estimate est = redraw_estimate_of(geo_, counts, cfg_.l2_experts_used, plan.selected, next.selected, in_file,
+            cfg_.mode == GGML_EXPERT_MODE_EXCLUSIVE, now, proposed, l1_budget, redraw_);
+        const redraw_verdict v = redraw_decide(redraw_, est, redraw_gate_);
+        char move[48], benefit[48];
+        if (redraw_.move_pct > 0.0) { snprintf(move, sizeof(move), "> %g %%: %s", redraw_.move_pct, v.move_ok ? "yes" : "no"); }
+        else { snprintf(move, sizeof(move), "not set"); }
+        if (redraw_.benefit > 0.0) { snprintf(benefit, sizeof(benefit), "> %g: %s", redraw_.benefit, v.benefit_ok ? "yes" : "no"); }
+        else { snprintf(benefit, sizeof(benefit), "not set"); }
+        GGML_LOG_INFO("expert cache: L1 redraw check, plan %u of bank '%s': static split %s -> %s (floors %s, ceilings %s), "
+                      "moves %.1f MiB = %.3f %% of the L1 budget (%s); benefit %.5f ms/token x %d tokens = %.2f ms, cost %.2f ms "
+                      "(promote %.2f, demote %.2f, remap %.2f, evacuate %.2f; %zu slices in, %zu out, %zu handles), "
+                      "ratio %.3f (%s); streak %d, hold-off %d: %s\n",
+            id, banks_[plan.bank].label.c_str(), split_text(now).c_str(), split_text(proposed).c_str(), split_text(lo).c_str(),
+            split_text(hi).c_str(), double(est.moved_bytes)/double(1 << 20), est.move_pct, move, est.benefit_ms_token,
+            redraw_.horizon, est.benefit_ms, est.cost_ms, est.cost_promote_ms, est.cost_demote_ms, est.cost_remap_ms,
+            est.cost_evacuate_ms, est.enter_slices, est.leave_slices, est.handles, est.ratio, benefit, redraw_gate_.streak,
+            redraw_gate_.holdoff, v.why.c_str());
+        if (cfg_.log_mask & GGML_EXPERT_LOG_L2) {
+            GGML_LOG_INFO("expert_metrics {\"kind\":\"l1_redraw_check\",\"plan\":%u,\"moved_bytes\":%zu,\"move_pct\":%.6f,"
+                          "\"benefit_ms_token\":%.9f,\"horizon\":%d,\"benefit_ms\":%.6f,\"cost_ms\":%.6f,\"cost_promote_ms\":%.6f,"
+                          "\"cost_demote_ms\":%.6f,\"cost_remap_ms\":%.6f,\"cost_evacuate_ms\":%.6f,\"ratio\":%.6f,"
+                          "\"move_ok\":%d,\"benefit_ok\":%d,\"fire\":%d}\n",
+                id, est.moved_bytes, est.move_pct, est.benefit_ms_token, redraw_.horizon, est.benefit_ms, est.cost_ms,
+                est.cost_promote_ms, est.cost_demote_ms, est.cost_remap_ms, est.cost_evacuate_ms,
+                std::isfinite(est.ratio) ? est.ratio : -1.0, v.move_ok ? 1 : 0, v.benefit_ok ? 1 : 0, v.fire ? 1 : 0);
+        }
+        return v.fire ? proposed : std::vector<int>();
+    }
+
+    // The redraw, inside the install's quiescence (the device is drained, the mutex held):
+    //   1. the shrinking classes' kept residents above their new slot count move down (VRAM copies,
+    //      swapped with residents the new plan drops when no slot below is free);
+    //   2. an install of the plan with the shrinking classes at their new capacity and the growing ones
+    //      at the old: the slots above the new count retire;
+    //   3. the arena moves the handles (expert-l1.cu, resize);
+    //   4. an install of the plan in the new capacities: the growing classes fill their new slots.
+    // Every step keeps one home per expert (exclusive) and the file as the backing of what it drops.
+    bool redraw_locked(ggml_expert_plan_id id, const plan_state & plan, const std::vector<int> & caps_new) {
+        const auto t0 = std::chrono::steady_clock::now();
+        const size_t classes = geo_.class_bytes.size();
+        const std::vector<int> caps_old = capacities_, slots_old = l1_->slot_counts();
+        std::vector<int> caps_shrink(classes), limit(classes), slots_new(classes);
+        for (size_t c = 0; c < classes; ++c) {
+            const int fixed = slots_old[c] - caps_old[c];   // the spares
+            caps_shrink[c] = std::min(caps_old[c], caps_new[c]);
+            limit[c]       = caps_shrink[c] + fixed;
+            slots_new[c]   = caps_new[c] + fixed;
+        }
+        const bool owned = l1_->owns_host_storage();
+        auto place = [&](const std::vector<int> & caps) {
+            placement_inputs in;
+            in.geo              = &geo_;
+            in.counts           = plan.scores.empty() ? nullptr : plan.scores.data();
+            in.budget_bytes     = SIZE_MAX;
+            in.exclusive        = owned;
+            in.fixed_capacities = &caps;
+            return plan_placement(in).selected;
+        };
+        plan_state step = plan;
+        step.selected = place(caps_shrink);
+        // 1. the spares stay where they are
+        std::vector<std::vector<uint8_t>> other(classes);
+        for (size_t c = 0; c < classes; ++c) { other[c].assign((size_t) std::max(slots_old[c], 0), 0); }
+        const auto & spares = l1_->gpu_spares();
+        for (size_t c = 0; c < spares.size() && c < classes; ++c) {
+            for (int s : spares[c]) { if (s >= 0 && s < slots_old[c]) { other[c][(size_t) s] = 1; } }
+        }
+        const evac_plan ev = plan_evacuation(geo_.layer_class, geo_.n_experts, l1_->host_slots(), step.selected, other, slots_old, limit);
+        if (!ev.valid) { abort_locked(("L1 redraw: " + ev.reason).c_str()); }
+        double evac_ms = 0.0;
+        if (!l1_->evacuate(ev.ops, evac_ms)) { abort_locked("L1 redraw: the evacuation copies failed"); }
+        size_t swaps = 0, evac_bytes = 0;
+        for (const evac_op & op : ev.ops) {
+            swaps += op.victim_layer >= 0 ? 1 : 0;
+            evac_bytes += geo_.class_total_bytes(op.cls)*(op.victim_layer >= 0 ? 3 : 1);
+        }
+        GGML_LOG_INFO("expert cache: L1 redraw %llu, plan %u: static %s -> %s (slots %s -> %s); step 1: %zu kept residents moved "
+                      "below the new slot counts (%zu swaps, %.1f MiB copied) in %.1f ms\n",
+            (unsigned long long) redraw_count_ + 1, id, split_text(caps_old).c_str(), split_text(caps_new).c_str(),
+            split_text(slots_old).c_str(), split_text(slots_new).c_str(), ev.ops.size(), swaps,
+            double(evac_bytes)/double(1 << 20), evac_ms);
+        // 2. the shrink install
+        const auto t1 = std::chrono::steady_clock::now();
+        set_capacities_locked(caps_shrink);
+        l1_->set_retire(limit);
+        redraw_unequal_ = cfg_.mode == GGML_EXPERT_MODE_EXCLUSIVE;
+        l1_->set_unequal(redraw_unequal_);
+        const bool shrunk = install_once_locked(id, step);
+        l1_->set_retire({});
+        if (!shrunk) {
+            redraw_unequal_ = false;
+            l1_->set_unequal(false);
+            return false;
+        }
+        if (tier_) {
+            tier_->stop_worker();
+        }
+        const double shrink_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t1).count();
+        // 3. the handles
+        l1_arena::resize_stats rs;
+        std::string why;
+        if (!l1_->resize(slots_new, rs, why)) { abort_locked(("L1 redraw resize: " + why).c_str()); }
+        set_capacities_locked(caps_new);
+        ++redraw_epoch_;
+        GGML_LOG_INFO("expert cache: L1 redraw %llu: step 2: shrink install in %.1f ms; step 3: %zu handles moved, %zu created, "
+                      "%zu released, %zu partial units replaced (%.1f MiB copied), %.1f MiB zeroed, VRAM %.1f -> %.1f MiB, in %.1f ms\n",
+            (unsigned long long) redraw_count_ + 1, shrink_ms, rs.handles_moved, rs.handles_created, rs.handles_released,
+            rs.units_replaced, double(rs.copied_bytes)/double(1 << 20), double(rs.zeroed_bytes)/double(1 << 20),
+            double(rs.mapped_before)/double(1 << 20), double(rs.mapped_after)/double(1 << 20), rs.ms);
+        // 4. the grow install
+        const auto t2 = std::chrono::steady_clock::now();
+        step.selected = place(caps_new);
+        step.epoch    = redraw_epoch_;
+        const bool grown = install_once_locked(id, step);
+        redraw_unequal_ = false;
+        l1_->set_unequal(false);
+        ++redraw_count_;
+        const double grow_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t2).count();
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        GGML_LOG_INFO("expert cache: L1 redraw %llu done: step 4: grow install in %.1f ms; %.1f ms in all, epoch %u\n",
+            (unsigned long long) redraw_count_, grow_ms, ms, redraw_epoch_);
+        if (cfg_.log_mask & GGML_EXPERT_LOG_L2) {
+            GGML_LOG_INFO("expert_metrics {\"kind\":\"l1_redraw\",\"plan\":%u,\"evacuated\":%zu,\"swaps\":%zu,\"evacuate_ms\":%.6f,"
+                          "\"shrink_ms\":%.6f,\"handles_moved\":%zu,\"handles_created\":%zu,\"handles_released\":%zu,"
+                          "\"units_replaced\":%zu,\"resize_ms\":%.6f,\"grow_ms\":%.6f,\"total_ms\":%.6f}\n",
+                id, ev.ops.size(), swaps, evac_ms, shrink_ms, rs.handles_moved, rs.handles_created, rs.handles_released,
+                rs.units_replaced, rs.ms, grow_ms, ms);
+        }
+        return grown;
     }
 
     tier_inputs tier_inputs_locked(const std::vector<uint64_t> & scores) const {
@@ -1949,7 +2265,8 @@ private:
         if (!host_plan.valid) { abort_locked(host_plan.reason.c_str()); }
         const auto tx = ggml_cuda_expert::plan_install(geo_, plan.selected, host_plan.selected, l1_->host_slots(), l1_->locations(),
             capacities_, l1_->layout(), layout, l1_->gpu_spares(),
-            {cfg_.mode == GGML_EXPERT_MODE_INCLUSIVE, cfg_.spare_slots}, true);
+            {cfg_.mode == GGML_EXPERT_MODE_INCLUSIVE, cfg_.spare_slots}, true, /*retain =*/ true,
+            /*unequal =*/ redraw_unequal_ && cfg_.mode == GGML_EXPERT_MODE_EXCLUSIVE);
         if (!tx.valid) { abort_locked(("install transaction: " + tx.reason).c_str()); }
         std::string reason;
         // Class layout: the moves run as relabels of the storage slots (the rings keep their
@@ -2644,12 +2961,14 @@ private:
 
         if (!allocate_profiler_locked()) { return false; }
         l1_.reset(new l1_arena(geo_));
+        redraw_prepare_locked();
         if (!l1_->allocate(capacities_, device_, cfg_.spare_slots, stage_class_slots_.empty() ? nullptr : &stage_class_slots_)) {
             l1_.reset();
             profiler_.reset();
             disable_locked("arena allocation failed");
             return false;
         }
+        redraw_started_locked(counts == nullptr);
         allocate_stage_locked();
         host_.reset(new host_arena(geo_));
         if (!host_->allocate(host_capacities, cfg_.spare_slots, device_,
@@ -3117,6 +3436,14 @@ private:
     std::vector<int>    file_cap_;   // class layout: [class] the ring slots of its storage class
     std::vector<uint64_t> tier_scores_;
     std::vector<std::vector<int32_t>> tier_vram_;
+    // size-class redraw of the VRAM tier (RANMA_EXPERT_L1_REDRAW_BENEFIT/_MOVE, expert-redraw.h)
+    redraw_params redraw_;
+    bool          redraw_on_ = false;          // requested, the mode supports it and the arenas are VMM
+    redraw_gate   redraw_gate_;
+    uint32_t      redraw_epoch_ = 0;           // the split's generation; plans of an older one are placed again
+    std::vector<int> redraw_max_static_;       // [class] static capacity the address ranges hold
+    bool          redraw_unequal_ = false;     // exclusive installs of a redraw: unequal exchange
+    uint64_t      redraw_count_ = 0;
     ggml_backend_buffer_t exclusive_buffer_ = nullptr; // owned by the model, not by the controller
     bool digests_enabled_ = false;
     std::vector<slice_digest> digests_;      // [(layer*n_kinds + kind)*n_experts + expert]
