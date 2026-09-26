@@ -2134,6 +2134,87 @@ private:
         }
     }
 
+    // removes [p0, end) of the slot's sequence from the target and the draft memory; false if either refused.
+    // A refusal after a checkpoint restore reprocesses the prompt from the start; one during a speculative
+    // rollback ends the request with an error and clears the slot.
+    bool slot_try_seq_rm(const server_slot & slot, llama_pos p0) const {
+        bool ok = llama_memory_seq_rm(llama_get_memory(slot.mem.ctx_tgt), slot.id, p0, -1);
+        if (ok && slot.mem.ctx_dft) {
+            ok = llama_memory_seq_rm(llama_get_memory(slot.mem.ctx_dft), slot.id, p0, -1);
+        }
+
+        return ok;
+    }
+
+    // the draft memory refused the removal of a draft [p0, end): rebuild the draft sequence up to p0 from the newest
+    // prompt checkpoint whose own suffix removal it accepts, else from the start
+    // (a standalone draft model only: its memory holds the target's tokens; a draft fed by target hidden states cannot
+    //  be replayed, and neither can a prompt with media or shifted positions)
+    bool slot_rebuild_dft(server_slot & slot, llama_pos p0) {
+        const auto & types = params_base.speculative.types;
+        const bool replayable =
+            std::find(types.begin(), types.end(), COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE) != types.end() &&
+            params_base.speculative.need_n_rs_seq() == 0;
+
+        const int32_t n = slot.prompt.n_tokens();
+        if (!replayable || slot.prompt.tokens.has_mtmd || slot.prompt.tokens.pos_next() != n || p0 != n) {
+            return false;
+        }
+
+        auto * mem_dft = llama_get_memory(ctx_dft);
+
+        int32_t n_kept = 0;
+        for (auto it = slot.prompt.checkpoints.rbegin(); it != slot.prompt.checkpoints.rend(); ++it) {
+            if (it->n_tokens > n || it->data_dft.empty() || it->pos_max + 1 != it->n_tokens) {
+                continue;
+            }
+            it->load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+            if (llama_memory_seq_rm(mem_dft, slot.id, it->pos_max + 1, -1)) {
+                n_kept = it->n_tokens;
+                break;
+            }
+        }
+        if (n_kept == 0 && !llama_memory_seq_rm(mem_dft, slot.id, -1, -1)) {
+            return false;
+        }
+
+        SLT_WRN(slot, "draft memory_seq_rm [%d, end) refused - rebuilding the draft sequence from n_tokens = %d\n", p0, n_kept);
+
+        const llama_tokens tokens  = slot.prompt.tokens.get_text_tokens();
+        const int32_t      n_batch = llama_n_batch(ctx_dft);
+
+        llama_batch batch_dft = llama_batch_init(n_batch, 0, 1);
+
+        bool ok = true;
+        for (int32_t i = n_kept; ok && i < n; i += n_batch) {
+            common_batch_clear(batch_dft);
+            for (int32_t j = i; j < std::min(n, i + n_batch); ++j) {
+                common_batch_add(batch_dft, tokens[j], j, { slot.id }, j == n - 1);
+            }
+            ok = llama_decode(ctx_dft, batch_dft) == 0;
+        }
+
+        llama_batch_free(batch_dft);
+
+        return ok;
+    }
+
+    // a rollback the memory refused leaves it holding tokens the slot no longer has: the request cannot go on
+    void slot_abandon_after_refused_seq_rm(server_slot & slot, llama_pos p0, const char * where) {
+        SLT_WRN(slot, "memory_seq_rm [%d, end) refused in %s - ending the request and clearing the slot\n", p0, where);
+
+        send_error(slot, "the sequence state could not be rolled back");
+
+        // the interval of this request is incomplete: it must not become a record
+        expert.on_interrupted(slot.id);
+
+        slot.release();
+        slot.prompt_clear();
+
+        slot.ckpt_restored         = nullptr;
+        slot.ckpt_restored_id_task = -1;
+    }
+
     void send_error(const server_task & task, const std::string & error, const enum error_type type = ERROR_TYPE_SERVER) {
         send_error(task.id, error, type);
     }
@@ -3235,7 +3316,10 @@ private:
                 }
 
                 if (!llama_memory_seq_rm(llama_get_memory(ctx_dft), slot.id, ckpt.pos_max + 1, -1)) {
-                    GGML_ABORT("failed to remove sequence %d\n", slot.id);
+                    if (!slot_rebuild_dft(slot, ckpt.pos_max + 1)) {
+                        slot_abandon_after_refused_seq_rm(slot, ckpt.pos_max + 1, "a draft rollback");
+                        return;
+                    }
                 }
             }
 
@@ -3266,6 +3350,10 @@ private:
                 }
             }
         });
+
+        // a slot ended by a refused draft rollback has nothing left to verify
+        generating.erase(std::remove_if(generating.begin(), generating.end(),
+                    [](const server_slot * s) { return !s->is_processing(); }), generating.end());
 
         // update the batch with the sampled/drafted tokens
         iterate(generating, [&](server_slot & slot) {
@@ -3623,7 +3711,49 @@ private:
 
                     SLT_TRC(slot, "cached n_tokens = %d, memory_seq_rm [%d, end)\n", slot.prompt.n_tokens(), p0);
 
-                    slot.mem.seq_rm(slot.id, p0, -1);
+                    // a memory that follows a suffix removal only at some positions (the pooled Qwen indexer,
+                    // when a checkpoint cannot supply the rows of the block it cuts) may refuse this one: fall
+                    // back to the next older checkpoint, as when the newest one does not fit, and start over
+                    // only when none is left
+                    for (llama_pos p0_try = p0; !slot_try_seq_rm(slot, p0_try); ) {
+                        const int32_t n_kept = slot.prompt.n_tokens();
+
+                        for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end();) {
+                            it = it->n_tokens >= n_kept ? slot.prompt.checkpoints.erase(it) : std::next(it);
+                        }
+
+                        slot.ckpt_restored         = nullptr;
+                        slot.ckpt_restored_id_task = -1;
+
+                        if (slot.prompt.checkpoints.empty()) {
+                            SLT_WRN(slot, "memory_seq_rm [%d, end) refused after n_tokens = %d were kept - reprocessing the full prompt\n",
+                                    p0_try, n_kept);
+
+                            slot.prompt_clear();
+                            slot.stats.n_prompt_cached = 0;
+                            break;
+                        }
+
+                        auto & ckpt = slot.prompt.checkpoints.back();
+
+                        ckpt.load_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                        ckpt.load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                        common_speculative_set_state(spec.get(), slot.id, ckpt.data_spec);
+
+                        const llama_pos pos_next = std::max(ckpt.pos_min + 1, ckpt.pos_max);
+                        const int32_t   n_past   = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) ckpt.n_tokens);
+
+                        SLT_WRN(slot, "memory_seq_rm [%d, end) refused after n_tokens = %d were kept - falling back to the context checkpoint with n_tokens = %" PRId64 "\n",
+                                p0_try, n_kept, ckpt.n_tokens);
+
+                        slot.prompt.tokens.keep_first(n_past);
+                        slot.stats.n_prompt_cached = n_past;
+
+                        slot.ckpt_restored         = &ckpt;
+                        slot.ckpt_restored_id_task = slot.task->id;
+
+                        p0_try = slot.prompt.tokens.pos_next();
+                    }
 
                     // If using an alora, there may be uncached tokens that come
                     // before the invocation sequence. When this happens, the
@@ -4145,7 +4275,10 @@ private:
                             ckpt.load_dft(slot.ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
                         }
 
-                        slot.mem.seq_rm(slot.id, ckpt.pos_max + 1, -1);
+                        if (!slot_try_seq_rm(slot, ckpt.pos_max + 1)) {
+                            slot_abandon_after_refused_seq_rm(slot, ckpt.pos_max + 1, "a speculative checkpoint restore");
+                            return;
+                        }
 
                         slot.prompt.tokens.keep_first(ckpt.n_tokens);
                         common_sampler_copy(smpl_save.get(), slot.smpl.get());
@@ -4198,7 +4331,10 @@ private:
             llama_expert_route_hint(slot.ctx_tgt, &slot.sampled, 1);
             SLT_DBG(slot, "add accepted tokens: sampled=%d, ids.size=%zu, n_draft=%zu\n", slot.sampled, ids.size(), n_draft);
 
-            slot.mem.seq_rm(slot.id, slot.prompt.tokens.pos_next(), -1);
+            if (!slot_try_seq_rm(slot, slot.prompt.tokens.pos_next())) {
+                slot_abandon_after_refused_seq_rm(slot, slot.prompt.tokens.pos_next(), "a speculative rollback");
+                return;
+            }
 
             for (size_t i = 0; i < ids.size(); ++i) {
                 completion_token_output result;
