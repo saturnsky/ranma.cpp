@@ -39,6 +39,297 @@ size_t arena_tail_total(const geometry & geo) {
     return total;
 }
 
+// ---- HIP virtual memory arenas (size-class redraw) ---------------------------------------------
+//
+// One reserved address range per (class, kind). Its slot range [0, end) is backed by units: physical
+// handles of `handle` bytes from offset 0 up, the last one possibly smaller (a multiple of the
+// allocation granularity), so the backed bytes exceed slots * stride + tail by less than one
+// granule. Moving the top of a range down unmaps whole units (full ones wait in `pool` for a growing
+// class) and replaces a unit the new top cuts by a smaller one; moving it up replaces a partial top
+// unit by a larger one and maps more. A replacement is mapped at the scratch range first, gets the
+// live bytes of the unit it replaces by a device copy, and is then mapped in its place. The staging
+// slots of a class have their own unit at a fixed offset above the largest slot range.
+
+struct l1_arena::vmm_state {
+    std::vector<int> max_static;
+    size_t handle_request = 0;
+#if defined(GGML_USE_HIP)
+    struct unit {
+        hipMemGenericAllocationHandle_t handle;
+        size_t offset, size;
+    };
+    struct region {
+        char * base = nullptr;
+        size_t reserved = 0;
+        std::vector<unit> units;   // the slot range, contiguous from offset 0
+        std::vector<unit> stage;   // the staging slots
+        size_t end() const { return units.empty() ? 0 : units.back().offset + units.back().size; }
+    };
+    hipMemAllocationProp prop = {};
+    hipMemAccessDesc access = {};
+    size_t gran = 0, handle = 0;
+    std::vector<std::array<region, 3>> regions;
+    std::vector<hipMemGenericAllocationHandle_t> pool;   // unmapped handles of `handle` bytes
+    char * scratch = nullptr;
+    bool active = false;
+    resize_stats * stats = nullptr;                       // counts of the resize in progress, or null
+#endif
+};
+
+#if defined(GGML_USE_HIP)
+static size_t vmm_round_up(size_t n, size_t a) { return (n + a - 1)/a*a; }
+
+static bool vmm_call(hipError_t e, const char * what, std::string & why) {
+    if (e == hipSuccess) {
+        return true;
+    }
+    (void) hipGetLastError();
+    why = std::string(what) + ": " + hipGetErrorString(e);
+    return false;
+}
+
+static bool vmm_handle(l1_arena::vmm_state & v, size_t size, hipMemGenericAllocationHandle_t & h, std::string & why) {
+    if (size == v.handle && !v.pool.empty()) {
+        h = v.pool.back();
+        v.pool.pop_back();
+        if (v.stats) { ++v.stats->handles_moved; }
+        return true;
+    }
+    if (v.stats) { ++v.stats->handles_created; }
+    return vmm_call(hipMemCreate(&h, size, &v.prop, 0), "hipMemCreate", why);
+}
+
+static void vmm_drop(l1_arena::vmm_state & v, hipMemGenericAllocationHandle_t h, size_t size) {
+    if (size == v.handle) {
+        v.pool.push_back(h);
+        return;
+    }
+    if (v.stats) { ++v.stats->handles_released; }
+    (void) hipMemRelease(h);
+}
+
+static bool vmm_map(l1_arena::vmm_state & v, char * at, size_t size, hipMemGenericAllocationHandle_t h, std::string & why) {
+    return vmm_call(hipMemMap(at, size, 0, h, 0), "hipMemMap", why) &&
+        vmm_call(hipMemSetAccess(at, size, &v.access, 1), "hipMemSetAccess", why);
+}
+
+// Replaces unit `index` of `r` by one of `size` bytes that holds the first `copy` bytes of it.
+static bool vmm_replace(l1_arena::vmm_state & v, l1_arena::vmm_state::region & r, size_t index, size_t size, size_t copy,
+        cudaStream_t stream, std::string & why) {
+    l1_arena::vmm_state::unit & u = r.units[index];
+    hipMemGenericAllocationHandle_t h;
+    if (!vmm_handle(v, size, h, why)) {
+        return false;
+    }
+    if (!vmm_map(v, v.scratch, size, h, why)) {
+        (void) hipMemRelease(h);
+        return false;
+    }
+    if (copy != 0 && (!vmm_call(hipMemcpyAsync(v.scratch, r.base + u.offset, copy, hipMemcpyDeviceToDevice, stream), "unit copy", why) ||
+            !vmm_call(hipStreamSynchronize(stream), "unit copy", why))) {
+        return false;
+    }
+    if (!vmm_call(hipMemUnmap(v.scratch, size), "hipMemUnmap", why) ||
+            !vmm_call(hipMemUnmap(r.base + u.offset, u.size), "hipMemUnmap", why)) {
+        return false;
+    }
+    vmm_drop(v, u.handle, u.size);
+    if (!vmm_map(v, r.base + u.offset, size, h, why)) {
+        return false;
+    }
+    if (v.stats) { ++v.stats->units_replaced; v.stats->copied_bytes += copy; }
+    u.handle = h;
+    u.size   = size;
+    return true;
+}
+
+// Moves the end of the backed slot range of `r` to `end` (a multiple of the granularity), keeping
+// every byte below min(old end, end).
+static bool vmm_set_end(l1_arena::vmm_state & v, l1_arena::vmm_state::region & r, size_t end, cudaStream_t stream,
+        std::string & why) {
+    while (!r.units.empty() && r.units.back().offset >= end) {
+        const l1_arena::vmm_state::unit u = r.units.back();
+        if (!vmm_call(hipMemUnmap(r.base + u.offset, u.size), "hipMemUnmap", why)) {
+            return false;
+        }
+        vmm_drop(v, u.handle, u.size);
+        r.units.pop_back();
+    }
+    if (!r.units.empty()) {
+        const l1_arena::vmm_state::unit u = r.units.back();
+        if (u.offset + u.size > end) {
+            if (!vmm_replace(v, r, r.units.size() - 1, end - u.offset, end - u.offset, stream, why)) {
+                return false;
+            }
+        } else if (u.offset + u.size < end && u.size < v.handle) {
+            if (!vmm_replace(v, r, r.units.size() - 1, std::min(v.handle, end - u.offset), u.size, stream, why)) {
+                return false;
+            }
+        }
+    }
+    while (r.end() < end) {
+        const size_t at = r.end(), size = std::min(v.handle, end - at);
+        hipMemGenericAllocationHandle_t h;
+        if (!vmm_handle(v, size, h, why)) {
+            return false;
+        }
+        if (!vmm_map(v, r.base + at, size, h, why)) {
+            (void) hipMemRelease(h);
+            return false;
+        }
+        r.units.push_back({h, at, size});
+    }
+    return true;
+}
+
+static size_t vmm_mapped(const l1_arena::vmm_state & v) {
+    size_t bytes = 0;
+    for (const auto & cls : v.regions) {
+        for (const auto & r : cls) {
+            bytes += r.end();
+            for (const auto & u : r.stage) { bytes += u.size; }
+        }
+    }
+    return bytes;
+}
+#endif
+
+void l1_arena::enable_vmm(const std::vector<int> & max_static, size_t handle_bytes) {
+    vmm_.reset(new vmm_state());
+    vmm_->max_static     = max_static;
+    vmm_->handle_request = handle_bytes;
+}
+
+bool l1_arena::vmm() const {
+#if defined(GGML_USE_HIP)
+    return vmm_ && vmm_->active;
+#else
+    return false;
+#endif
+}
+
+size_t l1_arena::vmm_reserved_bytes() const {
+    size_t bytes = 0;
+#if defined(GGML_USE_HIP)
+    if (vmm()) {
+        for (const auto & cls : vmm_->regions) {
+            for (const auto & r : cls) { bytes += r.reserved; }
+        }
+    }
+#endif
+    return bytes;
+}
+
+void l1_arena::free_vmm() {
+#if defined(GGML_USE_HIP)
+    if (!vmm_) {
+        return;
+    }
+    vmm_state & v = *vmm_;
+    for (auto & cls : v.regions) {
+        for (auto & r : cls) {
+            for (auto & u : r.units) { (void) hipMemUnmap(r.base + u.offset, u.size); (void) hipMemRelease(u.handle); }
+            for (auto & u : r.stage) { (void) hipMemUnmap(r.base + u.offset, u.size); (void) hipMemRelease(u.handle); }
+            r.units.clear();
+            r.stage.clear();
+            if (r.base) { (void) hipMemAddressFree(r.base, r.reserved); }
+            r.base = nullptr;
+        }
+    }
+    v.regions.clear();
+    for (auto h : v.pool) { (void) hipMemRelease(h); }
+    v.pool.clear();
+    if (v.scratch) { (void) hipMemAddressFree(v.scratch, v.handle); }
+    v.scratch = nullptr;
+    v.active  = false;
+    (void) hipGetLastError();
+#endif
+}
+
+// The VMM half of allocate(): false (with vmm_reason_ set and nothing left allocated) when the
+// device or the driver refuses; allocate() then takes plain allocations.
+bool l1_arena::allocate_vmm(const std::vector<int> & capacities, int spare_slots, const std::vector<int> * stage_slots) {
+#if defined(GGML_USE_HIP)
+    vmm_state & v = *vmm_;
+    int supported = 0;
+    if (hipDeviceGetAttribute(&supported, hipDeviceAttributeVirtualMemoryManagementSupported, device_) != hipSuccess || !supported) {
+        (void) hipGetLastError();
+        vmm_reason_ = "the device has no virtual memory management";
+        return false;
+    }
+    v.prop.type = hipMemAllocationTypePinned;
+    v.prop.requestedHandleType = hipMemHandleTypeNone;
+    v.prop.location.type = hipMemLocationTypeDevice;
+    v.prop.location.id   = device_;
+    v.access.location = v.prop.location;
+    v.access.flags    = hipMemAccessFlagsProtReadWrite;
+    std::string why;
+    if (!vmm_call(hipMemGetAllocationGranularity(&v.gran, &v.prop, hipMemAllocationGranularityMinimum), "granularity", why) || v.gran == 0) {
+        vmm_reason_ = why.empty() ? "no allocation granularity" : why;
+        return false;
+    }
+    v.handle = vmm_round_up(std::max<size_t>(v.handle_request, v.gran), v.gran);
+    const size_t classes = capacities.size();
+    v.regions.assign(classes, {});
+    vmm_stage_base_.assign(classes, 0);
+    bool ok = vmm_call(hipMemAddressReserve((void **) &v.scratch, v.handle, v.gran, nullptr, 0), "hipMemAddressReserve", why);
+    if (!ok) { v.scratch = nullptr; }
+    for (size_t c = 0; c < classes && ok; ++c) {
+        const int stage = stage_slots != nullptr ? std::max((*stage_slots)[c], 0) : 0;
+        const int slots = capacities[c] + spare_slots;
+        const int max_static = c < v.max_static.size() ? std::max(v.max_static[c], capacities[c]) : capacities[c];
+        const int max_slots = std::max(slots, max_static + spare_slots);
+        // the first staging slot: above the largest backed slot range of every kind
+        size_t first = size_t(max_slots);
+        for (int k = 0; k < geometry::n_kinds; ++k) {
+            const size_t nb = geo_.class_bytes[c][k];
+            const size_t top = vmm_round_up(size_t(max_slots)*nb + arena_tail_bytes(geo_, (int) c, k), v.gran);
+            first = std::max(first, nb == 0 ? size_t(max_slots) : (top + nb - 1)/nb);
+        }
+        vmm_stage_base_[c] = (int) first;
+        for (int k = 0; k < geometry::n_kinds && ok; ++k) {
+            vmm_state::region & r = v.regions[c][k];
+            const size_t nb = geo_.class_bytes[c][k], tail = arena_tail_bytes(geo_, (int) c, k);
+            r.reserved = stage > 0 ? vmm_round_up((first + size_t(stage))*nb + tail, v.gran) :
+                vmm_round_up(size_t(max_slots)*nb + tail, v.gran);
+            ok = vmm_call(hipMemAddressReserve((void **) &r.base, r.reserved, v.gran, nullptr, 0), "hipMemAddressReserve", why);
+            if (!ok) { r.base = nullptr; break; }
+            const size_t end = vmm_round_up(size_t(slots)*nb + tail, v.gran);
+            ok = vmm_set_end(v, r, end, copy_stream_, why) &&
+                vmm_call(hipMemsetAsync(r.base, 0, end, copy_stream_), "hipMemsetAsync", why);
+            if (ok && stage > 0) {
+                const size_t off = first*nb/v.gran*v.gran, stop = vmm_round_up((first + size_t(stage))*nb + tail, v.gran);
+                hipMemGenericAllocationHandle_t h;
+                ok = vmm_call(hipMemCreate(&h, stop - off, &v.prop, 0), "hipMemCreate", why);
+                if (ok) {
+                    ok = vmm_map(v, r.base + off, stop - off, h, why);
+                    if (!ok) { (void) hipMemRelease(h); break; }
+                    r.stage.push_back({h, off, stop - off});
+                    ok = vmm_call(hipMemsetAsync(r.base + off, 0, stop - off, copy_stream_), "hipMemsetAsync", why);
+                }
+            }
+            class_data_[c][k] = r.base;
+        }
+    }
+    ok = ok && vmm_call(hipStreamSynchronize(copy_stream_), "hipStreamSynchronize", why);
+    if (!ok) {
+        (void) hipStreamSynchronize(copy_stream_);
+        free_vmm();
+        vmm_stage_base_.clear();
+        class_data_.assign(capacities.size(), {nullptr, nullptr, nullptr});
+        vmm_reason_ = why;
+        return false;
+    }
+    v.active = true;
+    allocated_bytes_ += vmm_mapped(v);
+    return true;
+#else
+    GGML_UNUSED(capacities); GGML_UNUSED(spare_slots); GGML_UNUSED(stage_slots);
+    vmm_reason_ = "a CUDA build (the redraw is HIP only)";
+    return false;
+#endif
+}
+
 l1_arena::l1_arena(const geometry & geo) : geo_(geo) {
 }
 
@@ -48,6 +339,10 @@ l1_arena::~l1_arena() {
     }
     ggml_cuda_set_device(device_);
     (void) cudaDeviceSynchronize();
+    if (vmm()) {
+        free_vmm();
+        class_data_.clear();
+    }
     for (auto & cls : class_data_) {
         for (void * p : cls) {
             if (p) {
@@ -77,7 +372,10 @@ bool l1_arena::allocate(const std::vector<int> & capacities, int device, int spa
     CUDA_CHECK(cudaStreamCreateWithFlags(&copy_stream_, cudaStreamNonBlocking));
     capacities_ = capacities;
     class_data_.assign(capacities.size(), {nullptr, nullptr, nullptr});
-    for (size_t c = 0; c < capacities.size(); ++c) {
+    if (vmm_ && !allocate_vmm(capacities, spare_slots, stage_slots)) {
+        vmm_.reset();
+    }
+    for (size_t c = 0; c < capacities.size() && !vmm(); ++c) {
         const int stage = stage_slots != nullptr ? std::max((*stage_slots)[c], 0) : 0;
         if (capacities[c] == 0 && spare_slots == 0 && stage == 0) { continue; }
         for (int k = 0; k < geometry::n_kinds; ++k) {
@@ -322,10 +620,162 @@ bool l1_arena::publish_tables(const std::vector<std::vector<int32_t>> & slots) {
 }
 
 
+bool l1_arena::read_device_tables(std::vector<std::vector<int32_t>> & out) const {
+    if (!allocated()) {
+        return false;
+    }
+    ggml_cuda_set_device(device_);
+    out.assign(geo_.n_layers, std::vector<int32_t>(geo_.n_experts, -1));
+    for (int l = 0; l < geo_.n_layers; ++l) {
+        if (layer_slots_[l] == nullptr) {
+            continue;
+        }
+        CUDA_CHECK(cudaMemcpyAsync(out[l].data(), layer_slots_[l], size_t(geo_.n_experts)*sizeof(int32_t),
+            cudaMemcpyDeviceToHost, copy_stream_));
+    }
+    CUDA_CHECK(cudaStreamSynchronize(copy_stream_));
+    return true;
+}
+
 std::vector<int> l1_arena::slot_counts() const {
+    if (!slots_.empty()) {
+        return slots_;
+    }
     std::vector<int> out = capacities_;
     for (int & n : out) { n += spare_slots_; }
     return out;
+}
+
+void l1_arena::set_static_capacities(const std::vector<int> & capacities) {
+    if (slots_.empty()) {
+        slots_ = slot_counts();
+    }
+    capacities_ = capacities;
+}
+
+bool l1_arena::evacuate(const std::vector<evac_op> & ops, double & ms) {
+    const auto t0 = std::chrono::steady_clock::now();
+    ms = 0.0;
+    if (!allocated() || ops.empty()) {
+        return allocated();
+    }
+    ggml_cuda_set_device(device_);
+    size_t temp_bytes = 0;
+    for (const evac_op & op : ops) {
+        if (op.cls < 0 || (size_t) op.cls >= class_data_.size()) { return false; }
+        for (int k = 0; k < geometry::n_kinds; ++k) { temp_bytes = std::max(temp_bytes, geo_.class_bytes[op.cls][k]); }
+    }
+    void * temp = nullptr;
+    if (cudaMalloc(&temp, temp_bytes) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return false;
+    }
+    std::vector<std::vector<int32_t>> device;
+    const bool tables = read_device_tables(device);
+    for (const evac_op & op : ops) {
+        for (int k = 0; k < geometry::n_kinds; ++k) {
+            const size_t bytes = geo_.class_bytes[op.cls][k];
+            char * from = gpu_slice(op.cls, k, op.from), * to = gpu_slice(op.cls, k, op.to);
+            if (op.victim_layer >= 0) {
+                CUDA_CHECK(cudaMemcpyAsync(temp, to, bytes, cudaMemcpyDeviceToDevice, copy_stream_));
+                CUDA_CHECK(cudaMemcpyAsync(to, from, bytes, cudaMemcpyDeviceToDevice, copy_stream_));
+                CUDA_CHECK(cudaMemcpyAsync(from, temp, bytes, cudaMemcpyDeviceToDevice, copy_stream_));
+            } else {
+                CUDA_CHECK(cudaMemcpyAsync(to, from, bytes, cudaMemcpyDeviceToDevice, copy_stream_));
+            }
+        }
+        host_slots_[(size_t) op.layer][(size_t) op.expert] = op.to;
+        if (tables) { device[(size_t) op.layer][(size_t) op.expert] = op.to; }
+        if (op.victim_layer >= 0) {
+            host_slots_[(size_t) op.victim_layer][(size_t) op.victim_expert] = op.from;
+            if (tables) { device[(size_t) op.victim_layer][(size_t) op.victim_expert] = op.from; }
+        }
+    }
+    CUDA_CHECK(cudaStreamSynchronize(copy_stream_));
+    (void) cudaFree(temp);
+    const bool ok = !tables || publish_tables(device);
+    ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    return ok;
+}
+
+bool l1_arena::resize(const std::vector<int> & slots, resize_stats & stats, std::string & why) {
+    stats = {};
+#if defined(GGML_USE_HIP)
+    const auto t0 = std::chrono::steady_clock::now();
+    if (!vmm() || slots.size() != class_data_.size()) {
+        why = "no VMM arena or a wrong class count";
+        return false;
+    }
+    vmm_state & v = *vmm_;
+    const std::vector<int> before = slot_counts();
+    for (size_t c = 0; c < slots.size(); ++c) {
+        if (slots[c] < 0) { why = "negative slot count"; return false; }
+        if (slots[c] >= before[c]) { continue; }
+        for (int l = 0; l < geo_.n_layers; ++l) {
+            if (geo_.layer_class[l] != int(c)) { continue; }
+            for (int e = 0; e < geo_.n_experts; ++e) {
+                if (host_slots_[(size_t) l][(size_t) e] >= slots[c]) {
+                    why = "class " + std::to_string(c) + " still has a static home at slot " +
+                        std::to_string(host_slots_[(size_t) l][(size_t) e]);
+                    return false;
+                }
+            }
+        }
+        if (c < gpu_spares_.size()) {
+            for (int s : gpu_spares_[c]) {
+                if (s >= slots[c]) { why = "class " + std::to_string(c) + " still has a spare at slot " + std::to_string(s); return false; }
+            }
+        }
+    }
+    for (size_t c = 0; c < slots.size(); ++c) {
+        for (int k = 0; k < geometry::n_kinds; ++k) {
+            const vmm_state::region & r = v.regions[c][k];
+            const size_t top = vmm_round_up(size_t(slots[c])*geo_.class_bytes[c][k] + arena_tail_bytes(geo_, (int) c, k), v.gran);
+            if (top > (r.stage.empty() ? r.reserved : r.stage.front().offset)) {
+                why = "class " + std::to_string(c) + " cannot grow to " + std::to_string(slots[c]) + " slots (address range)";
+                return false;
+            }
+        }
+    }
+    ggml_cuda_set_device(device_);
+    stats.mapped_before = vmm_mapped(v);
+    v.stats = &stats;
+    // shrinking classes first: their full handles are what the growing ones map
+    for (int pass = 0; pass < 2; ++pass) {
+        for (size_t c = 0; c < slots.size(); ++c) {
+            if (slots[c] == before[c] || (pass == 0) != (slots[c] < before[c])) { continue; }
+            for (int k = 0; k < geometry::n_kinds; ++k) {
+                vmm_state::region & r = v.regions[c][k];
+                const size_t nb = geo_.class_bytes[c][k], tail = arena_tail_bytes(geo_, (int) c, k);
+                const size_t end = vmm_round_up(size_t(slots[c])*nb + tail, v.gran);
+                if (!vmm_set_end(v, r, end, copy_stream_, why)) {
+                    v.stats = nullptr;
+                    return false;
+                }
+                // the new slots and the tail: MMQ reads past the last row of the top slot
+                const size_t zero = size_t(std::min(slots[c], before[c]))*nb;
+                CUDA_CHECK(cudaMemsetAsync(r.base + zero, 0, end - zero, copy_stream_));
+                stats.zeroed_bytes += end - zero;
+            }
+        }
+    }
+    for (auto h : v.pool) { (void) hipMemRelease(h); ++stats.handles_released; }
+    v.pool.clear();
+    v.stats = nullptr;
+    CUDA_CHECK(cudaStreamSynchronize(copy_stream_));
+    stats.mapped_after = vmm_mapped(v);
+    allocated_bytes_ = allocated_bytes_ - stats.mapped_before + stats.mapped_after;
+    slots_ = slots;
+    if (layout_.gpu.size() == slots.size()) {
+        layout_.gpu = slots;
+    }
+    stats.ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    return true;
+#else
+    GGML_UNUSED(slots);
+    why = "a CUDA build";
+    return false;
+#endif
 }
 
 l1_transaction l1_arena::stage(const expert_slot_table & selected, bool retain) const {
@@ -337,7 +787,7 @@ l1_transaction l1_arena::stage(const expert_slot_table & selected, bool retain) 
     std::vector<std::vector<int>> spares = gpu_spares_;
     if (!host_) {
         homes.assign(geo_.n_layers, std::vector<expert_location>(geo_.n_experts));
-        layout.gpu = capacities_; layout.host.assign(capacities_.size(), 0);
+        layout.gpu = slot_counts(); layout.host.assign(capacities_.size(), 0);
         layout.lent_begin.assign(capacities_.size(), 0); layout.lent_count.assign(capacities_.size(), 0);
         spares.assign(capacities_.size(), {});
         for (int l = 0; l < geo_.n_layers; ++l) {
@@ -352,8 +802,12 @@ l1_transaction l1_arena::stage(const expert_slot_table & selected, bool retain) 
             if (host_master_ || std::find(selected[l].begin(), selected[l].end(), e) == selected[l].end()) { hs[l].push_back(e); }
         }
     }
-    tx.install = plan_install(geo_, selected, hs, host_slots_, homes, capacities_, layout, layout, spares,
-        {host_master_, spare_slots_}, false, retain);
+    // a redraw: the retiring slots are no longer in the layout after the install, and an exclusive
+    // mover runs the unequal exchange
+    install_layout after = layout;
+    if (!retire_.empty()) { after.gpu = retire_; }
+    tx.install = plan_install(geo_, selected, hs, host_slots_, homes, capacities_, layout, after, spares,
+        {host_master_, spare_slots_}, false, retain, !host_master_ && unequal_);
     tx.selected = selected;
     tx.valid = tx.install.valid;
     return tx;
@@ -445,6 +899,7 @@ bool l1_arena::publish(const l1_transaction & tx) {
     if (!tx.valid || !allocated() || !publish_tables(tx.install.gpu_slots)) { return false; }
     host_slots_ = tx.install.gpu_slots; homes_ = tx.install.host;
     selected_ = tx.selected; gpu_spares_ = tx.install.gpu_spares;
+    if (host_ && !retire_.empty() && layout_.gpu.size() == retire_.size()) { layout_.gpu = retire_; }
     if (host_) { arena_slots_ = host_slot_table(homes_); return host_->publish_tables(arena_slots_); }
     return true;
 }

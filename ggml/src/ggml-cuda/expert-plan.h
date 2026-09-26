@@ -654,6 +654,9 @@ inline install_transaction plan_install(const geometry & geo,
         bool has_file, bool retain = true, bool unequal = false) {
     // `unequal` (exclusive movers only): the exchange need not pair every promotion with a demotion,
     // and a class may end with fewer VRAM residents than its capacity (see the exchange below).
+    // `after.gpu[c]` may be smaller than `before.gpu[c]` (a size-class redraw, expert-redraw.h): the
+    // slots from after.gpu[c] up retire. No expert is retained or placed there; a demotion may still
+    // read one (the range stays readable until the transaction completes).
     install_transaction out;
     auto fail = [&](const char * text) { out.valid = false; out.reason = text; return out; };
     if (!verify_assignment(previous_gpu, previous_host, geo.layer_class, before, gpu_spares,
@@ -687,7 +690,7 @@ inline install_transaction plan_install(const geometry & geo,
     std::vector<std::vector<expert_location>> pool(classes);
     std::vector<std::vector<bool>> occupied(classes);
     for (size_t c = 0; c < classes; ++c) {
-        if (capacities[c] < 0 || after.gpu[c] != before.gpu[c] || capacities[c] > after.gpu[c] ||
+        if (capacities[c] < 0 || after.gpu[c] > before.gpu[c] || capacities[c] > after.gpu[c] ||
                 after.host[c] < 0 || after.lent_begin[c] < 0 || after.lent_count[c] < 0 ||
                 count_g[c] > capacities[c] || (!mover.has_host_master && !unequal && count_g[c] != capacities[c]) ||
                 count_h[c] > after.host[c] + after.lent_count[c]) { return fail("selection exceeds capacity"); }
@@ -753,6 +756,7 @@ inline install_transaction plan_install(const geometry & geo,
             for (int e = 0; e < geo.n_experts; ++e) {
                 const int g = previous_gpu[l][e];
                 if (want_g[l][e] && g >= 0 && (retain || !mover.has_host_master)) {
+                    if (g >= after.gpu[c]) { return fail("retained VRAM slot retires"); }
                     out.gpu_slots[l][e] = g; gpu_taken[g] = true; ++out.retained_gpu;
                 } else {
                     if (want_g[l][e]) { incoming.emplace_back(int(l), e); }
@@ -825,6 +829,7 @@ inline install_transaction plan_install(const geometry & geo,
                 for (size_t j = 0; j < n; ++j) {
                     const auto item = outgoing[base + j];
                     const int g = previous_gpu[item.first][item.second];
+                    if (g >= after.gpu[c]) { return fail("exclusive rotation cannot retire a slot"); }
                     if (want_h[item.first][item.second] && !fill_host(item.first, item.second, batch, {expert_storage::vram, g})) {
                         return fail("demotion has no destination");
                     }
