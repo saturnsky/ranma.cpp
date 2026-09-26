@@ -100,3 +100,13 @@ rows it needs. A partial (checkpoint) state carries the open-block rows and
 their positions too, so a server checkpoint taken at any position can be
 restored and continued. A full state written without the positions still
 loads; its rows then count as unknown and an unaligned removal is refused.
+
+The server no longer aborts when a memory refuses a suffix removal. After a
+checkpoint restore it falls back to the next older context checkpoint, as when
+the newest one does not fit, and reprocesses the prompt from the start only
+when none is left (one warning line per step); during a speculative rollback it
+ends the request with an error and clears the slot. When the memory of a
+standalone draft model refuses the removal of a draft, the server rebuilds the
+draft sequence from the newest prompt checkpoint whose removal it accepts, else
+from the start; a draft fed by target hidden states, a prompt with media or with
+shifted positions ends the request instead.
