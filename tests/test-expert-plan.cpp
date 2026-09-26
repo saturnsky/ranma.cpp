@@ -1,4 +1,5 @@
 #include "expert-plan.h"
+#include "expert-redraw.h"
 
 #include <algorithm>
 #include <array>
@@ -260,6 +261,84 @@ int total_selected(const std::vector<std::vector<int32_t>> & selected) {
 }
 
 } // namespace
+
+// ---------------------------------------------------------------------------
+// A shrink install of the VRAM tier (the prefill lend, expert-redraw.h): the evacuation plan and the
+// mover with a retiring slot range.
+// ---------------------------------------------------------------------------
+static int shrink_install_tests() {
+    {
+        // evacuation: class 0 goes from 8 to 5 slots; slots 1 and 6 are spares
+        const std::vector<int> layer_class = {0, 0};
+        expert_slot_table gpu = {{0, 2, 7, -1, -1, -1}, {3, 4, 5, -1, -1, -1}};
+        const expert_slot_table keep = {{0, 2}, {3, 4}};
+        std::vector<std::vector<uint8_t>> other = {{0, 1, 0, 0, 0, 0, 1, 0}};
+        // kept above the limit: layer 0 expert 2 (slot 7), layer 1 expert 3 is at slot 3 (below)
+        evac_plan ev = plan_evacuation(layer_class, 6, gpu, keep, other, {8}, {5});
+        CHECK(ev.valid && ev.ops.size() == 1);
+        // no free slot below 5 (0 static, 1 spare, 2 static, 3 static, 4 static): swap with a dropped one
+        CHECK(ev.ops[0].from == 7 && ev.ops[0].victim_layer == 0 && ev.ops[0].victim_expert == 1 && ev.ops[0].to == 2);
+        CHECK(ev.gpu[0][2] == 2 && ev.gpu[0][1] == 7);
+        // with a free slot, a plain move
+        gpu[0][1] = -1;
+        ev = plan_evacuation(layer_class, 6, gpu, keep, other, {8}, {5});
+        CHECK(ev.valid && ev.ops.size() == 1 && ev.ops[0].victim_layer < 0 && ev.ops[0].to == 2 && ev.gpu[0][2] == 2);
+        // more kept residents than the new range holds
+        const expert_slot_table keep_all = {{0, 1, 2}, {3, 4, 5}};
+        gpu[0][1] = 6; other[0][6] = 0;
+        CHECK(!plan_evacuation(layer_class, 6, gpu, keep_all, other, {8}, {3}).valid);
+        printf("PASS: L1 shrink evacuation plan: free slots first, swaps with dropped residents, spare slots untouched\n");
+    }
+    {
+        // mover with a retiring range, then growth. One class, 2 layers x 6 experts, slice 30 B.
+        geometry geo;
+        geo.n_layers = 2; geo.n_experts = 6; geo.layer_class = {0, 0}; geo.class_layers = {2};
+        geo.class_bytes = {{10, 10, 10}};
+        const std::vector<std::vector<int>> no_spares(1);
+        install_layout l8, l5;
+        l8.gpu = {8}; l8.host = {12}; l8.lent_begin = {0}; l8.lent_count = {0};
+        l5 = l8; l5.gpu = {5};
+        expert_slot_table host_ids(2, std::vector<int32_t>(6));
+        for (int l = 0; l < 2; ++l) { for (int e = 0; e < 6; ++e) { host_ids[l][e] = l*6 + e; } }
+        const expert_locations homes = host_locations(host_ids);
+        const expert_slot_table all = {{0, 1, 2, 3, 4, 5}, {0, 1, 2, 3, 4, 5}};
+        // inclusive: 8 residents; the new plan keeps 5, two of them above slot 5 must have been moved
+        const expert_slot_table prev = {{0, 1, 2, 3, -1, -1}, {4, 5, 6, 7, -1, -1}};
+        const expert_slot_table sel = {{0, 1, 2, 3}, {0}};
+        auto tx = plan_install(geo, sel, all, prev, homes, {5}, l8, l5, no_spares, {true, 0}, false, true);
+        CHECK(tx.valid && tx.retained_gpu == 5 && tx.moves.empty());   // retained slots all below 5
+        const expert_slot_table sel_hi = {{0, 1}, {0, 1, 2}};          // layer 1 expert 2 sits at slot 6
+        tx = plan_install(geo, sel_hi, all, prev, homes, {5}, l8, l5, no_spares, {true, 0}, false, true);
+        CHECK(!tx.valid && tx.reason == "retained VRAM slot retires");
+        tx = plan_install(geo, sel_hi, all, prev, homes, {5}, l8, l5, no_spares, {true, 0}, false, false);   // no retain: recopied
+        CHECK(tx.valid && tx.h2d_slices == 5);
+        for (int l = 0; l < 2; ++l) { for (int e = 0; e < 6; ++e) { CHECK(tx.gpu_slots[l][e] < 5); } }
+        // growth: before == after at the larger count, the incoming experts take the new slots
+        install_layout l10 = l8; l10.gpu = {10};
+        const expert_slot_table grown = {{0, 1, 2, 3, 4}, {0, 1, 2, 3, 4}};
+        tx = plan_install(geo, grown, all, prev, homes, {10}, l10, l10, no_spares, {true, 0}, false, true);
+        CHECK(tx.valid && tx.retained_gpu == 8 && tx.h2d_slices == 2 && tx.gpu_slots[0][4] == 8 && tx.gpu_slots[1][4] == 9);
+        // exclusive with a file: the unequal exchange (empty blocked rows) shrinks 8 -> 5 slots with 2 spares
+        install_layout x10 = l8, x7 = l8;   // 6 static + 2 spares = 8 today; 3 static + 2 spares = 5 after
+        x10.gpu = {8}; x7.gpu = {5};
+        const expert_slot_table xprev = {{0, 1, 2, -1, -1, -1}, {3, 4, 5, -1, -1, -1}};   // spares 6, 7
+        expert_locations xhomes(2, std::vector<expert_location>(6));
+        for (int l = 0; l < 2; ++l) { for (int e = 3; e < 6; ++e) { xhomes[l][e] = {expert_storage::host, l*3 + e - 3}; } }
+        install_layout xh8 = x10, xh5 = x7; xh8.host = {8}; xh5.host = {8};
+        const std::vector<std::vector<int>> xspares = {{6, 7}};
+        const expert_slot_table xsel = {{0, 1}, {3}};            // kept: all below 5
+        tx = plan_install(geo, xsel, {{3, 4, 5, 2}, {0, 1, 4, 5}}, xprev, xhomes, {3}, xh8, xh5, xspares, {false, 2}, true, true, true);
+        if (!tx.valid) { fprintf(stderr, "%s\n", tx.reason.c_str()); }
+        CHECK(tx.valid && tx.gpu_spares[0].size() == 2);
+        for (int s : tx.gpu_spares[0]) { CHECK(s < 5); }
+        for (int l = 0; l < 2; ++l) { for (int e = 0; e < 6; ++e) { CHECK(tx.gpu_slots[l][e] < 5); } }
+        // the same without the unequal exchange (spare rotation) cannot retire
+        CHECK(!plan_install(geo, xsel, {{3, 4, 5, 2}, {0, 1, 4, 5}}, xprev, xhomes, {3}, xh8, xh5, xspares, {false, 2}, true, true).valid);
+        GGML_UNUSED(x10);
+        printf("PASS: L1 shrink mover: a retiring slot range (inclusive, exclusive unequal exchange) and growth into new slots\n");
+    }
+    return 0;
+}
 
 int main() {
     // --- small hand-checked cases -----------------------------------------
@@ -757,6 +836,9 @@ int main() {
         CHECK(!over.ok && over.required_bytes == 129*gib && over.total_bytes == 128*gib);
         CHECK(check_host_memory(1024*gib, 0).ok); // the platform cannot answer: nothing is refused
         printf("PASS: host requirement against installed physical memory\n");
+    }
+    if (shrink_install_tests() != 0) {
+        return 1;
     }
     return 0;
 }

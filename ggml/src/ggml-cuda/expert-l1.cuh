@@ -11,9 +11,11 @@
 #include "expert-host.cuh"
 #include "expert-l2-ledger.h"
 #include "expert-plan.h"
+#include "expert-redraw.h"
 
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -74,6 +76,16 @@ public:
                   const std::vector<int> * stage_slots = nullptr);
     // The first staging slot of a class (after the static capacity and the spares).
     int stage_base(int cls) const { return capacities_[(size_t) cls] + spare_slots_; }
+
+    // A shrink install (the prefill lend, expert-redraw.h), while nothing computes:
+    //   - set_static_capacities: the static capacity the next plans and installs are bound to;
+    //   - set_retire: the slot count per class the next install leaves (slots at and above it retire;
+    //     empty = none), set_unequal: an exclusive mover runs the unequal exchange (expert-plan.h);
+    //   - evacuate: moves kept residents down (and swaps them with dropped ones), all kinds, VRAM to VRAM.
+    void set_static_capacities(const std::vector<int> & capacities);
+    void set_retire(const std::vector<int> & limit) { retire_ = limit; }
+    void set_unequal(bool on) { unequal_ = on; }
+    bool evacuate(const std::vector<evac_op> & ops, double & ms);
     bool allocated() const { return !layer_slots_.empty(); }
 
     // Exclusive mode and every finite tier: this arena and `host` together own the routed expert
@@ -130,8 +142,8 @@ public:
 
     size_t device_bytes() const { return allocated_bytes_; }
     const std::vector<int> & capacities() const { return capacities_; }
-    // Arena slots per class: the static capacity and the exchange spares. Every slot index of the
-    // class is below this.
+    // Arena slots per class: the static capacity and the exchange spares (while a shrink install lowers
+    // the static capacity: the slots allocate() made). Every slot index of the class is below this.
     std::vector<int> slot_counts() const;
     // Mirror of the device table that maps an expert to its VRAM slot, or -1.
     const std::vector<std::vector<int32_t>> & host_slots() const { return host_slots_; }
@@ -174,6 +186,10 @@ public:
     // Reads one VRAM slot back into `dst`, which must hold the class/kind stride. Verification only.
     bool read_slice(int layer, int kind, int slot, void * dst) const;
 
+    // Reads every device table back ([layer][expert]; -1 rows for layers outside the cache). The device
+    // tables can differ from the host mirror: the VRAM staging of early-route layers points at its own slots.
+    bool read_device_tables(std::vector<std::vector<int32_t>> & out) const;
+
 private:
     bool publish_tables(const std::vector<std::vector<int32_t>> & slots);
     char * gpu_slice(int cls, int kind, int slot) const {
@@ -184,6 +200,9 @@ private:
     int device_ = -1;
     cudaStream_t copy_stream_ = nullptr;
     std::vector<int> capacities_;
+    std::vector<int> slots_;                           // [class] slot counts once set_static_capacities ran
+    std::vector<int> retire_;                          // [class] slot count the next install leaves
+    bool unequal_ = false;
     std::vector<std::array<void *, 3>> class_data_;    // [class][kind]
     std::vector<int32_t *> layer_slots_;               // [layer] device tables
     std::vector<std::vector<int32_t>> host_slots_;     // [layer][expert] mirror of the device tables

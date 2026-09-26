@@ -11,6 +11,7 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <numeric>
 
 void ggml_cuda_set_device(int d) { CUDA_CHECK(hipSetDevice(d)); }
 int ggml_cuda_get_device() { int d = 0; CUDA_CHECK(hipGetDevice(&d)); return d; }
@@ -546,6 +547,21 @@ static int stage_test() {
     CUDA_CHECK(hipFree(arena)); CUDA_CHECK(hipHostFree(host));
     CUDA_CHECK(hipHostFree(pinned_ids)); CUDA_CHECK(hipHostFree(pinned_out));
     return 0;
+}
+
+// ---- fixture helpers: a gather of every expert through the slot tables, and the bytes of a slice ----
+
+static __global__ void slots_gather(const char * arena, const int32_t * slots, const char * host, const int32_t * host_slots,
+        size_t stride, char * out) {
+    const int e = blockIdx.x;
+    const int32_t s = slots[e];
+    const char * src = s >= 0 ? arena + size_t(s)*stride : (host != nullptr && host_slots != nullptr && host_slots[e] >= 0 ?
+        host + size_t(host_slots[e])*stride : nullptr);
+    for (size_t i = threadIdx.x; i < stride; i += blockDim.x) { out[size_t(e)*stride + i] = src ? src[i] : char(0); }
+}
+
+static char fixture_byte(int layer, int kind, int expert, size_t i) {
+    return char(((layer*37 + kind*11 + expert*5 + int(i % 241)) & 0x7f) | 1);
 }
 
 int main(int argc, char ** argv) {
