@@ -1633,8 +1633,9 @@ private:
             ep.freeze       = params_base.expert_freeze;
 
             expert.init(ctx_tgt, ep);
-            // a separate draft model in the same cache (--expert-cache-draft on)
-            if (model_dft != nullptr && model_dft != model_tgt && ctx_dft != nullptr && llama_expert_available(ctx_dft)) {
+            // a separate draft model in the same cache (--expert-cache-draft on), or an MTP context
+            // on the target's own weights: its NextN block is one more routed layer of the cache
+            if (ctx_dft != nullptr && ctx_dft != ctx_tgt && llama_expert_available(ctx_dft)) {
                 expert.join(ctx_dft);
             }
         }
