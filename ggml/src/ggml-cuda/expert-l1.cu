@@ -433,6 +433,10 @@ ggml_cuda_expert_lookup l1_arena::lookup(int layer, int kind) const noexcept {
         // first; host_addresses, when a tier attached one, answers the experts it does not hold.
         out.host_data  = host_->device_data(cls, kind);
         out.host_slots = host_->device_slots(layer);
+        if (!addresses_) {
+            // without a tier: the host arena's own address table, when it keeps one (null otherwise)
+            out.host_addresses = host_->device_addresses(layer, kind);
+        }
     }
     return out;
 }
@@ -776,6 +780,53 @@ bool l1_arena::resize(const std::vector<int> & slots, resize_stats & stats, std:
     why = "a CUDA build";
     return false;
 #endif
+}
+
+bool l1_arena::resize_host(const std::vector<int> & capacities, host_resize_stats & stats, std::string & why) {
+    stats = {};
+    const auto t0 = std::chrono::steady_clock::now();
+    if (!allocated() || host_ == nullptr || !host_->chunked() || host_master_ || addresses_ ||
+            capacities.size() != capacities_.size() || layout_.host.size() != capacities.size()) {
+        why = "no exclusive arena with a chunked host tier, or a wrong class count";
+        return false;
+    }
+    bool moved = false;
+    for (size_t c = 0; c < capacities.size(); ++c) {
+        const int now = layout_.host[c] - spare_slots_;
+        if (capacities[c] < 0) { why = "negative host capacity"; return false; }
+        if (capacities[c] == now) { continue; }
+        if (capacities[c] < now) {
+            std::vector<host_move> ops;
+            if (!plan_host_compaction(geo_.layer_class, geo_.n_experts, homes_, int(c), layout_.host[c],
+                    capacities[c] + spare_slots_, ops, why)) {
+                return false;
+            }
+            const auto tc = std::chrono::steady_clock::now();
+            for (const host_move & op : ops) {
+                for (int k = 0; k < geometry::n_kinds; ++k) {
+                    void * to = host_->slice(int(c), k, op.to);
+                    const void * from = host_->slice(int(c), k, op.from);
+                    if (to == nullptr || from == nullptr) { why = "host compaction outside the arena"; return false; }
+                    memcpy(to, from, geo_.class_bytes[c][k]);
+                    stats.copied_bytes += geo_.class_bytes[c][k];
+                }
+                homes_[(size_t) op.layer][(size_t) op.expert] = {expert_storage::host, op.to};
+                arena_slots_[(size_t) op.layer][(size_t) op.expert] = op.to;
+            }
+            stats.copy_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tc).count();
+            stats.moved += ops.size();
+            moved = moved || !ops.empty();
+        }
+        host_arena::resize_stats hs;
+        if (!host_->set_capacity(int(c), capacities[c], hs, why)) { return false; }
+        stats.chunks_added += hs.chunks_added; stats.chunks_released += hs.chunks_released;
+        stats.bytes_added += hs.bytes_added; stats.bytes_released += hs.bytes_released;
+        layout_.host[c] = capacities[c] + spare_slots_;
+        if (c < host_capacities_.size()) { host_capacities_[c] = capacities[c]; }
+    }
+    if (moved && !host_->publish_tables(arena_slots_)) { why = "the host tables could not be published"; return false; }
+    stats.ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    return true;
 }
 
 l1_transaction l1_arena::stage(const expert_slot_table & selected, bool retain) const {
