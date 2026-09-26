@@ -322,10 +322,82 @@ bool l1_arena::publish_tables(const std::vector<std::vector<int32_t>> & slots) {
 }
 
 
+bool l1_arena::read_device_tables(std::vector<std::vector<int32_t>> & out) const {
+    if (!allocated()) {
+        return false;
+    }
+    ggml_cuda_set_device(device_);
+    out.assign(geo_.n_layers, std::vector<int32_t>(geo_.n_experts, -1));
+    for (int l = 0; l < geo_.n_layers; ++l) {
+        if (layer_slots_[l] == nullptr) {
+            continue;
+        }
+        CUDA_CHECK(cudaMemcpyAsync(out[l].data(), layer_slots_[l], size_t(geo_.n_experts)*sizeof(int32_t),
+            cudaMemcpyDeviceToHost, copy_stream_));
+    }
+    CUDA_CHECK(cudaStreamSynchronize(copy_stream_));
+    return true;
+}
+
 std::vector<int> l1_arena::slot_counts() const {
+    if (!slots_.empty()) {
+        return slots_;
+    }
     std::vector<int> out = capacities_;
     for (int & n : out) { n += spare_slots_; }
     return out;
+}
+
+void l1_arena::set_static_capacities(const std::vector<int> & capacities) {
+    if (slots_.empty()) {
+        slots_ = slot_counts();
+    }
+    capacities_ = capacities;
+}
+
+bool l1_arena::evacuate(const std::vector<evac_op> & ops, double & ms) {
+    const auto t0 = std::chrono::steady_clock::now();
+    ms = 0.0;
+    if (!allocated() || ops.empty()) {
+        return allocated();
+    }
+    ggml_cuda_set_device(device_);
+    size_t temp_bytes = 0;
+    for (const evac_op & op : ops) {
+        if (op.cls < 0 || (size_t) op.cls >= class_data_.size()) { return false; }
+        for (int k = 0; k < geometry::n_kinds; ++k) { temp_bytes = std::max(temp_bytes, geo_.class_bytes[op.cls][k]); }
+    }
+    void * temp = nullptr;
+    if (cudaMalloc(&temp, temp_bytes) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return false;
+    }
+    std::vector<std::vector<int32_t>> device;
+    const bool tables = read_device_tables(device);
+    for (const evac_op & op : ops) {
+        for (int k = 0; k < geometry::n_kinds; ++k) {
+            const size_t bytes = geo_.class_bytes[op.cls][k];
+            char * from = gpu_slice(op.cls, k, op.from), * to = gpu_slice(op.cls, k, op.to);
+            if (op.victim_layer >= 0) {
+                CUDA_CHECK(cudaMemcpyAsync(temp, to, bytes, cudaMemcpyDeviceToDevice, copy_stream_));
+                CUDA_CHECK(cudaMemcpyAsync(to, from, bytes, cudaMemcpyDeviceToDevice, copy_stream_));
+                CUDA_CHECK(cudaMemcpyAsync(from, temp, bytes, cudaMemcpyDeviceToDevice, copy_stream_));
+            } else {
+                CUDA_CHECK(cudaMemcpyAsync(to, from, bytes, cudaMemcpyDeviceToDevice, copy_stream_));
+            }
+        }
+        host_slots_[(size_t) op.layer][(size_t) op.expert] = op.to;
+        if (tables) { device[(size_t) op.layer][(size_t) op.expert] = op.to; }
+        if (op.victim_layer >= 0) {
+            host_slots_[(size_t) op.victim_layer][(size_t) op.victim_expert] = op.from;
+            if (tables) { device[(size_t) op.victim_layer][(size_t) op.victim_expert] = op.from; }
+        }
+    }
+    CUDA_CHECK(cudaStreamSynchronize(copy_stream_));
+    (void) cudaFree(temp);
+    const bool ok = !tables || publish_tables(device);
+    ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    return ok;
 }
 
 l1_transaction l1_arena::stage(const expert_slot_table & selected, bool retain) const {
@@ -337,7 +409,7 @@ l1_transaction l1_arena::stage(const expert_slot_table & selected, bool retain) 
     std::vector<std::vector<int>> spares = gpu_spares_;
     if (!host_) {
         homes.assign(geo_.n_layers, std::vector<expert_location>(geo_.n_experts));
-        layout.gpu = capacities_; layout.host.assign(capacities_.size(), 0);
+        layout.gpu = slot_counts(); layout.host.assign(capacities_.size(), 0);
         layout.lent_begin.assign(capacities_.size(), 0); layout.lent_count.assign(capacities_.size(), 0);
         spares.assign(capacities_.size(), {});
         for (int l = 0; l < geo_.n_layers; ++l) {
@@ -352,8 +424,12 @@ l1_transaction l1_arena::stage(const expert_slot_table & selected, bool retain) 
             if (host_master_ || std::find(selected[l].begin(), selected[l].end(), e) == selected[l].end()) { hs[l].push_back(e); }
         }
     }
-    tx.install = plan_install(geo_, selected, hs, host_slots_, homes, capacities_, layout, layout, spares,
-        {host_master_, spare_slots_}, false, retain);
+    // a shrink install (the prefill lend): the retiring slots are no longer in the layout after the install,
+    // and an exclusive mover runs the unequal exchange
+    install_layout after = layout;
+    if (!retire_.empty()) { after.gpu = retire_; }
+    tx.install = plan_install(geo_, selected, hs, host_slots_, homes, capacities_, layout, after, spares,
+        {host_master_, spare_slots_}, false, retain, !host_master_ && unequal_);
     tx.selected = selected;
     tx.valid = tx.install.valid;
     return tx;
@@ -445,6 +521,7 @@ bool l1_arena::publish(const l1_transaction & tx) {
     if (!tx.valid || !allocated() || !publish_tables(tx.install.gpu_slots)) { return false; }
     host_slots_ = tx.install.gpu_slots; homes_ = tx.install.host;
     selected_ = tx.selected; gpu_spares_ = tx.install.gpu_spares;
+    if (host_ && !retire_.empty() && layout_.gpu.size() == retire_.size()) { layout_.gpu = retire_; }
     if (host_) { arena_slots_ = host_slot_table(homes_); return host_->publish_tables(arena_slots_); }
     return true;
 }

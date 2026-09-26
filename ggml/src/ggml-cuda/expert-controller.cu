@@ -10,6 +10,7 @@
 #include "expert-os.h"
 #include "expert-plan.h"
 #include "expert-profiler.cuh"
+#include "expert-redraw.h"
 #include "expert-profile-store.h"
 #include "expert-storage.h"
 
@@ -700,6 +701,7 @@ public:
         device_ = -1;
         disabled_reason_ = "";
         capacities_.clear();
+        unequal_ = false;
     }
 
     bool status(ggml_expert_status * out) {
@@ -848,15 +850,16 @@ public:
             GGML_LOG_WARN("expert cache: plan %u is stale or unknown; not installed\n", id);
             return false;
         }
-        const plan_state & stored = it->second;
-        if (banks_[stored.bank].latest_plan != id) {
-            GGML_LOG_WARN("expert cache: plan %u of bank '%s' is stale; not installed\n", id, banks_[stored.bank].label.c_str());
+        const plan_state & committed = it->second;
+        if (banks_[committed.bank].latest_plan != id) {
+            GGML_LOG_WARN("expert cache: plan %u of bank '%s' is stale; not installed\n", id, banks_[committed.bank].label.c_str());
             return false;
         }
         if (cfg_.freeze || cfg_.policy != GGML_EXPERT_POLICY_ADAPTIVE) {
             GGML_LOG_INFO("expert cache: frozen; plan %u not installed\n", id);
             return false;
         }
+        const plan_state & stored = committed;
         // A model that does not run in the plan's phase keeps the VRAM slices it has now. Its size
         // classes are its own (keep_members_locked checks that), so the class capacities still hold.
         plan_state patched;
@@ -891,9 +894,18 @@ public:
         // the install republishes the slot tables: the staging entries go, and the staging forgets its
         // experts (the next hint copies again; an install is rare next to the hints)
         for (std::vector<int32_t> & owners : stage_owner_) { stage_forget(owners); }
+        return install_once_locked(id, plan);
+    }
+
+    bool install_once_locked(ggml_expert_plan_id id, const plan_state & plan) {
         if (tier_) {
             return install_tier_locked(id, plan, /*seed =*/ false);
         }
+        return install_plain_locked(id, plan);
+    }
+
+    // An install without the SSD tier.
+    bool install_plain_locked(ggml_expert_plan_id id, const plan_state & plan) {
         l1_install_stats stats;
         if (!l1_->install(plan.selected, cfg_.delta_install, stats)) {
             disable_locked("install failed");
@@ -1472,6 +1484,19 @@ private:
         installed_plan_ = id;
     }
 
+    // ---- the static capacities (the prefill lend's shrink install) --------------------------------
+
+    void set_capacities_locked(const std::vector<int> & caps) {
+        capacities_ = caps;
+        l1_->set_static_capacities(caps);
+    }
+
+    static std::string split_text(const std::vector<int> & v) {
+        std::string out;
+        for (size_t c = 0; c < v.size(); ++c) { out += (c ? "," : "") + std::to_string(v[c]); }
+        return out;
+    }
+
     tier_inputs tier_inputs_locked(const std::vector<uint64_t> & scores) const {
         tier_inputs in;
         in.inclusive = cfg_.mode == GGML_EXPERT_MODE_INCLUSIVE;
@@ -1949,7 +1974,8 @@ private:
         if (!host_plan.valid) { abort_locked(host_plan.reason.c_str()); }
         const auto tx = ggml_cuda_expert::plan_install(geo_, plan.selected, host_plan.selected, l1_->host_slots(), l1_->locations(),
             capacities_, l1_->layout(), layout, l1_->gpu_spares(),
-            {cfg_.mode == GGML_EXPERT_MODE_INCLUSIVE, cfg_.spare_slots}, true);
+            {cfg_.mode == GGML_EXPERT_MODE_INCLUSIVE, cfg_.spare_slots}, true, /*retain =*/ true,
+            /*unequal =*/ unequal_ && cfg_.mode == GGML_EXPERT_MODE_EXCLUSIVE);
         if (!tx.valid) { abort_locked(("install transaction: " + tx.reason).c_str()); }
         std::string reason;
         // Class layout: the moves run as relabels of the storage slots (the rings keep their
@@ -3117,6 +3143,7 @@ private:
     std::vector<int>    file_cap_;   // class layout: [class] the ring slots of its storage class
     std::vector<uint64_t> tier_scores_;
     std::vector<std::vector<int32_t>> tier_vram_;
+    bool          unequal_ = false;            // the prefill lend's shrink install: exclusive unequal exchange
     ggml_backend_buffer_t exclusive_buffer_ = nullptr; // owned by the model, not by the controller
     bool digests_enabled_ = false;
     std::vector<slice_digest> digests_;      // [(layer*n_kinds + kind)*n_experts + expert]

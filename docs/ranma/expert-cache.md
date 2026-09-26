@@ -37,7 +37,7 @@ The cache is inclusive by default: each VRAM resident also keeps its host copy, 
 stays complete. `--expert-cache-mode exclusive` gives every routed expert exactly one home instead
 and takes the budget back out of host memory (`expert-cache-exclusive.md`). `--expert-l2-mib` bounds
 the host memory the cache may use in either mode and leaves the rest of the experts in the GGUF
-file, read on demand (`expert-cache-l2.md`).
+file, read on demand (`expert-cache-l2.md`). The VRAM capacity of each size class is fixed at load.
 
 This is a fork feature of the HIP build. It is not compiled into the CUDA backend; the options are
 accepted there and do nothing.
