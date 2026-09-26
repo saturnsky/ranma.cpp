@@ -157,9 +157,10 @@ exchange above. `RANMA_EXPERT_VERIFY=1` checks every VRAM and every host slot af
 
 ## Design notes
 
-- **`host_addresses` is null without a finite host tier.** A host slot is addressed by its slot
-  index. The finite tier supplies an address table for streamed and lent ring slices; the kernels
-  take a nonzero address before the host-slot path.
+- **`host_addresses` is null without a finite host tier**, unless the VRAM size-class redraw is on
+  (`expert-cache-l1-redraw.md`): its chunked host arenas publish their own address table. Otherwise a
+  host slot is addressed by its slot index. The finite tier supplies an address table for its ring
+  slots and host residents; the kernels take a nonzero address before the host-slot path.
 - **Non-expert tensors of the routed context are kept, not refused.** Refusing them would mean
   exclusive mode never runs on a model whose token embedding shares the context. The delegate buffer
   has the context's own buffer type; because that buffer is not in the model's buffer list, the
