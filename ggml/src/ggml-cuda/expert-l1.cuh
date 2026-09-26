@@ -86,6 +86,16 @@ public:
     void set_retire(const std::vector<int> & limit) { retire_ = limit; }
     void set_unequal(bool on) { unequal_ = on; }
     bool evacuate(const std::vector<evac_op> & ops, double & ms);
+    // Exclusive mode with a chunked host arena (no finite tier, expert-host-layout.h), while nothing
+    // computes: the host capacity per class (spares not counted) becomes `capacities`. A shrinking
+    // class first moves its host residents at or above the new slot count down to free slots (host
+    // copies, all kinds), then releases the chunks past it; a growing class gets zeroed slots. The
+    // host tables (and the address table) are published again when a resident moved.
+    struct host_resize_stats {
+        size_t moved = 0, copied_bytes = 0, chunks_added = 0, chunks_released = 0, bytes_added = 0, bytes_released = 0;
+        double copy_ms = 0.0, ms = 0.0;
+    };
+    bool resize_host(const std::vector<int> & capacities, host_resize_stats & stats, std::string & why);
     bool allocated() const { return !layer_slots_.empty(); }
 
     // Exclusive mode and every finite tier: this arena and `host` together own the routed expert
