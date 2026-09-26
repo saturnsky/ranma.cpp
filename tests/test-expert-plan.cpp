@@ -1,3 +1,4 @@
+#include "expert-host-layout.h"
 #include "expert-plan.h"
 #include "expert-redraw.h"
 
@@ -465,6 +466,147 @@ static int redraw_tests() {
         CHECK(!plan_install(geo, xsel, {{3, 4, 5, 2}, {0, 1, 4, 5}}, xprev, xhomes, {3}, xh8, xh5, xspares, {false, 2}, true, true).valid);
         GGML_UNUSED(x10);
         printf("PASS: L1 redraw mover: a retiring slot range (inclusive, exclusive unequal exchange) and growth into new slots\n");
+    }
+    return 0;
+}
+
+// Host arenas without a finite tier (expert-host-layout.h): the chunk arithmetic, the
+// compaction plan, and a whole redraw in exclusive mode with no file (host growth, evacuation, the
+// shrink install, the grow install, host compaction) through the real mover.
+static int host_layout_tests() {
+    {
+        geometry geo;
+        geo.class_bytes = {{900*1024, 900*1024, 1200*1024}, {size_t(5) << 20, size_t(1) << 20, size_t(1) << 20}};
+        CHECK(host_chunk_slots(geo, 0, size_t(128) << 20) == 109);
+        CHECK(host_chunk_slots(geo, 1, size_t(4) << 20) == 1);   // a slice larger than the chunk: one per chunk
+        CHECK(host_chunks_for(0, 109) == 1 && host_chunks_for(109, 109) == 1 && host_chunks_for(110, 109) == 2);
+        CHECK(host_chunked_bytes(1000, 512, 7, 3) == 3*(3*1000 + 512));
+        printf("PASS: host arenas: slots per chunk, chunk counts and bytes\n");
+    }
+    {
+        // compaction, random: every resident at or above the count moves to a free slot below, nothing collides
+        uint64_t rng = 12345;
+        auto rnd = [&](int n) { rng = rng*6364136223846793005ULL + 1442695040888963407ULL; return int((rng >> 33) % uint64_t(n)); };
+        const std::vector<int> layer_class = {0, 1, 0, -1};
+        const int experts = 20;
+        for (int round = 0; round < 300; ++round) {
+            const int slots = 10 + rnd(40);
+            expert_locations homes(4, std::vector<expert_location>(experts));
+            std::vector<int> order(slots);
+            for (int i = 0; i < slots; ++i) { order[i] = i; }
+            for (int i = slots - 1; i > 0; --i) { std::swap(order[i], order[rnd(i + 1)]); }
+            int used = 0;
+            for (int l : {0, 2}) {
+                for (int e = 0; e < experts && used < slots; ++e) {
+                    if (rnd(3) == 0) { homes[l][e] = {expert_storage::host, order[used++]}; }
+                    else if (rnd(2) == 0) { homes[l][e] = {expert_storage::vram, 0}; }
+                }
+            }
+            homes[1][3] = {expert_storage::host, 1000};   // another class: ignored
+            const int count = rnd(slots + 1);
+            std::vector<host_move> ops;
+            std::string why;
+            const bool ok = plan_host_compaction(layer_class, experts, homes, 0, slots, count, ops, why);
+            CHECK(ok == (used <= count));
+            if (!ok) { CHECK(!why.empty() && ops.empty()); continue; }
+            for (const host_move & op : ops) {
+                CHECK(op.from >= count && op.to < count && homes[op.layer][op.expert].slot == op.from);
+                homes[op.layer][op.expert].slot = op.to;
+            }
+            std::vector<int> seen(count, 0);
+            int n = 0;
+            for (int l : {0, 2}) {
+                for (int e = 0; e < experts; ++e) {
+                    if (homes[l][e].storage != expert_storage::host) { continue; }
+                    CHECK(homes[l][e].slot >= 0 && homes[l][e].slot < count && !seen[homes[l][e].slot]);
+                    seen[homes[l][e].slot] = 1;
+                    ++n;
+                }
+            }
+            CHECK(n == used);
+        }
+        printf("PASS: host compaction plan: residents above the new count move to free slots below (300 random cases)\n");
+    }
+    {
+        // A redraw in exclusive mode without a file: layers 0, 1 in class 0, layer 2 in class 1, 8 experts,
+        // 2 spares, no pool. Static VRAM capacities {6, 2} -> {3, 5}.
+        geometry geo;
+        geo.n_layers = 3; geo.n_experts = 8; geo.layer_class = {0, 0, 1}; geo.class_layers = {2, 1};
+        geo.class_bytes = {{10, 10, 10}, {20, 20, 20}};
+        const int spares = 2, E = 8;
+        const std::vector<int> caps_old = {6, 2}, caps_new = {3, 5};
+        const expert_slot_table sel0 = {{0, 1, 2}, {0, 1, 2}, {0, 1}};
+        expert_slot_table gpu(3, std::vector<int32_t>(E, -1));
+        expert_locations homes(3, std::vector<expert_location>(E));
+        std::vector<int> ng = {0, 0}, nh = {0, 0};
+        for (int l = 0; l < 3; ++l) {
+            const int c = geo.layer_class[l];
+            for (int e = 0; e < E; ++e) {
+                if (std::binary_search(sel0[l].begin(), sel0[l].end(), e)) { gpu[l][e] = ng[c]++; }
+                else { homes[l][e] = {expert_storage::host, nh[c]++}; }
+            }
+        }
+        std::vector<std::vector<int>> spare_slots = {{6, 7}, {2, 3}};
+        install_layout lay;
+        lay.gpu = {caps_old[0] + spares, caps_old[1] + spares};
+        lay.host = {2*E - caps_old[0] + spares, E - caps_old[1] + spares};
+        lay.lent_begin = {0, 0}; lay.lent_count = {0, 0};
+        std::string why;
+        CHECK(verify_assignment(gpu, homes, geo.layer_class, lay, spare_slots, E, {false, spares}, false, why));
+        auto complement = [&](const expert_slot_table & s) {
+            expert_slot_table out(3);
+            for (int l = 0; l < 3; ++l) {
+                for (int e = 0; e < E; ++e) {
+                    if (!std::binary_search(s[l].begin(), s[l].end(), e)) { out[l].push_back(e); }
+                }
+            }
+            return out;
+        };
+        const std::vector<std::vector<uint8_t>> none(2);
+        // 1. evacuation of the kept residents of class 0 at or above its new slot count (3 + 2 spares)
+        const expert_slot_table sel1 = {{0, 2}, {2}, {0, 1}};   // layer 1 expert 2 sits at slot 5
+        const std::vector<int> limit = {caps_new[0] + spares, caps_old[1] + spares};
+        std::vector<std::vector<uint8_t>> other = {std::vector<uint8_t>(8, 0), std::vector<uint8_t>(4, 0)};
+        for (int c = 0; c < 2; ++c) { for (int sp : spare_slots[c]) { other[c][sp] = 1; } }
+        const evac_plan ev = plan_evacuation(geo.layer_class, E, gpu, sel1, other, lay.gpu, limit);
+        CHECK(ev.valid && !ev.ops.empty());
+        gpu = ev.gpu;
+        // without the host growth the shrink install has nowhere to demote to
+        {
+            install_layout small = lay; small.gpu = limit;
+            CHECK(!plan_install(geo, sel1, complement(sel1), gpu, homes, {caps_new[0], caps_old[1]}, lay, small,
+                spare_slots, {false, spares}, false, true, &none).valid);
+        }
+        // 0. the shrinking class gets its future host slots
+        lay.host[0] = 2*E - caps_new[0] + spares;
+        // 2. the shrink install demotes into them (unequal exchange, no file)
+        install_layout after = lay; after.gpu = limit;
+        install_transaction tx = plan_install(geo, sel1, complement(sel1), gpu, homes, {caps_new[0], caps_old[1]}, lay, after,
+            spare_slots, {false, spares}, false, true, &none);
+        if (!tx.valid) { fprintf(stderr, "shrink: %s\n", tx.reason.c_str()); }
+        CHECK(tx.valid && tx.ssd_slices == 0 && tx.d2h_slices == 3);
+        gpu = tx.gpu_slots; homes = tx.host; spare_slots = tx.gpu_spares; lay = after;
+        // 3. the VRAM resize: class 1 grows to 5 + 2 slots
+        lay.gpu = {caps_new[0] + spares, caps_new[1] + spares};
+        // 4. the grow install promotes class 1 experts from host into the new slots
+        const expert_slot_table sel2 = {{0, 2}, {2}, {0, 1, 4, 5, 7}};
+        tx = plan_install(geo, sel2, complement(sel2), gpu, homes, caps_new, lay, lay, spare_slots, {false, spares}, false, true, &none);
+        if (!tx.valid) { fprintf(stderr, "grow: %s\n", tx.reason.c_str()); }
+        CHECK(tx.valid && tx.h2d_slices == 3);
+        gpu = tx.gpu_slots; homes = tx.host; spare_slots = tx.gpu_spares;
+        // 5. host compaction of class 1 to its new count (8 - 5 + 2 spares)
+        std::vector<host_move> ops;
+        CHECK(plan_host_compaction(geo.layer_class, E, homes, 1, lay.host[1], E - caps_new[1] + spares, ops, why));
+        for (const host_move & op : ops) { homes[op.layer][op.expert] = {expert_storage::host, op.to}; }
+        lay.host[1] = E - caps_new[1] + spares;
+        CHECK(verify_assignment(gpu, homes, geo.layer_class, lay, spare_slots, E, {false, spares}, false, why));
+        int vram = 0;
+        for (int l = 0; l < 3; ++l) {
+            for (int e = 0; e < E; ++e) { vram += gpu[l][e] >= 0 ? 1 : 0; }
+        }
+        CHECK(vram == caps_new[0] + caps_new[1]);
+        printf("PASS: exclusive redraw without a file: host growth, evacuation, shrink and grow installs, host compaction "
+               "(%zu host moves); one home per expert after every step\n", ops.size());
     }
     return 0;
 }
@@ -967,6 +1109,9 @@ int main() {
         printf("PASS: host requirement against installed physical memory\n");
     }
     if (redraw_tests() != 0) {
+        return 1;
+    }
+    if (host_layout_tests() != 0) {
         return 1;
     }
     return 0;
