@@ -3,7 +3,8 @@
 ## What it is
 
 When the server loads a separate draft model that has routed experts (for example a block drafter
-with MoE stages) and the expert cache is on, the draft joins the target's cache: one VRAM arena
+with MoE stages, or an MTP head loaded from its own file with `-md` and `--spec-type draft-mtp`)
+and the expert cache is on, the draft joins the target's cache: one VRAM arena
 (`--expert-l1-mib`) and one host budget (`--expert-l2-mib`) serve both models, and one greedy plan
 decides which `(model, layer, expert)` slices live in VRAM. Without the joint cache the draft keeps
 its own placement flags (`-ngld`, `-otd`) and its whole expert weight either takes VRAM away from the
@@ -36,8 +37,11 @@ target's arena or is read from host memory on every draft call.
   router selections of a context count only into its own model's layers. A context that runs no
   cached model (a draft outside the cache) is not profiled. Each model has its own row selection, so
   the draft's context counts every row of its block decodes into the `decode` bank while the server
-  is generating, and nothing outside generation. The draft only routes in block decodes, so its
-  experts appear only in the decode plan.
+  is generating, and nothing outside generation, so its experts appear only in the decode plan. A
+  block drafter routes only in block decodes. An MTP head also routes while a prompt is processed:
+  the server runs its catch-up decode after every prompt batch of the target (at most `n_ubatch`
+  rows per ubatch, before the switch to generation). Those rows are not counted, so the MTP head's
+  `prefill` bank stays empty.
 - **Profiles.** `<profile-dir>/<model key>/<bank>/records/` per model, where the model key is the
   architecture name plus a 64-bit hash of the routed-expert geometry signature (layers, types,
   shapes, bytes per expert). The manifest keeps the full signature, so a profile of another model or
@@ -45,7 +49,9 @@ target's arena or is read from host memory on every draft call.
   so a model finds its records whether it runs alone or with a draft in the joint cache.
 - **Modes.** Inclusive and exclusive both work; the mode is one for the whole cache. With the draft
   in the joint cache the validator accepts a finite `--expert-l2-mib` and `--expert-prefill-swap`
-  (both stay refused for other speculative setups, which no run has checked). Inclusive with an
+  for a block drafter and for an MTP head with its own file (both stay refused for other speculative
+  setups, which no run has checked, including an MTP context on the target's own weights without
+  `-md`, which does not join). Inclusive with an
   unlimited host tier keeps a host copy of every expert of both models; for a model the size of the
   machine's RAM use a finite L2, which stores both in the owned host arena.
 - **Finite L2.** One host budget and one greedy over every model: the host cut ranks the slices that
@@ -59,7 +65,10 @@ target's arena or is read from host memory on every draft call.
   first bank that has records for it (the draft: `decode`). A `prefill` plan re-plans the target's
   classes over the target's share with the target's prompt scores; a model that has no records in
   the prompt bank (the draft) keeps the VRAM slices it has when the plan is installed, and its share
-  of the host cut is ranked with its `decode` scores, so the swap moves no draft slice. This needs
+  of the host cut is ranked with its `decode` scores, so the swap moves no draft slice. An MTP head
+  reads those slices during prompt processing too: its catch-up decodes run under the `prefill` plan
+  and the prompt ring, and read what the plan left outside VRAM from the host arena or the file.
+  This needs
   the draft's size classes to be its own (true for an MXFP4 draft next to a K-quant or IQ target);
   a draft that shares a class with the target is re-planned like the target, with a log line.
 

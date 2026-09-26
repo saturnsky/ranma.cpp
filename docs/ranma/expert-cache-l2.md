@@ -174,7 +174,7 @@ without a CLI flag (`host-direct-moe.md`). Do not combine cache placement with `
 
 The validator refuses a finite tier with a multimodal projector and with speculative decoding: those
 combinations have no correctness check yet, not a structural problem. A draft model in the joint
-cache (`expert-cache-joint.md`) is the exception. More than one server slot is
+cache (`expert-cache-joint.md`), a block drafter or an MTP head loaded with `-md`, is the exception. More than one server slot is
 accepted by the tier; the prompt swap keeps its single-slot rule.
 
 | Environment switch | Default | Effect |
