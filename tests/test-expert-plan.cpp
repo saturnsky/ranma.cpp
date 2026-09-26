@@ -1,4 +1,5 @@
 #include "expert-plan.h"
+#include "expert-redraw.h"
 
 #include <algorithm>
 #include <array>
@@ -260,6 +261,213 @@ int total_selected(const std::vector<std::vector<int32_t>> & selected) {
 }
 
 } // namespace
+
+// ---------------------------------------------------------------------------
+// Size-class redraw of the VRAM tier (expert-redraw.h): the switches, the capacity recompute, the
+// byte cap, the estimate, the gate, the evacuation plan and the mover with a
+// retiring slot range.
+// ---------------------------------------------------------------------------
+static int redraw_tests() {
+    {
+        // switches: the redraw is on when a condition is set; each set condition must hold; a bad
+        // value leaves its condition unset and is reported
+        std::string warn;
+        auto env = [](std::vector<std::pair<const char *, const char *>> kv) {
+            return [kv](const char * name) -> const char * {
+                for (const auto & p : kv) { if (strcmp(p.first, name) == 0) { return p.second; } }
+                return nullptr;
+            };
+        };
+        redraw_params p = redraw_params_from(env({}), warn);
+        CHECK(!p.enabled && p.benefit == 0.0 && p.move_pct == 0.0 && warn.empty());
+        CHECK(p.confirm == 2 && p.holdoff == 3 && p.cap_bytes == size_t(4608) << 20 && p.horizon == 350 && p.handle_bytes == size_t(64) << 20);
+        p = redraw_params_from(env({{"RANMA_EXPERT_L1_REDRAW_MOVE", "2.5"}}), warn);
+        CHECK(p.enabled && p.benefit == 0.0 && p.move_pct == 2.5 && warn.empty());
+        p = redraw_params_from(env({{"RANMA_EXPERT_L1_REDRAW_BENEFIT", "2"}}), warn);
+        CHECK(p.enabled && p.benefit == 2.0 && p.move_pct == 0.0 && warn.empty());
+        p = redraw_params_from(env({{"RANMA_EXPERT_L1_REDRAW_BENEFIT", "2"}, {"RANMA_EXPERT_L1_REDRAW_MOVE", "5"}}), warn);
+        CHECK(p.enabled && p.benefit == 2.0 && p.move_pct == 5.0 && warn.empty());
+        p = redraw_params_from(env({{"RANMA_EXPERT_L1_REDRAW_MOVE", "x"}, {"RANMA_EXPERT_L1_REDRAW_BENEFIT", "-1"}}), warn);
+        CHECK(!p.enabled && p.move_pct == 0.0 && p.benefit == 0.0 && !warn.empty());
+        p = redraw_params_from(env({{"RANMA_EXPERT_L1_REDRAW_MOVE", "0"}, {"RANMA_EXPERT_L1_REDRAW_BENEFIT", "3"}}), warn);
+        CHECK(p.enabled && p.move_pct == 0.0 && p.benefit == 3.0 && !warn.empty());
+        p = redraw_params_from(env({{"RANMA_EXPERT_L1_REDRAW_MOVE", ""}}), warn);
+        CHECK(!p.enabled && warn.empty());
+    }
+    {
+        // the capacity recompute is the load's greedy: without floors and ceilings an exclusive
+        // recompute gives exactly plan_placement's capacities for the same bytes
+        uint64_t seed = 12345;
+        auto next = [&]() { seed = seed*6364136223846793005ULL + 1442695040888963407ULL; return uint32_t(seed >> 33); };
+        const std::vector<std::array<size_t, 3>> bytes{{100, 100, 120}, {60, 60, 90}, {200, 200, 300}};
+        geometry geo = make_geometry({0, 0, 1, 1, 1, -1, 2, 0}, 16, bytes);
+        for (int round = 0; round < 200; ++round) {
+            std::vector<uint64_t> counts(geo.n_counts());
+            for (auto & c : counts) { c = next() % 7 == 0 ? 0 : next() % 1000; }
+            std::vector<int> current = {int(next() % 20), int(next() % 30), int(next() % 10)};
+            const size_t budget = redraw_static_bytes(geo, current);
+            placement_inputs in;
+            in.geo = &geo; in.counts = counts.data(); in.budget_bytes = budget; in.exclusive = true;
+            const placement ref = plan_placement(in);
+            const std::vector<int> none(3, 0), all(3, 1 << 20);
+            const std::vector<int> caps = redraw_capacities(geo, counts.data(), budget, true, current, none, all);
+            CHECK(caps == ref.capacities);
+            CHECK(redraw_static_bytes(geo, caps) <= budget);
+            // floors and ceilings hold, the bytes stay within the budget
+            const std::vector<int> lo = {std::min(current[0], 3), 0, std::min(current[2], 1)}, hi = {1 << 20, current[1] + 2, 1 << 20};
+            const std::vector<int> b = redraw_capacities(geo, counts.data(), budget, true, current, lo, hi);
+            for (int c = 0; c < 3; ++c) { CHECK(b[c] >= lo[c] && b[c] <= hi[c]); }
+            CHECK(redraw_static_bytes(geo, b) <= budget);
+            // a byte cap moves every class the same fraction of its way and keeps the bytes
+            const size_t cap = redraw_moved_bytes(geo, current, caps)/2;
+            const std::vector<int> lim = redraw_limit(geo, current, caps, cap, budget);
+            CHECK(cap == 0 || redraw_moved_bytes(geo, current, lim) <= cap);
+            CHECK(redraw_static_bytes(geo, lim) <= budget);
+            for (int c = 0; c < 3; ++c) { CHECK((lim[c] - current[c])*(caps[c] - current[c]) >= 0 && std::abs(lim[c] - current[c]) <= std::abs(caps[c] - current[c])); }
+        }
+        // cold: no proposal
+        const std::vector<int> cur = {3, 4, 1};
+        CHECK(redraw_capacities(geo, nullptr, redraw_static_bytes(geo, cur), true, cur, {0, 0, 0}, {99, 99, 99}) == cur);
+        // inclusive: a class the scores do not reach keeps the bytes nobody else takes
+        std::vector<uint64_t> counts(geo.n_counts(), 0);
+        for (int e = 0; e < 3; ++e) { counts[2*16 + e] = 100; }   // three experts of class 1 score
+        const std::vector<int> inc = redraw_capacities(geo, counts.data(), redraw_static_bytes(geo, cur), false, cur, {0, 0, 0}, {99, 99, 99});
+        CHECK(inc[1] == 4 && inc[0] == 3 && inc[2] == 1);   // nothing grows: the split stays
+        for (int e = 0; e < 16; ++e) { counts[3*16 + e] = 50; counts[4*16 + e] = 40; }
+        const std::vector<int> grow = redraw_capacities(geo, counts.data(), redraw_static_bytes(geo, cur), false, cur, {0, 0, 0}, {99, 99, 99});
+        CHECK(grow[1] > 4 && redraw_static_bytes(geo, grow) <= redraw_static_bytes(geo, cur));
+        CHECK(grow[0] + grow[2] < 4 && redraw_moved_bytes(geo, cur, grow) > 0);
+        printf("PASS: L1 redraw capacity recompute equals the load greedy; floors, ceilings, byte cap, cold and inclusive give-back\n");
+    }
+    {
+        // estimate: one class-0 expert leaves VRAM, one class-1 expert enters from the file
+        const std::vector<std::array<size_t, 3>> bytes{{1000000, 1000000, 1000000}, {500000, 500000, 500000}};
+        geometry geo = make_geometry({0, 1}, 4, bytes);
+        std::vector<uint64_t> counts = {40, 30, 20, 10, 60, 50, 30, 10};   // 250 selections, 2 used, 2 layers: 62.5 tokens
+        const expert_slot_table now = {{0, 1}, {0}}, next = {{0}, {0, 1, 2}};
+        redraw_params p;
+        p.horizon = 100;
+        p.handle_bytes = size_t(1) << 20;
+        const redraw_estimate est = redraw_estimate_of(geo, counts.data(), 2, now, next, [](int l, int e) { return l == 1 && e == 2; },
+            true, {2, 1}, {1, 3}, 30000000, p);
+        CHECK(est.moved_bytes == 3000000 && std::fabs(est.move_pct - 10.0) < 1e-9);
+        CHECK(est.enter_slices == 2 && est.leave_slices == 1 && est.enter_bytes == 3000000 && est.enter_file_bytes == 1500000);
+        CHECK(std::fabs(est.tokens - 62.5) < 1e-9);
+        const double gain = 50.0/62.5*0.0015*redraw_link_ms_per_gb + 30.0/62.5*0.0015*redraw_ssd_ms_per_gb - 30.0/62.5*0.003*redraw_link_ms_per_gb;
+        CHECK(std::fabs(est.benefit_ms_token - gain) < 1e-9 && std::fabs(est.benefit_ms - 100.0*gain) < 1e-7);
+        CHECK(std::fabs(est.cost_promote_ms - (0.0015*redraw_link_ms_per_gb + 0.0015*redraw_ssd_ms_per_gb)) < 1e-9);
+        CHECK(std::fabs(est.cost_demote_ms - 0.003*redraw_link_ms_per_gb) < 1e-9);
+        CHECK(est.handles == 3*1 + 3*1 && est.cost_ms > est.cost_promote_ms + est.cost_demote_ms);
+        CHECK(std::fabs(est.ratio - est.benefit_ms/est.cost_ms) < 1e-9);
+
+        // the gate: each condition on its own, both, confirmation, fresh installs, hold-off
+        redraw_estimate e;
+        e.moved_bytes = 1; e.move_pct = 6.0; e.benefit_ms = 30.0; e.cost_ms = 10.0;
+        redraw_params q;   // move > 5 %, benefit > 2 x cost, confirm 2, hold-off 3
+        q.enabled = true; q.move_pct = 5.0; q.benefit = 2.0;
+        redraw_gate g;
+        redraw_verdict v = redraw_decide(q, e, g);
+        CHECK(!v.fire && v.move_ok && v.benefit_ok && g.streak == 1);
+        v = redraw_decide(q, e, g);
+        CHECK(v.fire && g.streak == 0 && g.holdoff == 3);
+        for (int i = 0; i < 3; ++i) { v = redraw_decide(q, e, g); CHECK(!v.fire); }
+        CHECK(g.holdoff == 0 && g.streak == 3);
+        v = redraw_decide(q, e, g);
+        CHECK(v.fire);
+        redraw_gate h;
+        e.benefit_ms = 15.0;                          // benefit 1.5 x cost
+        CHECK(!redraw_decide(q, e, h).fire && !redraw_decide(q, e, h).fire && h.streak == 0);
+        redraw_params nb = q; nb.benefit = 0.0;       // benefit condition not set
+        CHECK(!redraw_decide(nb, e, h).fire && redraw_decide(nb, e, h).fire);
+        e.benefit_ms = 30.0; e.move_pct = 4.0;        // move 4 %
+        redraw_gate m;
+        CHECK(!redraw_decide(q, e, m).fire && !redraw_decide(q, e, m).fire);
+        redraw_params nm = q; nm.move_pct = 0.0;      // move condition not set
+        CHECK(!redraw_decide(nm, e, m).fire && redraw_decide(nm, e, m).fire);
+        redraw_gate f;
+        e.move_pct = 6.0;
+        redraw_mark_fresh(f, q);                      // a cold load: the first two installs need no confirmation
+        CHECK(redraw_decide(q, e, f).fire);
+        redraw_gate z;
+        e.moved_bytes = 0;
+        redraw_params off = q; off.benefit = 0.0; off.move_pct = 0.0; off.confirm = 1;
+        CHECK(!redraw_decide(off, e, z).fire);        // nothing to move never fires
+        e.moved_bytes = 1;
+        CHECK(redraw_decide(off, e, z).fire);
+        printf("PASS: L1 redraw estimate and gate: benefit, cost, independent conditions, confirmation, fresh installs, hold-off\n");
+    }
+    {
+        // evacuation: class 0 goes from 8 to 5 slots; slots 1 and 6 are spares
+        const std::vector<int> layer_class = {0, 0};
+        expert_slot_table gpu = {{0, 2, 7, -1, -1, -1}, {3, 4, 5, -1, -1, -1}};
+        const expert_slot_table keep = {{0, 2}, {3, 4}};
+        std::vector<std::vector<uint8_t>> other = {{0, 1, 0, 0, 0, 0, 1, 0}};
+        // kept above the limit: layer 0 expert 2 (slot 7), layer 1 expert 3 is at slot 3 (below)
+        evac_plan ev = plan_evacuation(layer_class, 6, gpu, keep, other, {8}, {5});
+        CHECK(ev.valid && ev.ops.size() == 1);
+        // no free slot below 5 (0 static, 1 spare, 2 static, 3 static, 4 static): swap with a dropped one
+        CHECK(ev.ops[0].from == 7 && ev.ops[0].victim_layer == 0 && ev.ops[0].victim_expert == 1 && ev.ops[0].to == 2);
+        CHECK(ev.gpu[0][2] == 2 && ev.gpu[0][1] == 7);
+        // with a free slot, a plain move
+        gpu[0][1] = -1;
+        ev = plan_evacuation(layer_class, 6, gpu, keep, other, {8}, {5});
+        CHECK(ev.valid && ev.ops.size() == 1 && ev.ops[0].victim_layer < 0 && ev.ops[0].to == 2 && ev.gpu[0][2] == 2);
+        // more kept residents than the new range holds
+        const expert_slot_table keep_all = {{0, 1, 2}, {3, 4, 5}};
+        gpu[0][1] = 6; other[0][6] = 0;
+        CHECK(!plan_evacuation(layer_class, 6, gpu, keep_all, other, {8}, {3}).valid);
+        printf("PASS: L1 redraw evacuation plan: free slots first, swaps with dropped residents, spare slots untouched\n");
+    }
+    {
+        // mover with a retiring range, then growth. One class, 2 layers x 6 experts, slice 30 B.
+        geometry geo;
+        geo.n_layers = 2; geo.n_experts = 6; geo.layer_class = {0, 0}; geo.class_layers = {2};
+        geo.class_bytes = {{10, 10, 10}};
+        const std::vector<std::vector<int>> no_spares(1);
+        install_layout l8, l5;
+        l8.gpu = {8}; l8.host = {12}; l8.lent_begin = {0}; l8.lent_count = {0};
+        l5 = l8; l5.gpu = {5};
+        expert_slot_table host_ids(2, std::vector<int32_t>(6));
+        for (int l = 0; l < 2; ++l) { for (int e = 0; e < 6; ++e) { host_ids[l][e] = l*6 + e; } }
+        const expert_locations homes = host_locations(host_ids);
+        const expert_slot_table all = {{0, 1, 2, 3, 4, 5}, {0, 1, 2, 3, 4, 5}};
+        // inclusive: 8 residents; the new plan keeps 5, two of them above slot 5 must have been moved
+        const expert_slot_table prev = {{0, 1, 2, 3, -1, -1}, {4, 5, 6, 7, -1, -1}};
+        const expert_slot_table sel = {{0, 1, 2, 3}, {0}};
+        auto tx = plan_install(geo, sel, all, prev, homes, {5}, l8, l5, no_spares, {true, 0}, false, true);
+        CHECK(tx.valid && tx.retained_gpu == 5 && tx.moves.empty());   // retained slots all below 5
+        const expert_slot_table sel_hi = {{0, 1}, {0, 1, 2}};          // layer 1 expert 2 sits at slot 6
+        tx = plan_install(geo, sel_hi, all, prev, homes, {5}, l8, l5, no_spares, {true, 0}, false, true);
+        CHECK(!tx.valid && tx.reason == "retained VRAM slot retires");
+        tx = plan_install(geo, sel_hi, all, prev, homes, {5}, l8, l5, no_spares, {true, 0}, false, false);   // no retain: recopied
+        CHECK(tx.valid && tx.h2d_slices == 5);
+        for (int l = 0; l < 2; ++l) { for (int e = 0; e < 6; ++e) { CHECK(tx.gpu_slots[l][e] < 5); } }
+        // growth: before == after at the larger count, the incoming experts take the new slots
+        install_layout l10 = l8; l10.gpu = {10};
+        const expert_slot_table grown = {{0, 1, 2, 3, 4}, {0, 1, 2, 3, 4}};
+        tx = plan_install(geo, grown, all, prev, homes, {10}, l10, l10, no_spares, {true, 0}, false, true);
+        CHECK(tx.valid && tx.retained_gpu == 8 && tx.h2d_slices == 2 && tx.gpu_slots[0][4] == 8 && tx.gpu_slots[1][4] == 9);
+        // exclusive with a file: the unequal exchange (empty blocked rows) shrinks 8 -> 5 slots with 2 spares
+        install_layout x10 = l8, x7 = l8;   // 6 static + 2 spares = 8 today; 3 static + 2 spares = 5 after
+        x10.gpu = {8}; x7.gpu = {5};
+        const expert_slot_table xprev = {{0, 1, 2, -1, -1, -1}, {3, 4, 5, -1, -1, -1}};   // spares 6, 7
+        expert_locations xhomes(2, std::vector<expert_location>(6));
+        for (int l = 0; l < 2; ++l) { for (int e = 3; e < 6; ++e) { xhomes[l][e] = {expert_storage::host, l*3 + e - 3}; } }
+        install_layout xh8 = x10, xh5 = x7; xh8.host = {8}; xh5.host = {8};
+        const std::vector<std::vector<int>> xspares = {{6, 7}};
+        const expert_slot_table xsel = {{0, 1}, {3}};            // kept: all below 5
+        tx = plan_install(geo, xsel, {{3, 4, 5, 2}, {0, 1, 4, 5}}, xprev, xhomes, {3}, xh8, xh5, xspares, {false, 2}, true, true, true);
+        if (!tx.valid) { fprintf(stderr, "%s\n", tx.reason.c_str()); }
+        CHECK(tx.valid && tx.gpu_spares[0].size() == 2);
+        for (int s : tx.gpu_spares[0]) { CHECK(s < 5); }
+        for (int l = 0; l < 2; ++l) { for (int e = 0; e < 6; ++e) { CHECK(tx.gpu_slots[l][e] < 5); } }
+        // the same without the unequal exchange (spare rotation) cannot retire
+        CHECK(!plan_install(geo, xsel, {{3, 4, 5, 2}, {0, 1, 4, 5}}, xprev, xhomes, {3}, xh8, xh5, xspares, {false, 2}, true, true).valid);
+        GGML_UNUSED(x10);
+        printf("PASS: L1 redraw mover: a retiring slot range (inclusive, exclusive unequal exchange) and growth into new slots\n");
+    }
+    return 0;
+}
 
 int main() {
     // --- small hand-checked cases -----------------------------------------
@@ -757,6 +965,9 @@ int main() {
         CHECK(!over.ok && over.required_bytes == 129*gib && over.total_bytes == 128*gib);
         CHECK(check_host_memory(1024*gib, 0).ok); // the platform cannot answer: nothing is refused
         printf("PASS: host requirement against installed physical memory\n");
+    }
+    if (redraw_tests() != 0) {
+        return 1;
     }
     return 0;
 }
