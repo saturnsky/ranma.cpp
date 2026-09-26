@@ -806,6 +806,321 @@ static int redraw_test(bool exclusive) {
     return 0;
 }
 
+// ---- host arenas without a finite tier (expert-host-layout.h) -------------------------------------
+//
+// Exclusive mode with an unlimited host tier. host_table_test: the address table on the contiguous
+// arenas publishes host_data + slot * stride for every host resident, 0 for VRAM residents, follows
+// an install, and the kernels' select reads the same bytes with and without it. host_redraw_test:
+// chunked host arenas (small chunks, so slots straddle several chunks per class) under a sequence of
+// VRAM size-class redraws in both directions, run as the controller does (host growth, evacuation,
+// the shrink install, resize, the grow install, host compaction) through the real l1_arena::install.
+// After every step every expert equals its source through its one home (graph captured before the
+// first redraw, reading through ggml_cuda_expert_cache_select), the logical reads agree, the host
+// capacities and chunk counts follow the split. host_chunk_cost_test times chunk growth and release
+// at a Qwen class-0 slice geometry with 128 MiB chunks.
+
+static __global__ void select_gather(const char * tensor, const char * arena, const int32_t * slots, const int32_t * host_slots,
+        const uint64_t * host_addresses, size_t stride, char * out) {
+    const int e = blockIdx.x;
+    const ggml_cuda_expert_source src = ggml_cuda_expert_cache_select(tensor, arena, slots, (uint32_t) e, host_slots, host_addresses);
+    const char * p = (const char *) src.data + size_t(src.channel)*stride;
+    for (size_t i = threadIdx.x; i < stride; i += blockDim.x) { out[size_t(e)*stride + i] = p[i]; }
+}
+
+struct host_fixture_geo {
+    static constexpr int layers = 3, experts = 12;
+    geometry geo;
+    ggml_tensor tensors[layers][3] = {};
+    std::vector<char> values[layers][3];
+    host_fixture_geo() {
+        geo.n_layers = layers; geo.n_experts = experts;
+        geo.layer_class = {0, 0, 1}; geo.class_layers = {2, 1};
+        geo.class_bytes = {{70*1024 + 64, 70*1024 + 64, 90*1024 + 128}, {50*1024, 50*1024, 110*1024 + 256}};
+        geo.nb2.resize(layers); geo.tensors.resize(layers);
+        for (int l = 0; l < layers; ++l) for (int k = 0; k < 3; ++k) {
+            const size_t stride = geo.class_bytes[geo.layer_class[l]][k];
+            values[l][k].resize(experts*stride);
+            for (int e = 0; e < experts; ++e) for (size_t i = 0; i < stride; ++i) { values[l][k][e*stride + i] = redraw_byte(l, k, e, i); }
+            auto & t = tensors[l][k]; t.type = GGML_TYPE_F32; t.ne[0] = 32; t.ne[1] = 1; t.ne[2] = experts; t.ne[3] = 1;
+            t.data = values[l][k].data(); geo.tensors[l][k] = &t; geo.nb2[l][k] = stride;
+        }
+    }
+};
+
+// Every expert through the select rule, with the lookup's pointers (or with the address table
+// dropped), compared with its source.
+static bool select_all_equal(const host_fixture_geo & f, l1_arena & gpu, bool use_table, const char * when) {
+    const geometry & geo = f.geo;
+    for (int l = 0; l < f.layers; ++l) for (int k = 0; k < 3; ++k) {
+        const size_t stride = geo.class_bytes[geo.layer_class[l]][k];
+        const ggml_cuda_expert_lookup lk = gpu.lookup(l, k);
+        char * out = nullptr;
+        CUDA_CHECK(hipMalloc(&out, f.experts*stride));
+        select_gather<<<f.experts, 256>>>((const char *) lk.host_data, (const char *) lk.data, lk.slots, lk.host_slots,
+            use_table ? lk.host_addresses : nullptr, stride, out);
+        std::vector<char> back(f.experts*stride);
+        CUDA_CHECK(hipMemcpy(back.data(), out, back.size(), hipMemcpyDeviceToHost));
+        CUDA_CHECK(hipFree(out));
+        if (back != f.values[l][k]) { printf("FAIL %s: layer %d kind %d through the select (table %d)\n", when, l, k, use_table); return false; }
+    }
+    return true;
+}
+
+static int host_table_test() {
+    host_fixture_geo f;
+    const geometry & geo = f.geo;
+    constexpr int E = host_fixture_geo::experts;
+    const int spares = 2;
+    const std::vector<int> caps = {10, 6}, host_caps = {2*E - 10, E - 6};
+    for (int table = 0; table < 2; ++table) {
+        host_arena host(geo);
+        if (table) { host.enable_addresses(); }
+        l1_arena gpu(geo);
+        CHECK(gpu.allocate(caps, 0, spares));
+        CHECK(host.allocate(host_caps, spares, 0));
+        gpu.attach_host(&host, spares);
+        expert_slot_table sel = {{0, 1, 2, 3, 4}, {0, 1, 2, 3, 4}, {0, 1, 2, 3, 4, 5}};
+        CHECK(gpu.assign_exclusive(sel));
+        for (int l = 0; l < f.layers; ++l) for (int k = 0; k < 3; ++k) {
+            CHECK(gpu.logical_io(l, k, f.values[l][k].data(), 0, f.values[l][k].size(), true));
+        }
+        CHECK(host.map());
+        auto check_table = [&](const char * when) {
+            for (int l = 0; l < f.layers; ++l) for (int k = 0; k < 3; ++k) {
+                const ggml_cuda_expert_lookup lk = gpu.lookup(l, k);
+                if (!table) {
+                    if (lk.host_addresses != nullptr) { printf("FAIL %s: a table without the switch\n", when); return false; }
+                    continue;
+                }
+                if (lk.host_addresses == nullptr) { printf("FAIL %s: no table\n", when); return false; }
+                std::vector<uint64_t> t(E);
+                CUDA_CHECK(hipMemcpy(t.data(), lk.host_addresses, E*sizeof(uint64_t), hipMemcpyDeviceToHost));
+                const size_t stride = geo.class_bytes[geo.layer_class[l]][k];
+                for (int e = 0; e < E; ++e) {
+                    const int hs = gpu.arena_slots()[l][e];
+                    const uint64_t want = hs >= 0 ? (uint64_t) (uintptr_t) lk.host_data + uint64_t(hs)*stride : 0;
+                    if (t[e] != want || (hs >= 0) == (gpu.host_slots()[l][e] >= 0)) {
+                        printf("FAIL %s: layer %d kind %d expert %d: table %llx, want %llx\n", when, l, k, e,
+                            (unsigned long long) t[e], (unsigned long long) want);
+                        return false;
+                    }
+                }
+            }
+            return select_all_equal(f, gpu, true, when) && select_all_equal(f, gpu, false, when);
+        };
+        CHECK(check_table("after the load"));
+        // an ordinary exclusive install (spare rotation): the table follows the host slots
+        for (int round = 0; round < 3; ++round) {
+            sel = round == 0 ? expert_slot_table{{3, 5, 7, 9, 11}, {0, 2, 4, 6, 8}, {1, 3, 5, 7, 9, 11}} :
+                  round == 1 ? expert_slot_table{{0, 1, 2, 10, 11}, {5, 6, 7, 8, 9}, {0, 2, 4, 6, 8, 10}} :
+                               expert_slot_table{{0, 1, 2, 3, 4}, {0, 1, 2, 3, 4}, {0, 1, 2, 3, 4, 5}};
+            l1_install_stats st;
+            CHECK(gpu.install(sel, true, st));
+            CHECK(check_table("after an install"));
+        }
+    }
+    printf("PASS: host address table (exclusive, unlimited host): off = no table; on = host_data + slot x stride per host "
+           "resident, 0 in VRAM, follows installs; the select reads the same bytes with and without it\n");
+    return 0;
+}
+
+static int host_redraw_test() {
+    host_fixture_geo f;
+    const geometry & geo = f.geo;
+    constexpr int layers = host_fixture_geo::layers, E = host_fixture_geo::experts;
+    const int spares = 2;
+    const std::vector<int> stage = {2, 2};
+    // 300 KiB chunks: 3 slots per chunk in class 0 (largest kind 90 KiB), 2 in class 1 (110 KiB)
+    const size_t chunk = 300*1024;
+    host_arena host(geo);
+    host.enable_addresses();
+    host.enable_chunks(chunk);
+    l1_arena gpu(geo);
+    gpu.enable_vmm({24, 12}, 256*1024);
+    std::vector<int> caps = {10, 6};
+    CHECK(gpu.allocate(caps, 0, spares, &stage));
+    if (!gpu.vmm()) { printf("FAIL: no VMM arena: %s\n", gpu.vmm_reason().c_str()); return 1; }
+    auto host_caps_of = [&](const std::vector<int> & c) { return std::vector<int>{2*E - c[0], E - c[1]}; };
+    CHECK(host.allocate(host_caps_of(caps), spares, 0));
+    CHECK(host.chunked() && host.chunk_slots(0) == 3 && host.chunk_slots(1) == 2);
+    gpu.attach_host(&host, spares);
+    expert_slot_table sel = {{0, 1, 2, 3, 4}, {0, 1, 2, 3, 4}, {0, 1, 2, 3, 4, 5}};
+    CHECK(gpu.assign_exclusive(sel));
+    for (int l = 0; l < layers; ++l) for (int k = 0; k < 3; ++k) {
+        CHECK(gpu.logical_io(l, k, f.values[l][k].data(), 0, f.values[l][k].size(), true));
+    }
+    CHECK(host.map());
+    // one graph over every (layer, kind), captured before any redraw, through the kernels' select
+    hipStream_t stream; CUDA_CHECK(hipStreamCreate(&stream));
+    size_t out_bytes = 0;
+    std::vector<size_t> out_off;
+    for (int l = 0; l < layers; ++l) for (int k = 0; k < 3; ++k) {
+        out_off.push_back(out_bytes); out_bytes += E*geo.class_bytes[geo.layer_class[l]][k];
+    }
+    char * out = nullptr; CUDA_CHECK(hipMalloc(&out, out_bytes));
+    hipGraph_t graph = nullptr; hipGraphExec_t exec = nullptr;
+    CUDA_CHECK(hipStreamBeginCapture(stream, hipStreamCaptureModeGlobal));
+    for (int l = 0; l < layers; ++l) for (int k = 0; k < 3; ++k) {
+        const ggml_cuda_expert_lookup lk = gpu.lookup(l, k);
+        select_gather<<<E, 256, 0, stream>>>((const char *) lk.host_data, (const char *) lk.data, lk.slots, lk.host_slots,
+            lk.host_addresses, geo.class_bytes[geo.layer_class[l]][k], out + out_off[l*3 + k]);
+    }
+    CUDA_CHECK(hipStreamEndCapture(stream, &graph));
+    CUDA_CHECK(hipGraphInstantiate(&exec, graph, nullptr, nullptr, 0));
+    std::vector<char> back(out_bytes);
+    auto check_all = [&](const char * when) {
+        std::string reason;
+        if (!gpu.verify_current_assignment(reason)) { printf("FAIL %s: assignment: %s\n", when, reason.c_str()); return false; }
+        CUDA_CHECK(hipGraphLaunch(exec, stream)); CUDA_CHECK(hipStreamSynchronize(stream));
+        CUDA_CHECK(hipMemcpy(back.data(), out, out_bytes, hipMemcpyDeviceToHost));
+        for (int l = 0; l < layers; ++l) for (int k = 0; k < 3; ++k) {
+            const size_t stride = geo.class_bytes[geo.layer_class[l]][k];
+            for (int e = 0; e < E; ++e) {
+                const bool vram = gpu.host_slots()[l][e] >= 0, home = gpu.arena_slots()[l][e] >= 0;
+                if (vram == home) { printf("FAIL %s: layer %d expert %d has %d homes\n", when, l, e, vram ? 2 : 0); return false; }
+                if (memcmp(back.data() + out_off[l*3 + k] + e*stride, f.values[l][k].data() + e*stride, stride) != 0) {
+                    printf("FAIL %s: layer %d kind %d expert %d (VRAM slot %d, host slot %d) differs from its source\n", when, l, k, e,
+                        gpu.host_slots()[l][e], gpu.arena_slots()[l][e]);
+                    return false;
+                }
+            }
+            std::vector<char> io(f.values[l][k].size());
+            if (!gpu.logical_io(l, k, io.data(), 0, io.size(), false) || io != f.values[l][k]) {
+                printf("FAIL %s: logical read of layer %d kind %d\n", when, l, k); return false;
+            }
+        }
+        size_t chunks = 0;
+        for (int c = 0; c < 2; ++c) { chunks += 3*size_t(host_chunks_for(host.capacities()[c] + spares, host.chunk_slots(c))); }
+        if (chunks != host.chunk_count()) { printf("FAIL %s: %zu chunks, want %zu\n", when, host.chunk_count(), chunks); return false; }
+        return select_all_equal(f, gpu, true, when);
+    };
+    CHECK(check_all("before the first redraw"));
+    uint64_t rng = 4242;
+    auto rnd = [&](int n) { rng = rng*6364136223846793005ULL + 1442695040888963407ULL; return int((rng >> 33) % uint64_t(n)); };
+    auto choose = [&](int cls, int count) {
+        std::vector<int> ls;
+        for (int l = 0; l < layers; ++l) { if (geo.layer_class[l] == cls) { ls.push_back(l); } }
+        expert_slot_table part(layers);
+        for (size_t i = 0; i < ls.size(); ++i) {
+            const int n = count/int(ls.size()) + (int(i) < count % int(ls.size()) ? 1 : 0);
+            std::vector<int> order(E);
+            std::iota(order.begin(), order.end(), 0);
+            for (int j = E - 1; j > 0; --j) { std::swap(order[j], order[rnd(j + 1)]); }
+            std::stable_partition(order.begin(), order.end(), [&](int e) {
+                return rnd(2) == 0 && std::binary_search(sel[ls[i]].begin(), sel[ls[i]].end(), e); });
+            part[ls[i]].assign(order.begin(), order.begin() + n);
+            std::sort(part[ls[i]].begin(), part[ls[i]].end());
+        }
+        return part;
+    };
+    const std::vector<std::vector<int>> splits = {{6, 10}, {16, 2}, {8, 8}, {3, 12}, {20, 0}, {10, 6}, {4, 11}, {14, 4}};
+    size_t moved = 0, added = 0, released = 0;
+    for (size_t r = 0; r < splits.size(); ++r) {
+        const std::vector<int> caps_old = gpu.capacities(), slots_old = gpu.slot_counts(), caps_new = splits[r];
+        std::vector<int> caps1(2), limit(2), slots_new(2), host_up(2);
+        const std::vector<int> host_final = host_caps_of(caps_new);
+        for (int c = 0; c < 2; ++c) {
+            caps1[c] = std::min(caps_old[c], caps_new[c]);
+            limit[c] = caps1[c] + slots_old[c] - caps_old[c];
+            slots_new[c] = caps_new[c] + slots_old[c] - caps_old[c];
+            host_up[c] = std::max(host.capacities()[c], host_final[c]);
+        }
+        expert_slot_table next(layers);
+        for (int c = 0; c < 2; ++c) {
+            const expert_slot_table part = choose(c, caps_new[c]);
+            for (int l = 0; l < layers; ++l) { if (geo.layer_class[l] == c) { next[l] = part[l]; } }
+        }
+        expert_slot_table step1 = sel;
+        for (int l = 0; l < layers; ++l) { if (caps_new[geo.layer_class[l]] < caps_old[geo.layer_class[l]]) { step1[l] = next[l]; } }
+        // 0. host growth of the shrinking classes
+        l1_arena::host_resize_stats hs;
+        std::string why;
+        if (!gpu.resize_host(host_up, hs, why)) { printf("FAIL redraw %zu: host growth: %s\n", r, why.c_str()); return 1; }
+        added += hs.chunks_added;
+        CHECK(check_all("after the host growth"));
+        // 1. evacuation
+        std::vector<std::vector<uint8_t>> other(2);
+        for (int c = 0; c < 2; ++c) {
+            other[c].assign(slots_old[c], 0);
+            for (int s : gpu.gpu_spares()[c]) { other[c][s] = 1; }
+        }
+        const evac_plan ev = plan_evacuation(geo.layer_class, E, gpu.host_slots(), step1, other, slots_old, limit);
+        if (!ev.valid) { printf("FAIL redraw %zu: %s\n", r, ev.reason.c_str()); return 1; }
+        double ms = 0.0;
+        CHECK(gpu.evacuate(ev.ops, ms));
+        // 2. the shrink install (the controller's install_plain path: unequal exchange, retiring range)
+        gpu.set_static_capacities(caps1);
+        gpu.set_retire(limit);
+        gpu.set_unequal(true);
+        l1_install_stats st;
+        if (!gpu.install(step1, true, st)) { printf("FAIL redraw %zu: shrink install\n", r); return 1; }
+        gpu.set_retire({});
+        sel = step1;
+        CHECK(check_all("after the shrink install"));
+        // 3. the handles
+        l1_arena::resize_stats rs;
+        if (!gpu.resize(slots_new, rs, why)) { printf("FAIL redraw %zu: resize: %s\n", r, why.c_str()); return 1; }
+        gpu.set_static_capacities(caps_new);
+        CHECK(check_all("after the resize"));
+        // 4. the grow install
+        if (!gpu.install(next, true, st)) { printf("FAIL redraw %zu: grow install\n", r); return 1; }
+        gpu.set_unequal(false);
+        sel = next;
+        CHECK(check_all("after the grow install"));
+        // 5. host compaction and chunk release of the growing classes
+        if (!gpu.resize_host(host_final, hs, why)) { printf("FAIL redraw %zu: host shrink: %s\n", r, why.c_str()); return 1; }
+        moved += hs.moved; released += hs.chunks_released;
+        CHECK(host.capacities() == host_final);
+        CHECK(check_all("after the host compaction"));
+    }
+    CHECK(moved > 0 && added > 0 && released > 0);
+    // an ordinary install after the redraws still rotates through the spares
+    l1_install_stats st;
+    expert_slot_table again(layers);
+    for (int c = 0; c < 2; ++c) {
+        const expert_slot_table part = choose(c, gpu.capacities()[c]);
+        for (int l = 0; l < layers; ++l) { if (geo.layer_class[l] == c) { again[l] = part[l]; } }
+    }
+    CHECK(gpu.install(again, true, st));
+    CHECK(check_all("after a plain install"));
+    CUDA_CHECK(hipGraphExecDestroy(exec)); CUDA_CHECK(hipGraphDestroy(graph));
+    CUDA_CHECK(hipFree(out)); CUDA_CHECK(hipStreamDestroy(stream));
+    printf("PASS: exclusive L1 redraw with chunked host arenas (no finite tier): %zu redraws both ways (one to a zero static "
+           "class), %zu chunks added, %zu released, %zu host residents compacted; every expert equals its source through its "
+           "one home after every step, the graph captured before replays across them, slack %zu bytes\n",
+        splits.size(), added, released, moved, host.slack_bytes());
+    return 0;
+}
+
+static int host_chunk_cost_test() {
+    // Qwen class 0 slices (900/900/1200 KiB), 128 MiB chunks: 109 slots per chunk
+    geometry geo;
+    geo.n_layers = 1; geo.n_experts = 512; geo.layer_class = {0}; geo.class_layers = {1};
+    geo.class_bytes = {{900*1024, 900*1024, 1200*1024}};
+    geo.nb2.resize(1); geo.tensors.resize(1);
+    ggml_tensor t[3] = {};
+    for (int k = 0; k < 3; ++k) {
+        t[k].type = GGML_TYPE_F32; t[k].ne[0] = 32; t[k].ne[1] = 1; t[k].ne[2] = 512; t[k].ne[3] = 1;
+        geo.tensors[0][k] = &t[k]; geo.nb2[0][k] = geo.class_bytes[0][k];
+    }
+    host_arena host(geo);
+    host.enable_addresses();
+    host.enable_chunks(size_t(128) << 20);
+    CHECK(host.allocate({0}, 0, 0));
+    CHECK(host.map());
+    const int per = host.chunk_slots(0);
+    host_arena::resize_stats grow, shrink;
+    std::string why;
+    CHECK(host.set_capacity(0, 4*per, grow, why));        // 1 -> 4 chunks per kind
+    CHECK(host.chunk_count() == 12 && grow.chunks_added == 9);
+    CHECK(host.set_capacity(0, 0, shrink, why));
+    CHECK(host.chunk_count() == 3 && shrink.chunks_released == 9);
+    printf("PASS: host chunk cost (128 MiB, %d slots of 900/900/1200 KiB): %zu chunks (%.1f MiB) added in %.1f ms = %.2f ms per "
+           "chunk (commit, zero, register), released in %.1f ms\n", per, grow.chunks_added,
+        double(grow.bytes_added)/double(1 << 20), grow.ms, grow.ms/double(grow.chunks_added), shrink.ms);
+    return 0;
+}
+
 int main(int argc, char ** argv) {
     if (argc != 2) { return 2; }
     setvbuf(stdout, nullptr, _IONBF, 0);
@@ -819,6 +1134,9 @@ int main(int argc, char ** argv) {
     CHECK(stage_test() == 0);
     CHECK(redraw_test(false) == 0);
     CHECK(redraw_test(true) == 0);
+    CHECK(host_table_test() == 0);
+    CHECK(host_redraw_test() == 0);
+    CHECK(host_chunk_cost_test() == 0);
     CHECK(early_ssd_test(argv[1]) == 0);
     constexpr int K = 640, M = 2560, N = 14, J = 16, experts = 17, selected = 4;
     constexpr size_t slice = size_t(K/32)*24*M, shift = 4064, tail = 288;
