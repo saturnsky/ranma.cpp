@@ -725,6 +725,7 @@ public:
         redraw_epoch_ = 0;
         redraw_max_static_.clear();
         redraw_unequal_ = false;
+        host_redraw_ = false;
     }
 
     bool status(ggml_expert_status * out) {
@@ -1559,9 +1560,6 @@ private:
         const char * why = nullptr;
         if (cfg_.policy != GGML_EXPERT_POLICY_ADAPTIVE || cfg_.freeze) {
             why = "no plan installs (frozen or not adaptive)";
-        } else if (cfg_.mode == GGML_EXPERT_MODE_EXCLUSIVE && cfg_.l2_bytes == 0) {
-            why = "exclusive mode with an unlimited host tier keeps one host arena per class that the L1 split sizes; "
-                  "the redraw needs a finite L2 or inclusive mode";
         }
         if (why != nullptr) {
             GGML_LOG_WARN("expert cache: L1 redraw requested but off: %s\n", why);
@@ -1738,6 +1736,25 @@ private:
             (unsigned long long) redraw_count_ + 1, id, split_text(caps_old).c_str(), split_text(caps_new).c_str(),
             split_text(slots_old).c_str(), split_text(slots_new).c_str(), ev.ops.size(), swaps,
             double(evac_bytes)/double(1 << 20), evac_ms);
+        // exclusive mode with chunked host arenas (no finite tier): the experts a shrinking class gives
+        // up need host slots of their class before the shrink install demotes them there; the growing
+        // classes give theirs back after the grow install (below)
+        std::vector<int> host_final;
+        l1_arena::host_resize_stats host_grow, host_shrink;
+        if (host_redraw_) {
+            host_final.assign(classes, 0);
+            std::vector<int> host_up(classes, 0);
+            const std::vector<int> host_now = host_->capacities();
+            for (size_t c = 0; c < classes; ++c) {
+                host_final[c] = geo_.class_layers[c]*geo_.n_experts - caps_new[c];
+                host_up[c]    = std::max(host_now[c], host_final[c]);
+            }
+            std::string why;
+            if (!l1_->resize_host(host_up, host_grow, why)) { abort_locked(("L1 redraw: host arena growth: " + why).c_str()); }
+            GGML_LOG_INFO("expert cache: L1 redraw %llu: host capacities %s -> %s before the shrink install: %zu chunks added "
+                          "(%.1f MiB) in %.1f ms\n", (unsigned long long) redraw_count_ + 1, split_text(host_now).c_str(),
+                split_text(host_up).c_str(), host_grow.chunks_added, double(host_grow.bytes_added)/double(1 << 20), host_grow.ms);
+        }
         // 2. the shrink install
         const auto t1 = std::chrono::steady_clock::now();
         set_capacities_locked(caps_shrink);
@@ -1773,6 +1790,29 @@ private:
         const bool grown = install_once_locked(id, step);
         redraw_unequal_ = false;
         l1_->set_unequal(false);
+        if (grown && host_redraw_) {
+            const std::vector<int> host_now = host_->capacities();
+            std::string why;
+            if (!l1_->resize_host(host_final, host_shrink, why)) { abort_locked(("L1 redraw: host arena shrink: " + why).c_str()); }
+            std::string reason;
+            if (!l1_->verify_current_assignment(reason)) {
+                GGML_ABORT("expert cache: exclusive assignment is inconsistent after the host compaction: %s", reason.c_str());
+            }
+            GGML_LOG_INFO("expert cache: L1 redraw %llu: host capacities %s -> %s after the grow install: %zu residents moved "
+                          "down (%.1f MiB copied in %.1f ms), %zu chunks released (%.1f MiB); host arenas %.1f MiB with %.1f MiB of "
+                          "chunk slack, in %.1f ms\n", (unsigned long long) redraw_count_ + 1, split_text(host_now).c_str(),
+                split_text(host_final).c_str(), host_shrink.moved, double(host_shrink.copied_bytes)/double(1 << 20),
+                host_shrink.copy_ms, host_shrink.chunks_released, double(host_shrink.bytes_released)/double(1 << 20),
+                double(host_->host_bytes())/double(1 << 20), double(host_->slack_bytes())/double(1 << 20), host_shrink.ms);
+            if (cfg_.log_mask & GGML_EXPERT_LOG_L2) {
+                GGML_LOG_INFO("expert_metrics {\"kind\":\"l1_redraw_host\",\"plan\":%u,\"grow_chunks\":%zu,\"grow_bytes\":%zu,"
+                              "\"grow_ms\":%.6f,\"moved\":%zu,\"copied_bytes\":%zu,\"copy_ms\":%.6f,\"released_chunks\":%zu,"
+                              "\"released_bytes\":%zu,\"shrink_ms\":%.6f,\"host_bytes\":%zu,\"slack_bytes\":%zu}\n",
+                    id, host_grow.chunks_added, host_grow.bytes_added, host_grow.ms, host_shrink.moved, host_shrink.copied_bytes,
+                    host_shrink.copy_ms, host_shrink.chunks_released, host_shrink.bytes_released, host_shrink.ms,
+                    host_->host_bytes(), host_->slack_bytes());
+            }
+        }
         ++redraw_count_;
         const double grow_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t2).count();
         const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
@@ -2945,11 +2985,16 @@ private:
         // Plan time, before the first expert byte is copied: a host requirement larger than the
         // installed memory can never be met, so it is a configuration error, not a slow run.
         size_t host_required = cfg_.l2_bytes;
+        // exclusive mode without a finite tier: a redraw needs chunked host arenas (expert-host-layout.h)
+        const bool host_chunks = !tier_ && redraw_.enabled;
         if (host_required == 0) {
             for (size_t cls = 0; cls < host_capacities.size(); ++cls) {
                 for (int kind = 0; kind < geometry::n_kinds; ++kind) {
-                    host_required += size_t(host_capacities[cls] + cfg_.spare_slots)*geo_.class_bytes[cls][kind] +
-                        arena_tail_bytes(geo_, (int) cls, kind);
+                    const int slots = host_capacities[cls] + cfg_.spare_slots;
+                    host_required += host_chunks ?
+                        host_chunked_bytes(geo_.class_bytes[cls][kind], arena_tail_bytes(geo_, (int) cls, kind), slots,
+                            host_chunk_slots(geo_, (int) cls, host_chunk_mib << 20)) :
+                        size_t(slots)*geo_.class_bytes[cls][kind] + arena_tail_bytes(geo_, (int) cls, kind);
                 }
             }
         }
@@ -2971,6 +3016,11 @@ private:
         redraw_started_locked(counts == nullptr);
         allocate_stage_locked();
         host_.reset(new host_arena(geo_));
+        if (!tier_ && redraw_on_) {
+            // the redraw moves host capacity between classes: an address table and chunked arenas
+            host_->enable_addresses();
+            host_->enable_chunks(host_chunk_mib << 20);
+        }
         if (!host_->allocate(host_capacities, cfg_.spare_slots, device_,
                 tier_ && tier_->class_layout() ? &tier_->storage() : nullptr)) {
             host_.reset();
@@ -2978,6 +3028,19 @@ private:
             profiler_.reset();
             disable_locked("host arena allocation failed");
             return false;
+        }
+        if (host_->addresses_enabled()) {
+            size_t table = size_t(geo_.n_routed_layers())*geometry::n_kinds*size_t(geo_.n_experts)*sizeof(uint64_t);
+            std::string per;
+            for (size_t c = 0; c < host_capacities.size(); ++c) { per += (c ? "," : "") + std::to_string(host_->chunk_slots((int) c)); }
+            GGML_LOG_INFO("expert cache: host address table on (%zu KiB of routed-layer entries); host arenas in %zu chunks "
+                          "of about %zu MiB (slots per chunk %s), %.1f MiB of chunk slack\n", table/1024, host_->chunk_count(),
+                host_chunk_mib, per.c_str(), double(host_->slack_bytes())/double(1 << 20));
+        }
+        host_redraw_ = redraw_on_ && !tier_ && host_->chunked();
+        if (redraw_on_ && !tier_ && !host_redraw_) {
+            redraw_on_ = false;
+            GGML_LOG_WARN("expert cache: L1 redraw off: the host arenas are not chunked\n");
         }
         l1_->attach_host(host_.get(), cfg_.spare_slots, cfg_.mode == GGML_EXPERT_MODE_INCLUSIVE);
         if (tier_) {
@@ -3444,6 +3507,9 @@ private:
     std::vector<int> redraw_max_static_;       // [class] static capacity the address ranges hold
     bool          redraw_unequal_ = false;     // exclusive installs of a redraw: unequal exchange
     uint64_t      redraw_count_ = 0;
+    // exclusive mode with an unlimited host tier: a redraw also resizes the chunked host arenas
+    // (expert-host-layout.h)
+    bool          host_redraw_ = false;
     ggml_backend_buffer_t exclusive_buffer_ = nullptr; // owned by the model, not by the controller
     bool digests_enabled_ = false;
     std::vector<slice_digest> digests_;      // [(layer*n_kinds + kind)*n_experts + expert]
