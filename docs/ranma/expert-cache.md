@@ -17,8 +17,8 @@ Three parts, in the order the data flows:
    `decode` and its prompt phase into a bank called `prefill` (`expert-cache-banks.md`).
 2. **Profile store and plan** (`expert-profile-store.cpp`, `expert-score.h`, `expert-plan.h`). When
    a request ends the server commits the bank: the histogram since the last commit is stored as one
-   record under `<profile-dir>/<model key>/<bank>/records/` (the model key is the architecture name plus a
-   hash of the routed-expert geometry), the newest ten records are scored with a half-life
+   record under `<profile-dir>/<model key>/<bank>/records/` (one store per model, the same whether the
+   model runs alone or a draft shares the cache, `expert-cache-joint.md`), the newest ten records are scored with a half-life
    of three requests, and a greedy plan by score x bytes fills the budget. The plan is a set of
    `(layer, expert)` pairs; it is not installed yet.
 3. **Arena** (`expert-l1.cu`). One fixed-address arena per size class and kind (up, gate, down),
@@ -115,6 +115,8 @@ with `GGML_CUDA_HOST_DIRECT=1` and `GGML_CUDA_HOST_DIRECT_MAX_BATCH=512` in the 
 | `--expert-freeze` | off | Profile and plan, never change the cache contents (for collecting a profile without disturbing a measurement). |
 | `--expert-profile-archive` | off | Records that leave the ten-record score window move to `DIR/<model key>/<bank>/archive/` instead of being deleted. |
 | `--expert-profile-reset` | off | Delete the stored records at startup. Also the way to replace a profile that belongs to another model or quantization. |
+| `--expert-cache-draft on\|off` | on | A draft model with routed experts shares the cache; each model keeps its own profiles under `DIR/<model key>/<bank>/` (`expert-cache-joint.md`). |
+| `--expert-cache-weight MODEL=W,...` | 1 each | Joint cache: multiplier on the host read cost of the target's or the draft's experts in the plan. |
 
 Most options are also environment variables of the usual form (`LLAMA_ARG_EXPERT_L1_MIB` and so on).
 
@@ -164,8 +166,9 @@ requests rebuild a profile from cold.
 
 ## Limits and fallbacks
 
-- **One model per process.** A second routed model loaded in the same process runs uncached with a
-  warning. This matches the single-user server the fork targets.
+- **One cache per process.** A separate draft model with routed experts joins the target's cache
+  (`expert-cache-joint.md`, `--expert-cache-draft`); any other routed model loaded in the same
+  process runs uncached with a warning.
 - **Slot 0 is profiled.** With `--parallel N > 1` the other slots use the cache but do not feed the
   profile.
 - **A manual `-ot` on `_exps` tensors is left alone** and is the user's responsibility; if the
