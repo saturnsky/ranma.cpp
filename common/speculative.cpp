@@ -1,6 +1,7 @@
 #include "speculative.h"
 
 #include "common.h"
+#include "expert.h"
 #include "ggml.h"
 #include "ggml-cpp.h"
 #include "llama.h"
@@ -2666,6 +2667,14 @@ common_speculative_init_result::common_speculative_init_result(
     //       the extra memory for small models is likely negligible?
     cparams.n_rs_seq  = 0;
     cparams.ctx_other = ctx_tgt;
+
+    // ranma expert cache: a draft that shares the target's cache names its file, which the
+    // target's config declared (docs/ranma/expert-cache.md, joint cache)
+    ggml_expert_config expert_cfg = {};
+    if (has_draft && expert_draft_joins(params)) {
+        expert_cfg = expert_draft_config(params);
+        mparams.expert_config = &expert_cfg;
+    }
 
     std::string model_path;
     if (has_draft) {

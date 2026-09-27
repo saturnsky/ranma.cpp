@@ -986,6 +986,10 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
         }
         params.tensor_buft_overrides.push_back(llm_ffn_exps_cpu_override());
         LOG_INF("expert cache: %d MiB budget, every routed expert placed in host memory\n", params.expert_l1_mib);
+        if (expert_draft_joins(params)) {
+            params.speculative.draft.tensor_buft_overrides.push_back(llm_ffn_exps_cpu_override());
+            LOG_INF("%s", "expert cache: the draft model shares the cache, its routed experts are placed in host memory too\n");
+        }
     }
 
     // pad tensor_buft_overrides for llama_params_fit:
@@ -3978,6 +3982,46 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         {"--expert-l2-worker-cpu"}, "N", "logical CPU for the L2 worker (-1 = last active logical CPU; default: -1)",
         [](common_params & params, int value) { params.expert_l2_worker_cpu = value; }
     ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PERPLEXITY, LLAMA_EXAMPLE_COMPLETION}));
+    add_opt(common_arg(
+        {"--expert-cache-draft"}, "on|off",
+        string_format("whether a draft model with routed experts shares the expert cache of the target (default: %s)\n"
+                      "on: one L1 and one L2 budget for both models, the draft's routed experts are placed by the cache;\n"
+                      "off: the draft keeps its own placement flags (-otd, -ngld)", params.expert_cache_draft ? "on" : "off"),
+        [](common_params & params, const std::string & value) {
+            if (value == "on") {
+                params.expert_cache_draft = true;
+            } else if (value == "off") {
+                params.expert_cache_draft = false;
+            } else {
+                throw std::invalid_argument("invalid value: must be 'on' or 'off'");
+            }
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_EXPERT_CACHE_DRAFT"));
+    add_opt(common_arg(
+        {"--expert-cache-weight"}, "MODEL=W[,...]",
+        "joint expert cache: multiplier on the host read cost of one model's experts in the placement,\n"
+        "MODEL is 'target' or 'draft' (default: target=1,draft=1)",
+        [](common_params & params, const std::string & value) {
+            for (const std::string & item : string_split<std::string>(value, ',')) {
+                const size_t eq = item.find('=');
+                if (eq == std::string::npos) {
+                    throw std::invalid_argument("invalid value: expected MODEL=W, got '" + item + "'");
+                }
+                const std::string name = item.substr(0, eq);
+                const float w = std::stof(item.substr(eq + 1));
+                if (!(w > 0.0f)) {
+                    throw std::invalid_argument("invalid value: the weight must be greater than 0");
+                }
+                if (name == "target") {
+                    params.expert_weight_target = w;
+                } else if (name == "draft") {
+                    params.expert_weight_draft = w;
+                } else {
+                    throw std::invalid_argument("invalid value: MODEL must be 'target' or 'draft', got '" + name + "'");
+                }
+            }
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_EXPERT_CACHE_WEIGHT"));
     add_opt(common_arg(
         {"--expert-freeze"},
         "keep the expert cache contents as they are and only collect the profile (default: off)",

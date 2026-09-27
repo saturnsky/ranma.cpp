@@ -208,6 +208,9 @@ samples count the wait for the up slices only; `staged_wait_ms` adds up the gate
 
 ## Limits and fallbacks
 
+- **One model.** The tier numbers the files of one model, so a joint cache (`expert-cache-joint.md`)
+  with a finite host budget caches the target only; the server refuses a finite L2 with speculative
+  decoding in any case.
 - **Windows and HIP only**, for the unbuffered read queue and the address reservation. The validator
   refuses the option elsewhere before the model loads.
 - **The up reads of a layer are not overlapped.** The staged service hides the gate and down reads

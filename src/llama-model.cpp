@@ -1316,6 +1316,10 @@ const ggml_expert_iface * llama_model::expert_iface() const {
     return pimpl->expert_ctx ? pimpl->expert_iface : nullptr;
 }
 
+ggml_context * llama_model::expert_context() const {
+    return pimpl->expert_iface ? pimpl->expert_ctx : nullptr;
+}
+
 void llama_model_base::load_stats(llama_model_loader & ml) {
     pimpl->n_elements = ml.n_elements;
     pimpl->n_bytes = ml.n_bytes;
