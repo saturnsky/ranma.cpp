@@ -339,7 +339,8 @@ int main() {
         CHECK((filled.selected[3] == std::vector<int32_t>{0, 1, 2, 3, 4}));
     }
 
-    // Cold start with dense layers between and after the routed ones: the split divides by the four
+    // Cold start with dense layers and empty layer numbers (a joint cache whose second member
+    // numbers its only routed layer after the first member's): the split divides by the four
     // routed layers, not the span of eight. Dividing by the span gave {2, 16}: half the
     // proportional share each, and the greedy remainder went to the smaller class.
     {
@@ -363,9 +364,9 @@ int main() {
         printf("PASS: cold class split divides by the routed layers (dense and empty layer numbers excluded)\n");
     }
 
-    // Cold fill across layers: a class whose last layer (layer 4) follows two dense layers. The
-    // round robin gives the last layer its share; a layer-first order would give {0, 1, 2, 3},
-    // {0}, {}.
+    // Cold fill across layers: a class whose last layer is a late joint member (an MTP head at
+    // layer 4 after two empty layer numbers). The round robin gives the late layer its share; a
+    // layer-first order would give {0, 1, 2, 3}, {0}, {}.
     {
         const std::vector<std::array<size_t, 3>> bytes{{100, 100, 100}};
         geometry geo = make_geometry({0, 0, -1, -1, 0}, 4, bytes);
