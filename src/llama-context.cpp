@@ -374,6 +374,11 @@ llama_context::llama_context(
                     break;
                 }
             }
+            // the router selections of this context count for this model only (several models can
+            // share one cache)
+            if (expert_backend && expert_iface->attach_backend) {
+                expert_iface->attach_backend(expert_backend, model.expert_context());
+            }
         }
 
         // create a list of the set_n_threads functions in the backends
@@ -501,6 +506,11 @@ llama_context::llama_context(
 llama_context::~llama_context() {
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
+
+    // ranma expert cache: this context's compute backend is freed below
+    if (expert_iface && expert_backend && expert_iface->attach_backend) {
+        expert_iface->attach_backend(expert_backend, nullptr);
+    }
 
     // when training, ggml_opt allocates extra buffers through the scheduler, so the sizes no longer match the expectation
     if (!model.hparams.no_alloc && !opt_ctx) {
@@ -1481,7 +1491,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     if (expert_iface && expert_backend) {
         int32_t row_begin = -1;
         int32_t row_end   = -1;
-        if (expert_profiled_seq >= 0 && expert_profiled_bank != GGML_EXPERT_BANK_NONE) {
+        if (expert_profiled_seq == LLAMA_EXPERT_ALL_ROWS && expert_profiled_bank != GGML_EXPERT_BANK_NONE && ubatch.n_tokens > 0) {
+            row_begin = 0;
+            row_end   = (int32_t) ubatch.n_tokens;
+        } else if (expert_profiled_seq >= 0 && expert_profiled_bank != GGML_EXPERT_BANK_NONE) {
             for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
                 for (int32_t s = 0; s < ubatch.n_seq_id[i]; ++s) {
                     if (ubatch.seq_id[i][s] == expert_profiled_seq) {
