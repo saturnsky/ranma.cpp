@@ -34,6 +34,7 @@
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
 #include "ggml-cuda/mapped-host.cuh"
+#include "ggml-cuda/expert-controller.cuh"
 #include "ggml-cuda/moe-weighted-reduction.cuh"
 #include "ggml-cuda/norm.cuh"
 #include "ggml-cuda/opt-step-adamw.cuh"
@@ -1279,6 +1280,15 @@ struct ggml_backend_cuda_device_context {
     size_t  host_direct_coarse_min_bytes;
 };
 
+#if defined(GGML_USE_HIP)
+int ggml_backend_cuda_dev_index(ggml_backend_dev_t dev) {
+    if (dev == nullptr || ggml_backend_dev_backend_reg(dev) != ggml_backend_cuda_reg()) {
+        return -1;
+    }
+    return ((const ggml_backend_cuda_device_context *) dev->context)->device;
+}
+#endif
+
 // host buffer type
 
 static const char * ggml_backend_cuda_host_buffer_type_name(ggml_backend_buffer_type_t buft) {
@@ -2490,6 +2500,13 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_GET_ROWS:
             ggml_cuda_op_get_rows(ctx, dst);
+#if defined(GGML_USE_HIP)
+            // ranma expert cache: when the router is not fused into TOPK_MOE (scheduler splits keep
+            // prompt batches out of the fused path), the weights gather still sees the selected ids
+            if (strncmp(dst->name, "ffn_moe_weights-", 16) == 0) {
+                ggml_cuda_expert_profile_ids(ctx, dst->src[1]);
+            }
+#endif
             break;
         case GGML_OP_GET_ROWS_BACK:
             ggml_cuda_op_get_rows_back(ctx, dst);
@@ -6109,6 +6126,39 @@ static bool ggml_backend_cuda_host_direct_op(ggml_backend_dev_t dev, const ggml_
     return ggml_cuda_host_direct_allowed(dev_ctx, op, src);
 }
 
+#if defined(GGML_USE_HIP)
+// GGML_EXPERT_HOST_DIRECT_PROC_NAME proc address, see ggml_backend_expert_host_direct_t: the expert cache needs
+// host-direct, so it is on for the cache unless GGML_CUDA_HOST_DIRECT is set, and the in-place token limit is at least
+// the ubatch unless GGML_CUDA_HOST_DIRECT_MAX_BATCH is set. Runs before the model allocates its host buffers.
+static bool ggml_backend_cuda_expert_host_direct(int64_t max_batch) {
+    ggml_backend_reg_t reg = ggml_backend_cuda_reg();
+    const char * env_on    = getenv("GGML_CUDA_HOST_DIRECT");
+    const char * env_batch = getenv("GGML_CUDA_HOST_DIRECT_MAX_BATCH");
+    const bool   set_batch = env_batch == nullptr && max_batch > MMVQ_MAX_BATCH_SIZE;
+
+    bool    on    = false;
+    int64_t limit = 0;
+    for (size_t i = 0; i < ggml_backend_reg_dev_count(reg); i++) {
+        ggml_backend_cuda_device_context * dev_ctx =
+            (ggml_backend_cuda_device_context *) ggml_backend_reg_dev_get(reg, i)->context;
+        if (env_on == nullptr) {
+            dev_ctx->host_direct = true;
+        }
+        if (set_batch && dev_ctx->host_direct_max_batch < max_batch) {
+            dev_ctx->host_direct_max_batch = max_batch;
+        }
+        on    = on || dev_ctx->host_direct;
+        limit = std::max(limit, dev_ctx->host_direct_max_batch);
+    }
+
+    const std::string reads = limit > 0 ? "up to " + std::to_string(limit) + " tokens" : "up to the MMVQ limit";
+    GGML_LOG_INFO("%s: host-direct %s (%s), in-place reads %s (%s)\n", __func__, on ? "on" : "off",
+            env_on == nullptr ? "expert cache" : "GGML_CUDA_HOST_DIRECT", reads.c_str(),
+            env_batch != nullptr ? "GGML_CUDA_HOST_DIRECT_MAX_BATCH" : set_batch ? "ubatch" : "default");
+    return on;
+}
+#endif
+
 static ggml_backend_event_t ggml_backend_cuda_device_event_new(ggml_backend_dev_t dev) {
 #ifdef GGML_CUDA_NO_PEER_COPY
     GGML_UNUSED(dev);
@@ -6261,6 +6311,15 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
 #if defined(GGML_USE_HIP) && defined(_WIN32)
     if (strcmp(name, "ggml_backend_finalize_host_buffer") == 0) {
         return (void *)ggml_backend_cuda_finalize_host_buffer;
+    }
+#endif
+#if defined(GGML_USE_HIP)
+    if (strcmp(name, GGML_EXPERT_IFACE_PROC_NAME) == 0) {
+        // ranma expert cache, see ggml-expert.h
+        return (void *)ggml_backend_cuda_expert_iface;
+    }
+    if (strcmp(name, GGML_EXPERT_HOST_DIRECT_PROC_NAME) == 0) {
+        return (void *)ggml_backend_cuda_expert_host_direct;
     }
 #endif
     if (strcmp(name, "ggml_backend_get_features") == 0) {

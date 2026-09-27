@@ -12,7 +12,7 @@ stay in mapped pinned host memory and the `MUL_MAT_ID` kernels (MMVQ, or MMQ abo
 over PCIe, one expert row block at a time, while every other tensor of the op stays in VRAM.
 
 The feature is off by default and is turned on with an environment switch, `GGML_CUDA_HOST_DIRECT=1`. There is no CLI
-flag.
+flag. The expert cache (`expert-cache.md`) needs it and turns it on by itself when the switch is not set.
 
 ## Why it exists
 
@@ -65,7 +65,7 @@ backend.
 
 A weight is admitted only when all of the following hold:
 
-- `GGML_CUDA_HOST_DIRECT` is set,
+- host-direct is on (`GGML_CUDA_HOST_DIRECT` is set, or the expert cache turned it on),
 - the op is `MUL_MAT_ID` and the tensor is its `src0`,
 - the tensor type is quantized,
 - the tensor's buffer is the HIP backend's host buffer type and is mapped (see the coarse path below),
@@ -89,11 +89,13 @@ it in the buffer, and a non-finite scale there turns into NaN activations for th
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `GGML_CUDA_HOST_DIRECT` | unset | Unset or `0` disables the feature. Any other value enables it. No effect outside HIP. |
-| `GGML_CUDA_HOST_DIRECT_MAX_BATCH` | `0` | Token count limit (`op->ne[2]`) up to which a weight may be read in place. `0` means the per-type MMVQ `MUL_MAT_ID` limit, `get_mmvq_mmid_max_batch(type, cc)`. Set it to at least the ubatch size (for example `512`) to read in place during prompt processing as well. |
+| `GGML_CUDA_HOST_DIRECT` | unset | Unset or `0` disables the feature. Any other value enables it. No effect outside HIP. When it is unset, an expert cache budget turns the feature on. |
+| `GGML_CUDA_HOST_DIRECT_MAX_BATCH` | `0` | Token count limit (`op->ne[2]`) up to which a weight may be read in place. `0` means the per-type MMVQ `MUL_MAT_ID` limit, `get_mmvq_mmid_max_batch(type, cc)`. Set it to at least the ubatch size (for example `512`) to read in place during prompt processing as well. When it is unset, an expert cache budget raises it to the ubatch size. |
 | `GGML_CUDA_HOST_DIRECT_COARSE_MIN_MIB` | `1024` | Host buffers of at least this size take the coarse-grained path: `VirtualAlloc`, then `hipHostRegister(Mapped \| CoarseGrained)` after the model is loaded. `0` disables it, so every host buffer is a plain `hipHostMalloc(Mapped)`. Windows only. |
 
-All three are read once, when the backend registers its devices.
+All three are read once, when the backend registers its devices. The expert cache applies its own defaults for the
+first two afterwards, before the model loads, through the `ggml_backend_expert_host_direct` proc address
+(`ggml-expert.h`); a variable that is set, even to `0`, is kept.
 
 When the feature is enabled, the host buffer type allocates with `hipHostMalloc(Mapped)` instead of
 `cudaMallocHost`, because a kernel can only dereference a host pointer that was mapped into the device address space.
@@ -112,9 +114,10 @@ GGML_CUDA_HOST_DIRECT=1 GGML_CUDA_HOST_DIRECT_MAX_BATCH=512
 ```
 
 `MAX_BATCH` should be at least the ubatch size (`-ub`, default 512), so that prompt processing also reads the experts
-in place. The defaults are deliberately left as they are: the feature stays off unless asked for, and the limit keeps
-its conservative MMVQ meaning, because the measurements behind the recommendation come from one machine and one
-ubatch size.
+in place. Without the expert cache the defaults are deliberately left as they are: the feature stays off unless asked
+for, and the limit keeps its conservative MMVQ meaning, because the measurements behind the recommendation come from
+one machine and one ubatch size. The expert cache needs the feature and applies this setting by itself, with the limit
+at its own ubatch size.
 
 ## Limits and fallbacks
 

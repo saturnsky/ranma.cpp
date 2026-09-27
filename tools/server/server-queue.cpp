@@ -357,6 +357,11 @@ void server_queue::start_loop(int64_t idle_sleep_ms) {
                 if (res) {
                     break; // new task arrived or terminate
                 }
+                // ranma: idle-time maintenance runs outside the lock so that posting a task never waits on it
+                if (callback_idle_tick) {
+                    lock.unlock();
+                    callback_idle_tick();
+                }
                 // otherwise, loop again to check sleeping condition
             }
         }
