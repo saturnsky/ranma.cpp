@@ -4,6 +4,7 @@
 #include "ggml.h"
 #include "ggml-cpu.h"
 #include "ggml-backend.h"
+#include "ggml-expert.h"
 #include "ggml-opt.h"
 #include "gguf.h"
 
@@ -359,6 +360,9 @@ extern "C" {
         bool no_host;         // bypass host buffer allowing extra buffers to be used
         bool no_alloc;        // only load metadata and simulate memory allocations
         bool load_mtp;        // whether to load MTP layers
+
+        // ranma: optional backend-managed cache of MoE expert weights (ggml-expert.h); NULL = off
+        const struct ggml_expert_config * expert_config;
     };
 
     struct llama_sampler_seq_config {
@@ -1045,6 +1049,24 @@ extern "C" {
     // This is automatically done when using one of the functions below to obtain the computation results
     // and is not necessary to call it explicitly in most cases
     LLAMA_API void llama_synchronize(struct llama_context * ctx);
+
+    // ranma: optional backend-managed cache of MoE expert weights (see ggml-expert.h).
+    // The backend owns histograms ("banks") of router selections and plans derived from them; the
+    // caller names the banks and decides when to mark, commit and install. Every call returns false
+    // when the model has no such cache.
+    LLAMA_API bool llama_expert_available(const struct llama_context * ctx);
+    LLAMA_API bool llama_expert_bank_open(struct llama_context * ctx, const char * label, ggml_expert_bank_id * out_bank);
+    // begin an interval: the bank histogram is zeroed
+    LLAMA_API bool llama_expert_bank_mark(struct llama_context * ctx, ggml_expert_bank_id bank);
+    // store the interval as one profile record, rescore and plan; nothing is installed
+    LLAMA_API bool llama_expert_bank_commit(struct llama_context * ctx, ggml_expert_bank_id bank,
+                                            const struct ggml_expert_record * record, ggml_expert_plan_id * out_plan);
+    LLAMA_API bool llama_expert_bank_discard(struct llama_context * ctx, ggml_expert_bank_id bank);
+    // synchronizes the context, then makes the plan resident; call while no other thread decodes
+    LLAMA_API bool llama_expert_plan_install(struct llama_context * ctx, ggml_expert_plan_id plan);
+    // the router selections of this sequence feed the bank on every following decode;
+    // seq_id < 0 or GGML_EXPERT_BANK_NONE records nothing
+    LLAMA_API void llama_expert_set_profiled_seq(struct llama_context * ctx, llama_seq_id seq_id, ggml_expert_bank_id bank);
 
     // Token logits obtained from the last call to llama_decode()
     // The logits for which llama_batch.logits[i] != 0 are stored contiguously

@@ -1,6 +1,7 @@
 #include "ggml-cuda/common.cuh"
 #include "ggml.h"
 #include "topk-moe.cuh"
+#include "expert-controller.cuh"
 
 #include <cmath>
 #include <initializer_list>
@@ -393,6 +394,10 @@ void ggml_cuda_op_topk_moe(ggml_backend_cuda_context &     ctx,
         launch_topk_moe_cuda<false>(ctx, logits_d, weights_d, ids_d, bias_d, n_rows, n_experts, n_expert_used, clamp_val,
                              scale_val, config);
     }
+#if defined(GGML_USE_HIP)
+    // ranma expert cache: count the selections of the profiled rows (see expert-profiler.cuh)
+    ggml_cuda_expert_profile_ids(ctx, ids);
+#endif
 }
 
 bool ggml_cuda_should_use_topk_moe(const ggml_tensor * gating_op,

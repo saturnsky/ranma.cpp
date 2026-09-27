@@ -750,6 +750,9 @@ struct llama_model {
 
     bool has_tensor_overrides() const;
 
+    // ranma: the backend expert cache table when this model configured one, else nullptr
+    const struct ggml_expert_iface * expert_iface() const;
+
     const struct ggml_tensor * get_tensor(const char * name) const;
 
     float get_rope_freq_base (const llama_cparams & cparams, int il) const;

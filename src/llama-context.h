@@ -12,6 +12,7 @@
 #include "ggml-opt.h"
 
 #include <array>
+#include <atomic>
 #include <map>
 #include <vector>
 
@@ -57,6 +58,28 @@ struct llama_context {
     void sched_reserve();
 
     void synchronize();
+
+    // ranma expert cache: the model's backend table and the backend that computes the routed
+    // experts; the profiled sequence is turned into a row range of every ubatch before compute.
+    // Public because the llama_expert_* C functions are the only writers.
+    const ggml_expert_iface * expert_iface   = nullptr;
+    ggml_backend_t            expert_backend = nullptr;
+    llama_seq_id              expert_profiled_seq  = -1;
+    ggml_expert_bank_id       expert_profiled_bank = GGML_EXPERT_BANK_NONE;
+
+    // ranma expert cache: how many encode/decode calls of this context are computing right now.
+    // Installing a plan rewrites the arena and the slot tables, so it needs this to be zero; the
+    // outputs of a finished compute are drained by synchronize() inside the install itself.
+    std::atomic<int> expert_n_compute_in_flight { 0 };
+
+    // Raises the counter for the lifetime of one encode/decode call, on every return path.
+    struct expert_compute_guard {
+        std::atomic<int> & counter;
+        explicit expert_compute_guard(std::atomic<int> & c) : counter(c) { counter.fetch_add(1, std::memory_order_acq_rel); }
+        ~expert_compute_guard() { counter.fetch_sub(1, std::memory_order_acq_rel); }
+        expert_compute_guard(const expert_compute_guard &) = delete;
+        expert_compute_guard & operator=(const expert_compute_guard &) = delete;
+    };
 
     const llama_model   & get_model()   const;
     const llama_cparams & get_cparams() const;

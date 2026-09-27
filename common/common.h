@@ -495,6 +495,7 @@ struct common_params {
     int32_t main_gpu           = 0;     // the GPU that is used for scratch and small tensors
     float   tensor_split[128]  = {0};   // how split tensors should be distributed across GPUs
     bool    fit_params         = true;  // whether to fit unset model/context parameters to free device memory
+    bool    fit_params_explicit = false; // -fit was given on the command line (ranma: the expert cache needs to know)
     bool    fit_params_print   = false; // print the estimated required memory to run the model
     int32_t fit_params_min_ctx = 4096;  // minimum context size to set when trying to reduce memory use
 
@@ -547,6 +548,11 @@ struct common_params {
     std::vector<std::string> antiprompt; // strings upon which more user input is prompted (a.k.a. reverse prompts)
     std::vector<llama_model_kv_override> kv_overrides;
     std::vector<llama_model_tensor_buft_override> tensor_buft_overrides;
+
+    // ranma: the overrides above cannot tell an explicit expert placement from an implied one, so the
+    //        handlers of these options record that the user gave them (see docs/ranma/expert-cache.md)
+    bool cpu_moe_explicit   = false; // --cpu-moe / --spec-draft-cpu-moe was given
+    bool n_cpu_moe_explicit = false; // --n-cpu-moe / --spec-draft-n-cpu-moe was given
 
     bool lora_init_without_apply = false; // only load lora to memory, but do not apply it to ctx (user can manually apply lora later using llama_adapter_lora_apply)
     std::vector<common_adapter_lora_info> lora_adapters; // lora adapter path with user defined scale
@@ -673,6 +679,14 @@ struct common_params {
     bool prefill_assistant = true; // if true, any trailing assistant message will be prefilled into the response
     int sleep_idle_seconds = -1;   // if >0, server will sleep after this many seconds of idle time
     float gpu_heartbeat_seconds = 0.0f; // if >0, server records a GPU event on every model device every N seconds while idle and during model teardown (keeps VRAM resident on Windows)
+
+    // ranma expert cache (docs/ranma/expert-cache.md)
+    int32_t     expert_l1_mib          = 0;     // VRAM budget for cached MoE expert weights; 0 = off
+    std::string expert_profile_dir;                // root directory of the selection profiles; required when the cache is on
+    bool        expert_freeze             = false; // profile only, never change the cache contents
+    bool        expert_profile_archive    = false; // keep records that leave the score window under archive/
+    bool        expert_profile_reset      = false; // discard the stored profiles at startup
+    int32_t     expert_seed               = 1;
 
     std::vector<std::string> api_keys;
 
