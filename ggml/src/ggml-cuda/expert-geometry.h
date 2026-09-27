@@ -99,7 +99,48 @@ inline bool parse_expert_tensor_name(const char * name, int & layer, int & kind)
     return true;
 }
 
-inline bool build_geometry(const ggml_context * ctx, geometry & out, std::string & reason) {
+// Size classes. The reference implementation compared kind bytes plus type/ne0/ne1 of a reference
+// layer; generalized here to compare (type, ne0, ne1, nb2) per kind, which is the same predicate
+// expressed without a reference-layer lookup and without relying on the byte size alone. Classes
+// are numbered in the order of their first layer.
+inline void assign_size_classes(geometry & out) {
+    out.class_bytes.clear();
+    out.class_layers.clear();
+    out.layer_class.assign(out.n_layers, -1);
+    std::vector<int> reference;
+    for (int layer = 0; layer < out.n_layers; ++layer) {
+        if (out.tensors[layer][0] == nullptr) {
+            continue;
+        }
+        int cls = -1;
+        for (int i = 0; i < (int) reference.size(); ++i) {
+            const int ref = reference[i];
+            bool same = true;
+            for (int kind = 0; kind < geometry::n_kinds; ++kind) {
+                const ggml_tensor * a = out.tensors[ref][kind];
+                const ggml_tensor * b = out.tensors[layer][kind];
+                same = same && a->type == b->type && a->ne[0] == b->ne[0] && a->ne[1] == b->ne[1] &&
+                    out.nb2[ref][kind] == out.nb2[layer][kind];
+            }
+            if (same) {
+                cls = i;
+                break;
+            }
+        }
+        if (cls < 0) {
+            reference.push_back(layer);
+            out.class_bytes.push_back(out.nb2[layer]);
+            out.class_layers.push_back(0);
+            cls = (int) reference.size() - 1;
+        }
+        out.layer_class[layer] = cls;
+        ++out.class_layers[cls];
+    }
+}
+
+// Every tensor of `tensors` that is a routed expert weight is part of the geometry; the others are
+// ignored. build_geometry below is the same over the tensors of one context.
+inline bool build_geometry_tensors(const std::vector<const ggml_tensor *> & tensors, geometry & out, std::string & reason) {
     out = geometry();
     reason.clear();
 
@@ -113,8 +154,7 @@ inline bool build_geometry(const ggml_context * ctx, geometry & out, std::string
     int64_t experts = -1;
 
     char message[512];
-    for (ggml_tensor * tensor = ggml_get_first_tensor(ctx); tensor != nullptr;
-            tensor = ggml_get_next_tensor(ctx, tensor)) {
+    for (const ggml_tensor * tensor : tensors) {
         int layer = -1;
         int kind  = -1;
         if (!parse_expert_tensor_name(ggml_get_name(tensor), layer, kind)) {
@@ -190,43 +230,50 @@ inline bool build_geometry(const ggml_context * ctx, geometry & out, std::string
         }
     }
 
-    // Size classes. The reference implementation compared kind bytes plus type/ne0/ne1 of a reference
-    // layer; generalized here to compare (type, ne0, ne1, nb2) per kind, which
-    // is the same predicate expressed without a reference-layer lookup and
-    // without relying on the byte size alone.
-    std::vector<int> reference;
-    for (int layer = 0; layer < out.n_layers; ++layer) {
-        if (out.tensors[layer][0] == nullptr) {
-            continue;
-        }
-        int cls = -1;
-        for (int i = 0; i < (int) reference.size(); ++i) {
-            const int ref = reference[i];
-            bool same = true;
-            for (int kind = 0; kind < geometry::n_kinds; ++kind) {
-                const ggml_tensor * a = out.tensors[ref][kind];
-                const ggml_tensor * b = out.tensors[layer][kind];
-                same = same && a->type == b->type && a->ne[0] == b->ne[0] && a->ne[1] == b->ne[1] &&
-                    out.nb2[ref][kind] == out.nb2[layer][kind];
-            }
-            if (same) {
-                cls = i;
-                break;
-            }
-        }
-        if (cls < 0) {
-            reference.push_back(layer);
-            out.class_bytes.push_back(out.nb2[layer]);
-            out.class_layers.push_back(0);
-            cls = (int) reference.size() - 1;
-        }
-        out.layer_class[layer] = cls;
-        ++out.class_layers[cls];
-    }
+    assign_size_classes(out);
     return true;
 }
 
-// 64-bit FNV-1a of a string, for the model key of the profile directory.
+inline bool build_geometry(const ggml_context * ctx, geometry & out, std::string & reason) {
+    std::vector<const ggml_tensor *> tensors;
+    for (ggml_tensor * tensor = ggml_get_first_tensor(ctx); tensor != nullptr;
+            tensor = ggml_get_next_tensor(ctx, tensor)) {
+        tensors.push_back(tensor);
+    }
+    return build_geometry_tensors(tensors, out, reason);
+}
+
+// Joint cache: the geometries of several models laid end to end. Part i's layer l is joint layer
+// offsets[i] + l, and the size classes are recomputed over the union, so two models whose expert
+// slices have the same layout share a class. All parts must route the same number of experts.
+inline bool concat_geometry(const std::vector<const geometry *> & parts, geometry & out,
+        std::vector<int> & offsets, std::string & reason) {
+    out = geometry();
+    offsets.clear();
+    reason.clear();
+    for (const geometry * part : parts) {
+        if (part == nullptr || part->n_layers <= 0) {
+            reason = "a joined model has no routed layers";
+            return false;
+        }
+        if (out.n_experts != 0 && part->n_experts != out.n_experts) {
+            char message[160];
+            snprintf(message, sizeof(message), "joined models route %d and %d experts; the cache needs one expert count",
+                out.n_experts, part->n_experts);
+            reason = message;
+            return false;
+        }
+        out.n_experts = part->n_experts;
+        offsets.push_back(out.n_layers);
+        out.n_layers += part->n_layers;
+        out.nb2.insert(out.nb2.end(), part->nb2.begin(), part->nb2.end());
+        out.tensors.insert(out.tensors.end(), part->tensors.begin(), part->tensors.end());
+    }
+    assign_size_classes(out);
+    return true;
+}
+
+// 64-bit FNV-1a of a string, for the model keys of the joint cache.
 inline uint64_t geometry_hash(const std::string & text) {
     uint64_t h = UINT64_C(0xcbf29ce484222325);
     for (unsigned char c : text) {

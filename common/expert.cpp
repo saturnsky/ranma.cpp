@@ -7,6 +7,7 @@
 #include <algorithm>
 #include <cstdlib>
 #include <cerrno>
+#include <cstring>
 
 static expert_validation expert_reject(const std::string & reason) {
     expert_validation res;
@@ -66,7 +67,30 @@ expert_validation validate_expert_params(const common_params & params) {
     if (params.expert_profile_dir.empty() && (params.expert_profile_archive || params.expert_profile_reset)) {
         return expert_reject("expert profile archive/reset needs --expert-profile-dir");
     }
+    if (expert_draft_joins(params)) {
+        // the cache places the draft's routed experts; a manual placement of them would conflict
+        for (const llama_model_tensor_buft_override & o : params.speculative.draft.tensor_buft_overrides) {
+            if (o.pattern != nullptr && strstr(o.pattern, "exps") != nullptr && strcmp(o.pattern, LLM_FFN_EXPS_REGEX) != 0) {
+                return expert_reject(std::string("the draft model shares the expert cache, which places its routed experts; "
+                    "drop the draft override '") + o.pattern + "' or use --expert-cache-draft off");
+            }
+        }
+    }
     return {};
+}
+
+bool expert_draft_joins(const common_params & params) {
+    return (params.expert_l1_mib > 0 || params.expert_l2_mib > 0) && params.expert_cache_draft &&
+        params.speculative.has_dft() && !params.speculative.draft.mparams.path.empty();
+}
+
+ggml_expert_config expert_draft_config(const common_params & params) {
+    ggml_expert_config cfg = {};
+    cfg.abi_version  = GGML_EXPERT_ABI_VERSION;
+    cfg.mode         = params.expert_cache_mode == "exclusive" ? GGML_EXPERT_MODE_EXCLUSIVE : GGML_EXPERT_MODE_INCLUSIVE;
+    cfg.model_path   = params.speculative.draft.mparams.path.c_str();
+    cfg.model_weight = params.expert_weight_draft;
+    return cfg;
 }
 
 ggml_expert_config expert_config_from_params(const common_params & params) {
@@ -115,6 +139,21 @@ ggml_expert_config expert_config_from_params(const common_params & params) {
     // a profile directory that has only ever seen one of them.
     cfg.initial_bank = params.expert_prefill_swap ? "prefill,decode" : "decode";
     cfg.log_mask     = 0;
+
+    // joint cache: the target's config declares the draft model that joins later
+    cfg.model_path   = params.model.path.c_str();
+    cfg.model_weight = params.expert_weight_target;
+    if (expert_draft_joins(params)) {
+        // the arrays must outlive this call like the strings do: the config is used by the model
+        // load that follows, before this function runs again on the same thread
+        static thread_local const char * paths[1];
+        static thread_local float        weights[1];
+        paths[0]   = params.speculative.draft.mparams.path.c_str();
+        weights[0] = params.expert_weight_draft;
+        cfg.n_join       = 1;
+        cfg.join_paths   = paths;
+        cfg.join_weights = weights;
+    }
 
     const char * trace = getenv("RANMA_EXPERT_TRACE");
     if (trace != nullptr && trace[0] != '\0') {

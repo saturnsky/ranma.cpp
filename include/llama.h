@@ -1158,7 +1158,9 @@ extern "C" {
     // synchronizes the context, then makes the plan resident; call while no other thread decodes
     LLAMA_API bool llama_expert_plan_install(struct llama_context * ctx, ggml_expert_plan_id plan);
     // the router selections of this sequence feed the bank on every following decode;
-    // seq_id < 0 or GGML_EXPERT_BANK_NONE records nothing
+    // seq_id LLAMA_EXPERT_ALL_ROWS counts every row of every ubatch (a draft model's block decodes);
+    // any other seq_id < 0 or GGML_EXPERT_BANK_NONE records nothing
+#define LLAMA_EXPERT_ALL_ROWS (-2)
     LLAMA_API void llama_expert_set_profiled_seq(struct llama_context * ctx, llama_seq_id seq_id, ggml_expert_bank_id bank);
 
     // Token logits obtained from the last call to llama_decode()

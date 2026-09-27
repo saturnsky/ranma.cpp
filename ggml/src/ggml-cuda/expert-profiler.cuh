@@ -23,7 +23,9 @@ struct profile_selection {
 
 class profiler {
 public:
-    profiler(const geometry & geo, uint32_t n_banks);
+    // `n_selections` independent selections, one per model of a joint cache: each model's graphs
+    // run on their own contexts and select their own rows and bank.
+    profiler(const geometry & geo, uint32_t n_banks, uint32_t n_selections = 1);
     ~profiler();
 
     profiler(const profiler &) = delete;
@@ -39,11 +41,12 @@ public:
 
     // Kernel-facing pointers, fixed after allocate().
     uint32_t *                counts_base() const { return counts_; }
-    const profile_selection * selection()   const { return selection_; }
+    const profile_selection * selection(uint32_t slot = 0) const { return selection_ + slot; }
+    uint32_t                  n_selections() const { return n_selections_; }
 
-    // Publishes a new selection on `stream` (ordered before the next kernels on it). No launch when
-    // the selection is unchanged.
-    bool select(int32_t row_begin, int32_t row_end, uint32_t bank, cudaStream_t stream);
+    // Publishes a new selection of `slot` on `stream` (ordered before the next kernels on it). No
+    // launch when the selection is unchanged.
+    bool select(int32_t row_begin, int32_t row_end, uint32_t bank, cudaStream_t stream, uint32_t slot = 0);
 
     // Synchronize the device, copy a bank to the host and optionally zero it.
     bool read_bank(uint32_t bank, std::vector<uint64_t> & out, bool zero_after);
@@ -52,10 +55,11 @@ public:
 private:
     const uint32_t   n_banks_;
     const size_t     n_counts_;
+    const uint32_t   n_selections_;
     int              device_ = -1;
     uint32_t *          counts_    = nullptr;
     profile_selection * selection_ = nullptr;
-    profile_selection   last_selection_ = { -1, -1, 0xFFFFFFFFu, 0 };
+    std::vector<profile_selection> last_selection_;
 };
 
 // Adds the top-k ids of the selected rows to counts[bank*bank_stride + id]. ids is [n_used, n_rows]

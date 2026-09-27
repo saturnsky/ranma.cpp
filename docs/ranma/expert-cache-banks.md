@@ -159,7 +159,11 @@ and its generation test the decode bank, and `--expert-prefill-swap` is an optio
   request while the better plan only pays over the length of the prompt. That is why it is an option
   and not the default.
 - Everything the expert cache is limited by still applies: HIP only, host-direct required,
-  `--load-mode none`, one model per process.
+  `--load-mode none`, one cache per process.
+- **A draft in the joint cache feeds the `decode` bank only** (`expert-cache-joint.md`): every row of
+  its block decodes counts while slot 0 generates, into the draft's own store
+  `<profile-dir>/<model key>/decode/`. Router selections of a context that runs no cached model are
+  never counted; before the joint cache a draft's stages were counted into the target's first layers.
 
 ## How to verify it
 

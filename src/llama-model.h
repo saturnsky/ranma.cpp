@@ -782,6 +782,8 @@ struct llama_model {
 
     // ranma: the backend expert cache table when this model configured one, else nullptr
     const struct ggml_expert_iface * expert_iface() const;
+    // ranma: the weight context of the routed experts that the cache adopted, else nullptr
+    struct ggml_context * expert_context() const;
 
     const struct ggml_tensor * get_tensor(const char * name) const;
 
