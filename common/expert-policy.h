@@ -35,6 +35,7 @@
 
 #include <cinttypes>
 #include <cstdint>
+#include <vector>
 
 #define COMMON_EXPERT_INF(fmt, ...) LOG_INF("expert policy: " fmt, __VA_ARGS__)
 #define COMMON_EXPERT_DBG(fmt, ...) LOG_DBG("expert policy: " fmt, __VA_ARGS__)
@@ -109,12 +110,25 @@ struct common_expert {
             frozen ? ", frozen (profile only)" : "");
     }
 
+    // A context of another model that shares the cache (a draft model). Its routed layers only run
+    // in the block decodes of generation, so every row it computes during generation feeds the
+    // generation bank, and nothing is counted outside generation.
+    void join(llama_context * other) {
+        if (!active() || other == nullptr || !be->available(other)) {
+            return;
+        }
+        joined.push_back(other);
+        be->set_profiled_seq(other, -1, GGML_EXPERT_BANK_NONE);
+        COMMON_EXPERT_INF("%s", "a draft model shares the cache; its block decodes feed the 'decode' bank\n");
+    }
+
     // A benchmark can recreate the context while the model and its bank/plan ids remain live.
     void rebind(llama_context * context) { ctx = context; }
     bool ready() const { return active(); }
 
     // before the model is freed
     void release() {
+        joined.clear();
         ctx            = nullptr;
         be             = nullptr;
         bank_decode    = GGML_EXPERT_BANK_NONE;
@@ -148,6 +162,7 @@ struct common_expert {
         be->bank_mark(ctx, bank_prefill);
         marked_prefill = true;
         be->set_profiled_seq(ctx, slot_id, bank_prefill);
+        set_joined(-1, GGML_EXPERT_BANK_NONE);
     }
 
     // the prompt is processed and the slot begins generating
@@ -156,6 +171,7 @@ struct common_expert {
             return;
         }
         be->set_profiled_seq(ctx, slot_id, bank_decode);
+        set_joined(LLAMA_EXPERT_ALL_ROWS, bank_decode);
 
         if (marked_prefill) {
             marked_prefill = false;
@@ -181,6 +197,7 @@ struct common_expert {
             return;
         }
         be->set_profiled_seq(ctx, -1, GGML_EXPERT_BANK_NONE);
+        set_joined(-1, GGML_EXPERT_BANK_NONE);
 
         if (marked_prefill) {
             marked_prefill = false;
@@ -215,6 +232,7 @@ struct common_expert {
             return;
         }
         be->set_profiled_seq(ctx, -1, GGML_EXPERT_BANK_NONE);
+        set_joined(-1, GGML_EXPERT_BANK_NONE);
         if (marked_prefill) {
             marked_prefill = false;
             be->bank_discard(ctx, bank_prefill);
@@ -240,6 +258,12 @@ struct common_expert {
 
 private:
     bool active() const { return ctx != nullptr && be != nullptr && bank_decode != GGML_EXPERT_BANK_NONE; }
+
+    void set_joined(llama_seq_id seq_id, ggml_expert_bank_id bank) {
+        for (llama_context * other : joined) {
+            be->set_profiled_seq(other, seq_id, bank);
+        }
+    }
 
     // A bank whose interval saw no token is not a record: the prompt came out of the prompt cache,
     // or the request produced nothing. Storing it would tell the score window that every expert was
@@ -289,6 +313,7 @@ private:
 
     llama_context *               ctx = nullptr;
     const common_expert_backend * be  = nullptr;
+    std::vector<llama_context *>  joined; // contexts of other models in the same cache
 
     ggml_expert_bank_id bank_decode  = GGML_EXPERT_BANK_NONE;
     ggml_expert_bank_id bank_prefill = GGML_EXPERT_BANK_NONE;
