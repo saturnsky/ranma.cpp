@@ -1587,6 +1587,10 @@ private:
             ep.freeze       = params_base.expert_freeze;
 
             expert.init(ctx_tgt, ep);
+            // a separate draft model in the same cache (--expert-cache-draft on)
+            if (model_dft != nullptr && model_dft != model_tgt && ctx_dft != nullptr && llama_expert_available(ctx_dft)) {
+                expert.join(ctx_dft);
+            }
         }
 
         // propagate new defaults back to caller
