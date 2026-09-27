@@ -76,6 +76,8 @@ add_library(${TARGET}
     debug.h
     download.cpp
     download.h
+    expert.cpp
+    expert.h
     fit.cpp
     fit.h
     hf-cache.cpp

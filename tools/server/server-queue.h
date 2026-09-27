@@ -44,6 +44,7 @@ private:
     // callback functions
     std::function<bool(server_task &&, bool)> callback_new_task;
     std::function<void(void)>                 callback_update_slots;
+    std::function<void(void)>                 callback_idle_tick; // ranma: runs on the loop thread while no task is queued
     std::vector<std::function<void(bool)>>    callback_sleeping_state;
 
 public:
@@ -125,6 +126,12 @@ public:
     // Register the function to be called when all slots data is ready to be processed
     void on_update_slots(std::function<void(void)> callback) {
         callback_update_slots = std::move(callback);
+    }
+
+    // ranma: called on the start_loop() thread about once per second while the queue is empty and not
+    // sleeping, with no lock held; the place for idle-time maintenance that must not overlap inference
+    void on_idle_tick(std::function<void(void)> callback) {
+        callback_idle_tick = std::move(callback);
     }
 
     // Register callback for sleeping state change; multiple callbacks are allowed
