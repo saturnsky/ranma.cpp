@@ -13,6 +13,7 @@
 #include "ggml-alloc.h"
 #include "ggml-backend-impl.h"
 #include "ggml-cuda.h"
+#include "gguf.h"
 
 #include <algorithm>
 #include <array>
@@ -21,7 +22,9 @@
 #include <cerrno>
 #include <cstdlib>
 #include <cstdio>
+#include <cmath>
 #include <cstring>
+#include <filesystem>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -33,6 +36,10 @@ namespace ggml_cuda_expert {
 // Histograms are cheap (n_counts * 4 bytes each), so a fixed number of banks is allocated at
 // finalize time and bank_open hands them out; the caller's policy decides what each one means.
 static constexpr uint32_t max_banks = 4;
+
+// Models of one joint cache, and compute contexts that run them.
+static constexpr size_t max_members  = 4;
+static constexpr int    max_attached = 16;
 
 enum class state_t { unconfigured, configured, registered, installed, disabled };
 
@@ -47,14 +54,62 @@ static const char * state_name(state_t s) {
     return "?";
 }
 
+// A bank counts every model of the cache: its histogram spans the joint layers, and each model
+// keeps its own store of records, so each model's half-life score comes from its own records.
 struct bank_state {
     std::string label;
-    bool prompt = false;                    // the caller's policy says this bank counts prompt processing;
-                                            // set by whichever bank_open names it so, never cleared
-    std::unique_ptr<profile_store> store;   // null when profiling is off for this bank
-    bool store_usable = false;              // open() returned ok/missing/corrupt, not incompatible
+    bool prompt = false;                                // the caller's policy says this bank counts prompt processing;
+                                                        // set by whichever bank_open names it so, never cleared
+    std::vector<std::unique_ptr<profile_store>> stores; // [member]; empty when profiling is off
+    std::vector<uint8_t> usable;                        // [member] open() returned ok/missing/corrupt, not incompatible
     ggml_expert_plan_id latest_plan = GGML_EXPERT_PLAN_NONE;
     uint64_t commits = 0;
+
+    bool any_usable() const {
+        for (size_t m = 0; m < stores.size(); ++m) { if (stores[m] && usable[m]) { return true; } }
+        return false;
+    }
+    uint64_t total_selections() const {
+        uint64_t total = 0;
+        for (size_t m = 0; m < stores.size(); ++m) { if (stores[m] && usable[m]) { total += stores[m]->total_selections(); } }
+        return total;
+    }
+    size_t records() const {
+        size_t n = 0;
+        for (size_t m = 0; m < stores.size(); ++m) { if (stores[m] && usable[m]) { n = std::max(n, stores[m]->window().size()); } }
+        return n;
+    }
+};
+
+// One model whose routed experts live in the cache. A cache of one model has one member at offset
+// 0, and its geometry is the model's own. In a joint cache the members' layers are laid end to
+// end in the joint geometry (member m's layer l is joint layer offset + l), and the load-time plan
+// and the arenas cover every member. A member declared by the first model's config is described by
+// the tensor metadata of its GGUF file until its own weight context arrives and is bound.
+struct member_state {
+    std::string key;         // "<arch>-<16 hex digits of the geometry signature hash>", the profile directory
+    std::string identity;    // architecture name
+    std::string path;        // first GGUF file (declared members)
+    std::string signature;   // identity, a newline and the geometry signature: the profile compatibility key
+    geometry    geo;         // the member's own layout; tensors point into `meta` until bound
+    int   offset   = 0;      // first joint layer
+    float weight   = 1.0f;   // multiplier on the host read cost in the joint plan
+    bool  accepted = false;  // its config was accepted
+    bool  bound    = false;  // its weight context is adopted, the joint geometry holds its tensors
+    bool  loaded   = false;  // its load finished (finalize)
+    bool  released = false;
+    bool  dropped  = false;  // exclusive only: its context did not match; its slots stay unused
+    ggml_context * ctx = nullptr;
+    ggml_backend_buffer_t exclusive_buffer = nullptr; // owned by the model
+    std::vector<gguf_context *> gguf;                 // declared metadata, freed once bound
+    std::vector<ggml_context *> meta;
+
+    void free_meta() {
+        for (gguf_context * g : gguf) { gguf_free(g); }
+        for (ggml_context * c : meta) { ggml_free(c); }
+        gguf.clear();
+        meta.clear();
+    }
 };
 
 // Plans are kept only as long as they can still be installed: the newest plan of every bank, plus
@@ -156,7 +211,20 @@ public:
             return false;
         }
         if (state_ != state_t::unconfigured) {
-            // A second model in the same process runs without the cache (decision: one model per process).
+            // A later model joins when the first model's config declared its file.
+            if (config->model_path != nullptr && config->model_path[0] != '\0' && state_ != state_t::disabled) {
+                for (size_t m = 1; m < members_.size(); ++m) {
+                    member_state & mb = members_[m];
+                    if (!mb.accepted && !mb.dropped && mb.path == config->model_path) {
+                        mb.accepted = true;
+                        accepting_  = (int) m;
+                        GGML_LOG_INFO("expert cache: model %s (%s) joins the cache as model %zu\n",
+                            mb.key.c_str(), mb.path.c_str(), m);
+                        return true;
+                    }
+                }
+            }
+            // Any other model in the same process runs without the cache.
             GGML_LOG_WARN("expert cache: already %s for another model; the new model is not cached\n", state_name(state_));
             return false;
         }
@@ -205,14 +273,142 @@ public:
         if (verify_all_) {
             GGML_LOG_INFO("expert cache: RANMA_EXPERT_VERIFY set, every install is verified against the host weights\n");
         }
+        clear_members_locked();
+        member_state first;
+        first.path     = config->model_path ? config->model_path : "";
+        first.weight   = config->model_weight > 0.0f ? config->model_weight : 1.0f;
+        first.accepted = true;
+        members_.push_back(std::move(first));
+        if (config->n_join != 0 && cfg_.l2_bytes != 0) {
+            // The SSD tier numbers the files of one model; a second model's files are not wired.
+            GGML_LOG_WARN("expert cache: a finite L2 is not implemented for a joint cache; the %u joining model(s) are not cached\n",
+                config->n_join);
+        }
+        for (uint32_t i = 0; i < config->n_join && config->join_paths != nullptr && cfg_.l2_bytes == 0; ++i) {
+            const char * path   = config->join_paths[i];
+            const float  weight = config->join_weights != nullptr && config->join_weights[i] > 0.0f ? config->join_weights[i] : 1.0f;
+            if (members_.size() >= max_members) {
+                GGML_LOG_WARN("expert cache: at most %zu models can share the cache; %s is not cached\n", max_members, path ? path : "(null)");
+                continue;
+            }
+            member_state mb;
+            std::string why;
+            if (path == nullptr || !declare_member(path, weight, mb, why)) {
+                GGML_LOG_WARN("expert cache: %s cannot join the cache: %s\n", path ? path : "(null)", why.c_str());
+                mb.free_meta();
+                continue;
+            }
+            GGML_LOG_INFO("expert cache: model %s (%s) is declared to join: %d routed layers x %d experts, weight %.3f\n",
+                mb.key.c_str(), mb.path.c_str(), mb.geo.n_routed_layers(), mb.geo.n_experts, (double) mb.weight);
+            members_.push_back(std::move(mb));
+        }
         state_ = state_t::configured;
         return true;
+    }
+
+    // Reads the tensor layout of a model that will join later from its GGUF file(s), without data.
+    static bool declare_member(const char * path, float weight, member_state & out, std::string & why) {
+        out = member_state();
+        out.path   = path;
+        out.weight = weight;
+        std::vector<std::string> files = { out.path };
+        std::vector<const ggml_tensor *> tensors;
+        for (size_t f = 0; f < files.size(); ++f) {
+            ggml_context * meta = nullptr;
+            gguf_init_params params = { /*no_alloc =*/ true, /*ctx =*/ &meta };
+            gguf_context * g = gguf_init_from_file(files[f].c_str(), params);
+            if (g == nullptr) {
+                why = "cannot read the GGUF metadata of " + files[f];
+                return false;
+            }
+            out.gguf.push_back(g);
+            if (meta != nullptr) {
+                out.meta.push_back(meta);
+            }
+            if (f == 0) {
+                const int64_t arch = gguf_find_key(g, "general.architecture");
+                if (arch < 0 || gguf_get_kv_type(g, arch) != GGUF_TYPE_STRING) {
+                    why = "no general.architecture";
+                    return false;
+                }
+                out.identity = gguf_get_val_str(g, arch);
+                // the same naming rule as llama_split_path: <prefix>-%05d-of-%05d.gguf
+                const int64_t split = gguf_find_key(g, "split.count");
+                const int n_split = split >= 0 && gguf_get_kv_type(g, split) == GGUF_TYPE_UINT16 ? (int) gguf_get_val_u16(g, split) : 1;
+                if (n_split > 1) {
+                    char tail[64];
+                    snprintf(tail, sizeof(tail), "-%05d-of-%05d.gguf", 1, n_split);
+                    const size_t n = strlen(tail);
+                    if (out.path.size() <= n || out.path.compare(out.path.size() - n, n, tail) != 0) {
+                        why = "split file name does not end in " + std::string(tail);
+                        return false;
+                    }
+                    const std::string prefix = out.path.substr(0, out.path.size() - n);
+                    for (int i = 2; i <= n_split; ++i) {
+                        snprintf(tail, sizeof(tail), "-%05d-of-%05d.gguf", i, n_split);
+                        files.push_back(prefix + tail);
+                    }
+                }
+            }
+            for (ggml_tensor * t = meta ? ggml_get_first_tensor(meta) : nullptr; t != nullptr; t = ggml_get_next_tensor(meta, t)) {
+                tensors.push_back(t);
+            }
+        }
+        if (!build_geometry_tensors(tensors, out.geo, why)) {
+            return false;
+        }
+        if (out.geo.n_layers == 0) {
+            why = "the model has no routed experts";
+            return false;
+        }
+        out.signature = out.identity + "\n" + out.geo.signature();
+        out.key       = member_key(out.identity, out.signature);
+        return true;
+    }
+
+    static std::string member_key(const std::string & identity, const std::string & signature) {
+        char hex[32];
+        snprintf(hex, sizeof(hex), "%016llx", (unsigned long long) geometry_hash(signature));
+        std::string name = identity.empty() ? std::string("model") : identity;
+        for (char & c : name) {
+            const bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '-' || c == '.';
+            if (!ok) { c = '_'; }
+        }
+        return name + "-" + hex;
+    }
+
+    void clear_members_locked() {
+        for (member_state & m : members_) {
+            m.free_meta();
+        }
+        members_.clear();
+        members_.reserve(max_members);
+        accepting_ = -1;
+        joint_     = false;
+        n_attached_.store(0, std::memory_order_release);
     }
 
     // Owned host storage redirects loader writes for exclusive, finite inclusive and Off policies.
     // Unlimited inclusive uses the ordinary host buffer and register_context.
     ggml_backend_buffer_t alloc_context(ggml_context * ctx, ggml_backend_buffer_type_t buft, const char * identity) {
         std::lock_guard<std::mutex> lock(mutex_);
+        if (accepting_ >= 0) {
+            // a model that joins: only the owned host storage allocates here, inclusive registers
+            if (!l1_ || !l1_->owns_host_storage() || state_ != state_t::installed || ctx == nullptr || buft == nullptr ||
+                    !ggml_backend_buft_is_host(buft)) {
+                return nullptr;
+            }
+            const int m = join_context_locked(ctx, buft, identity);
+            if (m < 0) {
+                return nullptr;
+            }
+            ggml_backend_buffer_t buffer = exclusive_buffer_create(ctx, buft);
+            if (buffer == nullptr) {
+                abort_locked("exclusive address reservation of a joined model failed");
+            }
+            members_[m].exclusive_buffer = buffer;
+            return buffer;
+        }
         if (state_ != state_t::configured || (cfg_.mode != GGML_EXPERT_MODE_EXCLUSIVE && cfg_.l2_bytes == 0 && cfg_.policy != GGML_EXPERT_POLICY_OFF) ||
                 ctx == nullptr || buft == nullptr) {
             return nullptr;
@@ -257,8 +453,7 @@ public:
         }
         int layer = -1;
         int kind  = -1;
-        if (!parse_expert_tensor_name(ggml_get_name(root), layer, kind) || layer >= geo_.n_layers ||
-                geo_.tensors[layer][kind] != root) {
+        if (!resolve(root, layer, kind)) {
             return false;
         }
         if (!l1_->logical_io(layer, kind, data, offset, size, write)) { return false; }
@@ -270,6 +465,14 @@ public:
 
     bool register_context(ggml_context * ctx, ggml_backend_buffer_t buffer, const char * identity) {
         std::lock_guard<std::mutex> lock(mutex_);
+        if (accepting_ >= 0) {
+            // inclusive: the arenas are built once every member is registered and loaded
+            if (state_ != state_t::registered || (l1_ && l1_->owns_host_storage()) || ctx == nullptr || buffer == nullptr ||
+                    !ggml_backend_buffer_is_host(buffer)) {
+                return false;
+            }
+            return join_context_locked(ctx, ggml_backend_buffer_get_type(buffer), identity) >= 0;
+        }
         if (state_ != state_t::configured || ctx == nullptr || buffer == nullptr) {
             return false;
         }
@@ -294,16 +497,46 @@ public:
 
     bool finalize() {
         std::lock_guard<std::mutex> lock(mutex_);
+        return finalize_locked();
+    }
+
+    bool finalize_locked() {
+        // The load of every bound member is complete now.
+        bool newly_loaded = false;
+        for (member_state & m : members_) {
+            if (m.bound && !m.loaded) {
+                m.loaded     = true;
+                newly_loaded = true;
+            }
+        }
+        if (state_ == state_t::installed && newly_loaded && l1_ && l1_->owns_host_storage()) {
+            // A model joined an installed owned-host cache: its slices are in their homes.
+            return finalize_joined_locked();
+        }
         if (state_ != state_t::registered) {
             return false;
         }
+        const bool owns_host = l1_ && l1_->owns_host_storage();
+        if (!owns_host) {
+            // Inclusive: the arenas are planned over every member at once, so the cache waits for
+            // the models that were declared to join. Until then lookups miss and the host tensors
+            // are read, as without the cache.
+            size_t waiting = 0;
+            for (const member_state & m : members_) {
+                waiting += m.loaded ? 0 : 1;
+            }
+            if (waiting != 0) {
+                GGML_LOG_INFO("expert cache: waiting for %zu more model(s) to join before the arenas are built\n", waiting);
+                return true;
+            }
+        }
         ggml_cuda_set_device(device_);
 
-        if (l1_ && l1_->owns_host_storage()) {
+        if (owns_host) {
             // The delegate buffer is not in the model's buffer list, so the backend's own
             // post-load step for host buffers has not seen it. Do it here, while the loader's
             // writes to it are final, exactly as llama does for the buffers it knows.
-            if (!finalize_delegate_buffer_locked()) {
+            if (!finalize_delegate_buffer_locked(exclusive_buffer_)) {
                 abort_locked("delegate buffer finalization failed");
             }
             // The loader has written every slice to its home; register the host arenas as coarse
@@ -328,6 +561,7 @@ public:
             if (tier_) {
                 report_tier_plan_locked("at model load");
             }
+            log_members_locked("at model load");
             return true;
         }
 
@@ -382,15 +616,34 @@ public:
         state_ = state_t::installed;
         verify_all_locked();
         if (counts != nullptr) { log_plan_locked(initial.stats); }
-        GGML_LOG_INFO("expert cache: installed %zu MiB in VRAM (%zu slices, %.1f ms); tables and profiler %zu KiB\n",
+        GGML_LOG_INFO("expert cache: installed %zu MiB in VRAM (%zu slices, %.1f ms); tables and profiler %zu KiB%s\n",
             l1_->device_bytes()/(1024*1024), stats.copied, stats.ms,
-            (table_bytes + (profiler_ ? profiler_->device_bytes() : 0))/1024);
+            (table_bytes + (profiler_ ? profiler_->device_bytes() : 0))/1024, models_text_locked().c_str());
+        log_members_locked("at model load");
         return true;
     }
 
     void release(ggml_context * ctx) {
         std::lock_guard<std::mutex> lock(mutex_);
-        if (state_ == state_t::unconfigured || (ctx_ != nullptr && ctx != ctx_)) {
+        if (state_ == state_t::unconfigured) {
+            return;
+        }
+        // A joint cache lives until the last of its models is freed: the others may still compute.
+        bool member = false;
+        bool others = false;
+        for (member_state & m : members_) {
+            if (m.bound && m.ctx == ctx) {
+                m.released = true;
+                member     = true;
+            }
+        }
+        for (const member_state & m : members_) {
+            others |= m.bound && !m.released;
+        }
+        if (!member && ctx_ != nullptr && ctx != ctx_) {
+            return;
+        }
+        if (others) {
             return;
         }
         state_ = state_t::unconfigured;
@@ -411,6 +664,7 @@ public:
         digests_enabled_ = false;
         geo_ = geometry();
         ctx_ = nullptr;
+        clear_members_locked();
         device_ = -1;
         disabled_reason_ = "";
         capacities_.clear();
@@ -456,7 +710,7 @@ public:
             return false;
         }
         bank_state & b = banks_[bank];
-        if (!b.store_usable) {
+        if (!b.any_usable()) {
             return false;
         }
         std::vector<uint64_t> delta;
@@ -474,17 +728,39 @@ public:
         meta.output_tokens = record->output_tokens;
         meta.bank_tokens   = record->bank_tokens;
         const auto save_start = std::chrono::steady_clock::now();
-        if (total != 0 && !b.store->checkpoint(delta, meta)) {
-            GGML_LOG_WARN("expert cache: bank '%s' failed to store a record: %s\n", b.label.c_str(), b.store->last_error().c_str());
-            return false;
+        // every model stores its own part of the interval; a model that routed nothing in it gets
+        // no record, so its window is not diluted by intervals in which it did not run
+        for (size_t m = 0; m < b.stores.size(); ++m) {
+            if (!b.stores[m] || !b.usable[m]) {
+                continue;
+            }
+            const member_state & mb = members_[m];
+            const size_t begin = size_t(mb.offset)*geo_.n_experts;
+            const size_t end   = begin + size_t(mb.geo.n_layers)*geo_.n_experts;
+            std::vector<uint64_t> part;
+            if (!joint_) {
+                part = delta;
+            } else {
+                part.assign(delta.begin() + begin, delta.begin() + std::min(end, delta.size()));
+            }
+            uint64_t part_total = 0;
+            for (uint64_t v : part) {
+                part_total += v;
+            }
+            if (part_total != 0 && !b.stores[m]->checkpoint(part, meta)) {
+                GGML_LOG_WARN("expert cache: bank '%s' of model %s failed to store a record: %s\n", b.label.c_str(),
+                    mb.key.c_str(), b.stores[m]->last_error().c_str());
+                return false;
+            }
         }
         const double save_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - save_start).count();
         ++b.commits;
         if (cfg_.log_mask & GGML_EXPERT_LOG_L2) { report_round_locked(b.label, b.commits, *record, delta, save_ms); }
-        const std::vector<uint64_t> & scores = b.store->scores();
+        std::vector<uint64_t> scores;
+        joint_scores_locked(b, scores);
         placement_inputs in;
         in.geo              = &geo_;
-        in.counts           = b.store->total_selections() != 0 ? scores.data() : nullptr;
+        in.counts           = b.total_selections() != 0 ? scores.data() : nullptr;
         in.budget_bytes     = SIZE_MAX;
         in.exclusive        = l1_ && l1_->owns_host_storage();
         in.fixed_capacities = &capacities_;
@@ -494,7 +770,7 @@ public:
         plan.bank     = bank;
         plan.selected = std::move(next.selected);
         plan.stats    = next.stats;
-        if (tier_ && b.store->total_selections() != 0) {
+        if (tier_ && b.total_selections() != 0) {
             plan.scores = scores;
         }
         const ggml_expert_plan_id id = next_plan_id_++;
@@ -507,7 +783,7 @@ public:
         *out_plan = id;
         if (cfg_.log_mask & GGML_EXPERT_LOG_PROFILE) {
             GGML_LOG_INFO("expert cache: bank '%s' commit %llu: %llu selections, %zu records, plan %u selection-hit=%.2f%% byte-hit=%.2f%%\n",
-                b.label.c_str(), (unsigned long long) b.commits, (unsigned long long) total, b.store->window().size(),
+                b.label.c_str(), (unsigned long long) b.commits, (unsigned long long) total, b.records(),
                 id, 100.0*plans_[id].stats.selection_hit(), 100.0*plans_[id].stats.byte_hit());
         }
         return true;
@@ -574,6 +850,7 @@ public:
         // the plan that was installed until now is only reachable while it is a bank's newest one
         finish_plan_locked(id);
         verify_all_locked();
+        if (joint_) { log_members_locked("after install"); }
         return true;
     }
 
@@ -582,14 +859,18 @@ public:
             return false;
         }
         ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
-        if (cuda_ctx->device != device_) {
+        if (cuda_ctx->device != device_ || !profiler_) {
+            return false;
+        }
+        const int member = member_of(cuda_ctx);
+        if (member < 0) {
             return false;
         }
         ggml_cuda_set_device(device_);
         if (tier_ && bank < n_banks_.load(std::memory_order_acquire)) {
             tier_->set_phase(bank_prompt_[bank].load(std::memory_order_acquire) != 0);
         }
-        return profiler_->select(row_begin, row_end, bank, cuda_ctx->stream());
+        return profiler_->select(row_begin, row_end, bank, cuda_ctx->stream(), (uint32_t) member);
     }
 
     // ---- hot path ---------------------------------------------------------------------------
@@ -600,11 +881,97 @@ public:
         }
         int layer = -1;
         int kind  = -1;
-        if (!parse_expert_tensor_name(tensor->name, layer, kind) || layer >= geo_.n_layers ||
-                geo_.tensors[layer][kind] != tensor || ggml_cuda_get_device() != device_) {
+        if (!resolve(tensor, layer, kind) || ggml_cuda_get_device() != device_) {
             return {};
         }
         return l1_->lookup(layer, kind);
+    }
+
+    // Joint layer and kind of a routed expert tensor of one of the cached models. With one model
+    // the joint layer is the tensor's own layer. Hot path: no lock; the member table is fixed
+    // before any compute of the cached models.
+    bool resolve(const ggml_tensor * tensor, int & layer, int & kind) const noexcept {
+        if (!parse_expert_tensor_name(tensor->name, layer, kind)) {
+            return false;
+        }
+        if (!joint_) {
+            return layer < geo_.n_layers && geo_.tensors[layer][kind] == tensor;
+        }
+        for (const member_state & m : members_) {
+            if (layer < m.geo.n_layers && m.offset + layer < geo_.n_layers && geo_.tensors[m.offset + layer][kind] == tensor) {
+                layer += m.offset;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // The member whose model runs on this compute context, -1 when none was attached.
+    int member_of(const void * backend_ctx) const noexcept {
+        const int n = n_attached_.load(std::memory_order_acquire);
+        for (int i = 0; i < n; ++i) {
+            if (attached_ctx_[i].load(std::memory_order_relaxed) == backend_ctx) {
+                return attached_member_[i];
+            }
+        }
+        return -1;
+    }
+
+    // `weights` null detaches the context (it is being freed); its slot can then be reused.
+    bool attach_backend(ggml_backend_t backend, ggml_context * weights) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (backend == nullptr || !ggml_backend_is_cuda(backend)) {
+            return false;
+        }
+        const void * key = backend->context;
+        const int n = n_attached_.load(std::memory_order_acquire);
+        if (weights == nullptr) {
+            for (int i = 0; i < n; ++i) {
+                if (attached_ctx_[i].load(std::memory_order_relaxed) == key) {
+                    attached_ctx_[i].store(nullptr, std::memory_order_release);
+                }
+            }
+            return true;
+        }
+        if (state_ == state_t::unconfigured) {
+            return false;
+        }
+        int member = -1;
+        for (size_t m = 0; m < members_.size(); ++m) {
+            if (members_[m].bound && members_[m].ctx == weights) {
+                member = (int) m;
+            }
+        }
+        if (member < 0) {
+            return false;
+        }
+        int slot = -1;
+        for (int i = 0; i < n && slot < 0; ++i) {
+            if (attached_ctx_[i].load(std::memory_order_relaxed) == key) {
+                slot = i;
+            }
+        }
+        for (int i = 0; i < n && slot < 0; ++i) {
+            if (attached_ctx_[i].load(std::memory_order_relaxed) == nullptr) {
+                slot = i;
+            }
+        }
+        if (slot < 0) {
+            if (n >= max_attached) {
+                GGML_LOG_WARN("expert cache: more than %d compute contexts; the new one is not profiled\n", max_attached);
+                return false;
+            }
+            slot = n;
+        }
+        attached_member_[slot] = member;
+        attached_ctx_[slot].store(key, std::memory_order_release);
+        if (slot == n) {
+            n_attached_.store(n + 1, std::memory_order_release);
+        }
+        if (joint_) {
+            GGML_LOG_INFO("expert cache: compute context %d runs model %d (%s)\n", slot, member, members_[member].key.c_str());
+        }
+        return true;
     }
 
     void profile_ids(ggml_backend_cuda_context & ctx, const ggml_tensor * ids) {
@@ -617,21 +984,31 @@ public:
         }
         char * end = nullptr;
         const long layer = strtol(ids->name + sizeof(prefix) - 1, &end, 10);
-        if (end == ids->name + sizeof(prefix) - 1 || *end != '\0' || layer < 0 || layer >= geo_.n_layers ||
-                geo_.layer_class[layer] < 0) {
+        if (end == ids->name + sizeof(prefix) - 1 || *end != '\0' || layer < 0) {
             return;
         }
         if (ids->type != GGML_TYPE_I32 || ids->ne[2] != 1 || ids->ne[3] != 1 || ids->nb[0] != sizeof(int32_t)) {
             return;
         }
+        // The model is the one whose context computes: the layer names of two models overlap, so
+        // the name alone would count one model's selections into the other's layers. A context
+        // that runs no cached model (a draft that is not in the cache) is never profiled.
+        const int member = member_of(&ctx);
+        long joint = -1;
+        if (member >= 0 && layer < members_[member].geo.n_layers) {
+            joint = members_[member].offset + layer;
+        }
+        if (member < 0 || joint < 0 || joint >= geo_.n_layers || geo_.layer_class[joint] < 0) {
+            return;
+        }
         if (profiler_) {
         launch_profile_ids((const int32_t *) ids->data, (int) ids->ne[1], (int) (ids->nb[1]/sizeof(int32_t)), (int) ids->ne[0],
-            geo_.n_experts, profiler_->counts_base() + size_t(layer)*geo_.n_experts, profiler_->n_counts(), profiler_->n_banks(),
-            profiler_->selection(), ctx.stream());
+            geo_.n_experts, profiler_->counts_base() + size_t(joint)*geo_.n_experts, profiler_->n_counts(), profiler_->n_banks(),
+            profiler_->selection((uint32_t) member), ctx.stream());
         }
         // The SSD tier needs the same ids: this is the one site that sees both the fused and the
         // unfused router, and it is ordered before the layer's MUL_MAT_ID on the same stream.
-        tier_route(ctx, layer, ids);
+        tier_route(ctx, (int) joint, ids);
     }
 
     void before_read(ggml_backend_cuda_context & ctx, const ggml_tensor * src0) {
@@ -649,8 +1026,7 @@ public:
         std::lock_guard<std::mutex> lock(mutex_);
         int layer = -1;
         int kind  = -1;
-        if (!tier_ || tensor == nullptr || !parse_expert_tensor_name(ggml_get_name(tensor), layer, kind) ||
-                layer >= geo_.n_layers || geo_.tensors[layer][kind] != tensor) {
+        if (!tier_ || tensor == nullptr || !resolve(tensor, layer, kind)) {
             return false;
         }
         tier_->set_backing(layer, kind, file_index, path, offset);
@@ -662,8 +1038,7 @@ public:
         std::lock_guard<std::mutex> lock(mutex_);
         int layer = -1;
         int kind  = -1;
-        if (!tier_ || tensor == nullptr || !parse_expert_tensor_name(ggml_get_name(tensor), layer, kind) ||
-                layer >= geo_.n_layers || expert < 0 || expert >= geo_.n_experts) {
+        if (!tier_ || tensor == nullptr || !resolve(tensor, layer, kind) || expert < 0 || expert >= geo_.n_experts) {
             return true;
         }
         return tier_->wanted(layer, expert);
@@ -683,8 +1058,7 @@ public:
         }
         int layer = -1;
         int kind  = -1;
-        if (parse_expert_tensor_name(src0->name, layer, kind) && layer < geo_.n_layers &&
-                geo_.tensors[layer][kind] == src0) {
+        if (resolve(src0, layer, kind)) {
             tier_->wait_kind(layer, kind, ctx.stream());
         }
     }
@@ -695,8 +1069,7 @@ public:
         }
         int layer = -1;
         int kind  = -1;
-        if (parse_expert_tensor_name(src0->name, layer, kind) && kind == 2 && layer < geo_.n_layers &&
-                geo_.tensors[layer][kind] == src0) {
+        if (resolve(src0, layer, kind) && kind == 2) {
             tier_->mark_done(layer, ctx.stream());
         }
     }
@@ -711,29 +1084,213 @@ private:
             GGML_LOG_INFO("expert cache: routed experts are in a CPU buffer, not the HIP host buffer type; not cached\n");
             return false;
         }
-        geo_       = std::move(geo);
+        member_state & first = members_[0];
+        first.identity  = identity ? identity : "";
+        first.geo       = geo;
+        first.signature = first.identity + "\n" + first.geo.signature();
+        first.key       = member_key(first.identity, first.signature);
+        first.ctx       = ctx;
+        first.bound     = true;
+        // Declared members must route as many experts as this one; the others cannot join.
+        for (size_t m = members_.size(); m-- > 1; ) {
+            if (members_[m].geo.n_experts != geo.n_experts) {
+                GGML_LOG_WARN("expert cache: model %s routes %d experts, this model %d; it is not cached\n",
+                    members_[m].key.c_str(), members_[m].geo.n_experts, geo.n_experts);
+                members_[m].free_meta();
+                members_.erase(members_.begin() + m);
+            }
+        }
+        joint_ = members_.size() > 1;
+        if (joint_) {
+            std::vector<const geometry *> parts;
+            for (const member_state & m : members_) {
+                parts.push_back(&m.geo);
+            }
+            std::vector<int> offsets;
+            std::string reason;
+            if (!concat_geometry(parts, geo_, offsets, reason)) {
+                GGML_LOG_ERROR("expert cache: joint geometry rejected: %s\n", reason.c_str());
+                return false;
+            }
+            for (size_t m = 0; m < members_.size(); ++m) {
+                members_[m].offset = offsets[m];
+            }
+        } else {
+            geo_ = std::move(geo);
+        }
         ctx_       = ctx;
         device_    = device;
-        identity_  = identity ? identity : "";
+        identity_  = first.identity;
         signature_ = identity_ + "\n" + geo_.signature();
-        key_       = model_key(identity_, signature_);
         state_     = state_t::registered;
         GGML_LOG_INFO("expert cache: registered %s%s: %d routed layers x %d experts, %zu size classes, device %d\n",
             identity_.c_str(), owns_host ? " for owned host storage" : "", geo_.n_routed_layers(),
             geo_.n_experts, geo_.class_bytes.size(), device_);
+        if (joint_) {
+            for (size_t m = 0; m < members_.size(); ++m) {
+                const member_state & mb = members_[m];
+                GGML_LOG_INFO("expert cache: model %zu %s: joint layers %d..%d, weight %.3f%s\n", m, mb.key.c_str(),
+                    mb.offset, mb.offset + mb.geo.n_layers - 1, (double) mb.weight, mb.bound ? "" : ", joins later");
+            }
+            for (size_t cls = 0; cls < geo_.class_bytes.size(); ++cls) {
+                GGML_LOG_INFO("expert cache: size class %zu: %d layers, %zu KiB per expert\n",
+                    cls, geo_.class_layers[cls], geo_.class_total_bytes((int) cls)/1024);
+            }
+        }
         return true;
     }
 
-    // "<arch>-<16 hex digits of the geometry signature hash>": the model's profile directory
-    static std::string model_key(const std::string & identity, const std::string & signature) {
-        char hex[32];
-        snprintf(hex, sizeof(hex), "%016llx", (unsigned long long) geometry_hash(signature));
-        std::string name = identity.empty() ? std::string("model") : identity;
-        for (char & c : name) {
-            const bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '-' || c == '.';
-            if (!ok) { c = '_'; }
+    // A declared model's weight context arrives: its layout must be the one read from its file.
+    // Returns the member index, or -1 when the context holds no routed experts (the next context of
+    // the same model may) or does not match (the model is then not cached).
+    int join_context_locked(ggml_context * ctx, ggml_backend_buffer_type_t buft, const char * identity) {
+        geometry geo;
+        std::string reason;
+        if (!build_geometry(ctx, geo, reason)) {
+            GGML_LOG_WARN("expert cache: routed expert tensors of a joining model rejected: %s\n", reason.c_str());
+            drop_member_locked(accepting_);
+            return -1;
         }
-        return name + "-" + hex;
+        if (geo.n_layers == 0) {
+            return -1;
+        }
+        const int m = accepting_;
+        member_state & mb = members_[m];
+        const int device = ggml_backend_cuda_dev_index(ggml_backend_buft_get_device(buft));
+        // the layout decides; the architecture name of the key is the one the file declares
+        GGML_UNUSED(identity);
+        if (device != device_) {
+            GGML_LOG_WARN("expert cache: model %s puts its routed experts on device %d, the cache is on %d; it is not cached\n",
+                mb.key.c_str(), device, device_);
+            drop_member_locked(m);
+            return -1;
+        }
+        if (geo.signature() != mb.geo.signature()) {
+            GGML_LOG_WARN("expert cache: model %s: the routed expert tensors of the loaded model differ from the layout read "
+                          "from %s (all of its routed experts must be in host memory); it is not cached\n",
+                mb.key.c_str(), mb.path.c_str());
+            drop_member_locked(m);
+            return -1;
+        }
+        for (int l = 0; l < geo.n_layers; ++l) {
+            for (int k = 0; k < geometry::n_kinds; ++k) {
+                geo_.tensors[mb.offset + l][k] = geo.tensors[l][k];
+            }
+        }
+        mb.geo   = std::move(geo);
+        mb.ctx   = ctx;
+        mb.bound = true;
+        mb.free_meta();
+        accepting_ = -1;
+        GGML_LOG_INFO("expert cache: model %d %s bound: joint layers %d..%d%s\n", m, mb.key.c_str(), mb.offset,
+            mb.offset + mb.geo.n_layers - 1, l1_ && l1_->owns_host_storage() ? ", its slices are written to their homes" : "");
+        return m;
+    }
+
+    // A member that cannot join. Before the arenas exist it leaves the joint geometry; after that
+    // (owned host storage) its layers keep their slots, unused, and it is only marked.
+    void drop_member_locked(int m) {
+        accepting_ = -1;
+        if (m <= 0 || m >= (int) members_.size()) {
+            return;
+        }
+        members_[m].dropped = true;
+        if (l1_ || host_) {
+            // the joint geometry still points at its file metadata; freed with the cache
+            return;
+        }
+        members_[m].free_meta();
+        members_.erase(members_.begin() + m);
+        joint_ = members_.size() > 1;
+        std::vector<const geometry *> parts;
+        for (const member_state & mb : members_) {
+            parts.push_back(&mb.geo);
+        }
+        std::vector<int> offsets;
+        std::string reason;
+        if (joint_) {
+            if (!concat_geometry(parts, geo_, offsets, reason)) {
+                disable_locked(("joint geometry: " + reason).c_str());
+                return;
+            }
+            for (size_t i = 0; i < members_.size(); ++i) {
+                members_[i].offset = offsets[i];
+            }
+        } else {
+            geo_ = members_[0].geo;
+            members_[0].offset = 0;
+        }
+        signature_ = identity_ + "\n" + geo_.signature();
+        // an inclusive cache that waited for this model builds its arenas now
+        bool all_loaded = true;
+        for (const member_state & mb : members_) {
+            all_loaded &= mb.loaded;
+        }
+        if (state_ == state_t::registered && all_loaded) {
+            finalize_locked();
+        }
+    }
+
+    // A model joined the installed owned-host cache and its loader has written every slice.
+    bool finalize_joined_locked() {
+        ggml_cuda_set_device(device_);
+        for (member_state & m : members_) {
+            if (m.bound && m.loaded && m.exclusive_buffer != nullptr && !finalize_delegate_buffer_locked(m.exclusive_buffer)) {
+                abort_locked("delegate buffer finalization of a joined model failed");
+            }
+        }
+        // the device must see the loader's writes to the mapped host arena
+        CUDA_CHECK(cudaDeviceSynchronize());
+        std::string reason;
+        if (!l1_->verify_current_assignment(reason)) {
+            abort_locked(("exclusive assignment is inconsistent: " + reason).c_str());
+        }
+        verify_all_locked();
+        log_members_locked("after a model joined");
+        return true;
+    }
+
+    // " models=<key>*<weight>,..." for the plan and install lines.
+    std::string models_text_locked() const {
+        std::string out = " models=";
+        for (size_t m = 0; m < members_.size(); ++m) {
+            char w[32];
+            snprintf(w, sizeof(w), "*%.3g", (double) members_[m].weight);
+            out += (m ? "," : "") + members_[m].key + w;
+        }
+        return out;
+    }
+
+    // Per model: experts and bytes in VRAM and in host memory (and in the file with the SSD tier).
+    void log_members_locked(const char * what) const {
+        if (!l1_ || members_.empty()) {
+            return;
+        }
+        const std::vector<std::vector<int32_t>> & selected = l1_->selected();
+        for (size_t m = 0; m < members_.size(); ++m) {
+            const member_state & mb = members_[m];
+            size_t n_l1 = 0, b_l1 = 0, n_host = 0, b_host = 0, n_file = 0, b_file = 0;
+            for (int l = mb.offset; l < mb.offset + mb.geo.n_layers && l < geo_.n_layers; ++l) {
+                const int cls = geo_.layer_class[l];
+                if (cls < 0) {
+                    continue;
+                }
+                const size_t bytes = geo_.class_total_bytes(cls);
+                std::vector<uint8_t> in_l1(geo_.n_experts, 0);
+                if ((size_t) l < selected.size()) {
+                    for (int32_t e : selected[l]) { in_l1[e] = 1; }
+                }
+                for (int e = 0; e < geo_.n_experts; ++e) {
+                    if (in_l1[e]) { n_l1++; b_l1 += bytes; continue; }
+                    if (tier_ && !tier_->locations()[l][e].resident()) { n_file++; b_file += bytes; continue; }
+                    n_host++; b_host += bytes;
+                }
+            }
+            GGML_LOG_INFO("expert cache: model %zu %s %s: L1 %zu experts / %zu MiB, host %zu experts / %zu MiB%s%s\n",
+                m, mb.key.c_str(), what, n_l1, b_l1/(1024*1024), n_host, b_host/(1024*1024),
+                tier_ ? (", file " + std::to_string(n_file) + " experts / " + std::to_string(b_file/(1024*1024)) + " MiB").c_str() : "",
+                mb.dropped ? " (not cached, slots unused)" : (mb.bound ? "" : " (joins later)"));
+        }
     }
 
     void finish_plan_locked(ggml_expert_plan_id id) {
@@ -1018,6 +1575,7 @@ private:
                 banks_[plan.bank].label.c_str(), id, ms, tx.h2d_bytes, tx.d2h_bytes, tx.ssd_bytes, ring_before, tier_->ring_count());
         }
         finish_plan_locked(id); verify_all_locked();
+        if (joint_) { log_members_locked("after install"); }
         return true;
     }
 
@@ -1131,9 +1689,9 @@ private:
     // registers as coarse-grained mapped memory only after the model is loaded. llama runs that step
     // for every buffer of the model, but the delegate is owned by the exclusive buffer and is not in
     // that list, so it is run here instead. Buffers that need nothing answer true.
-    bool finalize_delegate_buffer_locked() {
-        ggml_backend_buffer_t delegate = exclusive_buffer_ != nullptr ?
-            exclusive_delegate_buffer(exclusive_buffer_) : nullptr;
+    bool finalize_delegate_buffer_locked(ggml_backend_buffer_t exclusive_buffer) {
+        ggml_backend_buffer_t delegate = exclusive_buffer != nullptr ?
+            exclusive_delegate_buffer(exclusive_buffer) : nullptr;
         if (delegate == nullptr) {
             return true;
         }
@@ -1161,9 +1719,9 @@ private:
     }
 
     void log_plan_locked(const placement_stats & stats) const {
-        GGML_LOG_INFO("expert cache: plan budget=%zu MiB choices=%d per-layer=%d..%d selection-hit=%.2f%% byte-hit=%.2f%%\n",
+        GGML_LOG_INFO("expert cache: plan budget=%zu MiB choices=%d per-layer=%d..%d selection-hit=%.2f%% byte-hit=%.2f%%%s\n",
             cfg_.l1_bytes/(1024*1024), stats.choices, stats.per_layer_min, stats.per_layer_max,
-            100.0*stats.selection_hit(), 100.0*stats.byte_hit());
+            100.0*stats.selection_hit(), 100.0*stats.byte_hit(), models_text_locked().c_str());
     }
 
     // Free slots that the owned-host exchange rotates through.
@@ -1190,7 +1748,7 @@ private:
     bool profiling_enabled() const { return cfg_.policy != GGML_EXPERT_POLICY_OFF && !profile_dir_.empty(); }
     bool allocate_profiler_locked() {
         if (!profiling_enabled()) { return true; }
-        profiler_.reset(new profiler(geo_, max_banks));
+        profiler_.reset(new profiler(geo_, max_banks, (uint32_t) std::max<size_t>(members_.size(), 1)));
         if (profiler_->allocate(device_)) { return true; }
         profiler_.reset(); disable_locked("profiler allocation failed"); return false;
     }
@@ -1413,17 +1971,57 @@ private:
             }
             ggml_expert_bank_id bank = GGML_EXPERT_BANK_NONE;
             // A seed bank is opened before the caller names its phase; init reopens it by label.
-            if (open_bank_locked(label.c_str(), false, &bank) && banks_[bank].store_usable &&
-                    banks_[bank].store->total_selections() != 0) {
-                scores = banks_[bank].store->scores();
+            if (open_bank_locked(label.c_str(), false, &bank) && banks_[bank].any_usable() &&
+                    banks_[bank].total_selections() != 0) {
+                joint_scores_locked(banks_[bank], scores);
                 GGML_LOG_INFO("expert cache: bank '%s' seeds the plan from %zu stored records\n",
-                    label.c_str(), banks_[bank].store->window().size());
+                    label.c_str(), banks_[bank].records());
+                if (joint_) {
+                    for (size_t m = 0; m < members_.size(); ++m) {
+                        const profile_store * st = banks_[bank].stores[m].get();
+                        GGML_LOG_INFO("expert cache: bank '%s' model %zu %s: %zu records, %llu selections, weight %.3f\n",
+                            label.c_str(), m, members_[m].key.c_str(), st && banks_[bank].usable[m] ? st->window().size() : 0,
+                            (unsigned long long) (st && banks_[bank].usable[m] ? st->total_selections() : 0), (double) members_[m].weight);
+                    }
+                }
                 return scores.data();
             }
             GGML_LOG_INFO("expert cache: bank '%s' has no usable profile\n", label.c_str());
         }
         GGML_LOG_INFO("expert cache: no bank of '%s' has a stored profile; starting cold\n", initial_bank_.c_str());
         return nullptr;
+    }
+
+    // The scores of a bank over the joint layers: each model's own half-life scores at its layers,
+    // times its weight (the relative cost of reading one of its bytes from host memory). The
+    // greedy then ranks every (model, layer, expert) by weighted frequency per byte. A cache of one
+    // model uses its scores unchanged.
+    void joint_scores_locked(const bank_state & b, std::vector<uint64_t> & out) const {
+        if (!joint_) {
+            if (!b.stores.empty() && b.stores[0] && b.usable[0]) {
+                out = b.stores[0]->scores();
+            } else {
+                out.assign(geo_.n_counts(), 0);
+            }
+            return;
+        }
+        out.assign(geo_.n_counts(), 0);
+        for (size_t m = 0; m < b.stores.size(); ++m) {
+            if (!b.stores[m] || !b.usable[m]) {
+                continue;
+            }
+            const std::vector<uint64_t> & part = b.stores[m]->scores();
+            const size_t begin = size_t(members_[m].offset)*geo_.n_experts;
+            const double w = members_[m].weight;
+            for (size_t i = 0; i < part.size() && begin + i < out.size(); ++i) {
+                if (w == 1.0) {
+                    out[begin + i] = part[i];
+                } else {
+                    const double v = double(part[i])*w;
+                    out[begin + i] = v >= 1.8e19 ? UINT64_C(18000000000000000000) : (uint64_t) std::llround(v);
+                }
+            }
+        }
     }
 
     bool open_bank_locked(const char * label, bool prompt_bank, ggml_expert_bank_id * out) {
@@ -1447,29 +2045,35 @@ private:
         b.label  = label;
         b.prompt = prompt_bank;
         if (!profile_dir_.empty()) {
-            // one store per model at <dir>/<model key>/<bank>; the manifest signature keeps a store of
-            // another model or geometry from being applied
-            profile_store_params p;
-            p.bank_dir  = std::filesystem::path(profile_dir_)/key_/label;
-            p.label     = label;
-            p.signature = signature_;
-            p.n_layers  = geo_.n_layers;
-            p.n_experts = geo_.n_experts;
-            p.archive   = cfg_.profile_archive;
-            b.store.reset(new profile_store(p));
-            if (cfg_.profile_reset) {
-                b.store->reset();
-            }
-            const profile_store_status st = b.store->open();
-            b.store_usable = st != profile_store_status::incompatible;
-            GGML_LOG_INFO("expert cache: bank '%s' opens %s (%zu records)\n", label,
-                p.bank_dir.string().c_str(), b.store_usable ? b.store->window().size() : (size_t) 0);
-            if (!b.store_usable) {
-                GGML_LOG_WARN("expert cache: profile at %s belongs to another model or format; ignored (use --expert-profile-reset to replace it)\n",
-                    p.bank_dir.string().c_str());
-            } else if (b.store->skipped_records() != 0) {
-                GGML_LOG_WARN("expert cache: profile at %s: %zu unreadable records skipped\n",
-                    p.bank_dir.string().c_str(), b.store->skipped_records());
+            // one store per model at <dir>/<model key>/<bank>, alone or in a joint cache: the key,
+            // signature and layer count are the model's own, so a model finds the same records either
+            // way; the manifest signature keeps a store of another model or geometry from being applied
+            b.stores.resize(members_.size());
+            b.usable.assign(members_.size(), 0);
+            for (size_t m = 0; m < members_.size(); ++m) {
+                const member_state & mb = members_[m];
+                profile_store_params p;
+                p.bank_dir  = std::filesystem::path(profile_dir_)/mb.key/label;
+                p.label     = label;
+                p.signature = mb.signature;
+                p.n_layers  = mb.geo.n_layers;
+                p.n_experts = geo_.n_experts;
+                p.archive   = cfg_.profile_archive;
+                b.stores[m].reset(new profile_store(p));
+                if (cfg_.profile_reset) {
+                    b.stores[m]->reset();
+                }
+                const profile_store_status st = b.stores[m]->open();
+                b.usable[m] = st != profile_store_status::incompatible && !mb.dropped;
+                GGML_LOG_INFO("expert cache: bank '%s' of model %zu opens %s (%zu records)\n", label, m,
+                    p.bank_dir.string().c_str(), b.usable[m] ? b.stores[m]->window().size() : (size_t) 0);
+                if (st == profile_store_status::incompatible) {
+                    GGML_LOG_WARN("expert cache: profile at %s belongs to another model or format; ignored (use --expert-profile-reset to replace it)\n",
+                        p.bank_dir.string().c_str());
+                } else if (b.stores[m]->skipped_records() != 0) {
+                    GGML_LOG_WARN("expert cache: profile at %s: %zu unreadable records skipped\n",
+                        p.bank_dir.string().c_str(), b.stores[m]->skipped_records());
+                }
             }
         }
         banks_.push_back(std::move(b));
@@ -1488,8 +2092,13 @@ private:
     std::string initial_bank_;
     std::string identity_;
     std::string signature_;
-    std::string key_;             // <arch>-<hash>, the profile directory of this model
     geometry geo_;
+    std::vector<member_state> members_;   // [0] = the model that configured the cache
+    bool joint_ = false;                   // more than one member; fixed before any compute
+    int  accepting_ = -1;                  // member whose config was accepted and whose context is awaited
+    std::array<std::atomic<const void *>, max_attached> attached_ctx_{};  // compute contexts, read without the mutex
+    std::array<int, max_attached> attached_member_{};
+    std::atomic<int> n_attached_{ 0 };
     ggml_context * ctx_ = nullptr;
     int device_ = -1;
     std::string disabled_reason_;
@@ -1779,6 +2388,10 @@ static bool iface_memory(ggml_backend_buffer_t buffer, size_t * host_bytes, size
     return true;
 }
 
+static bool iface_attach_backend(ggml_backend_t backend, ggml_context * weights) {
+    return instance().attach_backend(backend, weights);
+}
+
 static const ggml_expert_iface g_expert_iface = {
     /* .abi_version      = */ GGML_EXPERT_ABI_VERSION,
     /* .configure        = */ iface_configure,
@@ -1796,6 +2409,7 @@ static const ggml_expert_iface g_expert_iface = {
     /* .load_wanted      = */ iface_load_wanted,
     /* .set_backing      = */ iface_set_backing,
     /* .memory           = */ iface_memory,
+    /* .attach_backend   = */ iface_attach_backend,
 };
 
 const ggml_expert_iface * ggml_backend_cuda_expert_iface(void) {

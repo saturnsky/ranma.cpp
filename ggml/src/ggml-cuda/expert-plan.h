@@ -145,7 +145,9 @@ inline std::vector<plan_candidate> sorted_candidates(const geometry & geo, const
 // Cold start: split the budget between size classes in proportion to their
 // routed layer counts so a later refresh has stable capacity to fill. The
 // divisor is the number of routed layers (the sum of the class layer counts),
-// not the layer span: dense layers hold no experts, and counting them would give every class a fraction of its
+// not the layer span: dense layers and the empty layer numbers of a joint
+// cache member (an MTP head that numbers its only layer after the target's)
+// hold no experts, and counting them would give every class a fraction of its
 // share and leave the rest to the greedy loop below, which favours the
 // smallest slice class. The loop only places the rounding remainder.
 inline std::vector<int> allocate_cold_capacities(const geometry & geo, size_t remaining) {

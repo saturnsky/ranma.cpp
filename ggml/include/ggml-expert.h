@@ -23,7 +23,7 @@
 extern "C" {
 #endif
 
-#define GGML_EXPERT_ABI_VERSION      5
+#define GGML_EXPERT_ABI_VERSION      6
 #define GGML_EXPERT_IFACE_PROC_NAME  "ggml_backend_expert_iface"
 
 #define GGML_EXPERT_BANK_NONE        0xFFFFFFFFu
@@ -79,6 +79,17 @@ struct ggml_expert_config {
                                       // with stored records seeds the plan installed at model load.
                                       // NULL or "" = start with empty arenas
     uint32_t log_mask;                // ggml_expert_log_flags
+
+    // Joint cache: every model of the process that has routed experts can share the one cache,
+    // with one L1 and one L2 budget. The first model's config names the models that join later,
+    // by their first GGUF file; the backend reads their tensor layout from the file so that the
+    // load-time plan and the arenas cover all of them. A later model's config names its own file
+    // and is accepted as that member; its other fields are ignored.
+    const char * model_path;          // first GGUF file of the model this config is passed with; NULL = unnamed
+    float        model_weight;        // multiplier on this model's host read cost in the joint plan; <= 0 = 1
+    uint32_t     n_join;              // number of models that join after this one (first config only)
+    const char * const * join_paths;  // [n_join] first GGUF file of each; splits follow split.count
+    const float * join_weights;       // [n_join] multipliers, NULL = 1 each
 };
 
 // Numbers only; the caller attaches them to the record a bank commit writes.
@@ -139,6 +150,11 @@ struct ggml_expert_iface {
 
     // Memory accounting for buffers the cache owns (exclusive mode).
     bool (*memory)(ggml_backend_buffer_t buffer, size_t * host_bytes, size_t * device_bytes);
+
+    // A compute backend that runs the model whose routed-expert context is `weights`. The router
+    // selections of its graphs are counted for that model only; selections of a backend that was
+    // never attached are not profiled. Call once per context, before its first compute.
+    bool (*attach_backend)(ggml_backend_t backend, struct ggml_context * weights);
 };
 
 typedef const struct ggml_expert_iface * (*ggml_backend_expert_iface_t)(void);

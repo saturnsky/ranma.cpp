@@ -1,5 +1,7 @@
 #include "expert-profiler.cuh"
 
+#include <algorithm>
+
 namespace ggml_cuda_expert {
 
 static __global__ void profile_ids_kernel(
@@ -41,8 +43,9 @@ void launch_profile_ids(
         counts, bank_stride, n_banks, selection);
 }
 
-profiler::profiler(const geometry & geo, uint32_t n_banks) :
-    n_banks_(n_banks), n_counts_(geo.n_counts()) {
+profiler::profiler(const geometry & geo, uint32_t n_banks, uint32_t n_selections) :
+    n_banks_(n_banks), n_counts_(geo.n_counts()), n_selections_(std::max<uint32_t>(n_selections, 1)),
+    last_selection_(n_selections_, profile_selection{ -1, -1, 0xFFFFFFFFu, 0 }) {
 }
 
 profiler::~profiler() {
@@ -58,7 +61,7 @@ profiler::~profiler() {
 }
 
 size_t profiler::device_bytes() const {
-    return counts_ ? n_counts_*sizeof(uint32_t)*n_banks_ + sizeof(profile_selection) : 0;
+    return counts_ ? n_counts_*sizeof(uint32_t)*n_banks_ + n_selections_*sizeof(profile_selection) : 0;
 }
 
 bool profiler::allocate(int device) {
@@ -73,7 +76,7 @@ bool profiler::allocate(int device) {
         counts_ = nullptr;
         return false;
     }
-    if (cudaMalloc((void **) &selection_, sizeof(profile_selection)) != cudaSuccess) {
+    if (cudaMalloc((void **) &selection_, n_selections_*sizeof(profile_selection)) != cudaSuccess) {
         (void) cudaGetLastError();
         (void) cudaFree(counts_);
         counts_ = nullptr;
@@ -81,12 +84,12 @@ bool profiler::allocate(int device) {
         return false;
     }
     CUDA_CHECK(cudaMemset(counts_, 0, bytes));
-    CUDA_CHECK(cudaMemcpy(selection_, &last_selection_, sizeof(profile_selection), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(selection_, last_selection_.data(), n_selections_*sizeof(profile_selection), cudaMemcpyHostToDevice));
     return true;
 }
 
-bool profiler::select(int32_t row_begin, int32_t row_end, uint32_t bank, cudaStream_t stream) {
-    if (selection_ == nullptr) {
+bool profiler::select(int32_t row_begin, int32_t row_end, uint32_t bank, cudaStream_t stream, uint32_t slot) {
+    if (selection_ == nullptr || slot >= n_selections_) {
         return false;
     }
     profile_selection next = { row_begin, row_end, bank, 0 };
@@ -94,14 +97,14 @@ bool profiler::select(int32_t row_begin, int32_t row_end, uint32_t bank, cudaStr
         // canonical "nothing" so that repeated empty selections do not launch
         next = { -1, -1, 0xFFFFFFFFu, 0 };
     }
-    if (next.row_begin == last_selection_.row_begin && next.row_end == last_selection_.row_end &&
-            next.bank == last_selection_.bank) {
+    profile_selection & last = last_selection_[slot];
+    if (next.row_begin == last.row_begin && next.row_end == last.row_end && next.bank == last.bank) {
         return true;
     }
     ggml_cuda_set_device(device_);
     const ggml_cuda_kernel_launch_params launch(dim3(1), dim3(1), 0, stream);
-    ggml_cuda_kernel_launch(set_selection_kernel, launch, selection_, next);
-    last_selection_ = next;
+    ggml_cuda_kernel_launch(set_selection_kernel, launch, selection_ + slot, next);
+    last = next;
     return true;
 }
 
