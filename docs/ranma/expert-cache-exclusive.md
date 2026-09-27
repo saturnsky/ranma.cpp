@@ -138,8 +138,12 @@ exchange above. `RANMA_EXPERT_VERIFY=1` checks every VRAM and every host slot af
   an abort.
 - **The cache is a process singleton** bound to the device it was registered on. A second device
   does not accept the exclusive buffer type.
-- Everything inclusive mode is limited by still applies: one model per process, slot 0 is profiled,
+- Everything inclusive mode is limited by still applies: one cache per process, slot 0 is profiled,
   `--load-mode none` is required.
+- **A joining draft is written after the target is live.** The arenas are planned over both models
+  when the target loads; the draft's slices are written to their homes when the draft loads, after
+  the target's warm-up (`expert-cache-joint.md`). A draft that turns out not to match the layout read
+  from its file leaves its slots unused.
 
 ## How to verify it
 

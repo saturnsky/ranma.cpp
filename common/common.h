@@ -695,6 +695,9 @@ struct common_params {
     int32_t     expert_l2_prefill_ring_mib = -1;   // -1 = inherit the staging value, 0 = automatic
     int32_t     expert_seed                = 1;
     int32_t     expert_l2_worker_cpu       = -1;
+    bool        expert_cache_draft         = true;  // a draft model with routed experts shares the expert cache
+    float       expert_weight_target       = 1.0f;  // joint cache: multiplier on the host read cost of the target's experts
+    float       expert_weight_draft        = 1.0f;  // joint cache: the same for the draft model's experts
 
     std::vector<std::string> api_keys;
 
