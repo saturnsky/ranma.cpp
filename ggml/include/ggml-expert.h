@@ -23,7 +23,7 @@
 extern "C" {
 #endif
 
-#define GGML_EXPERT_ABI_VERSION      4
+#define GGML_EXPERT_ABI_VERSION      5
 #define GGML_EXPERT_IFACE_PROC_NAME  "ggml_backend_expert_iface"
 
 #define GGML_EXPERT_BANK_NONE        0xFFFFFFFFu
@@ -40,22 +40,33 @@ enum ggml_expert_mode {
 enum ggml_expert_policy {
     GGML_EXPERT_POLICY_ADAPTIVE = 0,
     GGML_EXPERT_POLICY_STATIC = 1, // seeded placement, profiling without installs
+    GGML_EXPERT_POLICY_OFF = 2,    // no L1 payload, seeded fixed L2, no profiling
 };
 
 enum ggml_expert_log_flags {
     GGML_EXPERT_LOG_INSTALL = 1u << 0,
     GGML_EXPERT_LOG_PROFILE = 1u << 1,
     GGML_EXPERT_LOG_PREFILL = 1u << 2,
+    GGML_EXPERT_LOG_L2      = 1u << 3,
 };
 
 // Passed once, before the model's weight buffers are allocated. Strings must outlive the call only.
 struct ggml_expert_config {
     uint32_t abi_version;             // GGML_EXPERT_ABI_VERSION
 
-    size_t   l1_bytes;                // VRAM budget for cached expert slices and their tables; 0 = cache off
+    size_t   l1_bytes;                // VRAM budget for cached expert slices and their tables; 0 = cache off, except for POLICY_OFF (L2 only)
     enum ggml_expert_mode mode;
     enum ggml_expert_policy policy;
-    uint32_t random_seed;             // STATIC: deterministic per-layer expert order
+    uint32_t random_seed;             // STATIC/OFF: deterministic per-layer expert order
+
+    size_t   l2_bytes;                // host tier budget (exclusive only); 0 = unlimited host arena
+    size_t   l2_prefill_ring_bytes;
+    size_t   l2_decode_ring_bytes;
+    uint64_t l2_prefill_rows, l2_decode_rows; // Worst-case rows, before any expert allocation.
+    int32_t  l2_experts_used;          // Filled from model metadata before configure.
+    int32_t  l2_worker_cpu;           // -1 selects the last active logical CPU
+    bool     l2_phase_rings;          // the ring shrinks during generation and grows at the request end;
+                                      // false keeps one ring, sized for prompt processing
 
     bool     delta_install;           // keep slices that stay selected in place when a new plan is installed
     bool     freeze;                  // profile only: commits still score and plan, installs are refused
@@ -66,8 +77,7 @@ struct ggml_expert_config {
     const char * profile_dir;         // root of the profile banks; NULL or "" = no profiling, no plans
     const char * initial_bank;        // bank labels separated by commas, most wanted first: the first one
                                       // with stored records seeds the plan installed at model load.
-                                      // NULL or "" = start with empty arenas (ABI 4: the list replaces
-                                      // the single label of ABI 3)
+                                      // NULL or "" = start with empty arenas
     uint32_t log_mask;                // ggml_expert_log_flags
 };
 
@@ -119,6 +129,13 @@ struct ggml_expert_iface {
     // Rows [row_begin, row_end) of the next graph computed on `backend` feed `bank`; an empty range
     // or GGML_EXPERT_BANK_NONE records nothing. Cheap when unchanged.
     bool (*profile_select)(ggml_backend_t backend, int32_t row_begin, int32_t row_end, ggml_expert_bank_id bank);
+
+    // The SSD tier, called by the model loader for routed expert tensors it is about to fill.
+    // load_wanted is false for an expert whose bytes stay in the file, so the loader skips them.
+    // set_backing says where the tensor's bytes live; false means the tier is off for this tensor
+    // and the loader must read it whole, as before.
+    bool (*load_wanted)(const struct ggml_tensor * tensor, int32_t expert);
+    bool (*set_backing)(const struct ggml_tensor * tensor, int32_t file_index, const char * path, uint64_t file_offset);
 
     // Memory accounting for buffers the cache owns (exclusive mode).
     bool (*memory)(ggml_backend_buffer_t buffer, size_t * host_bytes, size_t * device_bytes);
