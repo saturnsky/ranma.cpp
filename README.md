@@ -69,7 +69,61 @@ misbehave. Other platforms and backends are not tested and not supported by this
 ## Changes over upstream
 
 Each user-visible change gets a line here and a page under `docs/ranma/` that describes what it is, when it
-applies, how to switch it, and its limits.
+applies, how to switch it, and its limits. Measured effects are collected in
+[docs/ranma/benchmark.md](docs/ranma/benchmark.md).
+
+### Measured
+
+This release against its upstream base `53ed051ce` on the Radeon AI PRO R9700 with 128 GB: decode of the server
+scenarios that the project runs (roleplay in four languages and coding, one slot, greedy decoding), release warm
+against upstream. [docs/ranma/benchmark.md](docs/ranma/benchmark.md#this-release) has the t/s behind the ratios,
+the cold and 64 GB rows, the prompt times, the `llama-bench` curves, Gemma 4 31B and the protocol.
+
+| model | English roleplay | coding | Korean roleplay | Japanese roleplay | Chinese roleplay |
+|---|---:|---:|---:|---:|---:|
+| DeepSeek V4 Flash UD-IQ3_XXS, MTP n1 | x2.79 | x2.52 | x2.89 | x2.95 | x2.92 |
+| DeepSeek V4 Flash UD-IQ3_XXS, no MTP | x2.97 | x2.70 | x3.07 | x3.11 | x3.09 |
+| Qwen3.8-Flash-Next UD-Q4_K_XL | x2.78 | x2.57 | x2.78 | x2.79 | x2.79 |
+
+Upstream keeps the routed experts of the first 35 layers in host memory (`-ncmoe 35`; `-ncmoe 36` with the
+DeepSeek MTP head on the GPU). The release runs the exclusive expert cache with a VRAM budget of 20480 MiB, or
+18432 MiB when the DeepSeek MTP head sits on the GPU outside the cache, and an unlimited host tier, with the
+prefill swap in the Qwen roleplay rows. The joint cache (`--expert-cache-draft`) is on by default in this release
+but was switched off in these rows; the L1 redraw and the hash early read are off by default and were off. All
+builds use OpenMP. On a 64 GB system, emulated by a host tier of 40 GiB (`--expert-l2-mib 40960`), warm decode is
+13 to 17 % lower for DeepSeek with MTP, 10 to 13 % lower without it and 5 % lower for Qwen. The measured effect
+of the options that are off here is on the same page.
+
+The tables below were measured once, on 2026-09-22, at ranma_20260922 (`e48103e1e`) against its upstream base
+`aa39d7a3e`, and are not repeated for every release; "ranma_20260922" in them is that commit, not this release.
+
+`llama-bench` PP512 / TG128 in t/s at depth 0, 8192 and 65536, upstream `aa39d7a3e` on the Radeon AI PRO R9700
+(32 GiB) with 128 GiB of host memory against the last commit of ranma_20260922 on two systems: the same R9700 with
+128 GiB, and an RX 9070 XT (16 GiB) with 64 GiB of host memory, emulated on the R9700 by the placement and the
+host-tier budget. PCIe 5.0 x16 throughout. Upstream runs `-ncmoe 35`, the lowest offload that keeps the
+device buffers in VRAM at depth 65536; ranma_20260922 runs the exclusive expert cache (20480 MiB on the R9700,
+3072 MiB for Qwen and 4096 MiB for DeepSeek on the emulated RX 9070 XT) with prefill swap where that is
+faster. The last column is the peak memory of the process, in GiB: VRAM in use on the card, and the commit
+charge on the host (which on Windows also carries part of the VRAM allocations, so it is an upper bound of
+the host memory the row needs). The expert cache budgets are conservative for their cards: the rows leave 2
+to 4 GiB of VRAM unused, so a larger budget than theirs is possible. The protocol, every other configuration and the 64 / 32 GB rows of
+both devices are in [docs/ranma/benchmark.md](docs/ranma/benchmark.md).
+
+| model | system | @0 | @8192 | @65536 | VRAM / host |
+|---|---|---:|---:|---:|---:|
+| Qwen3.8-Flash-Next UD-Q4_K_XL | upstream `aa39d7a3e`, R9700, 128 GB | 335 / 15.9 | 316 / 15.2 | 307 / 13.2 | 29.9 / 80.7 |
+| | ranma_20260922, R9700, 128 GB | 1014 / 49.7 | 949 / 47.9 | 692 / 44.8 | 29.1 / 78.2 |
+| | ranma_20260922, RX 9070 XT emulation, 64 GB | 625 / 36.7 | 596 / 38.2 | 480 / 35.2 | 12.0 / 48.8 |
+| DeepSeek V4 Flash UD-IQ3_XXS | upstream `aa39d7a3e`, R9700, 128 GB | 248 / 9.8 | 209 / 9.7 | (measured to 8192) | 27.8 / 98.7 |
+| | ranma_20260922, R9700, 128 GB | 310 / 31.8 | 255 / 30.9 | 108 / 28.1 | 27.9 / 90.3 |
+| | ranma_20260922, RX 9070 XT emulation, 64 GB | 129 / 18.8 | 128 / 20.3 | 78 / 18.9 | 11.8 / 49.0 |
+
+Gemma 4 31B Q4_K_M, dense in VRAM on the R9700 with `ROCBLAS_USE_HIPBLASLT=1`, at depth 0 / 8192 / 32768:
+
+| system | @0 | @8192 | @32768 | VRAM / host |
+|---|---:|---:|---:|---:|
+| upstream `aa39d7a3e`, R9700 | 897 / 28.3 | 628 / 26.3 | 328 / 24.2 | 23.8 / 21.0 |
+| ranma_20260922, R9700 | 1001 / 29.3 | 762 / 26.9 | 440 / 24.7 | 23.3 / 21.0 |
 
 ### RDNA4 kernels (HIP)
 
