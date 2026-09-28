@@ -21,6 +21,7 @@ for equivalence checks, or a diagnostic.
 | name | default | effect |
 | --- | --- | --- |
 | `GGML_CUDA_TOP_K_STABLE_TIES` | off | `1` makes the top-k pick the smallest columns among tied values, so selections and outputs can be compared between runs. Option for reproducible runs. |
+| `LLAMA_QSA_LEGACY` | off | `1` selects the per-token indexer cache instead of pooled block keys. Reference path. |
 
 ## Tie-breaking in the top-k
 
@@ -50,3 +51,52 @@ With the switch unset, the only permanent change is one extra comparison in
 the gather.
 
 `test-backend-ops -o TOP_K` covers both settings.
+
+## Pooled block keys in the indexer cache
+
+The indexer cache holds one pooled key per block. Since a step completes at
+most one block, only that block has to be pooled; the rest of the context is
+read from the cache as it stands.
+
+Each ubatch is planned on the host before its graph is built. The plan says
+which of the ubatch's raw keys belong to a block that is still open and must
+be kept for a later step, which blocks the ubatch completes, and which cache
+row each completed key is written to. The graph pools the completed blocks,
+writes them into the indexer cache, and copies the members of the still-open
+block into a small persistent state tensor, which the next ubatch reads back
+as the earlier members of that block. A reservation ubatch carries no real
+positions, so it is planned as if its tokens were consecutive and at the full
+block count - the worst case any later graph can ask for.
+
+`LLAMA_QSA_LEGACY=1` restores the previous per-token indexer cache, which
+stores one raw key per token and pools the whole context on every graph. It is
+kept as the reference the pooled path is compared against, not as a fallback.
+Keys pooled on the per-token path pass through the cache type first, so the
+pooled path applies the same rounding to its members before pooling them; both
+produce the same block key bit for bit.
+
+The pooled cache keeps one stream per sequence. A unified KV cache keeps a
+single stream for all sequences, so with more than one sequence the two
+shapes do not line up; that combination is refused when the context is
+created, with a message to run without `--kv-unified`. A single sequence, a
+split cache and `LLAMA_QSA_LEGACY=1` are not affected.
+
+The layout of the indexer cache is part of the sequence state. Each layout
+writes its own version into the state file, and a file written by another
+layout is refused instead of being read as keys that do not match it.
+
+### Suffix removal inside an open block
+
+A suffix removal whose start is not a block boundary cuts a block that is
+still open: the tokens of that block below the cut stay, and the next ubatch
+needs their raw keys as the earlier members of the block. The pooled cache
+therefore records which position each open-block row of the persistent state
+tensor holds, and accepts such a removal when every row of the cut block below
+the cut is still held at its position; otherwise the removal is refused before
+any cache is touched, as before. The rows form a ring of `ratio + n_rs_seq - 1`
+per stream (`ratio` without speculative decoding, so the graph is unchanged
+there), so a speculative rollback of up to `n_rs_seq` tokens always finds the
+rows it needs. A partial (checkpoint) state carries the open-block rows and
+their positions too, so a server checkpoint taken at any position can be
+restored and continued. A full state written without the positions still
+loads; its rows then count as unknown and an unaligned removal is refused.

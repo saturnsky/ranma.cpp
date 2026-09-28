@@ -10,6 +10,8 @@
 #include <clocale>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <set>
 #include <vector>
@@ -302,6 +304,111 @@ static bool test_multi_seq_split_replay(const common_params & params, llama_mode
     return true;
 }
 
+// The server's checkpoint flow on a memory without rollback snapshots: a partial checkpoint taken
+// at a position that is not a multiple of the indexer block ratio, the sequence carried on past
+// it, the checkpoint restored and the suffix removed at the checkpoint, then a different
+// continuation. The result must equal a context that decoded the prefix and that continuation
+// with the same batches and never went past the checkpoint.
+static bool test_partial_restore_unaligned(const common_params & params, llama_model * model, const int n_vocab, uint8_t fill) {
+    constexpr uint32_t n_prefix = 13;   // 13 % 4 != 0: the checkpoint cuts an indexer block
+    constexpr uint32_t n_old    = 21;   // the earlier continuation, long enough to reuse every open-block row
+    constexpr uint32_t n_new    = 11;
+
+    const auto make_ctx_plain = [&]() {
+        auto cparams = common_context_params_to_llama(params);
+        cparams.n_seq_max = 1;
+        cparams.n_rs_seq  = 0;
+        cparams.n_ctx     = 256;
+        cparams.n_batch   = 256;
+        cparams.n_ubatch  = 64;
+        return init_ctx(model, cparams, fill);
+    };
+
+    llama_context * ctx_ckpt = make_ctx_plain();
+    llama_context * ctx_ref  = make_ctx_plain();
+    if (ctx_ckpt == nullptr || ctx_ref == nullptr) {
+        fprintf(stderr, "%s : failed to init contexts\n", __func__);
+        llama_free(ctx_ckpt);
+        llama_free(ctx_ref);
+        return false;
+    }
+
+    const auto cleanup = [&]() {
+        llama_free(ctx_ckpt);
+        llama_free(ctx_ref);
+    };
+
+    const auto tok = [&](uint32_t salt, llama_pos pos) {
+        return (llama_token) ((7*(uint32_t) pos + 31*salt + 1) % (uint32_t) n_vocab);
+    };
+
+    const auto decode_range = [&](llama_context * ctx, uint32_t salt, llama_pos p0, llama_pos p1, bool logits) {
+        llama_batch batch = llama_batch_init(p1 - p0, 0, 1);
+        for (llama_pos pos = p0; pos < p1; ++pos) {
+            common_batch_add(batch, tok(salt, pos), pos, { 0 }, logits);
+        }
+        const bool ok = llama_decode(ctx, batch) == 0;
+        llama_batch_free(batch);
+        return ok;
+    };
+
+    bool ok = decode_range(ctx_ckpt, 0, 0, n_prefix, false) && decode_range(ctx_ref, 0, 0, n_prefix, false);
+
+    common_prompt_checkpoint ckpt;
+    if (ok) {
+        ckpt.update_tgt(ctx_ckpt, 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+
+        // the earlier request goes on past the checkpoint
+        ok = decode_range(ctx_ckpt, 1, n_prefix, n_prefix + n_old, false);
+    }
+    if (!ok) {
+        fprintf(stderr, "%s : prefix decode failed\n", __func__);
+        cleanup();
+        return false;
+    }
+
+    ckpt.load_tgt(ctx_ckpt, 0, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+
+    if (!llama_memory_seq_rm(llama_get_memory(ctx_ckpt), 0, n_prefix, -1)) {
+        fprintf(stderr, "%s : suffix removal at %u after the checkpoint restore was refused\n", __func__, n_prefix);
+        cleanup();
+        return false;
+    }
+
+    ok = decode_range(ctx_ckpt, 2, n_prefix, n_prefix + n_new, true) &&
+         decode_range(ctx_ref,  2, n_prefix, n_prefix + n_new, true);
+    if (!ok) {
+        fprintf(stderr, "%s : continuation decode failed\n", __func__);
+        cleanup();
+        return false;
+    }
+
+    float diff_max = 0.0f;
+    for (uint32_t i = 0; i < n_new; ++i) {
+        const float * l_ckpt = llama_get_logits_ith(ctx_ckpt, i);
+        const float * l_ref  = llama_get_logits_ith(ctx_ref,  i);
+        if (l_ckpt == nullptr || l_ref == nullptr) {
+            fprintf(stderr, "%s : missing logits at index %u\n", __func__, i);
+            cleanup();
+            return false;
+        }
+        for (int t = 0; t < n_vocab; ++t) {
+            diff_max = std::max(diff_max, logit_diff(l_ckpt[t], l_ref[t]));
+        }
+    }
+
+    // identical batches on identical states: bit for bit
+    if (diff_max > 0.0f) {
+        fprintf(stderr, "%s : restored-checkpoint logits differ from the reference (max diff %g)\n", __func__, (double) diff_max);
+        cleanup();
+        return false;
+    }
+
+    fprintf(stderr, "%s : checkpoint at %u restored and continued, logits identical\n", __func__, n_prefix);
+    cleanup();
+    return true;
+}
+
 static int test_rollback(const common_params & params, llama_model * model, uint8_t fill) {
     const llama_vocab * vocab   = llama_model_get_vocab(model);
     const int           n_vocab = llama_vocab_n_tokens(vocab);
@@ -509,9 +616,18 @@ int main(int argc, char ** argv) {
         return 0;
     }
 
+    // the partial checkpoint flow is checked where it has been seen to break: the pooled Qwen indexer
+    char arch[64] = {};
+    llama_model_meta_val_str(model, "general.architecture", arch, sizeof(arch));
+    const bool check_partial_restore = strcmp(arch, "qwen4exp") == 0;
+
     for (uint8_t fill : { 0, 0x3e }) {
         fprintf(stderr, "%s : testing with cache fill 0x%02x\n", __func__, fill);
         if (test_rollback(params, model, fill) != 0) {
+            return 1;
+        }
+        if (check_partial_restore &&
+                !test_partial_restore_unaligned(params, model, llama_vocab_n_tokens(llama_model_get_vocab(model)), fill)) {
             return 1;
         }
     }
