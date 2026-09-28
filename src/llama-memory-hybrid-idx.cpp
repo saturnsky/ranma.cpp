@@ -1016,8 +1016,17 @@ bool llama_memory_hybrid_idx::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_po
             // the open block.
             if (pooled_keeps_open_block) {
                 idx_open_block_reset(seq_id, p0);
-            } else if (p0 <= 0 || pooled_removes_existing) {
+            } else if (p0 <= 0) {
                 idx_state->clear(seq_id, true);
+                idx_open_block_reset(seq_id);
+            } else if (pooled_removes_existing) {
+                // A cut on a block boundary leaves no open block. The rows are not cleared: a
+                // graph reads a row only as a member of a block it completes, the members of
+                // every later block lie at or above p0, and positions continue from p0, so each
+                // such member comes from the completing ubatch itself or was persisted again by
+                // the earlier ubatch that decoded it. Forgetting the positions is enough, and it
+                // spares a speculative rollback one synchronous memset per layer, rollback plane
+                // and tensor.
                 idx_open_block_reset(seq_id);
             }
         } else {
