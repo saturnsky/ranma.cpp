@@ -323,3 +323,13 @@ error rather than silently ignored.
   to agree token for token.
 - Saving and restoring a session, and a context shift, exercise the paths that
   read the joint tensor through the sub-caches.
+
+## Small-kernel fusions in decode
+
+Several short chains of small kernels of every layer run as one launch each:
+the persisted compressor state rows, the FFN sum that feeds the
+hyper-connection post, the q, kv and compressor norm and rope including the
+store into the K cache, and the compressor source concatenations; the
+compressor APE add is taken by its matmul. The CUDA/HIP backend matches the
+unfused path; a KL-divergence comparison against it stays at the measurement
+floor. The fusions have no switch.
