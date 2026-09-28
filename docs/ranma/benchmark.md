@@ -186,7 +186,8 @@ the row of "Optional features" below).
 
 ### Qwen3.8-Flash-Next UD-Q4_K_XL
 
-No MTP rows: MTP for Qwen is not part of this fork. Prefill swap on in the roleplay rows.
+No MTP in these rows: MTP for Qwen is not part of the release. The branch `ranma_20260928_qwen_mtp` adds it for
+English roleplay, see the next section. Prefill swap on in the roleplay rows.
 
 | scenario | upstream `-ncmoe 35` | release cold | release warm | release warm, 64 GB | cold / upstream | warm / upstream |
 |---|---:|---:|---:|---:|---:|---:|
@@ -203,6 +204,43 @@ No MTP rows: MTP for Qwen is not part of this fork. Prefill swap on in the rolep
 | Korean roleplay | 45.4 | 24.3 | 24.1 | - | 16.6 | 27.7 | 40.2 | - |
 | Japanese roleplay | 44.5 | 24.2 | 23.8 | - | 16.5 | 27.9 | 40.8 | - |
 | Chinese roleplay | 38.3 | 20.4 | 19.9 | - | 16.7 | 27.7 | 43.5 | - |
+
+### Qwen3.8-Flash-Next UD-Q4_K_XL, MTP n1 (branch `ranma_20260928_qwen_mtp`)
+
+The branch `ranma_20260928_qwen_mtp` is this release with upstream pull request
+[ggml-org/llama.cpp#28243](https://github.com/ggml-org/llama.cpp/pull/28243) ("models: Qwen3.8-Flash-Next MTP",
+open, not merged into master; its head `6fcaa16f4`) applied as one commit, `d93615962`. The pull request adds
+the NextN/MTP draft head of Qwen3.8-Flash-Next. Measured on 2026-09-28 in English roleplay only, after the rows
+above, with the same server settings and the prefill swap on.
+
+The head is `mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf`, a draft-only export of the head that borrows the token
+embeddings and the LM head of the target (`-md`). It runs on the GPU (`-ngld 999`) with
+`--spec-type draft-mtp --spec-draft-n-max 1 --spec-draft-p-min 0`. Two placements:
+
+- **joint cache off** (`--expert-cache-draft off`): the head stays outside the expert cache, and the cache budget
+  is `--expert-l1-mib 18432`;
+- **joint cache on** (`--expert-cache-draft on`, the default): the routed experts of the head share the cache,
+  and the budget is 20480 MiB.
+
+The warm rows of both use one profile. It was recorded with the joint cache on from the warm-up preset and holds
+the profile of the target and that of the head. The row without MTP runs the same build with the English
+roleplay profile of the release rows above. Upstream has no MTP for this model, so the ratio is against upstream
+without MTP.
+
+| row | decode t/s | / no MTP, warm | / upstream | first request | prompt s | acceptance |
+|---|---:|---:|---:|---:|---:|---:|
+| no MTP, warm | 46.34 | - | x2.77 | 44.0 | 20.3 | - |
+| MTP n1, joint cache off, cold | 52.47 | +13.2 % | x3.13 | 30.6 | 22.9 | 75.7 % |
+| MTP n1, joint cache off, warm | 54.72 | +18.1 % | x3.27 | 51.3 | 22.6 | 75.7 % |
+| MTP n1, joint cache on, cold | 53.11 | +14.6 % | x3.17 | 30.7 | 22.2 | 75.7 % |
+| MTP n1, joint cache on, warm | 55.62 | +20.0 % | x3.32 | 52.4 | 22.0 | 75.7 % |
+
+- The joint cache is 1.2 % (cold) and 1.6 % (warm) faster than the head outside the cache, and its peak
+  dedicated VRAM is 0.5 GiB lower (27.7 against 28.2 GiB).
+- The row without MTP decodes 0.4 % below the release row above (46.54) and gives the same replies, so the pull
+  request leaves the path without MTP unchanged.
+- The four MTP rows give the same replies. They differ from the replies without MTP from the first tokens of
+  most requests on. The text reads correctly in both.
 
 ### `llama-bench` curves
 

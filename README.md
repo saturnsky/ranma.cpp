@@ -94,6 +94,13 @@ builds use OpenMP. On a 64 GB system, emulated by a host tier of 40 GiB (`--expe
 13 to 17 % lower for DeepSeek with MTP, 10 to 13 % lower without it and 5 % lower for Qwen. The measured effect
 of the options that are off here is on the same page.
 
+The branch `ranma_20260928_qwen_mtp` is this release with upstream pull request
+[ggml-org/llama.cpp#28243](https://github.com/ggml-org/llama.cpp/pull/28243) (Qwen3.8-Flash-Next MTP, not merged
+into master) applied as one commit. In English roleplay, Qwen with MTP n1 and the joint cache on decodes 55.62 t/s
+warm. That is x3.32 against upstream without MTP and +20.0 % over the same build without MTP (46.34). With the
+head outside the cache it decodes 54.72 t/s (+18.1 %)
+([docs/ranma/benchmark.md](docs/ranma/benchmark.md#qwen38-flash-next-ud-q4_k_xl-mtp-n1-branch-ranma_20260928_qwen_mtp)).
+
 The tables below were measured once, on 2026-09-22, at ranma_20260922 (`e48103e1e`) against its upstream base
 `aa39d7a3e`, and are not repeated for every release; "ranma_20260922" in them is that commit, not this release.
 
