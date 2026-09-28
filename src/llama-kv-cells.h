@@ -3,11 +3,14 @@
 #include "llama.h"
 #include "llama-cparams.h"
 
+#include <algorithm>
+#include <atomic>
 #include <bitset>
 #include <cassert>
 #include <cstring>
 #include <limits>
 #include <set>
+#include <utility>
 #include <vector>
 
 struct llama_kv_cell_ext {
@@ -52,6 +55,8 @@ public:
         for (uint32_t s = 0; s < LLAMA_MAX_SEQ; ++s) {
             seq_pos[s].clear();
         }
+
+        jr_reset();
     }
 
     void reset_shift() {
@@ -100,6 +105,41 @@ public:
 
     bool get_has_shift() const {
         return has_shift;
+    }
+
+    // change journal, for users that keep data derived from the cells and want to update it
+    // instead of rescanning every cell. Every change of a cell's position, sequences or ext
+    // takes a new generation from a process-wide counter, so a generation names one content of
+    // the cells: a copy carries the generation of the content it copied.
+    uint64_t get_gen() const {
+        return gen;
+    }
+
+    // appends to `out` the cells changed after generation `since` (with repeats)
+    // returns false if the journal does not reach back to `since`: the caller has to rescan
+    bool get_changed_since(uint64_t since, std::vector<uint32_t> & out) const {
+        if (since == gen) {
+            return true;
+        }
+
+        size_t first = 0;
+
+        if (since != jr_base) {
+            const auto it = std::lower_bound(jr.begin(), jr.end(), since,
+                    [](const std::pair<uint64_t, uint32_t> & e, uint64_t g) { return e.first < g; });
+
+            if (it == jr.end() || it->first != since) {
+                return false;
+            }
+
+            first = (size_t) (it - jr.begin()) + 1;
+        }
+
+        for (size_t k = first; k < jr.size(); ++k) {
+            out.push_back(jr[k].second);
+        }
+
+        return true;
     }
 
     // move cell isrc to idst (used during defrag)
@@ -169,6 +209,8 @@ public:
         for (uint32_t j = 0; j < other.pos.size(); ++j) {
             const auto idx = i + j;
 
+            jr_add(idx);
+
             if (pos[idx] == -1 && other.pos[j] != -1) {
                 used.insert(i + j);
             }
@@ -200,6 +242,8 @@ public:
         for (uint32_t j = 0; j < other.pos.size(); ++j) {
             const auto idx = idxs[j];
 
+            jr_add(idx);
+
             if (pos[idx] == -1 && other.pos[j] != -1) {
                 used.insert(idx);
             }
@@ -229,6 +273,8 @@ public:
         assert(i < pos.size());
         assert(pos[i] != -1);
 
+        jr_add(i);
+
         seq_pos_rm(i);
         seq[i].reset();
 
@@ -246,6 +292,8 @@ public:
         assert(seq[i].test(seq_id));
         assert(pos[i] != -1);
         assert(seq_id >= 0);
+
+        jr_add(i);
 
         seq[i].reset(seq_id);
         seq_pos_dec(seq_id, i);
@@ -266,6 +314,10 @@ public:
     // return true if the cell becomes empty (i.e. it did not contain seq_id before the call)
     bool seq_keep(uint32_t i, llama_seq_id seq_id) {
         assert(i < pos.size());
+
+        if (seq[i].any()) {
+            jr_add(i);
+        }
 
         if (seq[i].test(seq_id)) {
             seq_pos_rm(i);
@@ -341,6 +393,8 @@ public:
         assert(i < pos.size());
         assert(pos[i] != -1);
         assert(!seq[i].test(seq_id));
+
+        jr_add(i);
 
         seq[i].set(seq_id);
         seq_pos_inc(seq_id, i);
@@ -424,6 +478,8 @@ public:
         assert(pos[i] == -1);
         assert(seq[i].none());
 
+        jr_add(i);
+
         pos[i] = p;
 
         used.insert(i);
@@ -431,6 +487,7 @@ public:
 
     void ext_set(uint32_t i, llama_kv_cell_ext p) {
         assert(i < ext.size());
+        jr_add(i);
         ext[i] = p;
     }
 
@@ -440,6 +497,8 @@ public:
     bool pos_add(uint32_t i, llama_pos d) {
         assert(i < pos.size());
         assert(pos[i] != -1);
+
+        jr_add(i);
 
         seq_pos_rm(i);
 
@@ -472,6 +531,8 @@ public:
 
         const llama_pos p_old = pos[i];
 
+        jr_add(i);
+
         seq_pos_rm(i);
 
         pos[i]   /= d;
@@ -484,6 +545,36 @@ public:
 
 private:
     bool has_shift = false;
+
+    // change journal, see get_gen(): (generation, cell) per change since generation jr_base
+    // it is bounded: when full it restarts, and a user older than jr_base then rescans
+    static constexpr size_t JR_MAX = 16384;
+
+    static inline std::atomic<uint64_t> gen_next{1};
+
+    uint64_t gen     = 0;
+    uint64_t jr_base = 0;
+
+    std::vector<std::pair<uint64_t, uint32_t>> jr;
+
+    void jr_add(uint32_t i) {
+        if (jr.size() >= JR_MAX) {
+            jr.clear();
+            jr_base = gen;
+        }
+
+        gen = gen_next.fetch_add(1, std::memory_order_relaxed);
+
+        jr.emplace_back(gen, i);
+    }
+
+    // every cell changed: nothing older than this can be updated
+    void jr_reset() {
+        gen = gen_next.fetch_add(1, std::memory_order_relaxed);
+
+        jr.clear();
+        jr_base = gen;
+    }
 
     // set of indices of used cells (i.e. pos[i] != -1, allowed to not have any seq_id)
     std::set<uint32_t> used;
