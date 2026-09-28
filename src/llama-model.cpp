@@ -1465,7 +1465,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             if (iface == nullptr || iface->abi_version != GGML_EXPERT_ABI_VERSION) {
                 continue;
             }
-            if (iface->configure(params.expert_config)) {
+            ggml_expert_config config = *params.expert_config;
+            config.l2_experts_used = int32_t(hparams.n_expert_used_max());
+            if (iface->configure(&config)) {
                 pimpl->expert_iface = iface;
             } else {
                 LLAMA_LOG_INFO("%s: expert cache not enabled for this model\n", __func__);
@@ -1841,6 +1843,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
                     buf = pimpl->expert_iface->alloc_context(ctx, buft, ml.get_arch_name().c_str());
                     if (buf) {
                         pimpl->expert_ctx = ctx;
+                        // the loader asks the cache which experts it has to read
+                        ml.expert_iface = pimpl->expert_iface;
                     }
                 }
                 if (buf == nullptr) {

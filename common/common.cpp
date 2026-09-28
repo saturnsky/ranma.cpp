@@ -1329,7 +1329,7 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
 
     // ranma expert cache: the config must live until the model is loaded, see docs/ranma/expert-cache.md
     ggml_expert_config expert_cfg = {};
-    if (params.expert_l1_mib > 0) {
+    if (params.expert_l1_mib > 0 || params.expert_l2_mib > 0) {
         const expert_validation valid = validate_expert_params(params);
         if (!valid.ok) {
             throw std::runtime_error(valid.reason);

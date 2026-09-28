@@ -1597,6 +1597,11 @@ struct ggml_cuda_mm_fusion_args_device {
     // fusion.gate) and whose slot for this expert is here. Null in inclusive mode, where a miss
     // reads the mapped tensor at the expert index.
     const int32_t * x_host_slots  = nullptr;
+    // SSD tier: a slice staged in a ring slot is not at slot * stride of any arena, so the kernels
+    // take a device address instead of a slot index. Null unless the host budget is finite; 0 for an
+    // expert the address table does not own.
+    const uint64_t * x_host_addresses    = nullptr;
+    const uint64_t * gate_host_addresses = nullptr;
     ggml_glu_op glu_op;
     float glu_limit = 0.0f;
 };
@@ -1614,13 +1619,22 @@ struct ggml_cuda_expert_source {
 // `host_slots` is set by exclusive mode only: there the tensor has no bytes of its own, so
 // `tensor_data` is the base of the host arena of this kind and a miss reads the host slot of the
 // expert instead of the expert index. Inclusive mode passes null and a miss reads the mapped tensor.
+// `host_addresses` is set by the SSD tier on top of that: a non-zero entry is the device address of
+// the slice itself, which is what a ring slot needs, and the channel index becomes 0.
 static __device__ __forceinline__ ggml_cuda_expert_source ggml_cuda_expert_cache_select(
         const void * tensor_data, const void * arena, const int32_t * slots, const uint32_t expert,
-        const int32_t * host_slots = nullptr) {
+        const int32_t * host_slots = nullptr, const uint64_t * host_addresses = nullptr) {
     if (arena != nullptr && slots != nullptr) {
         const int32_t slot = slots[expert];
         if (slot >= 0) {
             return { arena, (uint32_t) slot, slot };
+        }
+        if (host_addresses != nullptr) {
+            const uint64_t address = host_addresses[expert];
+            if (address != 0) {
+                return { (const void *) (uintptr_t) address, 0u, -1 };
+            }
+
         }
         if (host_slots != nullptr) {
             return { tensor_data, (uint32_t) host_slots[expert], -1 };
