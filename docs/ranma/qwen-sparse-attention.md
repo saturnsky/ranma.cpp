@@ -24,6 +24,8 @@ for equivalence checks, or a diagnostic.
 | `LLAMA_QSA_LEGACY` | off | `1` selects the per-token indexer cache instead of pooled block keys. Reference path. |
 | `LLAMA_QSA_CACHE_NORM_ROPE` | on | `0` stores the pooled keys untransformed and applies norm and rotation in every graph. Reference path. |
 | `LLAMA_QSA_BLOCK_TOP_K` | `1` | `0` selects over the cells, `2` forces the general block kernels. Reference paths. |
+| `LLAMA_QSA_LAYOUT_CACHE` | on | `0` rebuilds the indexer inputs from every cell for each ubatch instead of updating a cached block layout. Reference path. |
+| `LLAMA_QSA_LAYOUT_CHECK` | off | `1` also runs the full rebuild for every ubatch and aborts if any input byte differs from the cached layout. Test switch. |
 | `GGML_CUDA_FATTN_SPARSE` | on | `0` keeps the dense flash-attention kernel. Reference path. |
 | `GGML_CUDA_FATTN_SPARSE_MIN_KV` | 4096 | the floor of the cell count at which the gather is used. |
 | `GGML_CUDA_FATTN_COMPACT_PARALLEL` | on | `0` always builds an index list with the serial kernel. Reference path. |
@@ -107,6 +109,8 @@ rows it needs. A partial (checkpoint) state carries the open-block rows and
 their positions too, so a server checkpoint taken at any position can be
 restored and continued. A full state written without the positions still
 loads; its rows then count as unknown and an unaligned removal is refused.
+`LLAMA_QSA_LAYOUT_CHECK=1` also checks, per ubatch, that every open-block row
+the graph reads holds the expected position.
 
 The server no longer aborts when a memory refuses a suffix removal. After a
 checkpoint restore it falls back to the next older context checkpoint, as when
