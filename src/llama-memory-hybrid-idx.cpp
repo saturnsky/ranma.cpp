@@ -12,6 +12,7 @@
 #include <cassert>
 #include <cmath>
 #include <cstdlib>
+#include <cstring>
 #include <iterator>
 #include <map>
 #include <stdexcept>
@@ -22,10 +23,12 @@ static constexpr uint32_t LLAMA_HYBRID_IDX_STATE_MAGIC          = 0x58444951; //
 static constexpr uint32_t LLAMA_HYBRID_IDX_STATE_VERSION_RAW    = 1;   // one key per token
 static constexpr uint32_t LLAMA_HYBRID_IDX_STATE_VERSION_POOLED = 2;   // one pooled key per block
 
+static constexpr uint32_t LLAMA_HYBRID_IDX_STATE_VERSION_TRANSFORMED = 3;
+
 // [TAG_QSA_OPEN_BLOCK] the open-block rows travel with a partial (checkpoint) state as well
 static constexpr uint32_t LLAMA_HYBRID_IDX_STATE_VERSION_OPEN_BLOCK  = 4;
 
-// set on the pooled version when the open-block positions follow the open-block rows
+// set on the pooled/transformed version when the open-block positions follow the open-block rows
 static constexpr uint32_t LLAMA_HYBRID_IDX_STATE_FLAG_SLOT_POS = 0x100;
 
 static constexpr llama_pos LLAMA_QSA_SLOT_NONE    = -1;
@@ -35,6 +38,11 @@ static constexpr llama_pos LLAMA_QSA_SLOT_UNKNOWN = -2;
 static bool qwen_idx_pooled_enabled() {
     const char * env = std::getenv("LLAMA_QSA_LEGACY");
     return env == nullptr || std::atoi(env) == 0;
+}
+
+static bool qwen_idx_norm_rope_enabled() {
+    const char * env = std::getenv("LLAMA_QSA_CACHE_NORM_ROPE");
+    return env == nullptr || std::atoi(env) != 0;
 }
 
 // pooled keys the cache can be asked for, one per block of `ratio` tokens
@@ -400,6 +408,7 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
         filter_attn, filter_recr),
     hparams_idx(model.hparams),
     idx_pooled(filter_idx != nullptr && qwen_idx_pooled_enabled()),
+    idx_norm_rope(idx_pooled && qwen_idx_norm_rope_enabled()),
     idx_ratio(qwen_idx_ratio(model)),
     idx_n_seq_max(n_seq_max),
     idx_raw_type(type_k),
@@ -436,7 +445,7 @@ llama_memory_hybrid_idx::llama_memory_hybrid_idx(
         const ggml_type idx_type = idx_pooled ? GGML_TYPE_F32 : type_k;
 
         LLAMA_LOG_INFO("%s: creating indexer %scache, size = %u cells, type = %s\n", __func__,
-                idx_pooled ? "pooled K " : "K", idx_size, ggml_type_name(idx_type));
+                idx_norm_rope ? "norm+RoPE pooled K " : idx_pooled ? "pooled K " : "K", idx_size, ggml_type_name(idx_type));
 
         return new llama_kv_cache(
             model, hparams_idx, idx_type, type_v, v_trans, offload, idx_pooled ? false : unified,
@@ -673,12 +682,16 @@ void llama_memory_hybrid_idx::state_write(llama_io_write_i & io, llama_seq_id se
     // The indexer mirrors the attention cache, so it uses the same PARTIAL_ONLY gate.
     if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
         if (mem_idx) {
-            const uint32_t version = (idx_pooled ?
+            const uint32_t version = (idx_norm_rope ? LLAMA_HYBRID_IDX_STATE_VERSION_TRANSFORMED : idx_pooled ?
                 LLAMA_HYBRID_IDX_STATE_VERSION_POOLED : LLAMA_HYBRID_IDX_STATE_VERSION_RAW) |
                 (idx_open_block ? LLAMA_HYBRID_IDX_STATE_FLAG_SLOT_POS : 0);
 
             io.write(&LLAMA_HYBRID_IDX_STATE_MAGIC, sizeof(LLAMA_HYBRID_IDX_STATE_MAGIC));
             io.write(&version, sizeof(version));
+            if (idx_norm_rope) {
+                GGML_ASSERT(!idx_transform.empty());
+                io.write(idx_transform.data(), idx_transform.size());
+            }
 
             if (idx_pooled) {
                 qwen_idx_state_write_cache(io, mem_idx.get(), get_mem_attn(), idx_ratio, seq_id);
@@ -757,7 +770,7 @@ void llama_memory_hybrid_idx::state_read(llama_io_read_i & io, llama_seq_id seq_
                 io.read(&magic, sizeof(magic));
                 io.read(&version, sizeof(version));
 
-                const uint32_t version_expected = idx_pooled ?
+                const uint32_t version_expected = idx_norm_rope ? LLAMA_HYBRID_IDX_STATE_VERSION_TRANSFORMED : idx_pooled ?
                     LLAMA_HYBRID_IDX_STATE_VERSION_POOLED : LLAMA_HYBRID_IDX_STATE_VERSION_RAW;
 
                 // [TAG_QSA_OPEN_BLOCK] a state without the open-block positions still loads; its rows
@@ -768,6 +781,14 @@ void llama_memory_hybrid_idx::state_read(llama_io_read_i & io, llama_seq_id seq_
                     throw std::runtime_error("incompatible indexer cache state format");
                 }
 
+                if (idx_norm_rope) {
+                    GGML_ASSERT(!idx_transform.empty());
+                    std::vector<uint8_t> transform(idx_transform.size());
+                    io.read(transform.data(), transform.size());
+                    if (transform != idx_transform) {
+                        throw std::runtime_error("incompatible Qwen indexer transform parameters");
+                    }
+                }
                 if (idx_pooled) {
                     qwen_idx_state_read_cache(io, mem_idx.get(), get_mem_attn(), idx_ratio, seq_id);
                     idx_state->state_read(io, seq_id, flags);
@@ -833,6 +854,21 @@ llama_kv_cache * llama_memory_hybrid_idx::get_mem_idx() const {
 
 llama_dsv4_comp_state * llama_memory_hybrid_idx::get_idx_state() const {
     return idx_state.get();
+}
+
+bool llama_memory_hybrid_idx::get_idx_norm_rope() const {
+    return idx_norm_rope;
+}
+
+void llama_memory_hybrid_idx::bind_idx_transform(const ggml_tensor * rope, float norm_eps) const {
+    GGML_ASSERT(idx_norm_rope && rope->op == GGML_OP_ROPE);
+    std::vector<uint8_t> transform(sizeof(rope->op_params) + sizeof(norm_eps));
+    memcpy(transform.data(), rope->op_params, sizeof(rope->op_params));
+    memcpy(transform.data() + sizeof(rope->op_params), &norm_eps, sizeof(norm_eps));
+    if (!idx_transform.empty() && idx_transform != transform) {
+        throw std::runtime_error("Qwen cached indexer transform parameters changed");
+    }
+    idx_transform = std::move(transform);
 }
 
 bool llama_memory_hybrid_idx::get_idx_pooled() const {
@@ -934,7 +970,9 @@ void llama_memory_hybrid_idx::set_input_qsa(
         const llama_ubatch * ubatch,
         uint32_t ratio,
         bool blk_bias,
-        bool causal_attn) const {
+        bool causal_attn,
+        ggml_tensor * completed_pos,
+        const std::vector<int64_t> * write_idxs) const {
     GGML_ASSERT(ratio > 0);
     GGML_ASSERT(get_mem_idx() != nullptr);
 
@@ -942,7 +980,7 @@ void llama_memory_hybrid_idx::set_input_qsa(
 
     const int64_t n_kv     = cell_blk->ne[0];
     const int64_t n_ns     = cell_blk->ne[1];        // streams in this ubatch
-    const int64_t n_blocks = blk_pos->ne[0]/(4*n_ns);
+    const int64_t n_blocks = (n_kv + ratio - 1)/ratio;
     const int64_t n_tokens = ubatch->n_tokens;
     const int64_t r        = ratio;
 
@@ -950,7 +988,13 @@ void llama_memory_hybrid_idx::set_input_qsa(
     const int64_t n_tps = n_tokens/n_ns;             // tokens per stream
 
     int32_t * dst_cell_blk  = (int32_t *) cell_blk->data;
-    int32_t * dst_blk_pos   = (int32_t *) blk_pos->data;
+    // with the norm+RoPE cache the block positions are no longer a graph input, but the scan
+    // that fills them still feeds the completed-block bookkeeping below, so it keeps a buffer
+    std::vector<int32_t> blk_pos_tmp;
+    if (blk_pos == nullptr || blk_pos->data == nullptr) {
+        blk_pos_tmp.resize(4*n_blocks*n_ns);
+    }
+    int32_t * dst_blk_pos = blk_pos_tmp.empty() ? (int32_t *) blk_pos->data : blk_pos_tmp.data();
 
     // the pooled indexer builds no gather, so blk_cells has no tensor to fill
     std::vector<int32_t> blk_cells_unused;
@@ -1262,6 +1306,28 @@ void llama_memory_hybrid_idx::set_input_qsa(
             }
         }
     }
+
+    if (completed_pos) {
+        GGML_ASSERT(write_idxs && completed_pos->ne[0] == (int64_t) (4*write_idxs->size()));
+        std::vector<int32_t> positions(completed_pos->ne[0], 0);
+        const int64_t cache_size = mem_idx->get_size();
+        for (size_t w = 0; w < write_idxs->size(); ++w) {
+            const int64_t row = (*write_idxs)[w]%cache_size;
+            if (row >= idx_n_rows) {
+                continue; // scratch never names a live block
+            }
+            const llama_seq_id seq = (llama_seq_id) ((*write_idxs)[w]/cache_size);
+            int64_t s = 0;
+            while (s < n_ns && ubatch->seq_id[s*n_tps][0] != seq) {
+                ++s;
+            }
+            GGML_ASSERT(s < n_ns && row < n_blocks);
+            for (int64_t sec = 0; sec < 4; ++sec) {
+                positions[sec*write_idxs->size() + w] = dst_blk_pos[sec*(n_blocks*n_ns) + s*n_blocks + row];
+            }
+        }
+        ggml_backend_tensor_set(completed_pos, positions.data(), 0, positions.size()*sizeof(int32_t));
+    }
 }
 
 //
@@ -1400,6 +1466,15 @@ const llama_memory_hybrid_idx_context::idx_pool_plan & llama_memory_hybrid_idx_c
     return idx_pool_plans[i_cur];
 }
 
+bool llama_memory_hybrid_idx_context::get_idx_norm_rope() const {
+    return mem && mem->get_idx_norm_rope();
+}
+
+void llama_memory_hybrid_idx_context::bind_idx_transform(const ggml_tensor * rope, float norm_eps) const {
+    GGML_ASSERT(mem);
+    mem->bind_idx_transform(rope, norm_eps);
+}
+
 bool llama_memory_hybrid_idx_context::get_idx_pooled() const {
     return mem && mem->get_idx_pooled();
 }
@@ -1424,10 +1499,12 @@ void llama_memory_hybrid_idx_context::set_input_qsa(
         const llama_ubatch * ubatch,
         uint32_t ratio,
         bool blk_bias,
-        bool causal_attn) const {
+        bool causal_attn,
+        ggml_tensor * completed_pos) const {
     GGML_ASSERT(mem != nullptr);
 
-    mem->set_input_qsa(cell_blk, blk_cells, blk_pos, bias, ubatch, ratio, blk_bias, causal_attn);
+    mem->set_input_qsa(cell_blk, blk_cells, blk_pos, bias, ubatch, ratio, blk_bias, causal_attn, completed_pos,
+            completed_pos ? &get_idx_pool_plan(*ubatch).state_write_idxs : nullptr);
 }
 
 template<typename T>

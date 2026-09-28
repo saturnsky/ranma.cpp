@@ -179,6 +179,7 @@ applies, how to switch it, and its limits.
   Off by default. [docs/ranma/qwen-sparse-attention.md](docs/ranma/qwen-sparse-attention.md)
 - **Pooled block keys in the indexer cache** - a step pools only the block it completes instead of the whole
   context. Same page.
+- **Norm and rotation cached with the block keys**, so neither runs over the context on every step. Same page.
 
 ## Building
 

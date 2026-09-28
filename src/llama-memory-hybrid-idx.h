@@ -85,6 +85,9 @@ public:
     // selects the previous per-token cache, which pools the whole context every step.
     llama_dsv4_comp_state * get_idx_state() const;   // members of the block still being filled
 
+    bool      get_idx_norm_rope() const;
+    void bind_idx_transform(const ggml_tensor * rope, float norm_eps) const;
+
     bool      get_idx_pooled()    const;
     uint32_t  get_idx_ratio()     const;
     uint32_t  get_idx_n_slot()    const;   // open-block rows per stream: a ring over positions
@@ -103,7 +106,8 @@ public:
     // causal_attn selects the rule: causal forces the query's own block on, non-causal lets every visible block compete on score
     void set_input_qsa(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
                        ggml_tensor * bias, const llama_ubatch * ubatch, uint32_t ratio,
-                       bool blk_bias, bool causal_attn) const;
+                       bool blk_bias, bool causal_attn, ggml_tensor * completed_pos = nullptr,
+                       const std::vector<int64_t> * write_idxs = nullptr) const;
 
     // [TAG_QSA_OPEN_BLOCK] takes note of the open-block rows a ubatch persists, after checking
     // that every row it reads from the open-block state holds the position the plan expects
@@ -131,6 +135,8 @@ private:
     llama_hparams hparams_idx;
 
     const bool      idx_pooled;
+    const bool      idx_norm_rope;
+    mutable std::vector<uint8_t> idx_transform;
     const uint32_t  idx_ratio;
     const uint32_t  idx_n_seq_max;
     const ggml_type idx_raw_type;
@@ -221,6 +227,9 @@ public:
 
     const idx_pool_plan & get_idx_pool_plan(const llama_ubatch & ubatch) const;
 
+    bool      get_idx_norm_rope() const;
+    void bind_idx_transform(const ggml_tensor * rope, float norm_eps) const;
+
     bool      get_idx_pooled()   const;
     ggml_type get_idx_raw_type() const;
 
@@ -229,7 +238,7 @@ public:
 
     void set_input_qsa(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
                        ggml_tensor * bias, const llama_ubatch * ubatch, uint32_t ratio,
-                       bool blk_bias, bool causal_attn) const;
+                       bool blk_bias, bool causal_attn, ggml_tensor * completed_pos = nullptr) const;
 
     void set_input_idx_pool_plan(
             ggml_tensor * state_persist_src_idxs,
