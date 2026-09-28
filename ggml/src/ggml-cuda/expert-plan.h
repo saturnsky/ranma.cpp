@@ -285,7 +285,7 @@ inline placement plan_placement(const placement_inputs & in) {
     return result;
 }
 
-// ---- three tiers: VRAM, host, SSD (stage 6) ---------------------------------------------------
+// ---- three tiers: VRAM, host, file ------------------------------------------------------------
 //
 // With a finite host budget the routed experts no longer fit in VRAM plus host memory, and the
 // remainder stays in the GGUF file. The cut is the same greedy the VRAM tier uses, one level down:
@@ -295,24 +295,253 @@ inline placement plan_placement(const placement_inputs & in) {
 // layers 0 and 1 to be resident; that rule was the lead time of a speculative prefetch that was
 // measured and rejected, so ranma has no protected layers (design 11 and 13-1).
 
+struct tier_minimum {
+    bool valid = false;
+    size_t l1_payload = 0, bytes = 0;
+};
+
+inline tier_minimum minimum_host_budget(const geometry & geo, const std::vector<int> & gpu_capacities,
+        size_t fixed_bytes, bool inclusive) {
+    tier_minimum out;
+    if (gpu_capacities.size() != geo.class_bytes.size()) { return out; }
+    out.bytes = fixed_bytes;
+    for (size_t c = 0; c < gpu_capacities.size(); ++c) {
+        const size_t bytes = geo.class_total_bytes(int(c));
+        if (gpu_capacities[c] < 0 || (bytes && size_t(gpu_capacities[c]) > (SIZE_MAX - out.l1_payload)/bytes)) { return out; }
+        out.l1_payload += size_t(gpu_capacities[c])*bytes;
+    }
+    if (inclusive) {
+        if (out.l1_payload > SIZE_MAX - out.bytes) { return out; }
+        out.bytes += out.l1_payload;
+    }
+    out.valid = true;
+    return out;
+}
+
+// The machine must be able to hold the host side of the plan at all. Only the installed physical
+// memory is asked: below that line, what else runs on the machine is not the cache's business.
+// `total_bytes` 0 means the platform could not answer, and then nothing is refused.
+struct host_memory_check {
+    bool   ok = true;
+    size_t required_bytes = 0;
+    size_t total_bytes = 0;
+};
+
+inline host_memory_check check_host_memory(size_t required_bytes, uint64_t total_bytes) {
+    host_memory_check out;
+    out.required_bytes = required_bytes;
+    out.total_bytes    = size_t(total_bytes);
+    out.ok = total_bytes == 0 || uint64_t(required_bytes) <= total_bytes;
+    return out;
+}
+
+struct tier_inputs {
+    bool inclusive = false;
+    const std::vector<int> * minimum_capacities = nullptr; // Future L1 plans must also fit in the host tier.
+    const geometry * geo = nullptr;
+    const uint64_t * counts = nullptr;                          // scores, n_counts entries; null = cold
+    const std::vector<std::vector<int32_t>> * vram = nullptr;    // [layer][expert] VRAM slot or -1
+    const std::vector<size_t> * slot_pitch = nullptr;           // [class] bytes one host slot costs
+    size_t budget_bytes = 0;                                    // for host slices; ring and tables are gone
+    const std::vector<int> * fixed_capacities = nullptr;        // re-plan against allocated capacities
+};
+
+struct tier_plan {
+    bool valid = false;
+    std::string reason;
+    std::vector<std::vector<int32_t>> selected;   // [layer] host-resident expert ids, ascending
+    std::vector<int>                  capacities; // [class] host slots
+    size_t resident_bytes = 0;
+    size_t ssd_slices     = 0;   // (layer, expert) pairs left in the file
+    size_t ssd_bytes      = 0;
+};
+
+namespace detail {
+
+struct tier_candidate {
+    int      layer;
+    int      expert;
+    int      cls;
+    uint64_t score;
+    bool     mandatory;
+};
+
+// The candidates of the host cut in cut order: the inclusive VRAM residents (mandatory) first, then
+// the score (selection count x class bytes, the bytes a choice saves reading), equal scores spread
+// over the layers (sort_balancing_ties). An exclusive plan has no VRAM resident among them.
+// The dimensions must have been checked.
+inline std::vector<tier_candidate> host_tier_candidates(const tier_inputs & in) {
+    const geometry & geo = *in.geo;
+    std::vector<tier_candidate> candidates;
+    candidates.reserve(geo.n_counts());
+    for (int layer = 0; layer < geo.n_layers; ++layer) {
+        const int cls = geo.layer_class[layer];
+        if (cls < 0) {
+            continue;
+        }
+        for (int expert = 0; expert < geo.n_experts; ++expert) {
+            const bool in_vram = (*in.vram)[layer][expert] >= 0;
+            if (!in.inclusive && in_vram) {
+                continue;
+            }
+            const size_t index = (size_t) layer*(size_t) geo.n_experts + (size_t) expert;
+            const uint64_t count = in.counts ? in.counts[index] : uint64_t(0);
+            candidates.push_back({layer, expert, cls, count*(uint64_t) geo.class_total_bytes(cls), in.inclusive && in_vram});
+        }
+    }
+    sort_balancing_ties(candidates, geo.n_layers, [](const tier_candidate & a, const tier_candidate & b) {
+        if (a.mandatory != b.mandatory) {
+            return a.mandatory;
+        }
+        return a.score > b.score;
+    });
+    return candidates;
+}
+
+} // namespace detail
+
+// Pure. An empty plan (no geometry, no VRAM table) comes back with everything zero.
+inline tier_plan plan_host_tier(const tier_inputs & in) {
+    tier_plan out;
+    if (in.geo == nullptr || in.vram == nullptr || in.slot_pitch == nullptr ||
+            in.geo->n_layers <= 0 || in.geo->n_experts <= 0) {
+        return out;
+    }
+    const geometry & geo = *in.geo;
+    const size_t classes = geo.class_bytes.size();
+    if (in.vram->size() != (size_t) geo.n_layers || in.slot_pitch->size() != classes) {
+        return out;
+    }
+    for (size_t c = 0; c < classes; ++c) { if ((*in.slot_pitch)[c] == 0) { out.reason = "zero host pitch"; return out; } }
+    for (int l = 0; l < geo.n_layers; ++l) {
+        if ((*in.vram)[l].size() != size_t(geo.n_experts) || geo.layer_class[l] < -1 || geo.layer_class[l] >= int(classes)) {
+            out.reason = "host plan dimensions"; return out;
+        }
+    }
+    out.selected.assign(geo.n_layers, std::vector<int32_t>());
+    out.capacities.assign(classes, 0);
+
+    using detail::tier_candidate;
+    const std::vector<tier_candidate> candidates = detail::host_tier_candidates(in);
+
+    if (in.fixed_capacities != nullptr) {
+        if (in.fixed_capacities->size() != classes) { out.reason = "host capacity dimensions"; return out; }
+        out.capacities = *in.fixed_capacities;
+        out.capacities.resize(classes, 0);
+        for (size_t cls = 0; cls < classes; ++cls) {
+            out.resident_bytes += (size_t) out.capacities[cls]*(*in.slot_pitch)[cls];
+        }
+    } else {
+        if (in.minimum_capacities) {
+            if (in.minimum_capacities->size() != classes) { out.reason = "host minimum dimensions"; return out; }
+            out.capacities = *in.minimum_capacities;
+            for (size_t c = 0; c < classes; ++c) {
+                if (out.capacities[c] < 0 || size_t(out.capacities[c]) > (in.budget_bytes - out.resident_bytes)/(*in.slot_pitch)[c]) {
+                    out.reason = "host budget cannot contain all L1 class capacities"; return out;
+                }
+                out.resident_bytes += size_t(out.capacities[c])*(*in.slot_pitch)[c];
+            }
+        }
+        std::vector<int> rank(classes, 0);
+        for (const tier_candidate & c : candidates) {
+            const size_t pitch = (*in.slot_pitch)[c.cls];
+            if (++rank[c.cls] <= out.capacities[c.cls]) {
+                continue;
+            }
+            if (pitch != 0 && pitch <= in.budget_bytes - out.resident_bytes) {
+                ++out.capacities[c.cls];
+                out.resident_bytes += pitch;
+            }
+        }
+    }
+
+    std::vector<int> used(classes, 0);
+    for (const tier_candidate & c : candidates) {
+        if (used[c.cls] < out.capacities[c.cls]) {
+            out.selected[c.layer].push_back(c.expert);
+            ++used[c.cls];
+        } else if (c.mandatory) { out.reason = "host capacity excludes a mandatory L1 resident"; return out; }
+    }
+    for (int layer = 0; layer < geo.n_layers; ++layer) {
+        std::sort(out.selected[layer].begin(), out.selected[layer].end());
+        const int cls = geo.layer_class[layer];
+        if (cls < 0) {
+            continue;
+        }
+        int resident = 0;
+        for (int expert = 0; expert < geo.n_experts; ++expert) {
+            resident += ((*in.vram)[layer][expert] >= 0 || std::binary_search(out.selected[layer].begin(), out.selected[layer].end(), expert)) ? 1 : 0;
+        }
+        const int ssd = geo.n_experts - resident;
+        out.ssd_slices   += (size_t) ssd;
+        out.ssd_bytes    += (size_t) ssd*geo.class_total_bytes(cls);
+    }
+    out.valid = true;
+    return out;
+}
+
+// Extra host slots that share the tail of the prompt-sized ring while the decode ring is smaller.
+// The cut's own order continues past the base plan: each extra slot goes to the class of the next
+// candidate in cut order that the base plan left in the file, so a re-plan against the grown
+// capacities takes those candidates (before any file_cap exchange).
+inline std::vector<int> plan_borrowed_capacities(const tier_inputs & in,
+        const std::vector<int> & base_capacities, size_t extra_slots) {
+    std::vector<int> capacities = base_capacities;
+    if (extra_slots == 0 || in.geo == nullptr || in.vram == nullptr) {
+        return capacities;
+    }
+    tier_inputs fixed = in;
+    fixed.fixed_capacities = &base_capacities;
+    const tier_plan base = plan_host_tier(fixed);
+    if (!base.valid) {
+        return capacities;
+    }
+    size_t given = 0;
+    for (const detail::tier_candidate & c : detail::host_tier_candidates(in)) {
+        if (given == extra_slots) {
+            break;
+        }
+        const std::vector<int32_t> & resident = base.selected[c.layer];
+        if (c.mandatory || std::binary_search(resident.begin(), resident.end(), c.expert)) {
+            continue;
+        }
+        ++capacities[c.cls];
+        ++given;
+    }
+    return capacities;
+}
+
 struct mover_capability {
     bool has_host_master = true;
     int spare_slots = 0;
 };
 
+// The file is a valid fallback only when a finite tier is present.
 inline bool verify_assignment(const expert_slot_table & gpu, const expert_locations & host,
         const std::vector<int> & layer_class, const install_layout & layout,
         const std::vector<std::vector<int>> & spares, int experts, mover_capability mover,
-        std::string & reason) {
+        bool has_file, std::string & reason) {
     auto fail = [&](const char * text) { reason = text; return false; };
     reason.clear();
     const size_t classes = layout.gpu.size();
     if (experts <= 0 || gpu.size() != host.size() || gpu.size() != layer_class.size() ||
-            layout.host.size() != classes || spares.size() != classes) { return fail("assignment dimensions"); }
+            layout.host.size() != classes || layout.lent_begin.size() != classes ||
+            layout.lent_count.size() != classes || spares.size() != classes) { return fail("assignment dimensions"); }
     std::vector<std::vector<int>> go(classes), ho(classes);
+    int lent_end = 0;
     for (size_t c = 0; c < classes; ++c) {
-        if (layout.gpu[c] < 0 || layout.host[c] < 0) { return fail("negative capacity"); }
+        if (layout.gpu[c] < 0 || layout.host[c] < 0 || layout.lent_begin[c] < 0 || layout.lent_count[c] < 0 ||
+                layout.lent_count[c] > INT32_MAX - layout.lent_begin[c]) { return fail("negative or overflowing capacity"); }
+        lent_end = std::max(lent_end, layout.lent_begin[c] + layout.lent_count[c]);
         go[c].assign(layout.gpu[c], -1); ho[c].assign(layout.host[c], -1);
+    }
+    std::vector<int> lo(lent_end, -1), lent_class(lent_end, -1);
+    for (size_t c = 0; c < classes; ++c) {
+        for (int i = 0; i < layout.lent_count[c]; ++i) {
+            const int slot = layout.lent_begin[c] + i;
+            if (lent_class[slot] >= 0) { return fail("lent ranges overlap"); }
+            lent_class[slot] = int(c);
+        }
     }
     for (size_t l = 0; l < gpu.size(); ++l) {
         if (gpu[l].size() != size_t(experts) || host[l].size() != size_t(experts)) { return fail("expert table dimensions"); }
@@ -325,21 +554,21 @@ inline bool verify_assignment(const expert_slot_table & gpu, const expert_locati
                 if (g != -1 || h != expert_location{}) { return fail("dense layer has an expert home"); }
                 continue;
             }
-            if (g < -1 || (h.storage == expert_storage::none && h.slot != -1) ||
-                    (h.storage != expert_storage::none && !h.resident())) { return fail("invalid location"); }
+            if (g < -1 || (h.storage == expert_storage::file && h.slot != -1) ||
+                    (h.storage != expert_storage::file && !h.resident())) { return fail("invalid location"); }
             if (g >= 0) {
                 if (g >= layout.gpu[c] || go[c][g] != -1) { return fail("VRAM slot claimed twice or out of range"); }
                 go[c][g] = int(l)*experts + e;
             }
             if (h.resident()) {
                 if (!layout.contains(c, h)) { return fail("host location out of range"); }
-                int & owner = ho[c][h.slot];
+                auto & owner = h.storage == expert_storage::host ? ho[c][h.slot] : lo[h.slot];
                 if (owner != -1) { return fail("host location claimed twice"); }
                 owner = int(l)*experts + e;
             }
             if (mover.has_host_master && g >= 0 && !h.resident()) { return fail("inclusive VRAM resident has no host master"); }
             if (!mover.has_host_master && g >= 0 && h.resident()) { return fail("exclusive expert has two homes"); }
-            if (g < 0 && !h.resident()) { return fail("expert has no readable home"); }
+            if (!has_file && g < 0 && !h.resident()) { return fail("expert has no readable home"); }
         }
     }
     for (size_t c = 0; c < classes; ++c) {
@@ -365,22 +594,24 @@ struct install_transaction {
     std::vector<install_move> moves;
     size_t retained_gpu = 0, retained_host = 0;
     size_t h2d_slices = 0, h2d_bytes = 0, d2h_slices = 0, d2h_bytes = 0;
+    size_t ssd_slices = 0, ssd_bytes = 0;
 };
 
-// One ordered transaction for both movers. No device allocation or I/O occurs here.
+// One ordered transaction for both movers and both tier counts. No device allocation or I/O occurs here.
 inline install_transaction plan_install(const geometry & geo,
         const expert_slot_table & gpu_selected, const expert_slot_table & host_selected,
         const expert_slot_table & previous_gpu, const expert_locations & previous_host,
         const std::vector<int> & capacities, const install_layout & before, const install_layout & after,
         const std::vector<std::vector<int>> & gpu_spares, mover_capability mover,
-        bool retain = true) {
+        bool has_file, bool retain = true) {
     install_transaction out;
     auto fail = [&](const char * text) { out.valid = false; out.reason = text; return out; };
     if (!verify_assignment(previous_gpu, previous_host, geo.layer_class, before, gpu_spares,
-            geo.n_experts, mover, out.reason)) { return out; }
+            geo.n_experts, mover, has_file, out.reason)) { return out; }
     const size_t classes = capacities.size(), layers = geo.n_layers;
     if (classes != before.gpu.size() || classes != after.gpu.size() || classes != geo.class_bytes.size() ||
-            after.host.size() != classes || gpu_selected.size() != layers || host_selected.size() != layers || previous_gpu.size() != layers ||
+            after.host.size() != classes || after.lent_begin.size() != classes || after.lent_count.size() != classes ||
+            gpu_selected.size() != layers || host_selected.size() != layers || previous_gpu.size() != layers ||
             mover.spare_slots < 0) { return fail("install dimensions"); }
     out.gpu_slots.assign(layers, std::vector<int32_t>(geo.n_experts, -1));
     out.host.assign(layers, std::vector<expert_location>(geo.n_experts));
@@ -400,22 +631,23 @@ inline install_transaction plan_install(const geometry & geo,
         }
         for (int e = 0; e < geo.n_experts; ++e) {
             if (want_g[l][e] && want_h[l][e] != mover.has_host_master) { return fail("selection violates mover inclusion"); }
-            if (c >= 0 && !want_g[l][e] && !want_h[l][e]) { return fail("selection loses an expert"); }
+            if (c >= 0 && !has_file && !want_g[l][e] && !want_h[l][e]) { return fail("selection loses an expert"); }
         }
     }
     std::vector<std::vector<expert_location>> pool(classes);
     std::vector<std::vector<bool>> occupied(classes);
     for (size_t c = 0; c < classes; ++c) {
         if (capacities[c] < 0 || after.gpu[c] != before.gpu[c] || capacities[c] > after.gpu[c] ||
-                after.host[c] < 0 || count_g[c] > capacities[c] ||
-                (!mover.has_host_master && count_g[c] != capacities[c]) ||
-                count_h[c] > after.host[c]) { return fail("selection exceeds capacity"); }
+                after.host[c] < 0 || after.lent_begin[c] < 0 || after.lent_count[c] < 0 ||
+                count_g[c] > capacities[c] || (!mover.has_host_master && count_g[c] != capacities[c]) ||
+                count_h[c] > after.host[c] + after.lent_count[c]) { return fail("selection exceeds capacity"); }
         for (int s = 0; s < after.host[c]; ++s) { pool[c].push_back({expert_storage::host, s}); }
+        for (int s = 0; s < after.lent_count[c]; ++s) { pool[c].push_back({expert_storage::lent, after.lent_begin[c] + s}); }
         occupied[c].assign(pool[c].size(), false);
     }
     auto index = [&](int c, expert_location at) -> int {
         if (!after.contains(c, at)) { return -1; }
-        return at.slot;
+        return at.storage == expert_storage::host ? at.slot : after.host[c] + at.slot - after.lent_begin[c];
     };
     auto emit = [&](int l, int e, int batch, expert_location from, expert_location to) {
         const int c = geo.layer_class[l];
@@ -423,6 +655,7 @@ inline install_transaction plan_install(const geometry & geo,
         const size_t bytes = geo.class_total_bytes(c);
         if (to.storage == expert_storage::vram) { ++out.h2d_slices; out.h2d_bytes += bytes; }
         if (from.storage == expert_storage::vram) { ++out.d2h_slices; out.d2h_bytes += bytes; }
+        if (from.storage == expert_storage::file) { ++out.ssd_slices; out.ssd_bytes += bytes; }
     };
     for (size_t l = 0; l < layers; ++l) {
         const int c = geo.layer_class[l];
@@ -442,6 +675,7 @@ inline install_transaction plan_install(const geometry & geo,
         const int c = geo.layer_class[l];
         for (size_t i = 0; i < pool[c].size(); ++i) {
             if (occupied[c][i]) { continue; }
+            if (source.storage == expert_storage::file && !has_file) { return false; }
             emit(l, e, batch, source, pool[c][i]);
             out.host[l][e] = pool[c][i]; occupied[c][i] = true;
             release_source(l, e);
@@ -449,6 +683,7 @@ inline install_transaction plan_install(const geometry & geo,
         }
         return false;
     };
+    // Retired lent slots can still be read until the controller publishes the new ring size.
     // Retained destinations keep their address, so moves out of a retiring range cannot form a cycle.
     // With a host master every VRAM slice is promoted from its host home, so the host table must
     // be complete before the promotions below read it. The same loop runs again at the end for the
@@ -494,7 +729,7 @@ inline install_transaction plan_install(const geometry & geo,
                 for (size_t j = 0; j < n; ++j) {
                     const auto item = incoming[base + j];
                     const auto source = previous_host[item.first][item.second];
-                    if (!source.resident()) { return fail("promotion has no source"); }
+                    if (!source.resident() && !has_file) { return fail("promotion has no source"); }
                     emit(item.first, item.second, batch, source, {expert_storage::vram, out.gpu_spares[c][j]});
                     out.gpu_slots[item.first][item.second] = out.gpu_spares[c][j];
                     release_source(item.first, item.second);
@@ -516,8 +751,12 @@ inline install_transaction plan_install(const geometry & geo,
         }
     }
     out.valid = verify_assignment(out.gpu_slots, out.host, geo.layer_class, after, out.gpu_spares,
-        geo.n_experts, mover, out.reason);
+        geo.n_experts, mover, has_file, out.reason);
     return out;
+}
+
+inline bool plan_uses_prompt_ring(bool phase_rings, bool decode_bank, bool has_prefill, bool seed) {
+    return !phase_rings || !decode_bank || !has_prefill || seed;
 }
 
 } // namespace ggml_cuda_expert
