@@ -177,6 +177,8 @@ applies, how to switch it, and its limits.
 - **Stable top-k tie selection for reproducible runs** - `GGML_CUDA_TOP_K_STABLE_TIES=1` makes the radix top-k
   select the smallest columns among exactly tied values, so selections and outputs can be compared between runs.
   Off by default. [docs/ranma/qwen-sparse-attention.md](docs/ranma/qwen-sparse-attention.md)
+- **Pooled block keys in the indexer cache** - a step pools only the block it completes instead of the whole
+  context. Same page.
 
 ## Building
 

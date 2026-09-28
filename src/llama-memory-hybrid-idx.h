@@ -5,6 +5,9 @@
 #include <memory>
 #include <vector>
 
+class llama_dsv4_comp_state;
+class llama_kv_cache_dsv4_comp_context;
+
 //
 // llama_memory_hybrid_idx
 //
@@ -41,7 +44,7 @@ public:
                             /* the indexer cache exists only if this is given */
     const layer_filter_cb & filter_idx);
 
-    ~llama_memory_hybrid_idx() = default;
+    ~llama_memory_hybrid_idx();
 
     //
     // llama_memory_i
@@ -77,6 +80,18 @@ public:
 
     llama_kv_cache * get_mem_idx() const;   // nullptr when the model carries no indexer
 
+    // [TAG_QSA_POOLED] the indexer cache stores one mean-pooled key per block instead of one raw
+    // key per token, so a decode step pools only the block it completes. LLAMA_QSA_LEGACY=1
+    // selects the previous per-token cache, which pools the whole context every step.
+    llama_dsv4_comp_state * get_idx_state() const;   // members of the block still being filled
+
+    bool      get_idx_pooled()    const;
+    uint32_t  get_idx_ratio()     const;
+    uint32_t  get_idx_n_slot()    const;   // open-block rows per stream: a ring over positions
+    uint32_t  get_idx_n_seq_max() const;
+    uint32_t  get_idx_n_rows()    const;   // pooled rows a graph may read, i.e. without the scratch tail
+    ggml_type get_idx_raw_type()  const;
+
     // block-compressed sparse attention (qwen4exp QSA) over the cells of the indexer cache.
     // Blocks cut the position line, not the cell array, so no caller assumes a contiguous layout:
     //   cell_blk  I32 [n_kv, ns]           block each cell belongs to
@@ -90,7 +105,23 @@ public:
                        ggml_tensor * bias, const llama_ubatch * ubatch, uint32_t ratio,
                        bool blk_bias, bool causal_attn) const;
 
+    // [TAG_QSA_OPEN_BLOCK] takes note of the open-block rows a ubatch persists, after checking
+    // that every row it reads from the open-block state holds the position the plan expects
+    void idx_open_block_commit(
+            const std::vector<int32_t> & read_idxs, const std::vector<int32_t> & read_pos,
+            const std::vector<int32_t> & persist_dst, const std::vector<int32_t> & persist_pos) const;
+
 private:
+    // true when every position of the open block below p0 still has its row in the state
+    bool idx_open_block_available(llama_seq_id seq_id, llama_pos p0) const;
+
+    // forget the positions of seq_id's rows (all streams if seq_id < 0), or those at or after p0
+    void idx_open_block_reset(llama_seq_id seq_id, llama_pos p0 = -1) const;
+
+    // the positions of the open-block rows of seq_id (all streams if seq_id < 0)
+    void idx_open_block_write(llama_io_write_i & io, llama_seq_id seq_id) const;
+    void idx_open_block_read (llama_io_read_i  & io, llama_seq_id seq_id);
+
     // forget seq_id (all of it if seq_id < 0) in every cache at once, so a failed restore cannot leave the caches out of step
     // seq_id < 0 drops the whole context, as the caches themselves do on a failed restore
     void state_drop(llama_seq_id seq_id);
@@ -99,12 +130,55 @@ private:
     // llama_kv_cache keeps a reference to what it is given
     llama_hparams hparams_idx;
 
+    const bool      idx_pooled;
+    const uint32_t  idx_ratio;
+    const uint32_t  idx_n_seq_max;
+    const ggml_type idx_raw_type;
+    const uint32_t  idx_n_rows;
+
+    // [TAG_QSA_OPEN_BLOCK] the pooled indexer records which position each open-block row holds, so a
+    // suffix removal inside a block is followed when the rows of that block below the cut are still
+    // there (or come back with a checkpoint); the rows are a ring of ratio + n_rs_seq - 1 per stream,
+    // so a rollback of up to n_rs_seq tokens always finds them
+    const bool      idx_open_block;
+    const uint32_t  idx_n_slot;
+
     const std::unique_ptr<llama_kv_cache> mem_idx;
+
+    // null unless pooled: the raw keys of the block that no ubatch has completed yet
+    const std::unique_ptr<llama_dsv4_comp_state> idx_state;
+
+    // [TAG_QSA_OPEN_BLOCK] position held by each open-block row [n_seq_max*idx_n_slot]:
+    // -1 none, -2 unknown (restored from a state that did not carry it)
+    mutable std::vector<llama_pos> idx_slot_pos;
+    mutable uint32_t               idx_slot_n_warn = 0;
 };
 
 class llama_memory_hybrid_idx_context : public llama_memory_hybrid_context {
 public:
     using slot_info_vec_t = llama_kv_cache::slot_info_vec_t;
+
+    // [TAG_QSA_POOLED] per-ubatch recipe for the pooled indexer cache
+    struct idx_pool_plan {
+        // raw keys of this ubatch that must survive into the next one, as the open block's members
+        std::vector<int32_t> state_persist_src_idxs;
+        std::vector<int32_t> state_persist_dst_idxs;
+        std::vector<int32_t> state_persist_pos;   // position each persisted row holds
+
+        // members of every block this ubatch completes, r per block, indexing
+        // [open block state | this ubatch's raw keys]
+        std::vector<int32_t> state_read_idxs;
+        std::vector<int32_t> state_read_pos;      // position a member read from the state must hold, -1 otherwise
+
+        // pooled cache rows the completed blocks go to
+        std::vector<int64_t> state_write_idxs;
+
+        // blocks visible to each token; only the maximum shapes the graph
+        std::vector<int32_t> n_visible;
+
+        int64_t n_stream = 1;
+        int64_t n_kv     = 0;   // pooled rows the graph reads, i.e. the block count
+    };
 
     // used for errors
     explicit llama_memory_hybrid_idx_context(llama_memory_status status);
@@ -125,7 +199,7 @@ public:
                     slot_info_vec_t   sinfos_idx,
           std::vector<llama_ubatch>   ubatches);
 
-    ~llama_memory_hybrid_idx_context() = default;
+    ~llama_memory_hybrid_idx_context();
 
     //
     // llama_memory_context_i
@@ -138,8 +212,17 @@ public:
     // llama_memory_hybrid_idx_context specific API
     //
 
-    // nullptr with no indexer
+    // nullptr with no indexer, and when the pooled indexer is in use
     const llama_kv_cache_context * get_idx() const;
+
+    // [TAG_QSA_POOLED] nullptr unless the pooled indexer is in use
+    const llama_kv_cache_dsv4_comp_context * get_idx_pooled_ctx() const;
+    const llama_dsv4_comp_state *            get_idx_state()      const;
+
+    const idx_pool_plan & get_idx_pool_plan(const llama_ubatch & ubatch) const;
+
+    bool      get_idx_pooled()   const;
+    ggml_type get_idx_raw_type() const;
 
     // streams in the current slot info, the `ns` of get_k/get_v; 1 if unified
     uint32_t get_n_stream() const;
@@ -147,6 +230,13 @@ public:
     void set_input_qsa(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
                        ggml_tensor * bias, const llama_ubatch * ubatch, uint32_t ratio,
                        bool blk_bias, bool causal_attn) const;
+
+    void set_input_idx_pool_plan(
+            ggml_tensor * state_persist_src_idxs,
+            ggml_tensor * state_persist_dst_idxs,
+            ggml_tensor * state_read_idxs,
+            ggml_tensor * state_write_idxs,
+            const llama_ubatch * ubatch) const;
 
 private:
     const llama_memory_hybrid_idx * mem = nullptr;
@@ -157,6 +247,15 @@ private:
 
     // null unless the model has an indexer
     const llama_memory_context_ptr ctx_idx;
+
+    // [TAG_QSA_POOLED] one plan per ubatch; empty for the full and update contexts
+    std::vector<idx_pool_plan> idx_pool_plans;
+
+    // graph reservation walks ubatches this context never saw, so its plan is built on demand
+    mutable idx_pool_plan idx_pool_reserve_plan;
+    const bool idx_pool_reserve = false;
+
+    const std::unique_ptr<llama_kv_cache_dsv4_comp_context> ctx_idx_pooled;
 
     // mirrors the base class's ubatch cursor, which is private there
     size_t i_cur = 0;
