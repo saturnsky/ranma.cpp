@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <cfloat>
 #include <cmath>
+#include <vector>
 
 // ggml_compute_forward_dup
 
@@ -8542,6 +8543,67 @@ void ggml_compute_forward_argsort(
             {
                 GGML_ABORT("fatal error");
             }
+    }
+}
+
+// Select a score boundary with cell counts as block weights.
+void ggml_compute_forward_top_k_block(const ggml_compute_params * params, ggml_tensor * dst) {
+    const auto * scores = dst->src[0];
+    const auto * mapping = dst->src[1];
+    const auto * mask = dst->src[2];
+    const int nb = scores->ne[0], nq = scores->ne[1], nc = mapping->ne[0], k = dst->ne[0];
+    const bool preserve_ties = ggml_get_op_params_i32(dst, 0) != 0;
+    auto key = [](float v) {
+        uint32_t bits;
+        memcpy(&bits, &v, sizeof(bits));
+        return bits ^ ((uint32_t) (-(int32_t) (bits >> 31)) | 0x80000000u);
+    };
+    std::vector<int> weights(nb + 1), order(nb + 1);
+    std::vector<uint32_t> keys(nb + 1);
+    for (int64_t row = params->ith; row < ggml_nrows(scores); row += params->nth) {
+        auto * out = (int32_t *) dst->data + row*k;
+        if (k == nc) {
+            for (int c = 0; c < nc; ++c) { out[c] = c; }
+            continue;
+        }
+        const auto * sc = (const float *) scores->data + row*nb;
+        const auto * map = (const int32_t *) mapping->data + (row/nq)*nc;
+        auto visible = [&](int c) {
+            const int64_t i = row*nc + c;
+            const float m = mask->type == GGML_TYPE_F32 ? ((const float *) mask->data)[i] :
+                GGML_CPU_FP16_TO_FP32(((const ggml_fp16_t *) mask->data)[i]);
+            GGML_ASSERT(m == 0.0f || m == -INFINITY);
+            return m == 0.0f;
+        };
+        std::fill(weights.begin(), weights.end(), 0);
+        for (int b = 0; b < nb; ++b) {
+            GGML_ASSERT(std::isfinite(sc[b]) || sc[b] == -INFINITY);
+            keys[b] = key(sc[b] + 0.0f);
+        }
+        keys[nb] = key(-INFINITY);
+        for (int c = 0; c < nc; ++c) {
+            GGML_ASSERT(map[c] >= 0 && map[c] < nb);
+            ++weights[visible(c) ? map[c] : nb];
+        }
+        for (int b = 0; b <= nb; ++b) { order[b] = b; }
+        std::sort(order.begin(), order.end(), [&](int a, int b) { return keys[a] > keys[b]; });
+        int rank = k;
+        uint32_t boundary = 0;
+        for (int b : order) {
+            if (weights[b] >= rank) { boundary = keys[b]; break; }
+            rank -= weights[b];
+        }
+        int greater = 0;
+        for (int b = 0; b <= nb; ++b) { if (keys[b] > boundary) { greater += weights[b]; } }
+        int equal = k - greater, n = 0;
+        // the tied cells are taken from the low end for the stable selection, else from the high end;
+        // the block threshold does not depend on this order
+        for (int i = 0; i < nc; ++i) {
+            const int c = preserve_ties ? i : nc - 1 - i;
+            const uint32_t value = keys[visible(c) ? map[c] : nb];
+            if (value > boundary || (value == boundary && equal-- > 0)) { out[n++] = c; }
+        }
+        GGML_ASSERT(n == k);
     }
 }
 
