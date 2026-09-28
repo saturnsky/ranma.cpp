@@ -104,6 +104,10 @@ applies, how to switch it, and its limits.
 - **Per-position draft thresholds** - `--spec-draft-p-min` takes one probability per draft position, and
   `--spec-draft-p-continue` keeps a token in the draft but stops drafting after it. Defaults unchanged.
   [docs/ranma/spec-draft-thresholds.md](docs/ranma/spec-draft-thresholds.md)
+- **Reuse of a just-restored context checkpoint (llama-server)** - when the first prompt batch after a checkpoint
+  restore starts at that checkpoint, the server keeps the restored entry instead of serializing the unchanged
+  state again. `LLAMA_SERVER_CKPT_REUSE=0` restores the upstream behaviour.
+  [docs/ranma/server-checkpoints.md](docs/ranma/server-checkpoints.md)
 
 ## Building
 
