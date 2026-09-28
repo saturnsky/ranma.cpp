@@ -564,6 +564,7 @@ extern "C" {
         GGML_OP_TIMESTEP_EMBEDDING,
         GGML_OP_ARGSORT,
         GGML_OP_TOP_K,
+        GGML_OP_TOP_K_BLOCK,
         GGML_OP_LEAKY_RELU,
         GGML_OP_TRI,
         GGML_OP_FILL,
@@ -2466,6 +2467,38 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
             int                   k);
+
+    // ggml_top_k_block row meta: 0 fast flag, 1 full blocks, 2 spare block, 3 visible cells
+    // no full block covers, 4 masked cells, 5-7 reserved, then the cells counted by field 3
+#define GGML_TOP_K_BLOCK_META_HEAD 8
+#define GGML_TOP_K_BLOCK_META_CELLS 64
+#define GGML_TOP_K_BLOCK_META_N (GGML_TOP_K_BLOCK_META_HEAD + GGML_TOP_K_BLOCK_META_CELLS)
+
+    // Weighted block selection. Scores are F32 [blocks, queries, streams], already biased.
+    // cell_blocks is I32 [cells, streams]; mask is contiguous F16/F32 [cells, queries, streams].
+    // The mask contains only 0 or -inf. Scores must be finite or -inf, never NaN/+inf.
+    // Which of the cells that tie with the threshold are selected is unspecified, as in ggml_top_k.
+    // preserve_ties asks for the stable selection, the smallest cell indices, for tests that compare
+    // selections between runs or backends.
+    //
+    // blk_cells and blk_meta are optional (NULL keeps the general cell walk). They let a
+    // single-query row be selected without reading every cell:
+    //   blk_cells I32 [ratio*blocks, streams]  the cells of each block, ratio per block
+    //   blk_meta  I32 [GGML_TOP_K_BLOCK_META_N, queries, streams] per row, see below
+    // blk_meta[0] != 0 promises, for that row: every block below blk_meta[1] holds exactly
+    // `ratio` cells, all of them visible unless the block's key is -inf; block blk_meta[2]
+    // additionally holds the blk_meta[3] visible cells listed from GGML_TOP_K_BLOCK_META_HEAD
+    // on, which no full block covers; and blk_meta[4] cells are masked. A row that sets it to
+    // 0 is selected by the general walk, so the promise can be dropped per row.
+    GGML_API struct ggml_tensor * ggml_top_k_block(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * scores,
+            struct ggml_tensor  * cell_blocks,
+            struct ggml_tensor  * mask,
+            struct ggml_tensor  * blk_cells,
+            struct ggml_tensor  * blk_meta,
+            int                   k,
+            bool                  preserve_ties);
 
     GGML_API struct ggml_tensor * ggml_arange(
             struct ggml_context * ctx,
