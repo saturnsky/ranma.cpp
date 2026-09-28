@@ -118,6 +118,12 @@ struct llama_model_loader {
     } lazy;
 
     llama_files files;
+    // ranma expert cache: the SSD tier opens the model files itself, so it needs their paths. Empty
+    // for a loader that was handed a FILE * instead of a name.
+    std::vector<std::string> file_paths;
+    // Set by llama_model when the expert cache owns a weight context; the loader then asks it which
+    // experts to read. Null when there is no cache.
+    const struct ggml_expert_iface * expert_iface = nullptr;
     llama_ftype ftype;
     llama_fver  fver;
 
