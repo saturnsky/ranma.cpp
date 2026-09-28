@@ -26,6 +26,10 @@ ggml_cuda_expert_lookup ggml_cuda_expert_lookup_tensor(const ggml_tensor * src0)
 // selected for this compute. No-op unless the cache is installed.
 void ggml_cuda_expert_profile_ids(ggml_backend_cuda_context & ctx, const ggml_tensor * ids);
 
+// The GPU has read the last kind of a routed layer, so the SSD tier may reuse that layer's ring
+// slots. No-op unless the tier is built.
+void ggml_cuda_expert_layer_done(ggml_backend_cuda_context & ctx, const ggml_tensor * src0);
+
 // True for the buffer type that exclusive mode allocates the routed expert weights on. Its tensors
 // carry logical addresses only: their bytes live in the VRAM arena or in the host arena, so every
 // kernel that reads them must resolve them through ggml_cuda_expert_lookup_tensor.
