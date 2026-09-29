@@ -1330,6 +1330,12 @@ struct test_case {
         GGML_UNUSED(ctx);
     }
 
+    // perf mode: the nodes that one timed repetition appends to the graph (default: the output node), how many
+    // measured ops one repetition holds (the reported time is per op), and a cap on the repetitions per graph
+    virtual std::vector<ggml_tensor *> perf_nodes(ggml_tensor * out) { return { out }; }
+    virtual int perf_ops_per_rep() { return 1; }
+    virtual int perf_max_reps() { return 1 << 30; }
+
     virtual size_t op_size(ggml_tensor * t) {
         size_t size = ggml_nbytes(t);
         // add source tensors
@@ -1742,9 +1748,17 @@ struct test_case {
             n_runs = (int)std::min<int64_t>(ggml_graph_size(gf) - ggml_graph_n_nodes(gf), target_size / op_size(out)) + 1;
         }
 
-        // duplicate the op
+        // duplicate the op (repetition nodes outside the graph of out are expanded into it first)
+        const std::vector<ggml_tensor *> rep_nodes = perf_nodes(out);
+        for (ggml_tensor * node : rep_nodes) {
+            ggml_build_forward_expand(gf, node);
+        }
+        n_runs = std::min<int>(n_runs, (ggml_graph_size(gf) - ggml_graph_n_nodes(gf)) / (int) rep_nodes.size() + 1);
+        n_runs = std::min<int>(n_runs, perf_max_reps());
         for (int i = 1; i < n_runs; i++) {
-            ggml_graph_add_node(gf, out);
+            for (ggml_tensor * node : rep_nodes) {
+                ggml_graph_add_node(gf, node);
+            }
         }
 
         // calculate memory
@@ -1781,7 +1795,7 @@ struct test_case {
 
             total_time_us += end_time - start_time;
             total_mem += mem;
-            total_runs += n_runs;
+            total_runs += n_runs*perf_ops_per_rep();
 
             // re-draw any data-dependent inputs (expert ids) outside the timed region
             reinit_perf_iter(ctx.get());
@@ -5629,6 +5643,168 @@ struct test_mul_mat_id_routing_case : public test_mul_mat_id {
     }
 };
 
+// MUL_MAT_ID MMVQ -> MMQ crossover measurement (perf only, TBO_MOE_CROSSOVER=1): the full expert tensor of a real
+// MoE layer (all experts, weight bytes random: perf does not depend on the values), and `units` independent
+// MUL_MAT_ID ops per repetition, each with its own ids over its own random expert permutation, so that
+// consecutive ops read different experts as consecutive layers do, instead of re-reading cached ones.
+// route: rand (independent random experts per token), same, partial (half shared with the previous token),
+// pool<P> (the tokens together select exactly min(P, n*n_used) distinct experts: the logged per-layer count).
+// glu: gate and up MUL_MAT_ID + SWIGLU, the pattern ggml-cuda fuses into one mat-vec launch.
+struct test_moe_crossover : public test_case {
+    const ggml_type type;
+    const int       n_mats;
+    const int       n_used;
+    const bool      b;
+    const int64_t   m;
+    const int64_t   n;
+    const int64_t   k;
+    const int       route; // 0 rand, -1 same, -2 partial, >0 pool size
+    const bool      glu;
+    static constexpr int units = 8;
+
+    std::vector<ggml_tensor *> rep;
+    std::vector<ggml_tensor *> ids_list;
+
+    test_moe_crossover(ggml_type type, int n_mats, int n_used, bool b, int64_t m, int64_t n, int64_t k, int route, bool glu)
+        : type(type), n_mats(n_mats), n_used(n_used), b(b), m(m), n(n), k(k), route(route), glu(glu) {}
+
+    std::string route_name() const {
+        if (route == 0)  return "rand";
+        if (route == -1) return "same";
+        if (route == -2) return "partial";
+        return "pool" + std::to_string(route);
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR7(type, n_mats, n_used, b, m, n, k) + ",route=" + route_name() + ",glu=" + (glu ? "1" : "0");
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MOE_XOVER";
+    }
+
+    uint64_t op_flops(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return (uint64_t) (glu ? 2 : 1) * 2 * m * k * n * n_used * units;
+    }
+
+    bool use_host_weight_buffer() override { return host_weights && ggml_is_quantized(type); }
+    bool use_weight_context()     override { return true; }
+
+    std::vector<ggml_tensor *> perf_nodes(ggml_tensor * out) override { GGML_UNUSED(out); return rep; }
+    int perf_ops_per_rep() override { return units; }
+    int perf_max_reps() override { return 16; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        GGML_UNUSED(ctx);
+        GGML_ABORT("test_moe_crossover needs a weight context");
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx, ggml_context * ctx_w) override {
+        rep.clear();
+        ids_list.clear();
+        ggml_tensor * as    = ggml_new_tensor_3d(ctx_w, type, k, m, n_mats);
+        ggml_tensor * gates = glu ? ggml_new_tensor_3d(ctx_w, type, k, m, n_mats) : nullptr;
+        ggml_tensor * cur   = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, b ? 1 : n_used, n);
+        ggml_tensor * out   = nullptr;
+        for (int u = 0; u < units; u++) {
+            ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, n);
+            ids_list.push_back(ids);
+            if (glu) {
+                ggml_tensor * g = ggml_mul_mat_id(ctx, gates, cur, ids);
+                ggml_tensor * x = ggml_mul_mat_id(ctx, as, cur, ids);
+                out = ggml_swiglu_split(ctx, g, x);
+                rep.push_back(g);
+                rep.push_back(x);
+                rep.push_back(out);
+            } else {
+                out = ggml_mul_mat_id(ctx, as, cur, ids);
+                rep.push_back(out);
+            }
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void init_ids() {
+        static std::default_random_engine rng(12345);
+        std::vector<int32_t> perm(n_mats);
+        for (ggml_tensor * ids : ids_list) {
+            for (int i = 0; i < n_mats; i++) {
+                perm[i] = i;
+            }
+            std::shuffle(perm.begin(), perm.end(), rng);
+            std::vector<int32_t> data((size_t) n_used*n);
+            for (int64_t r = 0; r < n; r++) {
+                int32_t * row = data.data() + r*n_used;
+                if (route == 0) {
+                    std::vector<int32_t> p2(n_mats);
+                    for (int i = 0; i < n_mats; i++) {
+                        p2[i] = i;
+                    }
+                    // partial Fisher-Yates: n_used distinct random experts
+                    for (int i = 0; i < n_used; i++) {
+                        std::uniform_int_distribution<int> d(i, n_mats - 1);
+                        std::swap(p2[i], p2[d(rng)]);
+                        row[i] = p2[i];
+                    }
+                    continue;
+                }
+                for (int i = 0; i < n_used; i++) {
+                    int e = 0;
+                    if (route == -1) {
+                        e = i;
+                    } else if (route == -2) {
+                        e = (int) ((r*std::max(1, n_used/2) + i) % n_mats);
+                    } else {
+                        e = (int) ((r*n_used + i) % std::min(route, n_mats));
+                    }
+                    row[i] = perm[e];
+                }
+                std::shuffle(row, row + n_used, rng);
+            }
+            ggml_backend_tensor_set(ids, data.data(), 0, data.size()*sizeof(int32_t));
+        }
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_I32) {
+                continue;
+            }
+            if (t->type == GGML_TYPE_F32) {
+                init_tensor_uniform(t);
+                continue;
+            }
+            // weights: random bytes, written in chunks
+            uint64_t s = 0x9E3779B97F4A7C15ull ^ (uint64_t) ggml_nbytes(t);
+            const size_t chunk = 64u << 20;
+            std::vector<uint64_t> buf(chunk/8);
+            for (size_t off = 0; off < ggml_nbytes(t); off += chunk) {
+                const size_t len = std::min(chunk, ggml_nbytes(t) - off);
+                for (size_t i = 0; i < (len + 7)/8; i++) {
+                    s ^= s << 13; s ^= s >> 7; s ^= s << 17;
+                    buf[i] = s;
+                }
+                ggml_backend_tensor_set(t, buf.data(), off, len);
+            }
+        }
+        bool has_ids = false;
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            has_ids |= t->type == GGML_TYPE_I32;
+        }
+        if (has_ids) {
+            init_ids();
+        }
+    }
+
+    void reinit_perf_iter(ggml_context * ctx) override {
+        GGML_UNUSED(ctx);
+        init_ids();
+    }
+};
+
 // GGML_OP_MUL_MAT_ID + GGML_OP_ADD or GGML_OP_MUL
 struct test_mul_mat_id_fusion : public test_case {
     const ggml_type type_a;
@@ -7704,7 +7880,9 @@ struct test_mul_mat_vec_fusion : public test_case {
     }
 
     bool run_whole_graph() override { return true; }
-    bool use_weight_context() override { return use_id && with_lane_scale; }
+    // --host-weights: the gate and up experts of the MUL_MAT_ID variant in the host buffer, as host-direct places them
+    bool use_host_weight_buffer() override { return host_weights && use_id && !with_lane_scale && ggml_is_quantized(type); }
+    bool use_weight_context() override { return use_id && (with_lane_scale || use_host_weight_buffer()); }
 
     ggml_tensor * build_gate(ggml_context * ctx, ggml_tensor * ffn_gate, ggml_tensor * ffn_up) {
         ggml_tensor * out = nullptr;
@@ -7791,8 +7969,9 @@ struct test_mul_mat_vec_fusion : public test_case {
             ggml_set_name(out, "out");
             return out;
         } else {
-            ggml_tensor * gates = ggml_new_tensor_3d(ctx, type, k, n, n_mats);
-            ggml_tensor * ups   = ggml_new_tensor_3d(ctx, type, k, n, n_mats);
+            ggml_context * ctx_experts = use_host_weight_buffer() ? ctx_weights : ctx;
+            ggml_tensor * gates = ggml_new_tensor_3d(ctx_experts, type, k, n, n_mats);
+            ggml_tensor * ups   = ggml_new_tensor_3d(ctx_experts, type, k, n, n_mats);
             ggml_tensor * ids   = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_mats, m);
 
             if (n_used != n_mats) {
@@ -11118,27 +11297,33 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             int64_t   m;
             int64_t   k;
             int       n_max;
+            int       n_repeat_max; // repeated experts only up to the VRAM mat-vec limit: MMQ (mm_ids_helper)
+                                    // assumes a token selects an expert at most once, as top-k does
         };
         const routing_shape shapes[] = {
-            // 256 experts / 6 used, n_embd 4096, n_ff_exp 2048: gate/up (shared input) and down
-            { GGML_TYPE_IQ2_XS,  32,  6, true,  2048, 4096, 4 },
-            { GGML_TYPE_IQ3_XXS, 32,  6, true,  2048, 4096, 4 },
-            { GGML_TYPE_IQ3_S,   32,  6, true,  2048, 4096, 4 },
-            { GGML_TYPE_IQ3_XXS, 32,  6, false, 4096, 2048, 4 },
-            { GGML_TYPE_MXFP4,   32,  6, false, 4096, 2048, 5 },
+            // 256 experts / 6 used, n_embd 4096, n_ff_exp 2048: gate/up (shared input) and down. Up to 8 tokens:
+            // with --host-weights these types run MMVQ up to 8 tokens on RDNA4
+            { GGML_TYPE_IQ2_XS,  32,  6, true,  2048, 4096, 8, 4 },
+            { GGML_TYPE_IQ3_XXS, 32,  6, true,  2048, 4096, 8, 4 },
+            { GGML_TYPE_IQ3_S,   32,  6, true,  2048, 4096, 8, 4 },
+            { GGML_TYPE_IQ3_XXS, 32,  6, false, 4096, 2048, 8, 4 },
+            { GGML_TYPE_MXFP4,   32,  6, false, 4096, 2048, 8, 5 },
             // 512 experts / 10 used, n_embd 2560, n_ff_exp 640: gate/up and down
-            { GGML_TYPE_Q4_K,    64, 10, true,   640, 2560, 4 },
-            { GGML_TYPE_Q5_K,    64, 10, true,   640, 2560, 5 },
-            { GGML_TYPE_Q5_1,    64, 10, false, 2560,  640, 7 },
-            { GGML_TYPE_Q8_0,    64, 10, false, 2560,  640, 7 },
+            { GGML_TYPE_Q4_K,    64, 10, true,   640, 2560, 8, 4 },
+            { GGML_TYPE_Q5_K,    64, 10, true,   640, 2560, 8, 5 },
+            { GGML_TYPE_Q5_1,    64, 10, false, 2560,  640, 8, 7 },
+            { GGML_TYPE_Q8_0,    64, 10, false, 2560,  640, 8, 7 },
             // 128 experts / 8 used, n_embd 2816, n_ff_exp 704: merged gate_up and down
-            { GGML_TYPE_Q4_K,    32,  8, true,  1408, 2816, 4 },
-            { GGML_TYPE_Q5_0,    32,  8, false, 2816,  704, 7 },
+            { GGML_TYPE_Q4_K,    32,  8, true,  1408, 2816, 8, 4 },
+            { GGML_TYPE_Q5_0,    32,  8, false, 2816,  704, 7, 7 },
         };
         for (const routing_shape & s : shapes) {
             for (int n = 2; n <= s.n_max; n++) {
                 for (test_mul_mat_id_routing routing : {MUL_MAT_ID_ROUTING_SAME, MUL_MAT_ID_ROUTING_DISJOINT,
                                                         MUL_MAT_ID_ROUTING_PARTIAL, MUL_MAT_ID_ROUTING_REPEAT}) {
+                    if (routing == MUL_MAT_ID_ROUTING_REPEAT && n > s.n_repeat_max) {
+                        continue;
+                    }
                     test_cases.emplace_back(new test_mul_mat_id_routing_case(s.type, s.n_mats, s.n_used, s.b, s.m, n, s.k, routing));
                 }
             }
@@ -11161,12 +11346,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 }
             }
         }
+        // more expert slots per token than lanes in a warp: the grouped kernel declines them, and with --host-weights
+        // a launch above the VRAM mat-vec limit runs mul_mat_vec_q_moe with launch bounds for 8 tokens
+        for (int n : {5, 8}) {
+            for (test_mul_mat_id_routing routing : {MUL_MAT_ID_ROUTING_SAME, MUL_MAT_ID_ROUTING_DISJOINT}) {
+                test_cases.emplace_back(new test_mul_mat_id_routing_case(GGML_TYPE_Q4_K, 128, 40, true, 64, n, 256, routing));
+            }
+            test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q4_K, GGML_GLU_OP_SWIGLU, n, 64, 256,
+                /*use_id =*/ true, 128, 40, /*b =*/ true, /*with_bias =*/ false, /*with_gate =*/ true, false, {1, 1}));
+        }
         // the fused gate/up/GLU launch at the same gate/up shapes, random routing
         for (ggml_type type : {GGML_TYPE_IQ2_XS, GGML_TYPE_Q4_K}) {
             const bool    ds   = type == GGML_TYPE_IQ2_XS;
             const int64_t rows = ds ? 2048 : 640;
             const int64_t k    = ds ? 4096 : 2560;
-            for (int64_t n_tokens : {2, 3, 4}) {
+            for (int64_t n_tokens : {2, 3, 4, 5, 6, 7, 8}) {
                 test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, n_tokens, rows, k,
                     /*use_id =*/ true, ds ? 32 : 64, ds ? 6 : 10, /*b =*/ true, /*with_bias =*/ false, /*with_gate =*/ true,
                     false, {1, 1}));
@@ -12168,6 +12362,54 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
 
+    // TBO_MOE_CROSSOVER=1: only the MUL_MAT_ID crossover cases (the expert tensors of DeepSeek V4 Flash UD-IQ3_XXS and
+    // Qwen3.8-Flash-Next UD-Q4_K_XL, 1..16 tokens); the pool sizes are the logged distinct experts per layer by rows
+    if (getenv("TBO_MOE_CROSSOVER") != nullptr && atoi(getenv("TBO_MOE_CROSSOVER")) != 0) {
+        struct xover_shape {
+            ggml_type type;
+            int       n_mats;
+            int       n_used;
+            bool      b;
+            int64_t   m;
+            int64_t   k;
+            bool      glu;
+            bool      ds;
+        };
+        const xover_shape shapes[] = {
+            // DeepSeek V4 Flash: gate/up (25, 17 and 1 layers), down (41 and 2 layers)
+            { GGML_TYPE_IQ2_XS,  256,  6, true,  2048, 4096, false, true  },
+            { GGML_TYPE_IQ3_XXS, 256,  6, true,  2048, 4096, false, true  },
+            { GGML_TYPE_IQ3_S,   256,  6, true,  2048, 4096, false, true  },
+            { GGML_TYPE_IQ3_XXS, 256,  6, false, 4096, 2048, false, true  },
+            { GGML_TYPE_MXFP4,   256,  6, false, 4096, 2048, false, true  },
+            // Qwen3.8-Flash-Next: gate/up (47 and 1 layers), down (43 and 5 layers)
+            { GGML_TYPE_Q4_K,    512, 10, true,   640, 2560, false, false },
+            { GGML_TYPE_Q5_K,    512, 10, true,   640, 2560, false, false },
+            { GGML_TYPE_Q5_1,    512, 10, false, 2560,  640, false, false },
+            { GGML_TYPE_Q8_0,    512, 10, false, 2560,  640, false, false },
+            // gate+up+SWIGLU
+            { GGML_TYPE_IQ2_XS,  256,  6, true,  2048, 4096, true,  true  },
+            { GGML_TYPE_IQ3_XXS, 256,  6, true,  2048, 4096, true,  true  },
+            { GGML_TYPE_IQ3_S,   256,  6, true,  2048, 4096, true,  true  },
+            { GGML_TYPE_Q4_K,    512, 10, true,   640, 2560, true,  false },
+        };
+        // mean distinct experts per layer by the tokens of one speculative verification batch, logged on both models
+        const int pool_ds[17] = { 0,  6, 10, 13, 16, 19, 22, 25, 27, 29, 32, 34, 36, 38, 40, 41, 43 };
+        const int pool_qw[17] = { 0, 10, 16, 22, 27, 32, 36, 40, 44, 47, 51, 54, 57, 60, 62, 65, 67 };
+        for (const xover_shape & s : shapes) {
+            for (int n = 1; n <= 16; n++) {
+                const int pool = s.ds ? pool_ds[n] : pool_qw[n];
+                for (int route : {pool, 0, -1, -2}) {
+                    if (n == 1 && route != pool) {
+                        continue;
+                    }
+                    test_cases.emplace_back(new test_moe_crossover(s.type, s.n_mats, s.n_used, s.b, s.m, n, s.k, route, s.glu));
+                }
+            }
+        }
+        return test_cases;
+    }
+
     // skinny dense F32 products of a 512-token ubatch (HC inject, SSM alpha/beta, MoE router)
     for (int64_t n : {9, 64, 256, 512}) {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F32, GGML_TYPE_F32,   4, n, 10240, {1, 1}, {1, 1}));
@@ -12413,9 +12655,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
             { GGML_TYPE_IQ2_XS,  64,  6, true,  2048, 4096 },
             { GGML_TYPE_IQ3_XXS, 64,  6, true,  2048, 4096 },
             { GGML_TYPE_IQ3_XXS, 64,  6, false, 4096, 2048 },
+            { GGML_TYPE_MXFP4,   64,  6, false, 4096, 2048 },
         };
+        // 5..8 tokens: MMQ in VRAM, MMVQ with --host-weights on RDNA4
         for (const routing_perf_shape & s : shapes) {
-            for (int n : {1, 2, 3, 4}) {
+            for (int n : {1, 2, 3, 4, 5, 6, 7, 8}) {
                 test_cases.emplace_back(new test_mul_mat_id(s.type, GGML_TYPE_F32, s.n_mats, s.n_used, s.b, s.m, n, s.k));
                 if (n == 1) {
                     continue;
