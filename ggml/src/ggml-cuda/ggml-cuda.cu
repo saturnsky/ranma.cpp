@@ -1564,8 +1564,8 @@ static bool ggml_cuda_host_direct_allowed(const ggml_backend_cuda_device_context
 #endif
 
     const int cc = ggml_cuda_info().devices[dev_ctx->device].cc;
-    // the token count up to which ggml_cuda_mul_mat_id dispatches to MMVQ
-    const int64_t mmvq_max = std::min<int64_t>(MMVQ_MAX_BATCH_SIZE, get_mmvq_mmid_max_batch(src->type, cc));
+    // the token count up to which ggml_cuda_mul_mat_id dispatches to MMVQ, for weights read from host memory
+    const int64_t mmvq_max = std::min<int64_t>(MMVQ_MAX_BATCH_SIZE, get_mmvq_mmid_max_batch(src->type, cc, /*host_weights=*/true));
 
     const int64_t max_batch = dev_ctx->host_direct_max_batch > 0 ? dev_ctx->host_direct_max_batch : mmvq_max;
     if (op->ne[2] > max_batch) {
@@ -2105,7 +2105,8 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
         return false;
     }
 
-    if (tensor->op == GGML_OP_MUL_MAT_ID && dst->ne[2] > get_mmvq_mmid_max_batch(src0->type, cc)) {
+    if (tensor->op == GGML_OP_MUL_MAT_ID &&
+            dst->ne[2] > get_mmvq_mmid_max_batch(src0->type, cc, ggml_cuda_mmid_host_weights(src0))) {
         return false;
     }
 
@@ -2402,7 +2403,7 @@ static bool ggml_cuda_mul_mat_id_needs_sync(const ggml_tensor * dst, const int c
 
     if (dst->ne[2] <= MMVQ_MAX_BATCH_SIZE) {
         if (ggml_is_quantized(src0->type)) {
-            if (dst->ne[2] <= get_mmvq_mmid_max_batch(src0->type, cc)) {
+            if (dst->ne[2] <= get_mmvq_mmid_max_batch(src0->type, cc, ggml_cuda_mmid_host_weights(src0))) {
                 return false;
             }
         } else if (GGML_CUDA_CC_IS_AMD(cc)) {
@@ -2450,7 +2451,7 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 #endif
         if (ne2 <= MMVQ_MAX_BATCH_SIZE) {
             if (ggml_is_quantized(src0->type)) {
-                const int mmvq_mmid_max = get_mmvq_mmid_max_batch(src0->type, cc);
+                const int mmvq_mmid_max = get_mmvq_mmid_max_batch(src0->type, cc, ggml_cuda_mmid_host_weights(src0));
                 if (ne2 <= mmvq_mmid_max) {
                     ggml_cuda_mul_mat_vec_q(ctx, src0, src1, ids, dst);
                     return;
