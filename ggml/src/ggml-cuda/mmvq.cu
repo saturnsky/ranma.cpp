@@ -286,8 +286,33 @@ static constexpr __host__ __device__ int get_mmvq_mmid_max_batch_rdna4(ggml_type
     }
 }
 
-// Host function: returns the max batch size for the current arch+type at runtime.
-int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
+// RDNA4, MUL_MAT_ID whose expert weights are read from host memory (host-direct or the expert cache): the
+// grouped kernel (mul_mat_vec_q_moe_dedup) reads each distinct expert of a launch once, so it beats MMQ up to
+// MMVQ_MAX_BATCH_SIZE tokens for these types; measured on the expert shapes of DeepSeek V4 Flash and
+// Qwen3.8-Flash-Next. In VRAM the table above stays right, MMQ wins there at 5..8 tokens when the tokens share
+// their experts.
+static constexpr __host__ __device__ bool mmvq_mmid_host_weights_8(ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_IQ2_XS:
+        case GGML_TYPE_IQ3_S:
+        case GGML_TYPE_IQ3_XXS:
+        case GGML_TYPE_MXFP4:
+        case GGML_TYPE_Q4_K:
+        case GGML_TYPE_Q5_K:
+        case GGML_TYPE_Q5_1:
+        case GGML_TYPE_Q8_0:
+            return true;
+        default:
+            return false;
+    }
+}
+
+#if defined(GGML_USE_HIP)
+static int mmvq_id_dedup_mode();
+#endif // defined(GGML_USE_HIP)
+
+// Host function: returns the max batch size of the table for the current arch+type at runtime.
+static int get_mmvq_mmid_max_batch_table(ggml_type type, int cc) {
     // NVIDIA: Volta, Ada Lovelace, and Blackwell always use MMVQ for MUL_MAT_ID.
     if (GGML_CUDA_CC_IS_NVIDIA(cc)) {
         if (cc == GGML_CUDA_CC_VOLTA || cc >= GGML_CUDA_CC_ADA_LOVELACE) {
@@ -318,6 +343,31 @@ int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
         }
     }
     return MMVQ_MAX_BATCH_SIZE;
+}
+
+int get_mmvq_mmid_max_batch(ggml_type type, int cc, bool host_weights) {
+#if defined(GGML_USE_HIP)
+    // the grouped kernel runs these launches unless GGML_CUDA_MMVQ_ID_DEDUP=0 turns it off
+    if (host_weights && GGML_CUDA_CC_IS_RDNA4(cc) && mmvq_mmid_host_weights_8(type) && mmvq_id_dedup_mode() > 0) {
+        return MMVQ_MAX_BATCH_SIZE;
+    }
+#else
+    GGML_UNUSED(host_weights);
+#endif // defined(GGML_USE_HIP)
+    return get_mmvq_mmid_max_batch_table(type, cc);
+}
+
+bool ggml_cuda_mmid_host_weights(const ggml_tensor * src0) {
+#if defined(GGML_USE_HIP)
+    if (src0->buffer == nullptr) {
+        return false;
+    }
+    return ggml_backend_buffer_is_host(src0->buffer) ||
+           ggml_cuda_expert_is_exclusive_buffer_type(ggml_backend_buffer_get_type(src0->buffer));
+#else
+    GGML_UNUSED(src0);
+    return false;
+#endif // defined(GGML_USE_HIP)
 }
 
 bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
@@ -1224,8 +1274,10 @@ static __global__ void mul_mat_vec_q(
 // Grid: (ceil(nrows_x / c_rows_per_block), nchannels_dst)
 // Block: (warp_size, ncols_dst) - each warp handles one token independently.
 // No shared memory reduction needed since each warp works alone.
-template <ggml_type type, int c_rows_per_block, bool has_fusion = false>
-__launch_bounds__(get_mmvq_mmid_max_batch_for_device<type>()*ggml_cuda_get_physical_warp_size(), 1)
+// c_wide: bounds for MMVQ_MAX_BATCH_SIZE tokens, for host-read launches above the table of the arch that the
+// grouped kernel declines; the other launches keep the bounds and the code of the table.
+template <ggml_type type, int c_rows_per_block, bool has_fusion = false, bool c_wide = false>
+__launch_bounds__((c_wide ? MMVQ_MAX_BATCH_SIZE : get_mmvq_mmid_max_batch_for_device<type>())*ggml_cuda_get_physical_warp_size(), 1)
 static __global__ void mul_mat_vec_q_moe(
         const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion,
         float * dst_ptr,
@@ -1429,7 +1481,8 @@ static __global__ void mul_mat_vec_q_moe(
 static constexpr int MMVQ_ID_DEDUP_WARPS = 4;
 
 // GGML_CUDA_MMVQ_ID_DEDUP: 1 (default) groups the pairs when the weights are read from host memory (host-direct
-// or the expert cache), 2 also when they are all in VRAM, 0 keeps one warp per (token, expert slot) pair
+// or the expert cache), 2 also when they are all in VRAM, 0 keeps one warp per (token, expert slot) pair. 0 also
+// keeps host-read MUL_MAT_ID at the table of the arch (see mmvq_mmid_host_weights_8).
 static int mmvq_id_dedup_mode() {
     static const int mode = [] {
         const char * env = getenv("GGML_CUDA_MMVQ_ID_DEDUP");
@@ -1759,7 +1812,7 @@ static void mul_mat_vec_q_moe_launch(
         const uint32_t stride_row_x, const uint32_t stride_col_y, const uint32_t stride_col_dst,
         const uint32_t stride_channel_x, const uint32_t stride_channel_y, const uint32_t stride_channel_dst,
         const uint32_t ncols_dst, const uint32_t ids_stride,
-        const int warp_size, const int nchannels_dst, cudaStream_t stream) {
+        const int warp_size, const int nchannels_dst, const int cc, cudaStream_t stream) {
 
     constexpr int rows_per_block = 2; // 2 gives best perf based on tuning
     const int64_t nblocks_rows = (nrows_x + rows_per_block - 1) / rows_per_block;
@@ -1769,6 +1822,30 @@ static void mul_mat_vec_q_moe_launch(
 
     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
                             fusion.x_scale != nullptr || fusion.gate_scale != nullptr;
+
+#if defined(GGML_USE_HIP)
+    // host-read weights above the table of the arch: the block has more warps than the launch bounds of the
+    // table variant allow
+    if constexpr (mmvq_mmid_host_weights_8(type)) {
+        if ((int) ncols_dst > get_mmvq_mmid_max_batch_table(type, cc)) {
+            if (has_fusion) {
+                ggml_cuda_kernel_launch(mul_mat_vec_q_moe<type, rows_per_block, true, true>, launch_params,
+                    vx, vy, ids, fusion, dst, ncols_x, nchannels_y, nrows_x,
+                    stride_row_x, stride_col_y, stride_col_dst,
+                    stride_channel_x, stride_channel_y, stride_channel_dst,
+                    ncols_dst, ids_stride);
+            } else {
+                ggml_cuda_kernel_launch(mul_mat_vec_q_moe<type, rows_per_block, false, true>, launch_params,
+                    vx, vy, ids, fusion, dst, ncols_x, nchannels_y, nrows_x,
+                    stride_row_x, stride_col_y, stride_col_dst,
+                    stride_channel_x, stride_channel_y, stride_channel_dst,
+                    ncols_dst, ids_stride);
+            }
+            return;
+        }
+    }
+#endif // defined(GGML_USE_HIP)
+    GGML_UNUSED(cc);
 
     if (has_fusion) {
         ggml_cuda_kernel_launch(mul_mat_vec_q_moe<type, rows_per_block, true>, launch_params,
@@ -1786,14 +1863,6 @@ static void mul_mat_vec_q_moe_launch(
 }
 
 #if defined(GGML_USE_HIP)
-// Whether the eight-column variant of the grouped kernel exists for a type: only where an AMD table
-// sends more than four tokens of that type to MMVQ. Other launches keep mul_mat_vec_q_moe.
-static constexpr bool mmvq_id_dedup_has_8_cols(ggml_type type) {
-    return get_mmvq_mmid_max_batch_rdna4(type)       > 4 || get_mmvq_mmid_max_batch_rdna3(type) > 4 ||
-           get_mmvq_mmid_max_batch_rdna1_rdna2(type) > 4 || get_mmvq_mmid_max_batch_cdna(type)  > 4 ||
-           get_mmvq_mmid_max_batch_gcn(type)         > 4;
-}
-
 // Returns false when the launch does not fit the grouped kernel; the caller then runs mul_mat_vec_q_moe.
 template <ggml_type type>
 static bool mul_mat_vec_q_moe_dedup_launch(
@@ -1819,8 +1888,9 @@ static bool mul_mat_vec_q_moe_dedup_launch(
         return false;
     }
     // the eight-column variant with the fused gate: in the gfx1201 code of some types the weight loads appear
-    // more than once per K step, which would give back the saving on a host read; keep mul_mat_vec_q_moe there
-    if (ncols_dst > 4 && (!mmvq_id_dedup_has_8_cols(type) || fusion.gate != nullptr)) {
+    // more than once per K step, which would give back the saving on a host read; keep mul_mat_vec_q_moe there,
+    // except for the types measured with host-read weights, where the fused variant is as fast as the unfused pair
+    if (ncols_dst > 4 && fusion.gate != nullptr && !mmvq_mmid_host_weights_8(type)) {
         return false;
     }
 
@@ -1871,9 +1941,7 @@ static bool mul_mat_vec_q_moe_dedup_launch(
     if (ncols_dst <= 4) {
         launch(std::integral_constant<int, 4>{});
     } else {
-        if constexpr (mmvq_id_dedup_has_8_cols(type)) {
-            launch(std::integral_constant<int, 8>{});
-        }
+        launch(std::integral_constant<int, 8>{});
     }
     return true;
 }
@@ -1986,7 +2054,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
             vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, nrows_x,
             stride_row_x, stride_col_y, stride_col_dst,
             stride_channel_x, stride_channel_y, stride_channel_dst,
-            ncols_dst, ids_stride, warp_size, nchannels_dst, stream);
+            ncols_dst, ids_stride, warp_size, nchannels_dst, cc, stream);
         return;
     }
 
@@ -2510,7 +2578,7 @@ void ggml_cuda_mul_mat_vec_q(
 
     if (fusion) {
         const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
-        GGML_ASSERT( !ids || dst->ne[2] <= get_mmvq_mmid_max_batch(src0->type, cc));
+        GGML_ASSERT( !ids || dst->ne[2] <= get_mmvq_mmid_max_batch(src0->type, cc, ggml_cuda_mmid_host_weights(src0)));
         GGML_ASSERT(  ids || dst->ne[1] == 1);
         // Scale fusion is only allowed for NVFP4 currently as the cost of checking this at run-time in the prologue is
         // non-negligible for some models such as gpt-oss-20b
