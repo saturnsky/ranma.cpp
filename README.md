@@ -155,6 +155,10 @@ applies, how to switch it, and its limits.
 - **LoRA scale folding** - a LoRA scale of exactly 1 produces no graph node, and other scales are folded into
   a pre-scaled copy of the dense B matrices at attach time. `llama-bench` gains `--lora` and `--lora-scaled`.
   Same page.
+- **One HIP graph per batch shape** - the backend keys the graphs it captured by the batch shape as well as by
+  the first node, so a speculative verification whose width changes between rounds launches the graph it already
+  captured for that width. On by default in HIP builds; `GGML_CUDA_GRAPH_PER_SHAPE=0` restores the keying by the
+  first node. Same page.
 
 ### MoE decode kernels (HIP)
 
