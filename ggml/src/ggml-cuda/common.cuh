@@ -1318,6 +1318,13 @@ struct ggml_cuda_graph_key_hash {
 // (GGML_CUDA_GRAPH_PER_SHAPE, read once)
 int ggml_cuda_graph_per_shape_max();
 
+// time in us after which an unused per-shape graph is dropped, 0 if never (GGML_CUDA_GRAPH_EVICT_SECONDS, read once)
+int64_t ggml_cuda_graph_per_shape_evict_us();
+
+// whether a dropped graph is destroyed after a later graph compute of its context, once the work queued before the
+// drop has finished, instead of at once under a stream synchronization (GGML_CUDA_GRAPH_DEFER_FREE, read once)
+bool ggml_cuda_graph_defer_free();
+
 struct ggml_cuda_concurrent_event {
     std::vector<cudaEvent_t> join_events;
     cudaEvent_t              fork_event = nullptr;
@@ -1600,11 +1607,69 @@ struct ggml_backend_cuda_context {
 
     int64_t last_graph_eviction_sweep = 0;
 
+    // GGML_CUDA_GRAPH_DEFER_FREE: dropped graphs waiting to be destroyed, with an event recorded on the stream when
+    // the graph was dropped (nullptr: nothing queued can still use it); see free_retired_graphs()
+    struct retired_graph {
+        std::unique_ptr<ggml_cuda_graph> graph;
+        cudaEvent_t                      done = nullptr;
+    };
+    std::vector<retired_graph> retired_graphs;
+
+    void retire_graph(std::unique_ptr<ggml_cuda_graph> && graph, bool may_be_queued) {
+        retired_graph r;
+        r.graph = std::move(graph);
+        if (may_be_queued && streams[device][0] != nullptr) {
+            ggml_cuda_set_device(device);
+            CUDA_CHECK(cudaEventCreateWithFlags(&r.done, cudaEventDisableTiming));
+            CUDA_CHECK(cudaEventRecord(r.done, streams[device][0]));
+        }
+        retired_graphs.push_back(std::move(r));
+    }
+
+    // destroy all retired graphs if wait is set, else the first one whose event has completed: a destruction takes
+    // milliseconds of host time, and one per compute stays within the wait for the GPU after a sweep dropped several
+    void free_retired_graphs(bool wait) {
+        size_t n_kept = 0;
+        bool   freed  = false;
+        for (size_t i = 0; i < retired_graphs.size(); ++i) {
+            retired_graph & r = retired_graphs[i];
+            if (!wait && freed) {
+                if (n_kept != i) {
+                    retired_graphs[n_kept] = std::move(r);
+                }
+                n_kept++;
+                continue;
+            }
+            if (r.done != nullptr) {
+                if (wait) {
+                    CUDA_CHECK(cudaEventSynchronize(r.done));
+                } else {
+                    const cudaError_t err = cudaEventQuery(r.done);
+                    if (err == cudaErrorNotReady) {
+                        (void) cudaGetLastError();
+                        if (n_kept != i) {
+                            retired_graphs[n_kept] = std::move(r);
+                        }
+                        n_kept++;
+                        continue;
+                    }
+                    CUDA_CHECK(err);
+                }
+                CUDA_CHECK(cudaEventDestroy(r.done));
+                r.done = nullptr;
+            }
+            r.graph.reset();
+            freed = true;
+        }
+        retired_graphs.resize(n_kept);
+    }
+
     // per-shape keying statistics, logged when the context is destroyed
     struct {
         int64_t captures      = 0; // graph captures
         int64_t returns       = 0; // rebuilt ggml graphs that matched a stored instance, launched without capture
         int64_t cap_evictions = 0; // entries dropped because the per-context limit was reached
+        int64_t swept         = 0; // entries dropped because they were unused for GGML_CUDA_GRAPH_EVICT_SECONDS
         size_t  max_entries   = 0; // largest number of stored graphs
         bool    shared_logged = false;
     } graph_stats;
@@ -1612,11 +1677,18 @@ struct ggml_backend_cuda_context {
     ggml_cuda_graph * cuda_graph(const ggml_cuda_graph_key & key) {
         const int64_t time_now = ggml_time_us();
 
-        // sweep every 5s, evicting cuda graphs unused for >=10s
+        // sweep every 5s, evicting cuda graphs unused for >=10s; a per-shape graph is bounded by the
+        // per-context limit and is kept for GGML_CUDA_GRAPH_EVICT_SECONDS instead (never swept if 0)
         if (time_now - last_graph_eviction_sweep >= 5'000'000) {
             last_graph_eviction_sweep = time_now;
             for (auto it = cuda_graphs.begin(); it != cuda_graphs.end(); ) {
-                if (time_now - it->second->last_used_time >= 10'000'000) {
+                const int64_t unused_limit = it->first.shape != 0 ? ggml_cuda_graph_per_shape_evict_us() : 10'000'000;
+                if (unused_limit > 0 && time_now - it->second->last_used_time >= unused_limit) {
+                    graph_stats.swept += it->first.shape != 0 ? 1 : 0;
+                    if (ggml_cuda_graph_defer_free()) {
+                        // unused for seconds, nothing queued uses it; destroyed after the next compute
+                        retire_graph(std::move(it->second), false);
+                    }
                     it = cuda_graphs.erase(it);
                 } else {
                     ++it;
@@ -1628,14 +1700,17 @@ struct ggml_backend_cuda_context {
         if (it == cuda_graphs.end()) {
             const int max_entries = key.shape != 0 ? ggml_cuda_graph_per_shape_max() : 0;
             if (max_entries > 0 && cuda_graphs.size() >= (size_t) max_entries) {
-                // drop the least recently used graph; its instance may still be queued on the stream
+                // drop the least recently used graph; its instance may still be queued on the stream, so it is
+                // destroyed once the work queued so far has finished (or at once after a stream synchronization)
                 auto lru = cuda_graphs.begin();
                 for (auto jt = cuda_graphs.begin(); jt != cuda_graphs.end(); ++jt) {
                     if (jt->second->last_used_time < lru->second->last_used_time) {
                         lru = jt;
                     }
                 }
-                if (streams[device][0] != nullptr) {
+                if (ggml_cuda_graph_defer_free()) {
+                    retire_graph(std::move(lru->second), true);
+                } else if (streams[device][0] != nullptr) {
                     CUDA_CHECK(cudaStreamSynchronize(streams[device][0]));
                 }
                 cuda_graphs.erase(lru);
