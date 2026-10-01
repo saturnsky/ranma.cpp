@@ -33,6 +33,7 @@ uint64_t load_acquire(const uint64_t * p) {
     return uint64_t(_InterlockedCompareExchange64(reinterpret_cast<volatile long long *>(const_cast<uint64_t *>(p)), 0, 0));
 }
 void store_release(uint32_t * p, uint32_t value) { _InterlockedExchange(reinterpret_cast<volatile long *>(p), long(value)); }
+void store_release(uint64_t * p, uint64_t value) { _InterlockedExchange64(reinterpret_cast<volatile long long *>(p), (long long) value); }
 
 uint64_t total_physical_bytes() {
     MEMORYSTATUSEX status = {};

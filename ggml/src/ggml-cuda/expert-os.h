@@ -31,6 +31,7 @@ void aligned_free(void * p);
 uint32_t load_acquire(const uint32_t * p);
 uint64_t load_acquire(const uint64_t * p);
 void store_release(uint32_t * p, uint32_t value);
+void store_release(uint64_t * p, uint64_t value);
 bool pin_current_thread(int cpu, std::string & reason); // -1 selects the last active logical CPU.
 bool atomic_replace(const std::filesystem::path & temporary, const std::filesystem::path & destination, std::string & error);
 

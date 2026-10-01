@@ -29,13 +29,34 @@ struct alignas(64) l2_mailbox {
 };
 static_assert(sizeof(l2_mailbox) == 64, "the mailbox layout is part of the host budget");
 
+// Batched service, one per layer. `launches` follows the published generation (publish kernel); the
+// worker writes the tables of a batched generation, then `gen`, and releases each batch of a kind
+// through `ready`; the GPU reports each finished batch launch of a kind through `done`. A ready or
+// done word is (generation << 32) | batches, so a word of an earlier generation never passes.
+struct alignas(64) l2_batch_mail {
+    uint32_t launches;     // batch launches per kind of the published generation
+    uint32_t gen;          // the generation the tables belong to
+    uint32_t count;        // batches of that generation
+    uint32_t stage_ticks;  // wall ticks the batch launches waited, cumulative
+    uint32_t pad0[12];
+    uint64_t ready[3];
+    uint64_t pad1[5];
+    uint64_t done[3];
+    uint64_t pad2[5];
+};
+static_assert(sizeof(l2_batch_mail) == 192, "the batch mailbox layout is part of the host budget");
+
+static __device__ __forceinline__ uint64_t l2_batch_word(uint32_t seq, uint32_t batches) {
+    return (uint64_t(seq) << 32) | batches;
+}
+
 // `serve` marks the experts only the worker can place: file residents and ring occupants. It follows
 // a plan, not a generation. When no routed id needs the worker, this kernel answers its own wait, so
 // a fully resident layer never reaches the CPU.
 // The bitmap and the flags are built in shared memory and then stored: PCIe has no atomic OR, and on
 // some hosts an atomicOr on the mapped mailbox is lost.
 static __global__ void l2_publish_kernel(l2_mailbox * m, uint32_t * demand, const uint32_t * serve,
-        const int32_t * ids, int rows, int used, int stride, int experts) {
+        const int32_t * ids, int rows, int used, int stride, int experts, l2_batch_mail * bm, int launches) {
     extern __shared__ uint32_t demand_shared[];
     __shared__ uint32_t need, invalid;
     const int words = (experts + 31)/32;
@@ -62,6 +83,7 @@ static __global__ void l2_publish_kernel(l2_mailbox * m, uint32_t * demand, cons
     if (threadIdx.x == 0) {
         m->need = need;
         m->invalid = invalid;
+        bm->launches = uint32_t(launches);
         const uint32_t seq = ++m->generation;
         if (!need) {
             __hip_atomic_store(&m->ready, seq, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
@@ -101,6 +123,44 @@ static __global__ void l2_wait_kind_kernel(l2_mailbox * m, int kind, int record)
     } else {
         m->stage_ticks += uint32_t(wall_clock64() - steady_begin);
         __threadfence_system();
+    }
+}
+
+// Batched service: copies the batch tables of the generation to device memory for the MMQ launches,
+// after the route wait, so the worker has written them if the generation is batched. Any other
+// generation (one the publish kernel answered, one with nothing to batch) gets the tables of a single
+// launch: every expert in the first launch, every list empty.
+static __global__ void l2_batch_prep_kernel(const l2_mailbox * m, const l2_batch_mail * bm, const int32_t * host,
+        int32_t * dev, int experts, int words) {
+    __shared__ int valid;
+    if (threadIdx.x == 0) {
+        valid = __hip_atomic_load(&bm->gen, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM) == m->generation;
+    }
+    __syncthreads();
+    for (int i = threadIdx.x; i < words; i += blockDim.x) {
+        dev[i] = valid ? host[i] : (i < experts ? 0 : -1);
+    }
+}
+
+// Batch `batch` (1-based) of `kind`: waits until its reads are in place, or the whole generation is.
+static __global__ void l2_batch_wait_kernel(l2_mailbox * m, l2_batch_mail * bm, int kind, int batch) {
+    const uint64_t steady_begin = wall_clock64();
+    const uint32_t seq = m->generation;
+    while (__hip_atomic_load(&m->ready, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM) != seq) {
+        const uint64_t word = __hip_atomic_load(&bm->ready[kind], __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM);
+        if (uint32_t(word >> 32) == seq && uint32_t(word) >= uint32_t(batch)) { break; }
+        __builtin_amdgcn_s_sleep(1);
+    }
+    bm->stage_ticks += uint32_t(wall_clock64() - steady_begin);
+    __threadfence_system();
+}
+
+// After batch launch `batch` of `kind`: the GPU no longer reads its slots.
+static __global__ void l2_batch_done_kernel(const l2_mailbox * m, l2_batch_mail * bm, int kind, int batch) {
+    if (threadIdx.x == 0) {
+        __threadfence_system();
+        __hip_atomic_store(&bm->done[kind], l2_batch_word(m->generation, uint32_t(batch)), __ATOMIC_RELEASE,
+            __HIP_MEMORY_SCOPE_SYSTEM);
     }
 }
 
@@ -151,6 +211,9 @@ l2_tier::~l2_tier() {
     if (maps_host_)   { (void) hipHostFree(maps_host_); }
     if (demand_host_) { (void) hipHostFree(demand_host_); }
     if (serve_host_)  { (void) hipHostFree(serve_host_); }
+    if (batch_mail_host_) { (void) hipHostFree(batch_mail_host_); }
+    if (batch_tab_host_)  { (void) hipHostFree(batch_tab_host_); }
+    if (batch_dev_)       { (void) cudaFree(batch_dev_); }
     expert_os::aligned_free(bounce_aligned_);
 }
 
@@ -188,7 +251,10 @@ size_t l2_tier::metadata_bytes() const {
     const size_t maps   = (size_t) geo_.n_layers*geometry::n_kinds*(size_t) geo_.n_experts*sizeof(uint64_t);
     const size_t demand = bitmap_bytes();   // the demand table and the serve table have one layout
     const size_t bounce = std::max({ring_pitch_[0], ring_pitch_[1], ring_pitch_[2]});
-    return expert_os::align_up_io(mail) + expert_os::align_up_io(maps) + 2*expert_os::align_up_io(demand) + bounce;
+    const size_t batch = (size_t) geo_.n_layers*sizeof(l2_batch_mail);
+    const size_t tables = (size_t) geo_.n_layers*batch_tab_words()*sizeof(int32_t);
+    return expert_os::align_up_io(mail) + expert_os::align_up_io(maps) + 2*expert_os::align_up_io(demand) + bounce +
+        expert_os::align_up_io(batch) + expert_os::align_up_io(tables);
 }
 
 void l2_tier::set_storage(const class_storage & storage) {
@@ -232,7 +298,8 @@ bool l2_tier::allocate(int device) {
     CUDA_CHECK(hipDeviceGetAttribute(&steady_khz_, hipDeviceAttributeWallClockRate, device_));
     GGML_ASSERT(clock_khz_ > 0 && steady_khz_ > 0);
     pending_.resize(geo_.n_layers); wait_seen_.assign(geo_.n_layers, 0);
-    staged_layer_.assign(geo_.n_layers, 0); stage_seen_.assign(geo_.n_layers, 0);
+    staged_layer_.assign(geo_.n_layers, 0); stage_seen_.assign(geo_.n_layers, 0); batch_seen_.assign(geo_.n_layers, 0);
+    route_launches_.assign(geo_.n_layers, 0);
     seen_.assign(geo_.n_layers, 0);
     if (early_layer_.size() != (size_t) geo_.n_layers) { early_layer_.assign(geo_.n_layers, 0); }
     if (cfg_.early) {
@@ -287,6 +354,23 @@ bool l2_tier::allocate(int device) {
     }
     serve_host_   = static_cast<uint32_t *>(serve);
     serve_device_ = static_cast<uint32_t *>(serve_device);
+    if (!coherent_alloc(&batch_mail_host_, &batch_mail_device_, (size_t) geo_.n_layers*sizeof(l2_batch_mail))) {
+        GGML_LOG_ERROR("expert cache: the SSD tier could not allocate its batch mailboxes\n");
+        return false;
+    }
+    void * tab = nullptr, * tab_device = nullptr;
+    if (!coherent_alloc(&tab, &tab_device, (size_t) geo_.n_layers*batch_tab_words()*sizeof(int32_t))) {
+        GGML_LOG_ERROR("expert cache: the SSD tier could not allocate its batch tables\n");
+        return false;
+    }
+    batch_tab_host_   = static_cast<int32_t *>(tab);
+    batch_tab_device_ = static_cast<int32_t *>(tab_device);
+    if (batched() && cudaMalloc((void **) &batch_dev_, (size_t) geo_.n_layers*batch_tab_words()*sizeof(int32_t)) != cudaSuccess) {
+        (void) cudaGetLastError();
+        batch_dev_ = nullptr;
+        GGML_LOG_ERROR("expert cache: the SSD tier could not allocate its device batch tables\n");
+        return false;
+    }
     // Graphs capture the mailbox nodes, so they must exist from the first plan on. With an all-clear
     // serve table they cost two tiny self-answering kernels for each routed layer.
     mailbox_active_ = true;
@@ -351,6 +435,16 @@ bool l2_tier::allocate(int device) {
     }
     if (!size_note_.empty() && !class_layout()) {
         GGML_LOG_INFO("expert cache: %s\n", size_note_.c_str());
+    }
+    if (batched()) {
+        std::string caps;
+        for (int s = 0; s < storage_.storages(); ++s) {
+            caps += (s ? "," : "") + std::to_string(std::min(geo_.n_experts, l2_batch_capacity(storage_.ring_slots[s])));
+        }
+        GGML_LOG_INFO("expert cache: SSD tier batched service for ubatches of more than %llu rows: the experts that need no "
+                      "read first, then the file residents in batches of at most %s experts (per storage class) through two "
+                      "buffers; prompt fills %s\n", (unsigned long long) cfg_.decode_rows, caps.c_str(),
+            l2_prompt_fill_name(cfg_.prompt_fill));
     }
     if (staged()) {
         GGML_LOG_INFO("expert cache: SSD tier staged service for ubatches of at least %lld rows: up, gate and "
@@ -980,14 +1074,27 @@ void l2_tier::service_layer(int layer, uint32_t seq, const std::vector<int> & id
         const uint32_t done = expert_os::load_acquire(&static_cast<l2_mailbox *>(mail_host_)[other].done);
         if (class_layout()) { cledger_.set_done(other, done); } else { ledger_.set_done(other, done); }
     }
+    const int launches = batched() ?
+        int(expert_os::load_acquire(&static_cast<const l2_batch_mail *>(batch_mail_host_)[layer].launches)) : 0;
+    if (launches > 0) {
+        serve_batched(layer, seq, ids, launches);
+        item.ssd_bytes = counters_.ssd_bytes - before_bytes;
+        std::atomic_thread_fence(std::memory_order_release);
+        counters_.service_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+        return;
+    }
     auto homed = [this](int l, int e) { return wanted(l, e); };
+    // a prompt ubatch's fills and hits go where RANMA_EXPERT_L2_PROMPT_FILL says, decode's to the most recently used end
+    const l2_insert insert = l2_insert_for(cfg_.prompt_fill, item.rows > cfg_.decode_rows);
     l2_service service;
     if (cfg_.early) {
         // a slot an early read filled for this demand is not a ring hit: its read was counted
         auto quiet = [this](int l, int e) { return early_marked(l, e); };
-        service = class_layout() ? cledger_.service(layer, ids, seq, homed, quiet) : ledger_.service(layer, ids, seq, homed, quiet);
+        service = class_layout() ? cledger_.service(layer, ids, seq, homed, quiet, false, insert) :
+            ledger_.service(layer, ids, seq, homed, quiet);
     } else {
-        service = class_layout() ? cledger_.service(layer, ids, seq, homed) : ledger_.service(layer, ids, seq, homed);
+        service = class_layout() ? cledger_.service(layer, ids, seq, homed, l2_no_quiet(), false, insert) :
+            ledger_.service(layer, ids, seq, homed);
     }
     if (!service.ok) {
         GGML_ABORT("expert cache: the SSD tier cannot serve layer %d: %s", layer, service.reason.c_str());
@@ -1025,6 +1132,149 @@ void l2_tier::service_layer(int layer, uint32_t seq, const std::vector<int> & id
     std::atomic_thread_fence(std::memory_order_release);
     counters_.service_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
 }
+
+// The batched service of one prompt generation (expert-l2-batch.h). The experts that need no read
+// (residents and ring hits) are released at once for the first launch of every kind. The file
+// experts go in batches through one or two buffers of ring slots: the worker reads every batch that
+// may be read (the first two of each kind at once, batch b once the GPU has finished batch b - 2 of
+// that kind) in the order up, gate, down, publishes the addresses of a batch of a kind when its
+// reads are in place and then the batch's readiness. Before batch b of a kind is read into a buffer,
+// the addresses of that kind of the batch the buffer held go, so the address table ends as the
+// ledger does: each slot holds the last batch expert that used it.
+void l2_tier::serve_batched(int layer, uint32_t seq, const std::vector<int> & ids, int launches) {
+    l2_mailbox & mail = static_cast<l2_mailbox *>(mail_host_)[layer];
+    l2_batch_mail & bm = static_cast<l2_batch_mail *>(batch_mail_host_)[layer];
+    auto homed = [this](int l, int e) { return wanted(l, e); };
+    const l2_insert insert = l2_insert_for(cfg_.prompt_fill, true);
+    const int capacity = batch_capacity(layer);
+    l2_batch_plan plan;
+    if (cfg_.early) {
+        auto quiet = [this](int l, int e) { return early_marked(l, e); };
+        plan = cledger_.service_batched(layer, ids, seq, homed, launches, capacity, quiet, insert);
+    } else {
+        plan = cledger_.service_batched(layer, ids, seq, homed, launches, capacity, l2_no_quiet(), insert);
+    }
+    if (!plan.ok) {
+        GGML_ABORT("expert cache: the SSD tier cannot serve layer %d in batches: %s", layer, plan.reason.c_str());
+    }
+    const size_t n_experts = (size_t) geo_.n_experts;
+    auto entry = [&](int l, int kind, int e) -> uint64_t & {
+        return maps_host_[((size_t) l*geometry::n_kinds + (size_t) kind)*n_experts + (size_t) e];
+    };
+    for (const auto & old : plan.evicted) {
+        for (int kind = 0; kind < geometry::n_kinds; ++kind) { entry(old.layer, kind, old.expert) = 0; }
+        early_evicted(old.layer, old.expert);
+    }
+    for (const std::vector<int> & batch : plan.batches) {
+        for (int e : batch) {
+            // a demoted hit still names its old slot, which a batch may take
+            for (int kind = 0; kind < geometry::n_kinds; ++kind) { entry(layer, kind, e) = 0; }
+        }
+    }
+    counters_.ring_hits += (uint64_t) plan.hits;
+    counters_.batch_demoted += (uint64_t) plan.demoted;
+    if (cfg_.early && !early_list_[(size_t) layer].empty()) {
+        counters_.early_hits += (uint64_t) plan.early_hits;
+        std::vector<bool> asked(n_experts, false);
+        for (int e : ids) {
+            if (e >= 0 && e < geo_.n_experts) { asked[(size_t) e] = true; }
+        }
+        for (int e : early_list_[(size_t) layer]) {
+            uint8_t & mark = early_mark_[(size_t) layer*n_experts + (size_t) e];
+            if (mark && !asked[(size_t) e]) { ++counters_.early_unused; }
+            mark = 0;
+        }
+        early_list_[(size_t) layer].clear();
+    }
+    const int batches = plan.count();
+    if (batches > 0) {
+        int32_t * tab = batch_tab_host_ + (size_t) layer*batch_tab_words();
+        for (size_t i = 0; i < n_experts; ++i) { tab[i] = 0; }
+        for (size_t i = n_experts; i < batch_tab_words(); ++i) { tab[i] = -1; }
+        GGML_ASSERT(batches <= launches && plan.capacity <= capacity);
+        for (int b = 0; b < batches; ++b) {
+            for (size_t p = 0; p < plan.batches[(size_t) b].size(); ++p) {
+                const int e = plan.batches[(size_t) b][p];
+                tab[(size_t) e] = b + 1;
+                tab[n_experts + (size_t) b*(size_t) capacity + p] = e;
+            }
+        }
+        bm.count = (uint32_t) batches;
+        std::atomic_thread_fence(std::memory_order_release);
+        expert_os::store_release(&bm.gen, seq);
+    }
+    std::atomic_thread_fence(std::memory_order_release);
+    // the first launch of every kind reads residents and hits only
+    for (int kind = 0; kind < geometry::n_kinds; ++kind) { expert_os::store_release(&mail.kind_ready[kind], seq); }
+    if (batches == 0) {
+        return;
+    }
+    std::vector<int> next(geometry::n_kinds, 0), done(geometry::n_kinds, 0);
+    auto waited = std::chrono::steady_clock::now();   // since the last read wave
+    std::string reason;
+    while (next[0] < batches || next[1] < batches || next[2] < batches) {
+        for (int kind = 0; kind < geometry::n_kinds; ++kind) {
+            const uint64_t word = expert_os::load_acquire(&bm.done[kind]);
+            done[(size_t) kind] = uint32_t(word >> 32) == seq ? int(uint32_t(word)) : 0;
+        }
+        const std::vector<std::pair<int, int>> groups = l2_batch_readable(plan, next, done);
+        if (groups.empty()) {
+            const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - waited).count();
+            if (ms > double(cfg_.read_wait_ms)) {
+                GGML_ABORT("expert cache: layer %d: the GPU did not finish a batch within %lld ms (done %d/%d/%d of %d)",
+                    layer, (long long) cfg_.read_wait_ms, done[0], done[1], done[2], batches);
+            }
+            RANMA_CPU_PAUSE();
+            continue;
+        }
+        std::vector<l2_read> reads;
+        std::vector<size_t> ends;
+        for (const auto & group : groups) {
+            const int kind = group.first, b = group.second;
+            const std::vector<int> & batch = plan.batches[(size_t) b];
+            for (size_t p = 0; p < batch.size(); ++p) {
+                const int before = plan.previous(b, (int) p);
+                if (before >= 0) { entry(layer, kind, before) = 0; }   // the GPU has finished it
+                reads.push_back({layer, kind, batch[p], plan.slot(b, (int) p)});
+            }
+            ends.push_back(reads.size());
+        }
+        std::atomic_thread_fence(std::memory_order_release);
+        size_t released = 0;
+        auto progress = [&](size_t count) {
+            for (; released < groups.size() && ends[released] <= count; ++released) {
+                const int kind = groups[released].first, b = groups[released].second;
+                const std::vector<int> & batch = plan.batches[(size_t) b];
+                for (size_t p = 0; p < batch.size(); ++p) {
+                    entry(layer, kind, batch[p]) = uint64_t(reinterpret_cast<uintptr_t>(
+                        static_cast<char *>(storage_slot(layer, kind, plan.slot(b, (int) p), true)) +
+                        backing_[(size_t) layer][kind].shift));
+                }
+                std::atomic_thread_fence(std::memory_order_release);
+                // the last batch of a kind also releases the launches the generation leaves empty
+                expert_os::store_release(&bm.ready[kind], (uint64_t(seq) << 32) | uint64_t(b + 1 == batches ? launches : b + 1));
+            }
+            return true;
+        };
+        if (!run_reads(reads, reason, false, progress)) {
+            GGML_ABORT("expert cache: the SSD tier failed to read layer %d: %s", layer, reason.c_str());
+        }
+        GGML_ASSERT(released == groups.size());
+        waited = std::chrono::steady_clock::now();
+    }
+    ++counters_.batched_generations;
+    counters_.batches += (uint64_t) batches;
+    if (verify_) {
+        std::vector<int> owned = plan.hit_experts;
+        for (const std::vector<int> & batch : plan.batches) {
+            for (int e : batch) {
+                if (cledger_.slot_of(layer, e) >= 0) { owned.push_back(e); }
+            }
+        }
+        verify_addresses(layer, owned);
+    }
+}
+
 
 // The reads of one generation, ordered by kind in the order the graph multiplies them (up, gate,
 // down). Each kind's addresses and readiness are published as soon as its last read is in place, so
@@ -1372,7 +1622,47 @@ void l2_tier::serve_ready(const std::vector<uint8_t> & busy) {
 
 // ---- the hot path ---------------------------------------------------------------------------------------
 
-void l2_tier::publish_and_wait(int layer, const ggml_tensor * ids, cudaStream_t stream) {
+int l2_tier::batch_capacity(int layer) const {
+    const int s = storage_.storage_of[geo_.layer_class[layer]];
+    return std::min(geo_.n_experts, l2_batch_capacity(storage_.ring_slots[s]));
+}
+
+int l2_tier::batch_launches(int layer, int64_t rows, bool mmq) const {
+    if (!batched() || !mmq || !mailbox_active_ || layer < 0 || layer >= geo_.n_layers || geo_.layer_class[layer] < 0 ||
+            rows <= int64_t(cfg_.decode_rows)) {
+        return 0;
+    }
+    const int s = storage_.storage_of[geo_.layer_class[layer]];
+    const int demand = storage_demand_bound(geo_.n_experts, cfg_.experts_used, uint64_t(rows));
+    // a ubatch the vector kernels multiply keeps them while the ring holds its worst demand
+    if (rows <= cfg_.vec_rows && demand <= storage_.ring_slots[s]) {
+        return 0;
+    }
+    return l2_batch_launches(demand, batch_capacity(layer));
+}
+
+l2_tier::batch_tables l2_tier::batch_device(int layer) const {
+    batch_tables out;
+    if (batch_dev_ == nullptr || layer < 0 || layer >= geo_.n_layers || geo_.layer_class[layer] < 0) { return out; }
+    out.batch_of = batch_dev_ + (size_t) layer*batch_tab_words();
+    out.lists    = out.batch_of + geo_.n_experts;
+    out.capacity = batch_capacity(layer);
+    return out;
+}
+
+void l2_tier::batch_wait(int layer, int kind, int batch, cudaStream_t stream) {
+    const ggml_cuda_kernel_launch_params launch(dim3(1), dim3(1), 0, stream);
+    ggml_cuda_kernel_launch(l2_batch_wait_kernel, launch, static_cast<l2_mailbox *>(mail_device_) + layer,
+        static_cast<l2_batch_mail *>(batch_mail_device_) + layer, kind, batch);
+}
+
+void l2_tier::batch_done(int layer, int kind, int batch, cudaStream_t stream) {
+    const ggml_cuda_kernel_launch_params launch(dim3(1), dim3(1), 0, stream);
+    ggml_cuda_kernel_launch(l2_batch_done_kernel, launch, static_cast<const l2_mailbox *>(mail_device_) + layer,
+        static_cast<l2_batch_mail *>(batch_mail_device_) + layer, kind, batch);
+}
+
+void l2_tier::publish_and_wait(int layer, const ggml_tensor * ids, cudaStream_t stream, int launches) {
     if (!mailbox_active_ || mail_device_ == nullptr || layer < 0 || layer >= geo_.n_layers ||
             geo_.layer_class[layer] < 0) {
         return;
@@ -1386,7 +1676,20 @@ void l2_tier::publish_and_wait(int layer, const ggml_tensor * ids, cudaStream_t 
         static_cast<l2_mailbox *>(mail_device_) + layer,
         demand_device_ + size_t(layer)*bitmap_words(), serve_device_ + size_t(layer)*bitmap_words(),
         (const int32_t *) ids->data, (int) ids->ne[1], (int) ids->ne[0],
-        (int) (ids->nb[1]/sizeof(int32_t)), geo_.n_experts);
+        (int) (ids->nb[1]/sizeof(int32_t)), geo_.n_experts,
+        static_cast<l2_batch_mail *>(batch_mail_device_) + layer, launches);
+    route_launches_[(size_t) layer] = launches;
+    if (launches > 0) {
+        // The first launch of every kind needs no read; the batches wait for their own reads.
+        staged_layer_[(size_t) layer] = 1;
+        ggml_cuda_kernel_launch(l2_wait_kind_kernel, launch, static_cast<l2_mailbox *>(mail_device_) + layer, 0, 1);
+        const ggml_cuda_kernel_launch_params prep(dim3(1), dim3(256), 0, stream);
+        ggml_cuda_kernel_launch(l2_batch_prep_kernel, prep, static_cast<const l2_mailbox *>(mail_device_) + layer,
+            static_cast<const l2_batch_mail *>(batch_mail_device_) + layer,
+            (const int32_t *) (batch_tab_device_ + (size_t) layer*batch_tab_words()),
+            batch_dev_ + (size_t) layer*batch_tab_words(), geo_.n_experts, (int) batch_tab_words());
+        return;
+    }
     if (staged()) {
         // The worker decides from the same row count. A mismatch would still be safe: every kind
         // wait also passes on the whole generation, and the worker publishes that last either way.
@@ -1400,7 +1703,7 @@ void l2_tier::publish_and_wait(int layer, const ggml_tensor * ids, cudaStream_t 
 }
 
 void l2_tier::wait_kind(int layer, int kind, cudaStream_t stream) {
-    if (!staged() || !mailbox_active_ || mail_device_ == nullptr || layer < 0 || layer >= geo_.n_layers ||
+    if (!kind_waits() || !mailbox_active_ || mail_device_ == nullptr || layer < 0 || layer >= geo_.n_layers ||
             kind <= 0 || kind >= geometry::n_kinds || !staged_layer_[(size_t) layer]) {
         return;
     }
@@ -1413,6 +1716,7 @@ void l2_tier::mark_done(int layer, cudaStream_t stream) {
             geo_.layer_class[layer] < 0) {
         return;
     }
+    route_launches_[(size_t) layer] = 0;
     const ggml_cuda_kernel_launch_params launch(dim3(1), dim3(1), 0, stream);
     ggml_cuda_kernel_launch(l2_done_kernel, launch, static_cast<l2_mailbox *>(mail_device_) + layer);
 }
@@ -1443,10 +1747,15 @@ void l2_tier::collect_wait(int layer) {
 // The later kind waits of a staged layer add up in its mailbox; a generation's share arrives with the
 // next generation of the layer or when the worker stops.
 void l2_tier::collect_stage(int layer) {
-    if (!staged()) { return; }
+    if (!kind_waits()) { return; }
     const uint32_t ticks = expert_os::load_acquire(&static_cast<const l2_mailbox *>(mail_host_)[layer].stage_ticks);
     counters_.staged_wait_ticks += uint32_t(ticks - stage_seen_[(size_t) layer]);
     stage_seen_[(size_t) layer] = ticks;
+    if (batched()) {
+        const uint32_t bt = expert_os::load_acquire(&static_cast<const l2_batch_mail *>(batch_mail_host_)[layer].stage_ticks);
+        counters_.batch_wait_ticks += uint32_t(bt - batch_seen_[(size_t) layer]);
+        batch_seen_[(size_t) layer] = bt;
+    }
 }
 
 void l2_tier::report(const char * what) { report_counters(what); }
@@ -1473,6 +1782,9 @@ void l2_tier::report_counters(const char * what) {
         << ",\"verify_bad\":" << counters_.verify_bad << ",\"owner_checks\":" << counters_.owner_checks
         << ",\"staged_generations\":" << counters_.staged_generations
         << ",\"staged_wait_ms\":" << (steady_khz_ > 0 ? double(counters_.staged_wait_ticks)/steady_khz_ : 0)
+        << ",\"batched_generations\":" << counters_.batched_generations << ",\"batches\":" << counters_.batches
+        << ",\"batch_demoted\":" << counters_.batch_demoted
+        << ",\"batch_wait_ms\":" << (steady_khz_ > 0 ? double(counters_.batch_wait_ticks)/steady_khz_ : 0)
         << ",\"repartitions\":" << counters_.repartitions << ",\"ring_slots\":" << ring_count()
         << ",\"layout\":\"" << (class_layout() ? "class" : "ring") << '"';
     if (std::find(early_layer_.begin(), early_layer_.end(), uint8_t(1)) != early_layer_.end()) {

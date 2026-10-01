@@ -2100,6 +2100,13 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
         return false;
     }
 
+#if defined(GGML_USE_HIP)
+    // a ubatch the expert cache serves in batches runs MMQ
+    if (tensor->op == GGML_OP_MUL_MAT_ID && ggml_cuda_expert_batch_launches(src0, dst->ne[2]).launches > 0) {
+        return false;
+    }
+#endif
+
     return use_mul_mat_vec_q;
 }
 
@@ -2317,7 +2324,13 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         // Release the layer's pins after the last weight-reading kernel on every return path.
         expert_done_guard done_guard{&ctx, src0};
 #endif
-        if (ne2 <= MMVQ_MAX_BATCH_SIZE) {
+#if defined(GGML_USE_HIP)
+        // a ubatch the expert cache serves in batches runs MMQ, which splits into the batch launches
+        const bool expert_batched = ne2 <= MMVQ_MAX_BATCH_SIZE && ggml_cuda_expert_batch_launches(src0, ne2).launches > 0;
+#else
+        const bool expert_batched = false;
+#endif
+        if (ne2 <= MMVQ_MAX_BATCH_SIZE && !expert_batched) {
             if (ggml_is_quantized(src0->type)) {
                 const int mmvq_mmid_max = get_mmvq_mmid_max_batch(src0->type, cc, ggml_cuda_mmid_host_weights(src0));
                 if (ne2 <= mmvq_mmid_max) {

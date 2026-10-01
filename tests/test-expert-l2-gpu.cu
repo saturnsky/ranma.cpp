@@ -24,6 +24,16 @@ using namespace ggml_cuda_expert;
 
 #define CHECK(x) do { if (!(x)) { fprintf(stderr, "FAIL line %d: %s\n", __LINE__, #x); return 1; } } while (0)
 
+// A batch mailbox for the publish kernels the fixtures launch by hand (no batch launches).
+static l2_batch_mail * test_batch_mail() {
+    static l2_batch_mail * device = nullptr;
+    if (device == nullptr) {
+        void * host = nullptr;
+        if (!coherent_alloc(&host, (void **) &device, sizeof(l2_batch_mail))) { abort(); }
+    }
+    return device;
+}
+
 static __global__ void readback(const uint64_t * table, int expert, char * out, size_t n) {
     const char * src = (const char *) (uintptr_t) table[expert];
     for (size_t i = blockIdx.x*blockDim.x + threadIdx.x; i < n; i += blockDim.x*gridDim.x) { out[i] = src[i]; }
@@ -56,7 +66,7 @@ static int bitmap_test() {
             }
         }
         CUDA_CHECK(hipMemcpy(ids, input.data(), input.size()*sizeof(int32_t), hipMemcpyHostToDevice));
-        l2_publish_kernel<<<1, 128, words*sizeof(uint32_t)>>>(device, device_bits, device_serve, ids, rows, used, stride, experts);
+        l2_publish_kernel<<<1, 128, words*sizeof(uint32_t)>>>(device, device_bits, device_serve, ids, rows, used, stride, experts, test_batch_mail(), 0);
         CUDA_CHECK(hipDeviceSynchronize());
         CHECK(host->published == uint32_t(pattern + 1));
         CHECK(bool(host->invalid) == (pattern == 3));
@@ -87,18 +97,18 @@ static int serve_test() {
     const int routed = input[0], absent = experts - 1;   // rows*used = 32 < absent
     CUDA_CHECK(hipMemcpy(ids, input.data(), input.size()*sizeof(int32_t), hipMemcpyHostToDevice));
 
-    l2_publish_kernel<<<1, 128, words*sizeof(uint32_t)>>>(device, device_bits, device_serve, ids, rows, used, stride, experts);
+    l2_publish_kernel<<<1, 128, words*sizeof(uint32_t)>>>(device, device_bits, device_serve, ids, rows, used, stride, experts, test_batch_mail(), 0);
     CUDA_CHECK(hipDeviceSynchronize());
     CHECK(host->published == 1 && host->need == 0 && host->ready == host->generation);
 
     serve[routed/32] |= 1u << (routed%32);
-    l2_publish_kernel<<<1, 128, words*sizeof(uint32_t)>>>(device, device_bits, device_serve, ids, rows, used, stride, experts);
+    l2_publish_kernel<<<1, 128, words*sizeof(uint32_t)>>>(device, device_bits, device_serve, ids, rows, used, stride, experts, test_batch_mail(), 0);
     CUDA_CHECK(hipDeviceSynchronize());
     CHECK(host->published == 2 && host->need == 1 && host->ready == 0);
 
     serve[routed/32] &= ~(1u << (routed%32));
     serve[absent/32] |= 1u << (absent%32);
-    l2_publish_kernel<<<1, 128, words*sizeof(uint32_t)>>>(device, device_bits, device_serve, ids, rows, used, stride, experts);
+    l2_publish_kernel<<<1, 128, words*sizeof(uint32_t)>>>(device, device_bits, device_serve, ids, rows, used, stride, experts, test_batch_mail(), 0);
     CUDA_CHECK(hipDeviceSynchronize());
     CHECK(host->published == 3 && host->need == 0 && host->ready == host->generation);
 
@@ -1121,6 +1131,215 @@ static int host_chunk_cost_test() {
     return 0;
 }
 
+// ---- batched service end to end: worker, file reads, batch launches of MMQ_ID --------------------------
+//
+// A class-layout tier over a file of Q8_0 experts, a third of them host residents. Each prompt ubatch
+// runs through publish_and_wait, the kind waits, the first launch over the experts that need no read
+// and the batch launches with their waits and done reports, with the worker reading the batches. The
+// output must be bit-identical to one MMQ_ID launch over a contiguous copy of all experts. Ring sizes
+// from the smallest (two slots, batches of one) to one that needs a single batch; with RANMA's
+// verification on, every read and the address table are checked after each service.
+
+static void batch_mmq_launch(hipStream_t stream, const char * x, const int * y, const int32_t * ids_dst, const int32_t * bounds,
+        float * dst, const char * x_cache, const int32_t * slots, const uint64_t * addresses, const int32_t * map, int key,
+        int channels, int K, int M, int cols, int tokens, size_t channel_bytes) {
+    constexpr int J = 16;
+    const int cc = GGML_CUDA_CC_OFFSET_AMD + 0x1201;
+    const auto config = ggml_cuda_mmq_get_config(GGML_TYPE_Q8_0, J, false, cc);
+    const int ntx = (tokens + J - 1)/J, nty = (M + config.I - 1)/config.I;
+    const dim3 grid(nty, ntx, channels), block(32, config.nthreads/32, 1);
+    const auto one = init_fastdiv_values(1);
+    mul_mat_q<GGML_TYPE_Q8_0, J, false><<<grid, block, mmq_get_nbytes_shared(config, cc), stream>>>(
+        x, y, ids_dst, bounds, dst, nullptr, nullptr, x_cache, slots, slots, addresses, map, key,
+        init_fastdiv_values(K/32), M, cols, K/32, cols, M, one, init_fastdiv_values(channels), (int64_t) channel_bytes, 0, 0,
+        one, one, 0, 0, 0, init_fastdiv_values(ntx));
+    CUDA_CHECK(hipGetLastError());
+}
+
+static int batched_service_test(const std::filesystem::path & dir) {
+    constexpr int K = 512, M = 256, experts = 24, used = 4, tokens = 32, layers = 2, J = 16;
+    constexpr size_t block = 34, slice = size_t(K/32)*block*M, shift = 4064;
+    static_assert(slice % 4096 == 0, "a slice must be whole sectors");
+    const int cc = GGML_CUDA_CC_OFFSET_AMD + 0x1201;
+    if (ggml_cuda_mmq_get_stream_k(GGML_TYPE_Q8_0, J, false, cc)) { printf("SKIP: batched service test needs a tiling MMQ config\n"); return 0; }
+    // the file: layer, kind, expert; Q8_0 blocks with a small scale and random quants
+    std::vector<char> file(shift + size_t(layers*3*experts)*slice);
+    uint32_t rng = 77;
+    auto next = [&]() { rng = rng*1664525u + 1013904223u; return rng; };
+    for (size_t b = 0; b < (file.size() - shift)/block; ++b) {
+        char * p = file.data() + shift + b*block;
+        const uint16_t d = 0x2000 + uint16_t(next() % 64);   // about 0.008
+        memcpy(p, &d, 2);
+        for (size_t i = 2; i < block; ++i) { p[i] = char(next() % 31) - 15; }
+    }
+    const auto path = dir / "batch-weights.bin";
+    { std::ofstream out(path, std::ios::binary); out.write(file.data(), (std::streamsize) file.size()); CHECK(bool(out)); }
+    auto file_slice = [&](int l, int k, int e) { return file.data() + shift + (size_t((l*3 + k)*experts + e))*slice; };
+
+    ggml_tensor weights = {};
+    weights.type = GGML_TYPE_Q8_0; weights.ne[0] = K; weights.ne[1] = M; weights.ne[2] = experts; weights.ne[3] = 1;
+    geometry geo;
+    geo.n_layers = layers; geo.n_experts = experts;
+    geo.layer_class = {0, 0}; geo.class_layers = {layers};
+    geo.class_bytes = {{slice, slice, slice}};
+    geo.tensors = {{{&weights, &weights, &weights}}, {{&weights, &weights, &weights}}};
+
+    // y (activations in the MMQ layout, finite scales), ids, and the MUL_MAT_ID bookkeeping on the host
+    const int cols = tokens*used;
+    const size_t y_bytes = (size_t(cols)*(K/128) + J)*sizeof(block_q8_1_mmq);
+    std::vector<char> y_host(y_bytes);
+    for (size_t b = 0; b < y_bytes/sizeof(block_q8_1_mmq); ++b) {
+        char * p = y_host.data() + b*sizeof(block_q8_1_mmq);
+        for (int w = 0; w < 4; ++w) { const uint32_t v = 0x3C003C00u; memcpy(p + 4*w, &v, 4); }
+        for (int i = 16; i < (int) sizeof(block_q8_1_mmq); ++i) { p[i] = char(next() % 21) - 10; }
+    }
+    int * y = nullptr; float * dst = nullptr, * ref = nullptr; int32_t * dev_ids = nullptr, * ids_dst = nullptr, * bounds = nullptr;
+    int32_t * no_slots = nullptr; char * dummy = nullptr, * contiguous = nullptr;
+    CUDA_CHECK(hipMalloc(&y, y_bytes)); CUDA_CHECK(hipMemcpy(y, y_host.data(), y_bytes, hipMemcpyHostToDevice));
+    CUDA_CHECK(hipMalloc(&dst, size_t(M)*cols*sizeof(float))); CUDA_CHECK(hipMalloc(&ref, size_t(M)*cols*sizeof(float)));
+    CUDA_CHECK(hipMalloc(&dev_ids, size_t(cols)*sizeof(int32_t)));
+    CUDA_CHECK(hipMalloc(&ids_dst, size_t(cols)*sizeof(int32_t))); CUDA_CHECK(hipMalloc(&bounds, (experts + 1)*sizeof(int32_t)));
+    CUDA_CHECK(hipMalloc(&no_slots, experts*sizeof(int32_t))); CUDA_CHECK(hipMemset(no_slots, 0xff, experts*sizeof(int32_t)));
+    CUDA_CHECK(hipMalloc(&dummy, 4096));
+    CUDA_CHECK(hipMalloc(&contiguous, size_t(layers*3*experts)*slice));
+    CUDA_CHECK(hipMemcpy(contiguous, file.data() + shift, size_t(layers*3*experts)*slice, hipMemcpyHostToDevice));
+    hipStream_t stream; CUDA_CHECK(hipStreamCreate(&stream));
+
+    int total_batches = 0;
+    for (const int ring : {2, 3, 5, 9, 40}) {
+        for (const l2_prompt_fill fill : {l2_prompt_fill::lru, l2_prompt_fill::scan, l2_prompt_fill::mru}) {
+            l2_config cfg;
+            cfg.class_layout = true; cfg.batched = true; cfg.verify = true; cfg.log_mask = GGML_EXPERT_LOG_L2;
+            cfg.experts_used = used; cfg.prefill_rows = tokens; cfg.decode_rows = 1; cfg.staged_min_rows = 2;
+            cfg.prompt_fill = fill;
+            l2_tier tier(geo, cfg);
+            // residents: every third expert of each layer
+            expert_slot_table host(layers, std::vector<int32_t>(experts, -1));
+            int residents = 0;
+            for (int l = 0; l < layers; ++l) for (int e = 0; e < experts; e += 3) { host[l][e] = residents++; }
+            std::vector<std::array<size_t, 3>> tails(1);
+            for (int k = 0; k < 3; ++k) { tails[0][k] = arena_tail_bytes(geo, 0, k); }
+            class_storage st = plan_storage_classes(geo, tails, expert_os::io_alignment, 0, false);
+            CHECK(st.place({residents}, {ring}));
+            st.floor = {2};
+            tier.set_storage(st);
+            CHECK(tier.sized());
+            CHECK(tier.allocate(0));
+            l2_host_geometry host_geo;
+            host_geo.device_base.resize(1); host_geo.host_base.resize(1);
+            std::vector<void *> arenas;
+            for (int k = 0; k < 3; ++k) {
+                void * h = nullptr; void * d = nullptr;
+                const size_t bytes = size_t(st.slots(0))*st.pitch[0][k] + st.tail[0][k];
+                CUDA_CHECK(hipHostMalloc(&h, bytes, hipHostMallocMapped | hipHostMallocCoherent));
+                memset(h, 0, bytes);
+                CUDA_CHECK(hipHostGetDevicePointer(&d, h, 0));
+                host_geo.host_base[0][k] = h; host_geo.device_base[0][k] = d;
+                arenas.push_back(h);
+            }
+            const std::string filename = path.string();
+            for (int l = 0; l < layers; ++l) for (int k = 0; k < 3; ++k) {
+                tier.set_backing(l, k, 0, filename.c_str(), shift + uint64_t((l*3 + k)*experts)*slice);
+            }
+            std::string reason;
+            CHECK(tier.open_files(reason));
+            CHECK(tier.map());
+            const std::vector<std::vector<int32_t>> vram(layers, std::vector<int32_t>(experts, -1));
+            const expert_locations homes = host_locations(host);
+            // the residents' bytes: written as the loader would, at slot + shift, tail cleared
+            tier.set_homes(vram, homes, host_geo);
+            for (int l = 0; l < layers; ++l) for (int e = 0; e < experts; ++e) {
+                if (host[l][e] < 0) { continue; }
+                for (int k = 0; k < 3; ++k) {
+                    memcpy(tier.location_address(l, k, homes[l][e]), file_slice(l, k, e), slice);
+                    tier.finish_write(l, k, homes[l][e]);
+                }
+            }
+            tier.refresh_addresses();
+            tier.start_worker();
+            for (int ub = 0; ub < 6; ++ub) {
+                const int layer = ub % layers;
+                // routing: `used` distinct experts per token, more of them as the ubatches go on
+                std::vector<int32_t> ids(cols);
+                const int spread = ub < 2 ? 6 : experts;
+                for (int t = 0; t < tokens; ++t) {
+                    for (int u = 0; u < used; ++u) {
+                        int e;
+                        bool again;
+                        do {
+                            e = int(next() % uint32_t(spread));
+                            again = false;
+                            for (int v = 0; v < u; ++v) { again = again || ids[t*used + v] == e; }
+                        } while (again);
+                        ids[t*used + u] = e;
+                    }
+                }
+                std::vector<int32_t> order, start(experts + 1, 0);
+                for (int e = 0; e < experts; ++e) {
+                    start[e] = (int) order.size();
+                    for (int c = 0; c < cols; ++c) { if (ids[c] == e) { order.push_back(c); } }
+                }
+                start[experts] = (int) order.size();
+                CUDA_CHECK(hipMemcpy(dev_ids, ids.data(), cols*sizeof(int32_t), hipMemcpyHostToDevice));
+                CUDA_CHECK(hipMemcpy(ids_dst, order.data(), cols*sizeof(int32_t), hipMemcpyHostToDevice));
+                CUDA_CHECK(hipMemcpy(bounds, start.data(), (experts + 1)*sizeof(int32_t), hipMemcpyHostToDevice));
+                ggml_tensor tids = {}; tids.type = GGML_TYPE_I32; tids.data = dev_ids;
+                tids.ne[0] = used; tids.ne[1] = tokens; tids.ne[2] = tids.ne[3] = 1;
+                tids.nb[0] = 4; tids.nb[1] = 4*used;
+                const int launches = tier.batch_launches(layer, tokens, true);
+                CHECK(launches == l2_batch_launches(std::min(experts, used*tokens), std::min(experts, l2_batch_capacity(ring))));
+                tier.publish_and_wait(layer, &tids, stream, launches);
+                const l2_tier::batch_tables tables = tier.batch_device(layer);
+                CHECK(tables.batch_of != nullptr && tables.capacity == std::min(experts, l2_batch_capacity(ring)));
+                for (int k = 0; k < 3; ++k) {
+                    tier.wait_kind(layer, k, stream);
+                    CUDA_CHECK(hipMemsetAsync(dst, 0xff, size_t(M)*cols*sizeof(float), stream));
+                    batch_mmq_launch(stream, dummy, y, ids_dst, bounds, dst, dummy, no_slots, tier.addresses(layer, k),
+                        tables.batch_of, 0, experts, K, M, cols, tokens, slice);
+                    for (int b = 1; b <= launches; ++b) {
+                        tier.batch_wait(layer, k, b, stream);
+                        batch_mmq_launch(stream, dummy, y, ids_dst, bounds, dst, dummy, no_slots, tier.addresses(layer, k),
+                            tables.lists + size_t(b - 1)*tables.capacity, -1, tables.capacity, K, M, cols, tokens, slice);
+                        tier.batch_done(layer, k, b, stream);
+                    }
+                    // the reference: one launch over a contiguous copy of every expert
+                    batch_mmq_launch(stream, contiguous + size_t((layer*3 + k)*experts)*slice, y, ids_dst, bounds, ref, nullptr,
+                        nullptr, nullptr, nullptr, 0, experts, K, M, cols, tokens, slice);
+                    std::vector<float> a(size_t(M)*cols), r(size_t(M)*cols);
+                    CUDA_CHECK(hipMemcpyAsync(a.data(), dst, a.size()*sizeof(float), hipMemcpyDeviceToHost, stream));
+                    CUDA_CHECK(hipMemcpyAsync(r.data(), ref, r.size()*sizeof(float), hipMemcpyDeviceToHost, stream));
+                    CUDA_CHECK(hipStreamSynchronize(stream));
+                    bool nonzero = false;
+                    for (size_t i = 0; i < a.size(); ++i) { CHECK(std::isfinite(r[i])); nonzero = nonzero || r[i] != 0.0f; }
+                    CHECK(nonzero);
+                    if (memcmp(a.data(), r.data(), a.size()*sizeof(float)) != 0) {
+                        fprintf(stderr, "ring %d ub %d kind %d: the batched launches differ from the single launch\n", ring, ub, k);
+                        return 1;
+                    }
+                }
+                tier.mark_done(layer, stream);
+                CUDA_CHECK(hipStreamSynchronize(stream));
+            }
+            tier.stop_worker();
+            const l2_counters c = tier.counters();
+            CHECK(c.verify_bad == 0 && c.batched_generations > 0 && c.batches >= c.batched_generations);
+            CHECK(c.ssd_reads > 0 && c.ssd_reads % 3 == 0);
+            total_batches += (int) c.batches;
+            printf("PASS: batched service, ring %d, prompt fill %s: %llu generations in %llu batches, %llu reads, %llu ring hits, "
+                   "%llu demoted, bit-identical to one launch\n", ring, l2_prompt_fill_name(fill),
+                (unsigned long long) c.batched_generations, (unsigned long long) c.batches, (unsigned long long) c.ssd_reads,
+                (unsigned long long) c.ring_hits, (unsigned long long) c.batch_demoted);
+            for (void * h : arenas) { CUDA_CHECK(hipHostFree(h)); }
+        }
+    }
+    CHECK(total_batches > 0);
+    CUDA_CHECK(hipStreamDestroy(stream));
+    CUDA_CHECK(hipFree(contiguous)); CUDA_CHECK(hipFree(dummy)); CUDA_CHECK(hipFree(no_slots));
+    CUDA_CHECK(hipFree(bounds)); CUDA_CHECK(hipFree(ids_dst)); CUDA_CHECK(hipFree(dev_ids));
+    CUDA_CHECK(hipFree(ref)); CUDA_CHECK(hipFree(dst)); CUDA_CHECK(hipFree(y));
+    return 0;
+}
+
 int main(int argc, char ** argv) {
     if (argc != 2) { return 2; }
     setvbuf(stdout, nullptr, _IONBF, 0);
@@ -1138,6 +1357,7 @@ int main(int argc, char ** argv) {
     CHECK(host_redraw_test() == 0);
     CHECK(host_chunk_cost_test() == 0);
     CHECK(early_ssd_test(argv[1]) == 0);
+    CHECK(batched_service_test(argv[1]) == 0);
     constexpr int K = 640, M = 2560, N = 14, J = 16, experts = 17, selected = 4;
     constexpr size_t slice = size_t(K/32)*24*M, shift = 4064, tail = 288;
     const auto path = std::filesystem::path(argv[1]) / "ring-weights.bin";

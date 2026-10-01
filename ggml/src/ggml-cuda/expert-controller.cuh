@@ -36,6 +36,22 @@ void ggml_cuda_expert_layer_done(ggml_backend_cuda_context & ctx, const ggml_ten
 // with enough rows to be staged.
 void ggml_cuda_expert_before_read(ggml_backend_cuda_context & ctx, const ggml_tensor * src0);
 
+// Batched SSD tier service (expert-l2-batch.h): the batch launches per kind of the MUL_MAT_ID that
+// reads `src0` for a ubatch of `rows` rows, 0 for one launch as without batching, and the device tables
+// the launches read: `batch_of` [expert] the launch of each expert (0 = the first), `lists`
+// [batch - 1][capacity] the experts of each batch launch, -1 when empty. A ubatch with batch launches
+// runs MMQ whatever its row count.
+struct ggml_cuda_expert_batches {
+    int launches = 0;
+    int capacity = 0;
+    const int32_t * batch_of = nullptr;
+    const int32_t * lists = nullptr;
+};
+ggml_cuda_expert_batches ggml_cuda_expert_batch_launches(const ggml_tensor * src0, int64_t rows);
+// Before batch launch `batch` (1-based) of `src0`: waits for its reads. After it: reports it done.
+void ggml_cuda_expert_batch_wait(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, int batch);
+void ggml_cuda_expert_batch_done(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, int batch);
+
 // True for the buffer type that exclusive mode allocates the routed expert weights on. Its tensors
 // carry logical addresses only: their bytes live in the VRAM arena or in the host arena, so every
 // kernel that reads them must resolve them through ggml_cuda_expert_lookup_tensor.

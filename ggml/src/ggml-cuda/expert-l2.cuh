@@ -6,6 +6,7 @@
 
 #include "common.cuh"
 #include "expert-geometry.h"
+#include "expert-l2-batch.h"
 #include "expert-l2-class-ledger.h"
 #include "expert-l2-ledger.h"
 #include "expert-l2-relabel.h"
@@ -55,12 +56,26 @@ struct l2_config {
     // Early reads (RANMA_EXPERT_HASH_EARLY ssd|both): the demand of a layer whose route is known before
     // its generation (post_early) is read into the ring by the worker as soon as it is posted.
     bool    early             = false;
+    // Batched service (expert-l2-batch.h, class layout): a prompt ubatch multiplies the experts that
+    // need no read first and the file residents in batches through half the class ring each, so the
+    // rings no longer have to hold the most one ubatch can demand. False is the prompt floor ring.
+    bool    batched           = false;
+    // The most rows a ubatch multiplies with the vector kernels; above it MMQ runs. A batched ubatch
+    // of fewer rows runs MMQ as well when its demand can exceed the ring.
+    int64_t vec_rows          = 8;
+    // Where the fills and hits of a prompt ubatch go in the ring's least recently used list.
+    l2_prompt_fill prompt_fill = l2_prompt_fill::mru;
 };
 
 // Whether the staged service is on when RANMA_EXPERT_L2_STAGED is not set. On, it covers the
 // ubatches with more rows than the decode bound, i.e. prompt processing; generation keeps the
 // single wait. It reads the same bytes into the same slots and runs the same kernels.
 static constexpr bool l2_staged_default = true;
+
+// Whether the batched service is on when RANMA_EXPERT_L2_BATCHED is not set, and where it puts the
+// fills and hits of a prompt ubatch when RANMA_EXPERT_L2_PROMPT_FILL is not set.
+static constexpr bool l2_batched_default = true;
+static constexpr l2_prompt_fill l2_prompt_fill_default = l2_prompt_fill::lru;
 
 // What the tier reports every so often under GGML_EXPERT_LOG_L2.
 struct l2_counters {
@@ -89,6 +104,9 @@ struct l2_counters {
     uint64_t early_jobs = 0, early_layers = 0, early_late = 0, early_reads = 0, early_bytes = 0;
     uint64_t early_already = 0, early_hits = 0, early_unused = 0, early_lost = 0, early_inline = 0;
     uint64_t early_layer_wait_ticks = 0, early_layer_samples = 0;
+    // Batched service: generations served in batches, their batches, ring hits read again to make
+    // room for two buffers, and the wall ticks the batch launches waited for their reads.
+    uint64_t batched_generations = 0, batches = 0, batch_demoted = 0, batch_wait_ticks = 0;
 };
 
 // One posted early demand: per layer the hinted expert ids and the layer's published counter when
@@ -207,10 +225,31 @@ public:
 
     // ---- the hot path ------------------------------------------------------------------------------
     const uint64_t * addresses(int layer, int kind) const;
-    void publish_and_wait(int layer, const ggml_tensor * ids, cudaStream_t stream);
+    // The batch launches per kind of a ubatch of `rows` rows of `layer` (0 = one launch, as without
+    // batching). `mmq` says whether every kind of the layer runs MMQ at that row count; a ubatch that
+    // cannot run MMQ is never batched. The same for the route and for every MUL_MAT_ID of the layer.
+    int  batch_launches(int layer, int64_t rows, bool mmq) const;
+    bool batched() const { return cfg_.batched && class_layout(); }
+    // `launches`: batch_launches of this ubatch. Publishes the demand and orders the first launch of
+    // the first kind after what it needs; with batch launches, also the batch tables of the layer.
+    void publish_and_wait(int layer, const ggml_tensor * ids, cudaStream_t stream, int launches = 0);
+    // Batch launches of `layer`: the device tables the MMQ launches read (expert -> batch, and
+    // [batch][position] -> expert, -1 when empty) and the stride of the second.
+    struct batch_tables { const int32_t * batch_of = nullptr; const int32_t * lists = nullptr; int capacity = 0; };
+    batch_tables batch_device(int layer) const;
+    // The batch launches the last route of `layer` published (0 after the layer is done): what the
+    // MUL_MAT_IDs of the layer must launch, since the worker serves the generation by it.
+    int  routed_launches(int layer) const {
+        return layer >= 0 && (size_t) layer < route_launches_.size() ? route_launches_[(size_t) layer] : 0;
+    }
+    // Orders batch launch `batch` (1-based) of `kind` after that batch's reads, and reports it done.
+    void batch_wait(int layer, int kind, int batch, cudaStream_t stream);
+    void batch_done(int layer, int kind, int batch, cudaStream_t stream);
     // Staged service only: orders the kernel that reads `kind` of `layer` after that kind's reads.
     // A no-op for the first kind, which the route waits for, and for a layer routed unstaged.
     bool staged() const { return cfg_.staged_min_rows > 0; }
+    // Whether the MUL_MAT_IDs of a layer may wait for their own kind (staged or batched service).
+    bool kind_waits() const { return staged() || batched(); }
     void wait_kind(int layer, int kind, cudaStream_t stream);
     void mark_done(int layer, cudaStream_t stream);
 
@@ -278,6 +317,9 @@ private:
     bool   verify_slice(int layer, int kind, int expert, const void * data, std::string & reason);
     bool   read_raw(int layer, int kind, int expert, void * dst, std::string & reason);
     void   service_layer(int layer, uint32_t seq, const std::vector<int> & ids);
+    // The batched service of one generation with `launches` batch launches per kind.
+    void   serve_batched(int layer, uint32_t seq, const std::vector<int> & ids, int launches);
+    int    batch_capacity(int layer) const;
     void   serve_staged(int layer, uint32_t seq, const std::vector<l2_read> & reads);
     // `progress(n)` runs once the first n reads are in place (checked, tails cleared) while the
     // rest are still in flight.
@@ -332,6 +374,13 @@ private:
     uint32_t * demand_device_ = nullptr;
     uint32_t * serve_host_  = nullptr;   // same layout, written by the CPU when a plan changes
     uint32_t * serve_device_ = nullptr;
+    // batched service
+    void *    batch_mail_host_ = nullptr;     // l2_batch_mail[n_layers]
+    void *    batch_mail_device_ = nullptr;
+    int32_t * batch_tab_host_  = nullptr;     // [layer][3*n_experts]: batch of each expert, then the lists
+    int32_t * batch_tab_device_ = nullptr;
+    int32_t * batch_dev_       = nullptr;     // device copy the MMQ launches read, same layout
+    size_t batch_tab_words() const { return 3*(size_t) geo_.n_experts; }
 
     std::vector<std::string>          paths_;
     std::vector<expert_os::file_handle> files_;
@@ -367,7 +416,9 @@ private:
     std::vector<sample> pending_, samples_;
     std::vector<uint32_t> wait_seen_;
     std::vector<uint8_t>  staged_layer_;   // compute thread: the last route of the layer was staged
+    std::vector<int>      route_launches_; // compute thread: the batch launches of the layer's last route
     std::vector<uint32_t> stage_seen_;     // worker: the stage wait ticks of each layer already counted
+    std::vector<uint32_t> batch_seen_;     // worker: the batch wait ticks of each layer already counted
     std::vector<uint32_t> seen_;           // worker: the last published generation handled per layer
     // early reads
     std::vector<uint8_t> early_layer_;     // [layer] declared early layer

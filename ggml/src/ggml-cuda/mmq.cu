@@ -362,6 +362,30 @@ void ggml_cuda_mul_mat_q(
         ne03, ne13, s03, s13, s3,
         ne12, ncols_opt};
 
+#if defined(GGML_USE_HIP)
+    // expert cache, batched SSD tier service: the experts that need no read first, then each batch of
+    // file residents once its reads are in place. Every expert runs in exactly one launch, on the
+    // tiles of the single launch.
+    const ggml_cuda_expert_batches batches = x_host_addresses != nullptr ?
+        ggml_cuda_expert_batch_launches(src0, ne12) : ggml_cuda_expert_batches();
+    if (batches.launches > 0) {
+        mmq_args first = args;
+        first.expert_of = batches.batch_of;
+        ggml_cuda_mul_mat_q_switch_type(ctx, first, stream, prec_src1);
+        for (int b = 1; b <= batches.launches; ++b) {
+            ggml_cuda_expert_batch_wait(ctx, src0, b);
+            mmq_args batch = args;
+            batch.expert_of     = batches.batch_of;
+            batch.expert_batch  = b;
+            batch.expert_list   = batches.lists + (size_t) (b - 1)*(size_t) batches.capacity;
+            batch.expert_list_n = batches.capacity;
+            ggml_cuda_mul_mat_q_switch_type(ctx, batch, stream, prec_src1);
+            ggml_cuda_expert_batch_done(ctx, src0, b);
+        }
+        return;
+    }
+#endif
+
     ggml_cuda_mul_mat_q_switch_type(ctx, args, stream, prec_src1);
 }
 

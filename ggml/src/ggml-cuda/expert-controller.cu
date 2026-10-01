@@ -13,6 +13,10 @@
 #include "expert-redraw.h"
 #include "expert-profile-store.h"
 #include "expert-storage.h"
+#include "mmvq.cuh"
+
+// mmq.cuh: whether MMQ runs a type at a row count (the batched SSD tier service needs MMQ).
+bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts);
 
 #include "ggml-alloc.h"
 #include "ggml-backend-impl.h"
@@ -221,6 +225,20 @@ static l2_config l2_debug_config(const ggml_expert_config & cfg, bool verify_all
         } else {
             out.ring_factor = value;
             GGML_LOG_INFO("expert cache: RANMA_EXPERT_L2_RING_FACTOR sets %g\n", value);
+        }
+    }
+    // Batched service: 1 (default) serves prompt ubatches in batches; 0 the unbatched service.
+    out.batched = number("RANMA_EXPERT_L2_BATCHED", l2_batched_default ? 1 : 0, 0, 1) != 0;
+    out.vec_rows = MMVQ_MAX_BATCH_SIZE;
+    out.prompt_fill = out.batched ? l2_prompt_fill_default : l2_prompt_fill::mru;
+    if (const char * text = getenv("RANMA_EXPERT_L2_PROMPT_FILL"); text != nullptr && *text != '\0') {
+        const std::string value = text;
+        if (value == "mru") { out.prompt_fill = l2_prompt_fill::mru; }
+        else if (value == "lru") { out.prompt_fill = l2_prompt_fill::lru; }
+        else if (value == "scan") { out.prompt_fill = l2_prompt_fill::scan; }
+        else { GGML_LOG_WARN("expert cache: ignoring invalid RANMA_EXPERT_L2_PROMPT_FILL='%s' (mru, lru or scan)\n", text); }
+        if (value == "mru" || value == "lru" || value == "scan") {
+            GGML_LOG_INFO("expert cache: RANMA_EXPERT_L2_PROMPT_FILL sets %s\n", text);
         }
     }
     return out;
@@ -1247,15 +1265,59 @@ public:
         return tier_->wanted(layer, expert);
     }
 
+    // Whether every kind of a layer runs MMQ for a ubatch of `rows` rows (the batched service needs it).
+    bool layer_mmq(int layer, int64_t rows) const {
+        const int cc = ggml_cuda_info().devices[device_].cc;
+        for (int kind = 0; kind < geometry::n_kinds; ++kind) {
+            const ggml_tensor * t = geo_.tensors[layer][kind];
+            if (t == nullptr || !ggml_is_quantized(t->type) || !ggml_cuda_should_use_mmq(t->type, cc, rows, geo_.n_experts)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    int tier_launches(int layer, int64_t rows) const {
+        if (!tier_ || !tier_->batched() || state_ != state_t::installed || layer < 0 || layer >= geo_.n_layers) { return 0; }
+        return tier_->batch_launches(layer, rows, rows > int64_t(cfg_.l2_decode_rows) && layer_mmq(layer, rows));
+    }
+
     void tier_route(ggml_backend_cuda_context & ctx, int layer, const ggml_tensor * ids) {
         if (tier_ && state_ == state_t::installed && ctx.device == device_) {
-            tier_->publish_and_wait(layer, ids, ctx.stream());
+            tier_->publish_and_wait(layer, ids, ctx.stream(), tier_launches(layer, ids->ne[1]));
         }
     }
 
-    // Staged service: the kernel about to read `src0` waits for that kind's slices only.
+    ggml_cuda_expert_batches tier_batches(const ggml_tensor * src0, int64_t rows) const {
+        ggml_cuda_expert_batches out;
+        int layer = -1, kind = -1;
+        if (!tier_ || !tier_->batched() || state_ != state_t::installed || src0 == nullptr || !resolve(src0, layer, kind)) {
+            return out;
+        }
+        // what the layer's route published: the worker serves the generation by it
+        out.launches = tier_->routed_launches(layer);
+        GGML_ASSERT(out.launches == 0 || out.launches == tier_launches(layer, rows));
+        if (out.launches > 0) {
+            const l2_tier::batch_tables tables = tier_->batch_device(layer);
+            out.batch_of = tables.batch_of;
+            out.lists    = tables.lists;
+            out.capacity = tables.capacity;
+            if (out.batch_of == nullptr) { out = ggml_cuda_expert_batches(); }
+        }
+        return out;
+    }
+
+    void tier_batch_wait(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, int batch, bool done) {
+        int layer = -1, kind = -1;
+        if (!tier_ || state_ != state_t::installed || src0 == nullptr || ctx.device != device_ || !resolve(src0, layer, kind)) {
+            return;
+        }
+        if (done) { tier_->batch_done(layer, kind, batch, ctx.stream()); } else { tier_->batch_wait(layer, kind, batch, ctx.stream()); }
+    }
+
+    // Staged or batched service: the kernel about to read `src0` waits for that kind's slices only.
     void tier_before_read(ggml_backend_cuda_context & ctx, const ggml_tensor * src0) {
-        if (!tier_ || !tier_->staged() || !tier_->any_ssd() || state_ != state_t::installed || src0 == nullptr ||
+        if (!tier_ || !tier_->kind_waits() || !tier_->any_ssd() || state_ != state_t::installed || src0 == nullptr ||
                 ctx.device != device_) {
             return;
         }
@@ -3736,6 +3798,18 @@ void ggml_cuda_expert_layer_done(ggml_backend_cuda_context & ctx, const ggml_ten
 
 void ggml_cuda_expert_before_read(ggml_backend_cuda_context & ctx, const ggml_tensor * src0) {
     instance().before_read(ctx, src0);
+}
+
+ggml_cuda_expert_batches ggml_cuda_expert_batch_launches(const ggml_tensor * src0, int64_t rows) {
+    return instance().tier_batches(src0, rows);
+}
+
+void ggml_cuda_expert_batch_wait(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, int batch) {
+    instance().tier_batch_wait(ctx, src0, batch, false);
+}
+
+void ggml_cuda_expert_batch_done(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, int batch) {
+    instance().tier_batch_wait(ctx, src0, batch, true);
 }
 
 bool ggml_cuda_expert_is_exclusive_buffer_type(ggml_backend_buffer_type_t buft) {

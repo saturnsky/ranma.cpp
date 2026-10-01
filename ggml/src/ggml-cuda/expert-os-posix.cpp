@@ -35,6 +35,7 @@ void aligned_free(void * p) { free(p); }
 uint32_t load_acquire(const uint32_t * p) { return __atomic_load_n(p, __ATOMIC_ACQUIRE); }
 uint64_t load_acquire(const uint64_t * p) { return __atomic_load_n(p, __ATOMIC_ACQUIRE); }
 void store_release(uint32_t * p, uint32_t value) { __atomic_store_n(p, value, __ATOMIC_RELEASE); }
+void store_release(uint64_t * p, uint64_t value) { __atomic_store_n(p, value, __ATOMIC_RELEASE); }
 uint64_t total_physical_bytes() {
 #if defined(_SC_PHYS_PAGES) && defined(_SC_PAGESIZE)
     const long pages = sysconf(_SC_PHYS_PAGES);
