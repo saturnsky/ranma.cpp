@@ -30,6 +30,13 @@ warning and ignore it.
 
 The user-facing description of both options is in [docs/speculative.md](../speculative.md).
 
+For `draft-mtp` in llama-server the default is not these thresholds but `--spec-smart`
+([spec-smart.md](spec-smart.md)), which chooses the draft length from measured costs and needs no per-model values.
+Giving `--spec-draft-p-min` or `--spec-draft-p-continue` (on the command line or in the environment, any value)
+turns it off with a warning at startup, and then the thresholds below apply as before; `--no-spec-smart` turns it off
+without a warning (and without thresholds: `p_min` 0, `--spec-draft-n-max` default 3). With `--spec-smart`,
+`--spec-draft-n-max` is only the upper bound of the draft length (7 when it is not given).
+
 ## Why it exists
 
 Dropping a draft token and stopping the draft save two different things. A dropped token saves one
@@ -67,7 +74,8 @@ like this:
 
 These values were tuned for one target model, one draft head and one GPU. On other hardware the
 verification cost curve, and therefore the positions that deserve a threshold, are different; the
-structure carries over, the numbers do not.
+structure carries over, the numbers do not. That is why `draft-mtp` uses `--spec-smart` unless a
+threshold is given.
 
 ## Limits
 
@@ -87,5 +95,7 @@ structure carries over, the numbers do not.
   there.
 - Setting `--spec-draft-p-continue` with a block drafter must produce the warning and change
   nothing else.
+- With `draft-mtp` in llama-server, setting either option must log
+  `--spec-smart is off because --spec-draft-p-min or --spec-draft-p-continue was given ...`.
 - The per-position acceptance metric of the server uses the same position numbering, so it can be
   read directly against the list index.

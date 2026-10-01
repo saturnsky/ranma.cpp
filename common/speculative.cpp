@@ -1,4 +1,5 @@
 #include "speculative.h"
+#include "speculative-smart.h"
 
 #include "common.h"
 #include "expert.h"
@@ -1466,6 +1467,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     std::vector<int>                i_last;
     std::vector<std::vector<float>> chain_h;
 
+    // --spec-smart: chooses the draft length per step (owned by common_speculative, nullptr when off)
+    common_spec_smart * smart = nullptr;
+
     common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq, params.draft.n_max)
         , params(params.draft)
@@ -1705,6 +1709,16 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 continue;
             }
 
+            if (smart) {
+                // the previous round of this sequence ends here: its verification time is known now
+                smart->close_round(seq_id, ggml_time_us());
+
+                const int32_t n_max_seq = dp.n_max > 0 ? std::min(params.n_max, dp.n_max) : params.n_max;
+                if (!smart->begin_round(seq_id, n_max_seq)) {
+                    continue; // k = 0: no draft step, the result stays empty
+                }
+            }
+
             n_drafting++;
             drafting[seq_id] = true;
             // greedy drafting leaves no candidates behind, so the verifier falls back to sample-and-match
@@ -1735,6 +1749,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         int i = 0;
 
         while (n_drafting > 0) {
+            const int64_t t_step_us = smart ? ggml_time_us() : 0;
+
             // each step decodes under a different head, i.e. a different decoder layer, and
             // KV is per layer. process() filled this layer's KV only for positions < pos0
             // (prompt + accepted prefix) — nothing in the draft region yet. so reset the
@@ -1784,37 +1800,59 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 const llama_token id    = dparams.at(seq_id).result_q ? id_sampled : cur_p->data[0].id;
                 const float       p_top = cur_p->data[0].p;
 
-                // only collect very high-confidence draft tokens
-                if (p_top < params.p_min_at(i)) {
-                    drafting[seq_id] = false;
-                    n_drafting--;
-
-                    continue;
-                }
-
-                common_sampler_accept(smpl, id, true);
-
                 auto & dp = dparams.at(seq_id);
                 auto & result = *dp.result;
 
-                result.push_back(id);
+                if (smart) {
+                    // --spec-smart: keep the token, then one more step or stop (possibly dropping the tail);
+                    // --spec-draft-p-min / --spec-draft-p-continue are not used
+                    common_sampler_accept(smpl, id, true);
+                    result.push_back(id);
 
-                if (dp.result_q) {
-                    dp.result_q->emplace_back(cur_p->data, cur_p->data + cur_p->size);
-                }
+                    if (dp.result_q) {
+                        dp.result_q->emplace_back(cur_p->data, cur_p->data + cur_p->size);
+                    }
 
-                if (params.n_max <= (int) result.size()) {
-                    drafting[seq_id] = false;
-                    n_drafting--;
-                    continue;
-                }
+                    const int32_t n_keep = smart->after_step(seq_id, p_top);
+                    if (n_keep >= 0) {
+                        result.resize(n_keep);
+                        if (dp.result_q) {
+                            dp.result_q->resize(n_keep);
+                        }
+                        drafting[seq_id] = false;
+                        n_drafting--;
+                        continue;
+                    }
+                } else {
+                    // only collect very high-confidence draft tokens
+                    if (p_top < params.p_min_at(i)) {
+                        drafting[seq_id] = false;
+                        n_drafting--;
 
-                // keep the token but stop drafting below the per-position continue threshold
-                if (p_top < params.p_continue_at(i)) {
-                    drafting[seq_id] = false;
-                    n_drafting--;
+                        continue;
+                    }
 
-                    continue;
+                    common_sampler_accept(smpl, id, true);
+
+                    result.push_back(id);
+
+                    if (dp.result_q) {
+                        dp.result_q->emplace_back(cur_p->data, cur_p->data + cur_p->size);
+                    }
+
+                    if (params.n_max <= (int) result.size()) {
+                        drafting[seq_id] = false;
+                        n_drafting--;
+                        continue;
+                    }
+
+                    // keep the token but stop drafting below the per-position continue threshold
+                    if (p_top < params.p_continue_at(i)) {
+                        drafting[seq_id] = false;
+                        n_drafting--;
+
+                        continue;
+                    }
                 }
 
                 if (chain_heads) {
@@ -1841,6 +1879,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 }
             }
 
+            if (smart) {
+                smart->add_draft_step((double) (ggml_time_us() - t_step_us));
+            }
+
             if (batch.size() == 0) {
                 break;
             }
@@ -1860,6 +1902,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
             if (dp.result->size() < (size_t) params.n_min) {
                 dp.result->clear();
+            }
+
+            if (smart) {
+                smart->drafted(seq_id, (int32_t) dp.result->size(), ggml_time_us());
             }
         }
     }
@@ -2304,6 +2350,9 @@ struct common_speculative {
     std::vector<common_speculative_impl *> impl_last;
 
     std::vector<double> synth_probs;
+
+    // --spec-smart (draft-mtp only), nullptr when off
+    std::unique_ptr<common_spec_smart> smart;
 };
 
 static common_ngram_map get_common_ngram_map(
@@ -2444,6 +2493,39 @@ static uint32_t common_get_enabled_speculative_configs(const std::vector<common_
         result |= (1u << configs[i]);
     }
     return result;
+}
+
+void common_speculative_smart_resolve(common_params_speculative & params) {
+    auto & dft = params.draft;
+
+    dft.smart_on = false;
+    if (!dft.smart) {
+        return; // --no-spec-smart: the thresholds and --spec-draft-n-max as given
+    }
+
+    const bool has_mtp = std::find(params.types.begin(), params.types.end(),
+                                   COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.types.end();
+    if (!has_mtp) {
+        if (dft.smart_explicit) {
+            SPC_WRN("%s", "--spec-smart applies to draft-mtp only and is ignored\n");
+        }
+        return;
+    }
+
+    // a threshold given by the user (command line or environment) asks for the fixed rule
+    if (dft.p_min_explicit || dft.p_continue_explicit) {
+        SPC_WRN("--spec-smart is off because --spec-draft-p-min or --spec-draft-p-continue was given (p-min %s, "
+                "p-continue %s); the thresholds choose the draft length (--no-spec-smart avoids this warning)\n",
+                spec_threshold_list_str(dft.p_min).c_str(),
+                spec_threshold_list_str(dft.p_continue).c_str());
+        return;
+    }
+
+    // --spec-draft-n-max stays the upper bound when it was given; else the bound of the controller
+    if (!dft.n_max_explicit) {
+        dft.n_max = dft.smart_n_max;
+    }
+    dft.smart_on = true;
 }
 
 int32_t common_speculative_n_max(const common_params_speculative * spec) {
@@ -2856,7 +2938,33 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         /* .impls       = */ std::move(impls),
         /* .impl_last   = */ std::vector<common_speculative_impl *>(n_seq, nullptr),
         /* .synth_probs = */ {},
+        /* .smart       = */ nullptr,
     });
+
+    if (params.draft.smart_on) {
+        common_speculative_impl_draft_mtp * mtp = nullptr;
+        for (auto & impl : result->impls) {
+            if (impl->type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP) {
+                mtp = static_cast<common_speculative_impl_draft_mtp *>(impl.get());
+            }
+        }
+        if (mtp == nullptr) {
+            SPC_WRN("%s", "--spec-smart applies to draft-mtp only and is ignored\n");
+        } else {
+            SPC_INF("--spec-smart: the draft length is chosen per step, up to %d (--spec-draft-n-max%s)\n",
+                    mtp->params.n_max, params.draft.n_max_explicit ? "" : " not given");
+
+            common_spec_smart_config cfg;
+            cfg.n_max      = mtp->params.n_max;
+            cfg.store_path = params.draft.smart_store;
+            cfg.store_key  = params.draft.smart_key;
+            cfg.half_life  = params.draft.smart_half_life;
+            cfg.log_path   = params.draft.smart_log;
+
+            result->smart = std::make_unique<common_spec_smart>(cfg, (int32_t) n_seq);
+            mtp->smart    = result->smart.get();
+        }
+    }
 
     const int32_t n_max_configured = common_speculative_n_max(&params);
     const int32_t n_max_effective  = common_speculative_n_max(result.get());
@@ -2912,6 +3020,10 @@ void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, co
         common_time_meas tm(impl->t_begin_us, !impl->gen_perf);
         impl->begin(seq_id, prompt);
         impl->n_call_begin++;
+    }
+
+    if (spec->smart) {
+        spec->smart->request_begin(seq_id);
     }
 }
 
@@ -3053,6 +3165,23 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, u
             impl_other->accept(seq_id, n_accepted, true);
         }
     }
+}
+
+void common_speculative_smart_accepted(common_speculative * spec, llama_seq_id seq_id, int32_t n_accepted) {
+    if (spec == nullptr || !spec->smart) {
+        return;
+    }
+
+    spec->smart->accepted(seq_id, n_accepted);
+}
+
+std::string common_speculative_smart_summary(const common_speculative * spec, llama_seq_id seq_id) {
+    if (spec == nullptr || !spec->smart) {
+        return "";
+    }
+
+    spec->smart->log_flush(); // the end of a request: the round log reaches the file
+    return spec->smart->request_summary(seq_id);
 }
 
 // TODO: support the case of more than one speculative implementations having a state
