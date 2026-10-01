@@ -14,6 +14,7 @@
 // a resident (the ring shrinks; if the slot does not already hold that expert, the caller reads it).
 // A ring never shrinks below its floor.
 
+#include "expert-l2-batch.h"
 #include "expert-l2-ledger.h"
 
 #include <algorithm>
@@ -290,9 +291,11 @@ public:
     // `quiet(layer, expert)`: a hit on that expert was filled by an early read for this demand; it
     // counts in early_hits instead of hits. `early`: the early service (expert-l2-ledger.h,
     // l2_no_quiet): hits keep their lease, misses take `seq`, the layer's done counter.
+    // `insert`: where fills and hits go in the least recently used list (l2_insert_for); the default
+    // is the most recently used end for both.
     template <typename Homed, typename Quiet = l2_no_quiet>
     l2_service service(int layer, const std::vector<int> & ids, uint32_t seq, Homed homed, Quiet quiet = Quiet(),
-            bool early = false) {
+            bool early = false, l2_insert insert = l2_insert()) {
         l2_service out;
         const int s = layer >= 0 && layer < layers_ ? storage_of(layer) : -1;
         if (s < 0) {
@@ -330,7 +333,7 @@ public:
                 if (!early) {
                     owners_[(size_t) s][(size_t) slot].seq = seq;   // extend the lease to this generation
                 }
-                touch(s, slot);
+                if (insert.touch_hits) { touch(s, slot); }
                 continue;
             }
             slot = acquire(s, pinned);
@@ -347,12 +350,142 @@ public:
             }
             o.layer = layer; o.expert = expert; o.seq = seq;
             map_[(size_t) layer][(size_t) expert] = slot;
-            touch(s, slot);
+            if (insert.cold_fill) { make_cold(s, slot); } else { touch(s, slot); }
             pinned[(size_t) slot] = true;
             ++out.misses;
             for (int kind = 0; kind < kinds_; ++kind) {
                 out.reads.push_back({layer, kind, expert, slot});
             }
+        }
+        return out;
+    }
+
+    // The demand of a prompt ubatch served in batches (expert-l2-batch.h). The ring hits keep their
+    // slots and are served by the first launch; the misses are split into at most `max_batches`
+    // batches of at most `max_capacity` experts that go through one or two buffers of ring slots,
+    // taken from the least recently used end like the misses of service(). Every slot taken is leased
+    // to `seq` for the whole generation; inside the generation the caller reuses a buffer only after
+    // the GPU has finished the batch before it in that buffer. When the hits leave too few reusable
+    // slots for two buffers, the least recently used hits are read again as misses (`demoted`). At
+    // the end each slot holds the last batch expert that used it, and that is what the ledger
+    // records: the experts of earlier batches are not in the ring afterwards. `insert` places the
+    // slots and the hits in the least recently used list.
+    template <typename Homed, typename Quiet = l2_no_quiet>
+    l2_batch_plan service_batched(int layer, const std::vector<int> & ids, uint32_t seq, Homed homed, int max_batches,
+            int max_capacity, Quiet quiet = Quiet(), l2_insert insert = l2_insert()) {
+        l2_batch_plan out;
+        const int s = layer >= 0 && layer < layers_ ? storage_of(layer) : -1;
+        if (s < 0 || max_batches <= 0 || max_capacity <= 0) {
+            out.ok = false;
+            out.reason = s < 0 ? "layer " + std::to_string(layer) + " has no storage class" : std::string("no batch launches");
+            return out;
+        }
+        std::vector<bool> asked((size_t) experts_, false);
+        for (int expert : ids) {
+            if (expert < 0 || expert >= experts_) {
+                out.ok = false;
+                out.reason = "router id " + std::to_string(expert) + " is out of range";
+                return out;
+            }
+            asked[(size_t) expert] = true;
+        }
+        std::vector<int> hits, misses;
+        for (int expert = 0; expert < experts_; ++expert) {
+            if (!asked[(size_t) expert] || homed(layer, expert)) { continue; }
+            (map_[(size_t) layer][(size_t) expert] >= 0 ? hits : misses).push_back(expert);
+        }
+        // the hits from the least to the most recently used, so that a demotion reads the coldest first
+        std::vector<int> rank((size_t) slots(s), 0);
+        {
+            int r = 0;
+            for (int slot = head_[(size_t) s]; slot >= 0; slot = next_[(size_t) s][(size_t) slot]) { rank[(size_t) slot] = r++; }
+        }
+        std::sort(hits.begin(), hits.end(), [&](int a, int b) {
+            return rank[(size_t) map_[(size_t) layer][(size_t) a]] < rank[(size_t) map_[(size_t) layer][(size_t) b]];
+        });
+        std::vector<bool> pinned((size_t) slots(s), false);
+        for (int expert : hits) { pinned[(size_t) map_[(size_t) layer][(size_t) expert]] = true; }
+        auto available = [&]() {
+            int n = 0;
+            for (int slot = head_[(size_t) s]; slot >= 0; slot = next_[(size_t) s][(size_t) slot]) {
+                n += !pinned[(size_t) slot] && reusable(owners_[(size_t) s][(size_t) slot]) ? 1 : 0;
+            }
+            return n;
+        };
+        // the smallest batch capacity that keeps the misses within the batch launches
+        auto needed = [&](int m) { return (m + max_batches - 1)/max_batches; };
+        size_t first_hit = 0;   // hits [0, first_hit) are demoted
+        int avail = available();
+        int m = (int) misses.size();
+        while (m > 0 && avail < 2*needed(m) && first_hit < hits.size()) {
+            const int expert = hits[first_hit++];
+            const int slot = map_[(size_t) layer][(size_t) expert];
+            pinned[(size_t) slot] = false;
+            empty(s, slot);
+            misses.push_back(expert);
+            ++m;
+            ++out.demoted;
+            avail = available();
+        }
+        std::sort(misses.begin(), misses.end());
+        out.misses = m;
+        if (m > 0) {
+            const int need = needed(m);
+            if (need > max_capacity || avail < need) {
+                out.ok = false;
+                out.reason = "storage class " + std::to_string(s) + " has " + std::to_string(avail) +
+                    " reusable ring slots for " + std::to_string(m) + " file experts of layer " + std::to_string(layer) +
+                    " in at most " + std::to_string(max_batches) + " batches of at most " + std::to_string(max_capacity);
+                return out;
+            }
+            out.buffers = avail >= 2*need ? 2 : 1;
+            out.batches = l2_split_batches(misses, std::min(max_capacity, avail/out.buffers));
+            if (out.count() == 1) { out.buffers = 1; }
+            out.capacity = (int) out.batches[0].size();
+            // a buffer holds as many slots as the largest batch that uses it
+            out.slots.assign((size_t) out.buffers, {});
+            for (int b = 0; b < out.count(); ++b) {
+                std::vector<int> & buffer = out.slots[(size_t) (b % out.buffers)];
+                while (buffer.size() < out.batches[(size_t) b].size()) {
+                    const int slot = acquire(s, pinned);
+                    if (slot < 0) {
+                        out.ok = false;
+                        out.reason = "the ring of storage class " + std::to_string(s) + " lost a reusable slot";
+                        return out;
+                    }
+                    owner & o = owners_[(size_t) s][(size_t) slot];
+                    if (o.layer >= 0) {
+                        out.evicted.push_back({o.layer, o.expert, slot});
+                        map_[(size_t) o.layer][(size_t) o.expert] = -1;
+                    }
+                    o.layer = -1; o.expert = -1; o.seq = 0;
+                    pinned[(size_t) slot] = true;
+                    buffer.push_back(slot);
+                }
+            }
+            // each slot ends with the last batch expert that used it
+            for (int b = 0; b < out.count(); ++b) {
+                for (size_t p = 0; p < out.batches[(size_t) b].size(); ++p) {
+                    const int slot = out.slot(b, (int) p), expert = out.batches[(size_t) b][p];
+                    owner & o = owners_[(size_t) s][(size_t) slot];
+                    if (o.layer >= 0) { map_[(size_t) o.layer][(size_t) o.expert] = -1; }
+                    o.layer = layer; o.expert = expert; o.seq = seq;
+                    map_[(size_t) layer][(size_t) expert] = slot;
+                }
+            }
+            for (const std::vector<int> & buffer : out.slots) {
+                for (int slot : buffer) {
+                    if (insert.cold_fill) { make_cold(s, slot); } else { touch(s, slot); }
+                }
+            }
+        }
+        for (size_t i = first_hit; i < hits.size(); ++i) {
+            const int expert = hits[i];
+            const int slot = map_[(size_t) layer][(size_t) expert];
+            ++(quiet(layer, expert) ? out.early_hits : out.hits);
+            owners_[(size_t) s][(size_t) slot].seq = seq;   // extend the lease to this generation
+            if (insert.touch_hits) { touch(s, slot); }
+            out.hit_experts.push_back(expert);
         }
         return out;
     }
@@ -459,6 +592,14 @@ private:
         if (slot != tail_[(size_t) s]) {
             unlink(s, slot);
             link_tail(s, slot);
+        }
+    }
+
+    // Moves a ring slot to the least recently used end: it is the next one taken once it is reusable.
+    void make_cold(int s, int slot) {
+        if (slot != head_[(size_t) s]) {
+            unlink(s, slot);
+            link_head(s, slot);
         }
     }
 

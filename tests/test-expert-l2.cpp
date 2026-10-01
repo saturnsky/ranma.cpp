@@ -8,6 +8,7 @@
 // for the disk and a fake mailbox for the GPU, so this test needs neither.
 
 #include "expert-hash-early.h"
+#include "expert-l2-batch.h"
 #include "expert-l2-class-ledger.h"
 #include "expert-l2-ledger.h"
 #include "expert-l2-relabel.h"
@@ -1075,6 +1076,274 @@ static int early_tests() {
     return 0;
 }
 
+// ---- batched service (expert-l2-batch.h) ------------------------------------------------------------
+
+// One storage class with `ring` ring slots after `residents` resident slots, `layers` layers.
+static l2_class_ledger make_batch_ledger(int layers, int experts, int residents, int ring) {
+    l2_class_ledger ledger;
+    ledger.reset(layers, experts, std::vector<int>((size_t) layers, 0), {residents + ring}, 3);
+    for (int slot = 0; slot < residents; ++slot) { ledger.set_resident(0, slot, -1, -1); }
+    for (int slot = residents; slot < residents + ring; ++slot) { ledger.make_ring(0, slot); }
+    return ledger;
+}
+
+// Replays one batched generation on a byte model: per kind and slot the expert whose bytes the slot
+// holds. The worker reads what l2_batch_readable allows (and asserts that it never overwrites a slot
+// of an earlier batch the GPU has not finished); the GPU multiplies the kinds in `gpu_kinds` order,
+// each batch once its reads are ready, and checks every expert's bytes are in the slot the plan gives.
+// `rng` interleaves the two. Returns an empty string or what went wrong.
+static std::string replay_batches(const l2_batch_plan & plan, const std::vector<int> & gpu_kinds, unsigned rng) {
+    const int kinds = 3, n = plan.count();
+    std::map<std::pair<int, int>, int> bytes;   // (kind, slot) -> expert
+    std::map<std::pair<int, int>, int> owner;   // (kind, slot) -> batch that wrote it
+    std::vector<int> next(kinds, 0), ready(kinds, 0), done(kinds, 0);
+    size_t gpu_at = 0;   // index into gpu_kinds
+    int gpu_batch = 0;   // next batch of the current GPU kind
+    for (int step = 0; step < 100000; ++step) {
+        rng = rng*1103515245u + 12345u;
+        const bool worker_turn = (rng >> 16) % 2 == 0;
+        bool moved = false;
+        if (worker_turn) {
+            const auto groups = l2_batch_readable(plan, next, done);
+            for (const auto & g : groups) {
+                const int kind = g.first, b = g.second;
+                for (size_t p = 0; p < plan.batches[(size_t) b].size(); ++p) {
+                    const int slot = plan.slot(b, (int) p);
+                    auto it = owner.find({kind, slot});
+                    if (it != owner.end() && it->second >= done[(size_t) kind]) {
+                        return "batch " + std::to_string(b) + " overwrote slot " + std::to_string(slot) + " of unfinished batch " +
+                            std::to_string(it->second);
+                    }
+                    bytes[{kind, slot}] = plan.batches[(size_t) b][p];
+                    owner[{kind, slot}] = b;
+                }
+                if (ready[(size_t) kind] != b) { return "readiness out of order"; }
+                ready[(size_t) kind] = b + 1;
+                moved = true;
+            }
+        } else if (gpu_at < gpu_kinds.size()) {
+            const int kind = gpu_kinds[gpu_at];
+            if (gpu_batch < n && ready[(size_t) kind] > gpu_batch) {
+                for (size_t p = 0; p < plan.batches[(size_t) gpu_batch].size(); ++p) {
+                    if (bytes[{kind, plan.slot(gpu_batch, (int) p)}] != plan.batches[(size_t) gpu_batch][p]) {
+                        return "kind " + std::to_string(kind) + " batch " + std::to_string(gpu_batch) + " read the wrong bytes";
+                    }
+                }
+                done[(size_t) kind] = ++gpu_batch;
+                moved = true;
+            }
+            if (gpu_batch == n) { ++gpu_at; gpu_batch = 0; moved = true; }
+        }
+        if (gpu_at == gpu_kinds.size() && next[0] == n && next[1] == n && next[2] == n) { return ""; }
+        (void) moved;
+    }
+    return "no progress (deadlock)";
+}
+
+static int batch_tests() {
+    std::string why;
+    auto none = [](int, int) { return false; };
+    // ---- sizes ----------------------------------------------------------------------------------------
+    {
+        CHECK(l2_batch_capacity(2) == 1 && l2_batch_capacity(3) == 1 && l2_batch_capacity(9) == 4 && l2_batch_capacity(1) == 1);
+        CHECK(l2_batch_launches(0, 4) == 0 && l2_batch_launches(8, 4) == 2 && l2_batch_launches(9, 4) == 3 && l2_batch_launches(5, 0) == 0);
+        const auto split = l2_split_batches({1, 2, 3, 4, 5, 6, 7}, 3);
+        CHECK(split.size() == 3 && split[0].size() == 3 && split[1].size() == 2 && split[2].size() == 2);
+        CHECK(split[0][0] == 1 && split[1][0] == 4 && split[2][1] == 7);
+        CHECK(l2_split_batches({}, 3).empty() && l2_split_batches({1}, 0).empty());
+        const l2_insert decode = l2_insert_for(l2_prompt_fill::scan, false), lru = l2_insert_for(l2_prompt_fill::lru, true),
+            scan = l2_insert_for(l2_prompt_fill::scan, true), mru = l2_insert_for(l2_prompt_fill::mru, true);
+        CHECK(!decode.cold_fill && decode.touch_hits && lru.cold_fill && lru.touch_hits && scan.cold_fill && !scan.touch_hits);
+        CHECK(!mru.cold_fill && mru.touch_hits);
+        printf("PASS: batch capacity, launches, balanced splits and the prompt fill switch\n");
+    }
+    // ---- host tier zero, the smallest ring, every expert in one batch ----------------------------------
+    {
+        const int experts = 24;
+        for (int ring : {2, 3, 5, 8}) {
+            l2_class_ledger ledger = make_batch_ledger(2, experts, 0, ring);
+            const int capacity = l2_batch_capacity(ring), launches = l2_batch_launches(experts, capacity);
+            std::vector<int> ids;
+            for (int e = experts; e-- > 0;) { ids.push_back(e); ids.push_back(e); }   // duplicates, descending
+            const l2_batch_plan plan = ledger.service_batched(0, ids, 1, none, launches, capacity);
+            CHECK(plan.ok && plan.misses == experts && plan.hits == 0 && plan.count() <= launches);
+            CHECK(plan.buffers == (ring >= 2 ? 2 : 1) && plan.capacity <= capacity);
+            std::vector<int> seen((size_t) experts, 0);
+            int largest = 0, smallest = experts;
+            for (const auto & batch : plan.batches) {
+                largest = std::max(largest, (int) batch.size()); smallest = std::min(smallest, (int) batch.size());
+                for (size_t p = 0; p < batch.size(); ++p) {
+                    ++seen[(size_t) batch[p]];
+                    CHECK(p == 0 || batch[p - 1] < batch[p]);
+                }
+            }
+            CHECK(largest - smallest <= 1);
+            for (int e = 0; e < experts; ++e) { CHECK(seen[(size_t) e] == 1); }
+            // two buffers of distinct ring slots
+            std::set<int> slots;
+            for (const auto & buffer : plan.slots) { for (int s : buffer) { slots.insert(s); CHECK(s >= 0 && s < ring); } }
+            CHECK((int) slots.size() == (int) (plan.slots[0].size() + (plan.buffers > 1 ? plan.slots[1].size() : 0)));
+            // the ledger ends with the last batch of each buffer slot, earlier batch experts are gone
+            for (int b = 0; b < plan.count(); ++b) {
+                for (size_t p = 0; p < plan.batches[(size_t) b].size(); ++p) {
+                    const int e = plan.batches[(size_t) b][p];
+                    const bool last = b + plan.buffers >= plan.count() || p >= plan.batches[(size_t) (b + plan.buffers)].size();
+                    CHECK(last ? ledger.slot_of(0, e) == plan.slot(b, (int) p) : ledger.slot_of(0, e) < 0);
+                }
+            }
+            CHECK(ledger.check(why));
+            // the batch order is safe for any kind order of the GPU, also gate before up
+            for (const std::vector<int> & order : {std::vector<int>{0, 1, 2}, std::vector<int>{1, 0, 2}, std::vector<int>{2, 1, 0}}) {
+                for (unsigned seed = 1; seed < 40; ++seed) {
+                    const std::string err = replay_batches(plan, order, seed*7919u);
+                    if (!err.empty()) { fprintf(stderr, "ring %d: %s\n", ring, err.c_str()); }
+                    CHECK(err.empty());
+                }
+            }
+            // a leased batch slot is never taken by the next layer; once done, it goes first
+            const std::vector<int> taken = plan.slots[0];
+            const l2_batch_plan blocked = ledger.service_batched(1, {0, 1}, 1, none, launches, capacity);
+            if (blocked.ok) {
+                for (const auto & buffer : blocked.slots) {
+                    for (int s : buffer) { for (const auto & old : plan.slots) { CHECK(std::find(old.begin(), old.end(), s) == old.end()); } }
+                }
+            } else {
+                CHECK(blocked.reason.find("reusable ring slots") != std::string::npos);
+            }
+            printf("PASS: host tier zero, ring %d slots: %d batches of at most %d experts, each expert once, any GPU kind order\n",
+                ring, plan.count(), plan.capacity);
+        }
+    }
+    // ---- leases between layers and the cold end ---------------------------------------------------------
+    {
+        l2_class_ledger ledger = make_batch_ledger(3, 16, 2, 12);   // ring slots 2..13
+        // decode fills hot experts of layer 2
+        for (int e = 10; e < 14; ++e) { CHECK(ledger.service(2, {e}, 1, none).ok); }
+        ledger.set_done(2, 1);
+        const l2_insert scan = l2_insert_for(l2_prompt_fill::scan, true);
+        const l2_batch_plan a = ledger.service_batched(0, {0, 1, 2, 3, 4, 5, 6, 7, 8, 9}, 1, none, 3, 4, l2_no_quiet(), scan);
+        CHECK(a.ok && a.count() == 3 && a.buffers == 2);
+        // the batch slots sit at the cold end, the decode experts kept their slots
+        for (int e = 10; e < 14; ++e) { CHECK(ledger.slot_of(2, e) >= 0); }
+        const std::vector<int> order = ledger.order(0);
+        std::set<int> batch_slots;
+        for (const auto & buffer : a.slots) { batch_slots.insert(buffer.begin(), buffer.end()); }
+        for (size_t i = 0; i < batch_slots.size(); ++i) { CHECK(batch_slots.count(order[i]) == 1); }
+        // layer 0 is not done: layer 1 must not touch its slots, so it gets the decode slots or nothing
+        const l2_batch_plan b = ledger.service_batched(1, {0, 1, 2, 3}, 1, none, 4, 4, l2_no_quiet(), scan);
+        CHECK(b.ok);
+        for (const auto & buffer : b.slots) { for (int s : buffer) { CHECK(batch_slots.count(s) == 0); } }
+        ledger.set_done(1, 1);
+        ledger.set_done(0, 1);
+        // now layer 1's next batch takes the cold slots first: the slots of the batches before
+        const l2_batch_plan c = ledger.service_batched(1, {8, 9}, 2, none, 4, 4, l2_no_quiet(), scan);
+        CHECK(c.ok && c.count() == 1 && c.slots[0].size() == 2);
+        std::set<int> b_slots;
+        for (const auto & buffer : b.slots) { b_slots.insert(buffer.begin(), buffer.end()); }
+        for (int s : c.slots[0]) { CHECK(b_slots.count(s) == 1); }
+        CHECK(ledger.check(why));
+        printf("PASS: batch slots are leased for the generation, prompt fills go to the cold end and are taken first\n");
+    }
+    // ---- a prompt with mru fills sweeps the ring, scan keeps the decode experts ---------------------------
+    {
+        for (l2_prompt_fill fill : {l2_prompt_fill::mru, l2_prompt_fill::lru, l2_prompt_fill::scan}) {
+            l2_class_ledger ledger = make_batch_ledger(4, 32, 0, 12);
+            uint32_t g = 0;
+            for (int e = 20; e < 28; ++e) { CHECK(ledger.service(3, {e}, ++g, none).ok); ledger.set_done(3, g); }
+            const l2_insert ins = l2_insert_for(fill, true);
+            for (int layer = 0; layer < 3; ++layer) {
+                std::vector<int> ids;
+                for (int e = 0; e < 16; ++e) { ids.push_back(e); }
+                const l2_batch_plan p = ledger.service_batched(layer, ids, 1, none, 8, 3, l2_no_quiet(), ins);
+                CHECK(p.ok && p.misses == 16);
+                ledger.set_done(layer, 1);
+            }
+            int kept = 0;
+            for (int e = 20; e < 28; ++e) { kept += ledger.slot_of(3, e) >= 0 ? 1 : 0; }
+            if (fill == l2_prompt_fill::mru) { CHECK(kept == 0); } else { CHECK(kept == 6); }
+            CHECK(ledger.check(why));
+            printf("PASS: prompt fill %s: %d of 8 decode experts survive three batched prompt layers\n", l2_prompt_fill_name(fill), kept);
+        }
+        // the same with the unbatched service: cold fills leave the hot experts alone
+        l2_class_ledger ledger = make_batch_ledger(2, 32, 0, 8);
+        for (int e = 0; e < 4; ++e) { CHECK(ledger.service(1, {e}, 1, none).ok); }
+        ledger.set_done(1, 1);
+        CHECK(ledger.service(0, {10, 11, 12}, 1, none, l2_no_quiet(), false, l2_insert_for(l2_prompt_fill::scan, true)).ok);
+        ledger.set_done(0, 1);
+        CHECK(ledger.service(0, {13, 14, 15}, 2, none, l2_no_quiet(), false, l2_insert_for(l2_prompt_fill::scan, true)).ok);
+        for (int e = 0; e < 4; ++e) { CHECK(ledger.slot_of(1, e) >= 0); }
+        CHECK(ledger.slot_of(0, 10) < 0 && ledger.slot_of(0, 13) >= 0 && ledger.check(why));
+        printf("PASS: unbatched prompt fills at the cold end reuse their own slots first\n");
+    }
+    // ---- hits: kept and served by the first launch, demoted when they crowd out two buffers --------------
+    {
+        l2_class_ledger ledger = make_batch_ledger(1, 32, 0, 6);   // capacity 3
+        CHECK(ledger.service(0, {1, 2, 3, 4}, 1, none).ok);       // four ring occupants
+        ledger.set_done(0, 1);
+        // demand 1..4 (hits) and 10..17 (8 misses), 4 launches of 3: two buffers need more than the 2 unpinned slots
+        std::vector<int> ids = {1, 2, 3, 4};
+        for (int e = 10; e < 18; ++e) { ids.push_back(e); }
+        const l2_batch_plan p = ledger.service_batched(0, ids, 2, none, 4, 3, l2_no_quiet(), l2_insert_for(l2_prompt_fill::lru, true));
+        CHECK(p.ok && p.demoted > 0 && p.hits + p.demoted == 4 && p.misses == 8 + p.demoted && p.count() <= 4);
+        for (int e : p.hit_experts) { CHECK(ledger.slot_of(0, e) >= 0); }
+        int in_batches = 0;
+        for (const auto & batch : p.batches) { in_batches += (int) batch.size(); }
+        CHECK(in_batches == p.misses);
+        CHECK(ledger.check(why));
+        // with room, every hit stays and nothing is demoted; scan leaves the hits where they are
+        l2_class_ledger roomy = make_batch_ledger(1, 32, 0, 16);
+        CHECK(roomy.service(0, {1, 2}, 1, none).ok);
+        roomy.set_done(0, 1);
+        const std::vector<int> before = roomy.order(0);
+        const l2_batch_plan q = roomy.service_batched(0, {1, 2, 20, 21, 22}, 2, none, 4, 8, l2_no_quiet(), l2_insert_for(l2_prompt_fill::scan, true));
+        CHECK(q.ok && q.hits == 2 && q.demoted == 0 && q.count() == 1 && q.misses == 3);
+        const std::vector<int> after = roomy.order(0);
+        CHECK(after.back() == before.back());   // no hit moved to the hot end
+        // too few launches for the capacity: refused with the numbers
+        l2_class_ledger tiny = make_batch_ledger(1, 32, 0, 2);
+        const l2_batch_plan r = tiny.service_batched(0, {1, 2, 3, 4, 5}, 1, none, 2, 1);
+        CHECK(!r.ok && r.reason.find("batches") != std::string::npos);
+        printf("PASS: ring hits stay for the first launch, are demoted only to make room for two buffers\n");
+    }
+    // ---- random demands against the replay, with residents and hits ------------------------------------
+    {
+        unsigned rng = 12345;
+        for (int round = 0; round < 300; ++round) {
+            rng = rng*1103515245u + 12345u;
+            const int experts = 8 + int((rng >> 8) % 57), ring = 2 + int((rng >> 4) % 14);
+            l2_class_ledger ledger = make_batch_ledger(3, experts, 0, ring);
+            auto homed = [&](int, int e) { return e % 5 == 0; };
+            uint32_t g = 0;
+            for (int gen = 0; gen < 6; ++gen) {
+                const int layer = int((rng >> 12) % 3);
+                rng = rng*1103515245u + 12345u;
+                std::vector<int> ids;
+                const int n = 1 + int((rng >> 10) % (uint32_t) experts);
+                for (int i = 0; i < n; ++i) { rng = rng*1103515245u + 12345u; ids.push_back(int((rng >> 9) % (uint32_t) experts)); }
+                const int capacity = l2_batch_capacity(ring), launches = l2_batch_launches(experts, capacity);
+                ++g;
+                const l2_insert ins = l2_insert_for(l2_prompt_fill((rng >> 3) % 3), true);
+                const l2_batch_plan p = ledger.service_batched(layer, ids, g, homed, launches, capacity, l2_no_quiet(), ins);
+                CHECK(p.ok && p.count() <= launches);
+                std::set<int> want;
+                for (int e : ids) { if (e % 5 != 0) { want.insert(e); } }
+                std::set<int> got(p.hit_experts.begin(), p.hit_experts.end());
+                for (const auto & batch : p.batches) { for (int e : batch) { CHECK(got.insert(e).second); } }
+                CHECK(got == want);
+                if (p.count() > 0) {
+                    const std::string err = replay_batches(p, {0, 1, 2}, rng);
+                    if (!err.empty()) { fprintf(stderr, "round %d: %s\n", round, err.c_str()); }
+                    CHECK(err.empty());
+                }
+                CHECK(ledger.check(why));
+                ledger.set_done(layer, g);
+            }
+        }
+        printf("PASS: 300 random rings and demands: every non-resident expert in the first launch or one batch, replay clean\n");
+    }
+    return 0;
+}
+
 int main() {
     constexpr size_t mib = 1024*1024, stride = 4*mib;
     auto plan = plan_l2_ring(512, 8, 512, 1, stride, 0, 0, true);
@@ -1245,6 +1514,7 @@ int main() {
     CHECK(class_ledger_tests() == 0);
     CHECK(relabel_install_tests() == 0);
     CHECK(early_tests() == 0);
+    CHECK(batch_tests() == 0);
     printf("OK\n");
     return 0;
 }
