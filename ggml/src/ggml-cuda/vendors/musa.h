@@ -48,6 +48,7 @@
 #define cudaError_t musaError_t
 #define cudaErrorMemoryAllocation musaErrorMemoryAllocation
 #define cudaErrorPeerAccessAlreadyEnabled musaErrorPeerAccessAlreadyEnabled
+#define cudaErrorNotReady musaErrorNotReady
 #define cudaErrorPeerAccessNotEnabled musaErrorPeerAccessNotEnabled
 #define cudaEventCreateWithFlags musaEventCreateWithFlags
 #define cudaEventDisableTiming musaEventDisableTiming
@@ -55,6 +56,7 @@
 #define cudaEventSynchronize musaEventSynchronize
 #define cudaEvent_t musaEvent_t
 #define cudaEventDestroy musaEventDestroy
+#define cudaEventQuery musaEventQuery
 #define cudaFree musaFree
 #define cudaFreeHost musaFreeHost
 #define cudaGetDevice musaGetDevice

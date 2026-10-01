@@ -712,9 +712,13 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
 #ifdef USE_CUDA_GRAPH
     if (ggml_cuda_graph_per_shape_max() > 0 && graph_stats.captures > 0) {
         GGML_LOG_INFO("%s: per-shape graphs: %" PRId64 " captures, %" PRId64 " rebuilt graphs launched without capture, "
-                      "at most %zu stored, %" PRId64 " evicted at the limit\n", name.c_str(),
-                      graph_stats.captures, graph_stats.returns, graph_stats.max_entries, graph_stats.cap_evictions);
+                      "at most %zu stored, %" PRId64 " evicted at the limit, %" PRId64 " dropped unused\n", name.c_str(),
+                      graph_stats.captures, graph_stats.returns, graph_stats.max_entries, graph_stats.cap_evictions,
+                      graph_stats.swept);
     }
+
+    // dropped graphs wait for the work queued before the drop, while the streams still exist
+    free_retired_graphs(true);
 #endif // USE_CUDA_GRAPH
 
     std::unique_lock<std::mutex> lock(ggml_cuda_lock);
@@ -2984,6 +2988,43 @@ int ggml_cuda_graph_per_shape_max() {
         return v;
     }();
     return max_entries;
+}
+
+int64_t ggml_cuda_graph_per_shape_evict_us() {
+    // GGML_CUDA_GRAPH_EVICT_SECONDS: a per-shape graph unused for this many seconds is dropped by the periodic
+    // sweep; 0 drops it only at the per-context limit. Default 60. The graphs keyed by first node only keep
+    // the upstream 10 s, since nothing else bounds their number. A speculative verification uses its rarer
+    // widths less often than every 10 s, so the shorter time ran them without a graph and captured them again.
+    static const int64_t evict_us = [] {
+        int64_t v = 60;
+        const char * env = getenv("GGML_CUDA_GRAPH_EVICT_SECONDS");
+        if (env != nullptr) {
+            v = std::max<int64_t>(0, atoll(env));
+            if (ggml_cuda_graph_per_shape_max() > 0) {
+                GGML_LOG_INFO("%s: unused per-shape graphs dropped after %" PRId64 " s%s (GGML_CUDA_GRAPH_EVICT_SECONDS)\n",
+                              __func__, v, v == 0 ? " (never, only at the limit)" : "");
+            }
+        }
+        return v * 1'000'000;
+    }();
+    return evict_us;
+}
+
+bool ggml_cuda_graph_defer_free() {
+    // GGML_CUDA_GRAPH_DEFER_FREE: 1 = a dropped graph is destroyed after a later graph compute, once the work queued
+    // before the drop has finished; 0 = destroyed at the drop, after a stream synchronization at the limit. Default 1.
+    // The drop happens while the scheduler splits the new graph (graph optimize looks it up), before its submit.
+    static const bool defer = [] {
+        bool v = true;
+        const char * env = getenv("GGML_CUDA_GRAPH_DEFER_FREE");
+        if (env != nullptr) {
+            v = atoi(env) != 0;
+            GGML_LOG_INFO("%s: dropped graphs destroyed %s (GGML_CUDA_GRAPH_DEFER_FREE)\n", __func__,
+                          v ? "after a later compute" : "at once");
+        }
+        return v;
+    }();
+    return defer;
 }
 
 // Shape signature of a ggml graph: the node count and the shapes of the first and the last node. llama keeps
@@ -5414,6 +5455,13 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     }
 
     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
+
+#ifdef USE_CUDA_GRAPH
+    // destroy a dropped graph whose queued work has finished; the work of this call is already submitted
+    if (!cuda_ctx->retired_graphs.empty()) {
+        cuda_ctx->free_retired_graphs(false);
+    }
+#endif // USE_CUDA_GRAPH
 
     return GGML_STATUS_SUCCESS;
 }
