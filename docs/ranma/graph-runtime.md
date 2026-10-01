@@ -256,6 +256,7 @@ The per-shape keying has no switch: it is on in HIP builds (at most 96 graphs pe
 context) and off elsewhere. The quick capture of a changed graph of a replayed
 family (see below) has no switch either; it needs the per-shape keying.
 | `GGML_CUDA_GRAPH_PER_SHAPE` | env | `1` in HIP builds, `0` in CUDA builds | `0` keys the stored graphs by the first node only, the upstream keying; `1` keys them by first node and batch shape with at most 32 graphs per context; `N > 1` allows at most `N` (capped at 256). Read once per process. |
+| `GGML_CUDA_GRAPH_EVICT_SECONDS` | env | `60` | A per-shape graph that was not used for this many seconds is dropped by the sweep that runs every 5 s; `0` drops per-shape graphs only at the per-context bound. Graphs keyed by the first node only (per-shape keying off) keep the upstream 10 s, since nothing else bounds their number. Read once per process. |
 
 The default bound was 16 until the llama graph per batch shape (next section)
 was turned on by default. Each llama graph it keeps is a graph of its own for
@@ -265,10 +266,27 @@ dropped and captured graphs again at its bound; 32 leaves room for them.
 ### Limits
 
 - The graphs of one context are bounded. When the bound is reached, the least
-  recently used graph is dropped after a synchronization of the stream, because
-  its instance may still be queued.
+  recently used graph is dropped. Its instance may still be queued, so it is
+  destroyed after a later graph compute of the context, once an event recorded
+  at the drop has completed. The drop happens while the scheduler splits the
+  new graph, because the graph optimize step looks the graph up; destroying it
+  there after a stream synchronization (the previous behaviour) made the split
+  of that call wait and pay the destruction before the new graph was submitted.
+  Graphs dropped unused by the sweep are destroyed the same way.
+- Destroying a graph takes host time: about 3-4 ms for a verification graph of
+  Qwen3.8 Flash Next on HIP, under 0.1 ms for its drafter graph. After the
+  compute the host waits for the GPU anyway, so at most one graph is destroyed
+  per compute; a sweep that drops several graphs at once is spread over the
+  following computes.
 - A graph captured before the memory pool returned memory to the driver is
   captured again.
+- An unused graph used to be dropped after 10 s. A speculative verification
+  uses its rarer widths less often than that, so each such use ran the graph
+  directly and the next one captured it again. The per-shape graphs are bounded
+  by the per-context limit and are never dropped by the sweep, so they stay alive
+  at most up to the bound (host and driver memory of the executable graphs; they
+  have no compute buffers of their own). Graphs keyed by the first node only keep
+  the upstream 10 s, since nothing else bounds their number.
 
 ### How to verify it
 
@@ -281,7 +299,8 @@ dropped and captured graphs again at its bound; 32 leaves room for them.
   off.
 - The backend context logs `per-shape graphs: ... evicted at the limit` when it
   is destroyed; a count that grows with the run means the bound is too small for
-  the widths in use.
+  the widths in use. The same line counts the graphs `dropped unused` by the
+  sweep.
 
 
 ## One llama graph per batch shape
