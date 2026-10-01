@@ -32,13 +32,17 @@ static_assert(sizeof(l2_mailbox) == 64, "the mailbox layout is part of the host 
 // `serve` marks the experts only the worker can place: file residents and ring occupants. It follows
 // a plan, not a generation. When no routed id needs the worker, this kernel answers its own wait, so
 // a fully resident layer never reaches the CPU.
+// The bitmap and the flags are built in shared memory and then stored: PCIe has no atomic OR, and on
+// some hosts an atomicOr on the mapped mailbox is lost.
 static __global__ void l2_publish_kernel(l2_mailbox * m, uint32_t * demand, const uint32_t * serve,
         const int32_t * ids, int rows, int used, int stride, int experts) {
+    extern __shared__ uint32_t demand_shared[];
+    __shared__ uint32_t need, invalid;
     const int words = (experts + 31)/32;
-    for (int i = threadIdx.x; i < words; i += blockDim.x) { demand[i] = 0; }
+    for (int i = threadIdx.x; i < words; i += blockDim.x) { demand_shared[i] = 0; }
     if (threadIdx.x == 0) {
-        m->invalid = 0;
-        m->need = 0;
+        need = 0;
+        invalid = 0;
         m->rows = uint32_t(rows);
         __hip_atomic_store(&m->ready, 0u, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
     }
@@ -46,16 +50,20 @@ static __global__ void l2_publish_kernel(l2_mailbox * m, uint32_t * demand, cons
     for (int64_t i = threadIdx.x; i < int64_t(rows)*used; i += blockDim.x) {
         const int e = ids[(i/used)*stride + i%used];
         if ((unsigned) e < (unsigned) experts) {
-            atomicOr(demand + e/32, 1u << (e%32));
-            if (serve[e/32] & (1u << (e%32))) { atomicOr(&m->need, 1u); }
+            atomicOr(demand_shared + e/32, 1u << (e%32));
+            if (serve[e/32] & (1u << (e%32))) { need = 1; }
         } else {
-            atomicOr(&m->invalid, 1u);
+            invalid = 1;
         }
     }
     __syncthreads();
+    for (int i = threadIdx.x; i < words; i += blockDim.x) { demand[i] = demand_shared[i]; }
+    __syncthreads();
     if (threadIdx.x == 0) {
+        m->need = need;
+        m->invalid = invalid;
         const uint32_t seq = ++m->generation;
-        if (!m->need) {
+        if (!need) {
             __hip_atomic_store(&m->ready, seq, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
         }
         __threadfence_system();
@@ -1373,7 +1381,7 @@ void l2_tier::publish_and_wait(int layer, const ggml_tensor * ids, cudaStream_t 
         return;
     }
     const ggml_cuda_kernel_launch_params launch(dim3(1), dim3(1), 0, stream);
-    const ggml_cuda_kernel_launch_params publish_launch(dim3(1), dim3(128), 0, stream);
+    const ggml_cuda_kernel_launch_params publish_launch(dim3(1), dim3(128), bitmap_words()*sizeof(uint32_t), stream);
     ggml_cuda_kernel_launch(l2_publish_kernel, publish_launch,
         static_cast<l2_mailbox *>(mail_device_) + layer,
         demand_device_ + size_t(layer)*bitmap_words(), serve_device_ + size_t(layer)*bitmap_words(),
