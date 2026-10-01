@@ -184,6 +184,11 @@ applies, how to switch it, and its limits.
 - **Parallel mask compaction** for long index lists, with `GGML_CUDA_FATTN_COMPACT_VERIFY=1` as the equivalence
   gate. Same page.
 
+### DeepSeek V4
+
+- **Selected-cell attention for 512-wide heads**, including attention calls with sinks.
+  [docs/ranma/deepseek-v4.md](docs/ranma/deepseek-v4.md)
+
 ## Building
 
 RANMA.cpp builds exactly like upstream. For the primary target, follow the HIP section of

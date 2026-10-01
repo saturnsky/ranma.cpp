@@ -1233,7 +1233,9 @@ static bool ggml_cuda_fattn_tile_shall_use_sparse(const int device, const ggml_t
     }
 
     const int32_t n_kv_max = ggml_get_op_params_i32(dst, 4);
-    if (n_kv_max <= 0 || mask == nullptr || dst->src[4] != nullptr) {
+    // Attention sinks do not stop the gather: the sink correction acts on the accumulated maximum and
+    // sum after the KV loop and does not depend on which cells the loop visited.
+    if (n_kv_max <= 0 || mask == nullptr) {
         return false;
     }
 
