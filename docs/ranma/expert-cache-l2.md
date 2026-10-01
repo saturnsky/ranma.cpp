@@ -304,7 +304,7 @@ layer's file residents at once, and the floors above are no longer a minimum:
   keeps the prompt floor bound as its minimum. A budget below the minimum rings (with the metadata,
   spares and tails, plus `P_l1` for inclusive) is refused with the numbers.
 - The automatic ring of a class is its floor (from the seed plan, or `min(E, U * n_ubatch)` without a
-  stored profile) times `RANMA_EXPERT_L2_RING_FACTOR`, which defaults to 0.6 with the batched service
+  stored profile) times `RANMA_EXPERT_L2_RING_FACTOR`, which defaults to 0.7 with the batched service
   and may be below 1, never below the minimum and at most the class's layers x E slots. When the
   budget cannot hold that, every class keeps its minimum and the same fraction of what it wanted
   above it (one log line): with a host tier much smaller than the routed experts the rings take the
@@ -314,15 +314,18 @@ layer's file residents at once, and the floors above are no longer a minimum:
 - No plan is held to the rings: a layer may keep any number of experts in the file, since its prompt
   ubatches are served in batches through the ring whatever their count.
 
-Why 0.6 of the floor: a ring below the floor gives host residents back, which saves SSD reads in
+Why 0.7 of the floor: a ring below the floor gives host residents back, which saves SSD reads in
 prompt processing and decode, but loses decode ring hits on experts that were used a few tokens
-earlier; above the floor the reverse. A CPU replay of measured DeepSeek V4 Flash decode traces and
-prompt structure (est.), with the host tier from 1 % to 100 % of the routed expert bytes, VRAM from
-5 % to 30 %, and PCIe 3 to 5 with SSDs from 3.4 to 12 GB/s, found the best ring between 0.5 and 0.7
-of the floor wherever the budget holds it, and the whole budget as ring where it does not. The rule
-lost 0.3 % of a prompt-plus-reply run on average against the best ring of each point (at most 2.8 %,
-at a host tier of 1 % of the routed bytes). The decode value of a ring below the floor is not
-measured yet.
+earlier. Measured on DeepSeek V4 Flash (exclusive, L1 16 GiB, L2 24 GiB, 512 tokens per reply), a
+ring of 0.6 / 0.4 / 0.2 of the floor kept 0.82 / 0.69 / 0.47 of the floor ring's hits, for roleplay
+and coding alike, and decode changed by +0.3 / -0.8 / -2.1 % (roleplay) and -1.4 / -3.6 / -9.2 %
+(coding, which hits the ring twice as often). A CPU replay calibrated on these rows, with the host
+tier from 1 % to 100 % of the routed expert bytes, VRAM from 5 % to 30 %, and PCIe 3 to 5 with SSDs
+from 3.4 to 12 GB/s (est.), put the best ring near 0.4 of the floor for roleplay and 0.8 to 1 for
+coding; 0.7 is the fixed share that loses least against the prompt floor rings in the worse of the
+two (prompt plus reply at most 2 % slower for coding, 1.9 % faster on average for roleplay), and the
+whole budget is the best ring where it cannot hold that. A share chosen from the ring hits a running
+workload sees would do better, but the rings are sized at load.
 
 These are cache allocation budgets, not a cap on the process. Model metadata, non-expert weights,
 KV, backend workspaces, the driver, profiles and diagnostic buffers are additional.
@@ -412,7 +415,7 @@ accepted by the tier; the prompt swap keeps its single-slot rule.
 | `RANMA_EXPERT_L2_VERIFY` | the `RANMA_EXPERT_VERIFY` value | Independent buffered payload and ownership checks. |
 | `RANMA_EXPERT_L2_STAGED` | 1 | Staged service: 0 is off, 1 covers the ubatches with more rows than the decode bound, N > 1 the ubatches of at least N rows. |
 | `RANMA_EXPERT_L2_STAGED_DRAIN` | 0 | 1 completes every read of a kind before the next kind is issued (a diagnostic; the queue then drains at each kind). |
-| `RANMA_EXPERT_L2_RING_FACTOR` | 0.6 (batched), 1 | Each storage class ring is this many times its prompt floor, as far as the budget allows. With the batched service a real number from 0.01, never below the minimum ring; without it at least 1, 1 = the floors, and not applied without a stored profile. `--expert-l2-staging-mib` overrides it. |
+| `RANMA_EXPERT_L2_RING_FACTOR` | 0.7 (batched), 1 | Each storage class ring is this many times its prompt floor, as far as the budget allows. With the batched service a real number from 0.01, never below the minimum ring; without it at least 1, 1 = the floors, and not applied without a stored profile. `--expert-l2-staging-mib` overrides it. |
 | `RANMA_EXPERT_L2_BATCHED` | 1 | Batched service of prompt ubatches and rings sized by the budget; 0 restores the prompt floor rings and the unbatched service. |
 | `RANMA_EXPERT_L2_PROMPT_FILL` | `lru` (batched), `mru` | Where the ring slots a prompt ubatch fills go: `lru` the least recently used end, prompt hits to the most recently used end; `scan` the same, hits stay; `mru` the decode rule. |
 | `RANMA_EXPERT_HASH_EARLY` | 0 | Layers routed by token id ("Early routes"): `ssd` reads their file-tier experts when the tokens are known, `vram` stages their host-resident experts in VRAM slots, `both`; 0 changes nothing. |
