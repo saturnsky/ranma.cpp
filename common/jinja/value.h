@@ -723,17 +723,18 @@ struct value_func_t : public value_t {
     virtual hasher unique_hash() const noexcept override {
         // Note: this is unused for now, we don't support function as object keys
         // use function pointer as unique identifier
-        const auto target = val_func.target<func_hptr>();
-        return hasher(typeid(*this)).update(&target, sizeof(target));
+        const auto target = val_func.target<func_hptr *>();
+        func_hptr * fn = target ? *target : nullptr;
+        return hasher(typeid(*this)).update(&fn, sizeof(fn));
     }
 protected:
     virtual bool equivalent(const value_t & other) const override {
         // Note: this is unused for now, we don't support function as object keys
         // compare function pointers
         // (val_func == other.val_func does not work as std::function::operator== is only used for nullptr check)
-        const auto target_this  = this->val_func.target<func_hptr>();
-        const auto target_other = other.val_func.target<func_hptr>();
-        return typeid(*this) == typeid(other) && target_this == target_other;
+        const auto target_this  = this->val_func.target<func_hptr *>();
+        const auto target_other = other.val_func.target<func_hptr *>();
+        return typeid(*this) == typeid(other) && (target_this ? *target_this : nullptr) == (target_other ? *target_other : nullptr);
     }
 };
 using value_func = std::shared_ptr<value_func_t>;
