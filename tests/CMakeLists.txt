@@ -400,6 +400,7 @@ llama_build_and_test(test-expert-os.cpp
 target_include_directories(test-expert-os PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src/ggml-cuda ${PROJECT_SOURCE_DIR}/ggml/src)
 llama_build_and_test(test-expert-config.cpp)
 llama_build_and_test(test-server-expert.cpp)
+llama_build_and_test(test-spec-smart.cpp) # ranma: --spec-smart controller (no GPU)
 
 llama_build(test-export-graph-ops.cpp)
 if (TARGET gguf-model-data)
