@@ -106,6 +106,10 @@ applies, how to switch it, and its limits.
 - **Per-position draft thresholds** - `--spec-draft-p-min` takes one probability per draft position, and
   `--spec-draft-p-continue` keeps a token in the draft but stops drafting after it. Defaults unchanged.
   [docs/ranma/spec-draft-thresholds.md](docs/ranma/spec-draft-thresholds.md)
+- **Smart draft length for draft-mtp (llama-server)** - `--spec-smart` chooses the draft length at every step from
+  the measured verification time per width and a calibrated acceptance of the draft probabilities, up to
+  `--spec-draft-n-max`; `--spec-smart-store PATH` keeps the estimates across restarts of the same model, build and
+  cache settings. Off by default. [docs/ranma/spec-smart.md](docs/ranma/spec-smart.md)
 - **Reuse of a just-restored context checkpoint (llama-server)** - when the first prompt batch after a checkpoint
   restore starts at that checkpoint, the server keeps the restored entry instead of serializing the unchanged
   state again. `LLAMA_SERVER_CKPT_REUSE=0` restores the upstream behaviour.

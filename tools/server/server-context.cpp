@@ -18,6 +18,7 @@
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
+#include "speculative-smart.h"
 #include "mtmd.h"
 #include "mtmd-helper.h"
 
@@ -53,6 +54,18 @@ static void server_collect_model_devices(const llama_model * model, std::vector<
             devices_out.push_back(dev);
         }
     }
+}
+
+// --spec-smart store key: the model files, the build and the server options that change the verification time per
+// width (expert cache tiers and placement of the draft); a store written under another key is not used
+static std::string server_spec_smart_key(const common_params & params) {
+    const auto & dft = params.speculative.draft;
+    return string_format("target=%s@%s draft=%s@%s build=%s l1=%d l2=%d mode=%s cache_draft=%d weights=%g/%g ngld=%d",
+            params.model.path.c_str(), common_spec_smart_file_id(params.model.path).c_str(),
+            dft.mparams.path.c_str(), common_spec_smart_file_id(dft.mparams.path).c_str(),
+            common_spec_smart_build_id(llama_build_info()).c_str(),
+            params.expert_l1_mib, params.expert_l2_mib, params.expert_cache_mode.c_str(), (int) params.expert_cache_draft,
+            (double) params.expert_weight_target, (double) params.expert_weight_draft, dft.n_gpu_layers);
 }
 
 static common_speculative_output_limits server_output_limits(const common_params & params) {
@@ -743,6 +756,11 @@ struct server_slot {
         }
 
         common_speculative_print_stats(spec);
+
+        const std::string smart = common_speculative_smart_summary(spec, id);
+        if (!smart.empty()) {
+            SLT_INF(*this, "spec-smart: %s\n", smart.c_str());
+        }
     }
 
     json to_json(bool only_metrics = false) const {
@@ -1149,6 +1167,9 @@ private:
         const bool is_resume = sleeping;
 
         params_base = params;
+        // --spec-smart is decided first: without --spec-draft-n-max it sets the draft length bound, which sizes the
+        // outputs, the recurrent state rollback and the expert cache rows
+        common_speculative_smart_resolve(params_base.speculative);
         const auto output_limits = server_output_limits(params_base);
         params_base.n_outputs_max = output_limits.total;
         params_base.n_outputs_max_per_seq = output_limits.per_seq;
@@ -1427,6 +1448,9 @@ private:
 
         // try speculative decoding
         if (ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
+            if (params_base.speculative.draft.smart_on) {
+                params_base.speculative.draft.smart_key = server_spec_smart_key(params_base);
+            }
             try {
                 spec.reset(common_speculative_init(params_base.speculative, params_base.n_parallel));
             } catch (const std::exception & e) {
@@ -4483,6 +4507,9 @@ private:
             slot.spec_is_replay = false;
 
             slot.stats.update_gen_last();
+
+            // --spec-smart: the acceptance of the verified draft positions
+            common_speculative_smart_accepted(spec.get(), slot.id, (int32_t) n_accepted);
 
             // update how many tokens out of those tested were accepted
             slot.stats.n_draft_accepted += n_accepted;

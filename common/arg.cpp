@@ -4367,12 +4367,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
 
     add_opt(common_arg(
         {"--spec-draft-n-max"}, "N",
-        string_format("number of tokens to draft for speculative decoding (default: %d)", params.speculative.draft.n_max),
+        string_format("number of tokens to draft for speculative decoding; with --spec-smart the upper bound of the draft length (default: %d, with --spec-smart: %d)", params.speculative.draft.n_max, params.speculative.draft.smart_n_max),
         [](common_params & params, int value) {
             if (value < 0) {
                 throw std::invalid_argument("invalid value");
             }
             params.speculative.draft.n_max = value;
+            params.speculative.draft.n_max_explicit = true;
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_MAX"));
     add_opt(common_arg(
@@ -4424,18 +4425,58 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_P_SPLIT"));
     add_opt(common_arg(
         {"--spec-draft-p-min", "--draft-p-min"}, "P0,P1,...",
-        string_format("minimum draft token probability per draft position, comma-separated; a token below the value for its position is dropped and drafting stops; a short list repeats its last value (default: %.2f)", (double) params.speculative.draft.p_min_at(0)),
+        string_format("minimum draft token probability per draft position, comma-separated; a token below the value for its position is dropped and drafting stops; a short list repeats its last value; giving it turns --spec-smart off (default: %.2f)", (double) params.speculative.draft.p_min_at(0)),
         [](common_params & params, const std::string & value) {
             params.speculative.draft.p_min = parse_spec_draft_threshold_list(value);
+            params.speculative.draft.p_min_explicit = true;
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_P_MIN"));
     add_opt(common_arg(
         {"--spec-draft-p-continue"}, "P0,P1,...",
-        "minimum draft token probability per draft position to keep drafting after a kept token, comma-separated; below it the token is kept but drafting stops; applies to drafters that draft one token per step (draft-simple, draft-eagle3, draft-mtp); a short list repeats its last value (default: off)",
+        "minimum draft token probability per draft position to keep drafting after a kept token, comma-separated; below it the token is kept but drafting stops; applies to drafters that draft one token per step (draft-simple, draft-eagle3, draft-mtp); a short list repeats its last value; giving it turns --spec-smart off (default: off)",
         [](common_params & params, const std::string & value) {
             params.speculative.draft.p_continue = parse_spec_draft_threshold_list(value);
+            params.speculative.draft.p_continue_explicit = true;
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_P_CONTINUE"));
+    add_opt(common_arg(
+        {"--spec-smart"},
+        {"--no-spec-smart"},
+        "draft-mtp: choose the draft length at every step from the measured verification time per width and the "
+        "calibrated acceptance of the draft probabilities, up to --spec-draft-n-max (default without it: 7); "
+        "--no-spec-smart, or giving --spec-draft-p-min or --spec-draft-p-continue, uses the fixed thresholds instead "
+        "(default: enabled)",
+        [](common_params & params, bool value) {
+            params.speculative.draft.smart = value;
+            params.speculative.draft.smart_explicit = true;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_SMART"));
+    add_opt(common_arg(
+        {"--spec-smart-store"}, "PATH",
+        "file that keeps the --spec-smart estimates across restarts; it is used only with the same model files, build "
+        "and expert cache settings (default: none, nothing is kept)",
+        [](common_params & params, const std::string & value) {
+            params.speculative.draft.smart_store = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_SMART_STORE"));
+    add_opt(common_arg(
+        {"--spec-smart-half-life"}, "N",
+        string_format("--spec-smart: the confidence of every estimate but the level halves every N rounds, observed or not (default: %.0f)", (double) params.speculative.draft.smart_half_life),
+        [](common_params & params, const std::string & value) {
+            params.speculative.draft.smart_half_life = std::stof(value);
+            if (!(params.speculative.draft.smart_half_life >= 1.0f)) {
+                throw std::invalid_argument("--spec-smart-half-life must be at least 1");
+            }
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_SMART_HALF_LIFE"));
+    add_opt(common_arg(
+        {"--spec-smart-log"}, "PATH",
+        "--spec-smart: append one JSON line per round to PATH (draft probabilities, predicted acceptance and times, "
+        "measured times and accepted tokens) for diagnosis; the decisions do not change (default: none)",
+        [](common_params & params, const std::string & value) {
+            params.speculative.draft.smart_log = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_SMART_LOG"));
     add_opt(common_arg(
         {"--spec-draft-backend-sampling"},
         {"--no-spec-draft-backend-sampling"},
