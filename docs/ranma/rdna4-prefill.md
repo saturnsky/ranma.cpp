@@ -199,7 +199,7 @@ BLAS processes that landed on different hipBLASLt solutions.
 ### Measured effect
 
 Base revision: the series of ranma_20260922 (`e48103e1e`) rebased on upstream `ec5a12b85`, with this patch; Radeon AI PRO R9700 (PCIe 5.0 x16) with the setup of
-[benchmark.md](benchmark.md) (-30 % power limit, 0 mV voltage offset, headless), Qwen3.8-Flash-Next
+[benchmarks/method.md](benchmarks/method.md#machine) (-30 % power limit, 0 mV voltage offset, headless), Qwen3.8-Flash-Next
 UD-Q4_K_XL with the exclusive expert cache of 20480 MiB (warm, `--expert-l2-mib -1`, host-direct with
 `GGML_CUDA_HOST_DIRECT_MAX_BATCH=512`). The reference is the same binary with `GGML_CUDA_SKINNY_F32=0`
 and `ROCBLAS_USE_HIPBLASLT=0`: with hipBLASLt the reference itself moves between processes, while
@@ -217,7 +217,7 @@ about 0.020 on the same measurement. With the patch the result no longer depends
 `ROCBLAS_USE_HIPBLASLT`: repeated `llama-perplexity -c 512 --chunks 32` processes, with and without
 hipBLASLt, printed the same perplexity.
 
-`llama-bench` with the protocol of [benchmark.md](benchmark.md) (one process per setting, a discarded
+`llama-bench` with the protocol of [benchmarks/method.md](benchmarks/method.md#llama-bench-rows) (one process per setting, a discarded
 pass at depth 65536 first, five idle minutes between processes), PP512 and TG128 in t/s:
 
 | setting | PP @0 | PP @4096 | PP @8192 | PP @32768 | PP @65536 | TG @0 | TG @4096 | TG @8192 | TG @32768 | TG @65536 |
@@ -298,7 +298,7 @@ both have stopped gaining.
 
 Base revision: the series of ranma_20260922 (`e48103e1e`) rebased on upstream `ec5a12b85`, with the
 skinny F32 kernels of the previous commit and this patch;
-Radeon AI PRO R9700 (PCIe 5.0 x16) with the setup of [benchmark.md](benchmark.md) (-30 % power limit,
+Radeon AI PRO R9700 (PCIe 5.0 x16) with the setup of [benchmarks/method.md](benchmarks/method.md#machine) (-30 % power limit,
 0 mV voltage offset, headless), `ROCBLAS_USE_HIPBLASLT=0`, exclusive expert cache of 20480 MiB (warm,
 `--expert-l2-mib -1`, host-direct with `GGML_CUDA_HOST_DIRECT_MAX_BATCH=512`). One process per
 multiple, set with `GGML_CUDA_MMQ_ID_NCOLS_OPT_SCALE`.
@@ -309,7 +309,7 @@ for 2, 3 and 4. Qwen3.8-Flash-Next UD-Q4_K_XL gives mean KLD 0.00012 for a secon
 0.00029, 0.00012 and 0.00011 for 2, 3 and 4, so the multiples differ from 1 no more than two runs of 1
 differ from each other.
 
-Qwen3.8-Flash-Next UD-Q4_K_XL, `llama-bench` with the protocol of [benchmark.md](benchmark.md) (a
+Qwen3.8-Flash-Next UD-Q4_K_XL, `llama-bench` with the protocol of [benchmarks/method.md](benchmarks/method.md#llama-bench-rows) (a
 discarded pass at depth 65536 first, five idle minutes between processes), PP512 and TG128 in t/s:
 
 | multiple | PP @0 | PP @4096 | PP @8192 | PP @32768 | PP @65536 | TG @0 | TG @4096 | TG @8192 | TG @32768 | TG @65536 |

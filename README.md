@@ -71,7 +71,59 @@ misbehave. Other platforms and backends are not tested and not supported by this
 ## Changes over upstream
 
 Each user-visible change gets a line here and a page under `docs/ranma/` that describes what it is, when it
-applies, how to switch it, and its limits.
+applies, how to switch it, and its limits. Measured effects are collected in
+[docs/ranma/benchmarks](docs/ranma/benchmarks/README.md).
+
+### Measured
+
+The release ranma_20261001 is based on upstream `ed7ac35e1`. Its benchmark records keep the release each number was
+measured at: for ranma_20261001 the MTP draft length was measured again; the ratios against upstream are from
+ranma_20260928 and the full `llama-bench` set from ranma_20260922. The Radeon AI PRO R9700 with 128 GB of host memory
+throughout; [docs/ranma/benchmarks](docs/ranma/benchmarks/README.md) has every number with its release, and
+[the method](docs/ranma/benchmarks/method.md).
+
+Decode against upstream, measured at ranma_20260928 against its upstream base: the server scenarios that the project
+runs (roleplay in four languages and coding, one slot, greedy decoding), release warm against upstream. Upstream keeps
+the routed experts of the first 35 layers in host memory (`-ncmoe 35`; `-ncmoe 36` with the DeepSeek MTP head on the
+GPU); the release runs the exclusive expert cache with a VRAM budget of 20480 MiB (18432 MiB with the DeepSeek MTP
+head outside the cache) and an unlimited host tier
+([record](docs/ranma/benchmarks/2026-09-28-release.md), with the t/s, the cold and 64 GB rows and the prompt times).
+
+| model | English roleplay | coding | Korean roleplay | Japanese roleplay | Chinese roleplay |
+|---|---:|---:|---:|---:|---:|
+| DeepSeek V4 Flash UD-IQ3_XXS, MTP n1 | x2.79 | x2.52 | x2.89 | x2.95 | x2.92 |
+| DeepSeek V4 Flash UD-IQ3_XXS, no MTP | x2.97 | x2.70 | x3.07 | x3.11 | x3.09 |
+| Qwen3.8-Flash-Next UD-Q4_K_XL | x2.78 | x2.57 | x2.78 | x2.79 | x2.79 |
+
+MTP draft length, measured for ranma_20261001: decode with no MTP, with the single-argument values tuned on this
+machine for these two models (Qwen3.8-Flash-Next `--spec-draft-n-max 2 --spec-draft-p-min 0`, DeepSeek V4 Flash
+`--spec-draft-n-max 1 --spec-draft-p-min 0`), and with `--spec-smart`, the default of `draft-mtp` now, from a cold
+start and from a warm store. Six scenarios per model (coding, roleplay in four languages, a mixed scenario), the MTP
+head on the GPU in the joint expert cache ([record](docs/ranma/benchmarks/2026-10-01-mtp-smart.md)).
+
+| model | English roleplay t/s: no MTP / single / smart cold / smart warm | single against no MTP | smart cold against single | smart warm against single |
+|---|---:|---:|---:|---:|
+| Qwen3.8-Flash-Next UD-Q4_K_XL | 46.10 / 57.13 / 56.99 / 57.54 | +19.7 to +29.5 % | -4.3 to +0.6 % | -1.9 to +2.6 % |
+| DeepSeek V4 Flash UD-IQ3_XXS | 31.17 / 35.00 / 34.07 / 34.55 | +9.8 to +14.6 % | -3.8 to +1.0 % | -3.2 to +1.5 % |
+
+Smart needs no per-model values and stays within a few percent of the tuned values; on DeepSeek V4 Flash it is 1.3 to
+3.8 % slower in every roleplay scenario. `--no-spec-smart` or the thresholds give the single-argument rule back.
+
+`llama-bench` PP512 / TG128 in t/s at depth 0, 8192 and 65536, measured at ranma_20260922 against its upstream base on
+two systems: the R9700 (32 GiB) with 128 GiB of host memory, and an RX 9070 XT (16 GiB) with 64 GiB, emulated on the
+R9700 by the placement and the host-tier budget. Upstream runs `-ncmoe 35`; ranma_20260922 runs the exclusive expert
+cache (20480 MiB on the R9700, 3072 MiB for Qwen and 4096 MiB for DeepSeek on the emulated RX 9070 XT) with prefill
+swap where that is faster. The last column is the peak VRAM / host commit of the process in GiB
+([record](docs/ranma/benchmarks/2026-09-22-full-set.md), with the 32 GB rows and Gemma 4 31B).
+
+| model | system | @0 | @8192 | @65536 | VRAM / host |
+|---|---|---:|---:|---:|---:|
+| Qwen3.8-Flash-Next UD-Q4_K_XL | upstream, R9700, 128 GB | 335 / 15.9 | 316 / 15.2 | 307 / 13.2 | 29.9 / 80.7 |
+| | ranma_20260922, R9700, 128 GB | 1014 / 49.7 | 949 / 47.9 | 692 / 44.8 | 29.1 / 78.2 |
+| | ranma_20260922, RX 9070 XT emulation, 64 GB | 625 / 36.7 | 596 / 38.2 | 480 / 35.2 | 12.0 / 48.8 |
+| DeepSeek V4 Flash UD-IQ3_XXS | upstream, R9700, 128 GB | 248 / 9.8 | 209 / 9.7 | (measured to 8192) | 27.8 / 98.7 |
+| | ranma_20260922, R9700, 128 GB | 310 / 31.8 | 255 / 30.9 | 108 / 28.1 | 27.9 / 90.3 |
+| | ranma_20260922, RX 9070 XT emulation, 64 GB | 129 / 18.8 | 128 / 20.3 | 78 / 18.9 | 11.8 / 49.0 |
 
 ### RDNA4 kernels (HIP)
 
@@ -104,12 +156,15 @@ applies, how to switch it, and its limits.
   server is idle and while the model is freed, so that Windows does not evict the VRAM of the process between
   turns. Off by default. [docs/ranma/gpu-heartbeat.md](docs/ranma/gpu-heartbeat.md)
 - **Per-position draft thresholds** - `--spec-draft-p-min` takes one probability per draft position, and
-  `--spec-draft-p-continue` keeps a token in the draft but stops drafting after it. Defaults unchanged.
+  `--spec-draft-p-continue` keeps a token in the draft but stops drafting after it. Defaults unchanged; with
+  `draft-mtp`, giving either turns the smart draft length off.
   [docs/ranma/spec-draft-thresholds.md](docs/ranma/spec-draft-thresholds.md)
-- **Smart draft length for draft-mtp (llama-server)** - `--spec-smart` chooses the draft length at every step from
+- **Smart draft length for draft-mtp (llama-server)** - `draft-mtp` chooses the draft length at every step from
   the measured verification time per width and a calibrated acceptance of the draft probabilities, up to
-  `--spec-draft-n-max`; `--spec-smart-store PATH` keeps the estimates across restarts of the same model, build and
-  cache settings. Off by default. [docs/ranma/spec-smart.md](docs/ranma/spec-smart.md)
+  `--spec-draft-n-max` (7 when not given); `--spec-smart-store PATH` keeps the estimates across restarts of the same
+  model, build and cache settings. On by default with `draft-mtp`; `--no-spec-smart`, or giving
+  `--spec-draft-p-min` or `--spec-draft-p-continue`, returns to the single-argument rule.
+  [docs/ranma/spec-smart.md](docs/ranma/spec-smart.md)
 - **Reuse of a just-restored context checkpoint (llama-server)** - when the first prompt batch after a checkpoint
   restore starts at that checkpoint, the server keeps the restored entry instead of serializing the unchanged
   state again. `LLAMA_SERVER_CKPT_REUSE=0` restores the upstream behaviour.
@@ -157,8 +212,13 @@ applies, how to switch it, and its limits.
   Same page.
 - **One HIP graph per batch shape** - the backend keys the graphs it captured by the batch shape as well as by
   the first node, so a speculative verification whose width changes between rounds launches the graph it already
-  captured for that width. On by default in HIP builds; `GGML_CUDA_GRAPH_PER_SHAPE=0` restores the keying by the
-  first node. Same page.
+  captured for that width. On by default in HIP builds, at most 32 graphs per context;
+  `GGML_CUDA_GRAPH_PER_SHAPE=0` restores the keying by the first node. Same page.
+- **One llama graph per batch shape** - a context keeps the built graph of up to 24 batch shapes together with
+  its scheduler split and allocation, so a verification width seen before is made current again instead of
+  being built, split and allocated anew. On by default; `LLAMA_GRAPH_REUSE_SHAPES=0` turns it off. With both
+  defaults, decode with MTP (`--spec-draft-n-max 7`) in English roleplay is +11.1 % (Qwen3.8-Flash-Next) and
+  +8.6 % (DeepSeek V4 Flash) with identical replies. Same page.
 
 ### MoE decode kernels (HIP)
 
