@@ -256,6 +256,7 @@ its instantiated graph directly.
 | --- | --- | --- | --- |
 | `GGML_CUDA_GRAPH_PER_SHAPE` | env | `1` in HIP builds, `0` in CUDA builds | `0` keys the stored graphs by the first node only, the upstream keying; `1` keys them by first node and batch shape with at most 32 graphs per context; `N > 1` allows at most `N` (capped at 256). Read once per process. |
 | `GGML_CUDA_GRAPH_EVICT_SECONDS` | env | `60` | A per-shape graph that was not used for this many seconds is dropped by the sweep that runs every 5 s; `0` drops per-shape graphs only at the per-context bound. Graphs keyed by the first node only (per-shape keying off) keep the upstream 10 s, since nothing else bounds their number. Read once per process. |
+| `GGML_CUDA_GRAPH_QUICK_CAPTURE` | env | `1` | `1` captures a changed graph at once, without the direct warmup call, when a graph of the same family was captured and replayed in the same context before (see below). Needs the per-shape keying, so it only acts where that is on (HIP builds by default). `0` always warms a changed graph up with a direct call. Read once per process. |
 | `GGML_CUDA_GRAPH_DEFER_FREE` | env | `1` | `1` destroys a graph dropped at the per-context bound after a later graph compute of its context, once an event recorded at the drop shows that the work queued before it has finished; graphs dropped unused by the sweep are destroyed there too. At most one graph is destroyed per compute. `0` destroys them where they are dropped, at the bound after a synchronization of the stream. Read once per process. |
 
 The default bound was 16 until the llama graph per batch shape (next section)
@@ -287,6 +288,49 @@ dropped and captured graphs again at its bound; 32 leaves room for them.
   time keeps more instances alive, at most the bound (host and driver memory of
   the executable graphs; they have no compute buffers of their own).
 
+A graph whose properties changed is normally run directly once and captured
+on the next call that finds it unchanged. When the KV view of a verification
+width grows by a padding step, llama builds the graph of that width again, so
+each width paid a direct call and then a capture after every step. With
+`GGML_CUDA_GRAPH_QUICK_CAPTURE=1` such a graph is captured on the call that
+changed, if its family is ready:
+
+- The family is the shape signature of the key (which holds the width) and the
+  op and type of every node, so graphs of one family launch the same kernels in
+  the same order. It is computed only when a graph is captured or a changed
+  graph is about to be warmed up.
+- A family is ready once one of its graphs was captured and then replayed in
+  the same backend context, and no capture of the family issued a BLAS call (a
+  BLAS library may prepare kernels or workspaces on the first call of a new
+  problem size).
+- A capture that issues BLAS calls marks its family as a BLAS family for the
+  rest of the context: the family is no longer ready and never becomes ready
+  again, so every later change of its graphs keeps the warmup. Whether a
+  capture issues BLAS calls is only known after it, so when a family that was
+  ready without BLAS calls (for example below a KV size at which a matrix
+  multiplication goes to BLAS) first issues them, that one capture is still
+  taken at once.
+- A width used for the first time, a context whose memory pool released memory
+  since the ready capture, and a family whose last quick capture changed again
+  before it was replayed keep the direct warmup call. The last case makes the
+  family wait for a regular warmup and replay again, so a graph that changes on
+  every call is not captured on every call.
+- The kernels and their order are the same; only the call that captures moves.
+  The capture and the instantiation are still paid.
+- Measured on Qwen3.8 Flash Next with an MTP drafter, with the series released
+  as ranma_20261001, whose Qwen indexer built no selection while its budget
+  covered every cell (the current one builds it at every length): the replies
+  of a fixed width 2 verification were identical with the switch on and off.
+  Of the graphs rebuilt at a padding step about two thirds were captured at
+  once; the rest belong to the graphs of the sparse attention selection above
+  2048 cells, whose captures issue BLAS calls and keep the warmup. The host
+  time of the backend graph management (compare, direct runs, capture,
+  instantiate) of a mixed run fell by about 20 %. These numbers predate the
+  BLAS family marking: before it, one verification family that became ready
+  below 2048 cells was still captured at once about 15 times per run after its
+  captures began to issue BLAS calls, with identical replies. The marking
+  sends those back to the warmup (about 5 ms each).
+
 ### How to verify it
 
 - The backend logs `per-shape graphs on, at most N per context` once per
@@ -299,7 +343,9 @@ dropped and captured graphs again at its bound; 32 leaves room for them.
 - The backend context logs `per-shape graphs: ... evicted at the limit` when it
   is destroyed; a count that grows with the run means the bound is too small for
   the widths in use. The same line counts the graphs `dropped unused` by the
-  sweep.
+  sweep. With the quick capture a second line counts the changed graphs
+  `captured without a direct call` and those that changed again before a
+  replay.
 
 
 ## One llama graph per batch shape
