@@ -47,8 +47,9 @@ eviction needs no writeback.
 5. After the last down-weight read of the layer, a done kernel releases the layer's pins. The stream
    orders this before the next layer's demand.
 
-Prompt ubatches take a staged form of steps 3 and 4 ("Staged service for prompt batches" below);
-generation keeps the single wait.
+Prompt ubatches take a staged form of steps 3 and 4 ("Staged service for prompt batches" below), and
+with the batched service their file residents go through the ring in batches ("Batched service for
+prompt batches"); generation keeps the single wait.
 
 One row and a full ubatch use this same path. There is no whole-layer mode and no next-layer
 prefetch: a large prompt can select every expert of a layer, but only its actual bitmap decides which
@@ -60,7 +61,8 @@ used ring slot that is neither pinned by the current demand nor leased by a gene
 not finished. The worker invalidates an evicted address before overwriting its slot, and a ring
 occupant stays marked in the serve bitmap so that the worker extends its lease before a later layer
 can evict a slot the current layer still reads. The replacement decides which slices are read from
-the file and where they land, never their contents.
+the file and where they land, never their contents. The fills and hits of a prompt ubatch can go to
+the other end of the list (`RANMA_EXPERT_L2_PROMPT_FILL`, below).
 
 ### Staged service for prompt batches
 
@@ -91,6 +93,61 @@ The mailbox exists from the moment the tier allocates, not from the first plan t
 in the file: captured graphs hold its two kernels, so the alternative would be a plan-dependent
 graph. With an all-clear serve bitmap the two kernels answer themselves and cost two small launches
 per routed layer.
+
+### Batched service for prompt batches
+
+Without batching, a prompt ubatch can demand every file resident of a layer at once, and all of them
+stay leased until the layer is done, so the ring of each storage class must hold the most file
+residents one of its layers keeps (the prompt floor, "Ring size and budget"). The batched service
+(`RANMA_EXPERT_L2_BATCHED`, on by default with the class layout) removes that floor. Each
+MUL_MAT_ID of a prompt ubatch (more rows than the decode bound) runs as:
+
+1. one launch over the experts that need no read: VRAM and host residents and the ring hits;
+2. then the file residents in batches of at most half the storage class ring, each launch preceded
+   by a wait kernel for that batch's reads and followed by a small kernel that reports the batch done.
+
+The batches go through two buffers of ring slots. While the GPU multiplies batch b, the worker reads
+batch b + 1; batch b + 2 reuses the slots of batch b once the GPU has reported batch b of that kind
+done. The three kinds of an expert share one ring slot (one per kind arena), and the batches are the
+same for up, gate and down, so every slice is read once and each slot ends the layer holding the
+last batch expert that used it, in all three kinds. The worker reads every batch that may be read,
+in the order up, gate, down (the first two batches of each kind need no wait), so the order of the
+kinds on the GPU cannot deadlock it. The ring hits keep their slots for the whole generation; when
+they leave too few slots for two buffers, the least recently used hits are read again with the
+batches (`batch_demoted`).
+
+The kernels are those of the single launch on the same tiles: the first launch masks the experts of
+the batches, a batch launch of a tiling configuration runs over a list of the batch's experts (one
+grid channel per list entry), and a stream-k configuration keeps the grid and work partition of the
+single launch and masks the other experts. Every expert is multiplied by exactly one launch, so the
+output is bit-identical to the single launch.
+
+The graph holds a fixed number of batch launches per kind and layer: the experts one ubatch can
+demand (`min(E, U * rows)`) over the batch size, half the ring of the layer's storage class (at most
+E). A generation that needs fewer batches leaves the rest empty: their waits pass at once and their
+grids return without work. The worker writes the batches of a generation into a table that a small
+kernel copies to device memory after the route wait; a generation the publish kernel answers itself
+gets the tables of a single launch. A ubatch of at most the decode bound keeps the single wait and
+the vector kernels; one of at most 8 rows (the MMVQ bound) whose worst demand fits the ring keeps
+them as well, and a larger one runs MMQ in batches whatever its row count. A layer whose kinds do
+not all run MMQ at the row count is never batched, and its storage class keeps the prompt floor ring.
+
+`RANMA_EXPERT_L2_BATCHED=0` restores the prompt floor rings and the unbatched service.
+
+**Where prompt fills go.** A long prompt reads many file experts per layer. With the most recently
+used insertion every prompt fill moves to the hot end of the class ring, so a prompt sweeps the ring
+and the experts that decode reused are gone afterwards. `RANMA_EXPERT_L2_PROMPT_FILL` places the
+slots a prompt ubatch fills (batched or not) at the least recently used end instead: `lru` (default
+with the batched service) also moves a prompt ring hit to the hot end, `scan` leaves the hits where
+they are, `mru` is the decode rule. Decode fills and hits always go to the most recently used end.
+With `lru` or `scan` the batch slots of a layer are the first ones the next layer of the class takes
+once the layer is done, so a whole prompt cycles through about two batches of slots per class. A
+slot is never taken while the generation that leased it is unfinished, at either end of the list.
+In a CPU replay of measured DeepSeek V4 Flash traces (est.) `lru` was never worse than `mru` over host
+tiers from 1 % to 100 % of the routed expert bytes and PCIe 3 to 5 with SSDs from 3.4 to 12 GB/s, and
+slightly better (0.1–0.2 % of a prompt-plus-reply run on average, up to 1 %), from more ring hits
+during prompt processing; `scan` was close behind. Decode itself changed by less than 0.3 %: its
+ring hits come from reuse within a few tokens, not across requests.
 
 ### Early routes (layers routed by token id)
 
@@ -203,7 +260,9 @@ L2 minimum >= P_l1 + ring + host metadata + padding + spare slots
 `P_l1` is smaller than the L1 option value, which also pays for slot tables, histograms, padding and
 spares. A host budget well below the VRAM budget is therefore refused in inclusive mode.
 
-**Rings per storage class.** Each storage class has a ring of its own, and it must hold every file resident of any
+**Rings per storage class.** The rest of this paragraph and the next two describe the prompt floor
+rings, the sizing of `RANMA_EXPERT_L2_BATCHED=0`; the batched service changes them as described after
+them. Each storage class has a ring of its own, and it must hold every file resident of any
 one of its layers at once: a prompt ubatch can demand them all, and they stay leased until the layer
 is done. That is the prompt floor of the class: the most file residents one of its layers keeps
 under the plan that seeds the load, never more than `min(E, U * n_ubatch)`. The floors are found by
@@ -236,6 +295,34 @@ not change). An install whose plan cannot be held to the rings stops the process
 Every resident slot, every spare and every ring slot costs the storage pitch. The minimum budget is
 the rings, metadata, spares and tails (plus `P_l1` for inclusive); a budget below it is refused with
 the numbers.
+
+**With the batched service** ("Batched service for prompt batches") no prompt ubatch has to hold a
+layer's file residents at once, and the floors above are no longer a minimum:
+
+- The minimum ring of a storage class is what one decode ubatch can demand, `min(E, U * decode bound)`
+  slots, and at least two slots (two batches of one expert). A class whose layers do not all run MMQ
+  keeps the prompt floor bound as its minimum. A budget below the minimum rings (with the metadata,
+  spares and tails, plus `P_l1` for inclusive) is refused with the numbers.
+- The automatic ring of a class is its floor (from the seed plan, or `min(E, U * n_ubatch)` without a
+  stored profile) times `RANMA_EXPERT_L2_RING_FACTOR`, which defaults to 0.6 with the batched service
+  and may be below 1, never below the minimum and at most the class's layers x E slots. When the
+  budget cannot hold that, every class keeps its minimum and the same fraction of what it wanted
+  above it (one log line): with a host tier much smaller than the routed experts the rings take the
+  whole budget and nothing else is resident.
+- `--expert-l2-staging-mib` gives every class its minimum and splits the rest by the bytes each class
+  leaves in the file, as above; a total below the minimum is raised to it.
+- No plan is held to the rings: a layer may keep any number of experts in the file, since its prompt
+  ubatches are served in batches through the ring whatever their count.
+
+Why 0.6 of the floor: a ring below the floor gives host residents back, which saves SSD reads in
+prompt processing and decode, but loses decode ring hits on experts that were used a few tokens
+earlier; above the floor the reverse. A CPU replay of measured DeepSeek V4 Flash decode traces and
+prompt structure (est.), with the host tier from 1 % to 100 % of the routed expert bytes, VRAM from
+5 % to 30 %, and PCIe 3 to 5 with SSDs from 3.4 to 12 GB/s, found the best ring between 0.5 and 0.7
+of the floor wherever the budget holds it, and the whole budget as ring where it does not. The rule
+lost 0.3 % of a prompt-plus-reply run on average against the best ring of each point (at most 2.8 %,
+at a host tier of 1 % of the routed bytes). The decode value of a ring below the floor is not
+measured yet.
 
 These are cache allocation budgets, not a cap on the process. Model metadata, non-expert weights,
 KV, backend workspaces, the driver, profiles and diagnostic buffers are additional.
@@ -305,7 +392,7 @@ without a CLI flag (`host-direct-moe.md`). Do not combine cache placement with `
 | Option | Default | Meaning |
 |---|---|---|
 | `--expert-l2-mib N` | -1 | Host memory budget in MiB; -1 is unlimited and 0 is refused. |
-| `--expert-l2-staging-mib N` | 0 | Total ring size over the storage classes in MiB; 0 is automatic (the floors times `RANMA_EXPERT_L2_RING_FACTOR`). |
+| `--expert-l2-staging-mib N` | 0 | Total ring size over the storage classes in MiB; 0 is automatic (the floors times `RANMA_EXPERT_L2_RING_FACTOR`, as far as the budget allows with the batched service). |
 | `--expert-l2-prefill-ring-mib N` | the staging value | Overrides the staging value; 0 is automatic. |
 | `--expert-l2-worker-cpu N` | -1 | Logical CPU of the worker thread; -1 is the last active logical CPU. |
 | `--expert-l1-mib N` | 0 | VRAM budget; zero is valid with a finite tier. |
@@ -325,7 +412,9 @@ accepted by the tier; the prompt swap keeps its single-slot rule.
 | `RANMA_EXPERT_L2_VERIFY` | the `RANMA_EXPERT_VERIFY` value | Independent buffered payload and ownership checks. |
 | `RANMA_EXPERT_L2_STAGED` | 1 | Staged service: 0 is off, 1 covers the ubatches with more rows than the decode bound, N > 1 the ubatches of at least N rows. |
 | `RANMA_EXPERT_L2_STAGED_DRAIN` | 0 | 1 completes every read of a kind before the next kind is issued (a diagnostic; the queue then drains at each kind). |
-| `RANMA_EXPERT_L2_RING_FACTOR` | 1 | Each storage class ring is this many times its prompt floor, as far as the budget allows; a real number of at least 1, 1 = the floors. Not applied without a stored profile. `--expert-l2-staging-mib` overrides it. |
+| `RANMA_EXPERT_L2_RING_FACTOR` | 0.6 (batched), 1 | Each storage class ring is this many times its prompt floor, as far as the budget allows. With the batched service a real number from 0.01, never below the minimum ring; without it at least 1, 1 = the floors, and not applied without a stored profile. `--expert-l2-staging-mib` overrides it. |
+| `RANMA_EXPERT_L2_BATCHED` | 1 | Batched service of prompt ubatches and rings sized by the budget; 0 restores the prompt floor rings and the unbatched service. |
+| `RANMA_EXPERT_L2_PROMPT_FILL` | `lru` (batched), `mru` | Where the ring slots a prompt ubatch fills go: `lru` the least recently used end, prompt hits to the most recently used end; `scan` the same, hits stay; `mru` the decode rule. |
 | `RANMA_EXPERT_HASH_EARLY` | 0 | Layers routed by token id ("Early routes"): `ssd` reads their file-tier experts when the tokens are known, `vram` stages their host-resident experts in VRAM slots, `both`; 0 changes nothing. |
 | `RANMA_EXPERT_HASH_STAGE_SLOTS` | 6 | `vram`/`both`: staging slots per early layer (1..32), taken from the static VRAM capacity. |
 
@@ -335,7 +424,10 @@ bytes, CPU service time, GPU waiting per phase and per-ubatch samples, plus the 
 install lines of the profile banks. The `l2` line names the ring slots of each storage class; the `budget` line adds the storage classes (members, pitch, ring,
 floor) and `slot_padding`, the resident slot bytes beyond the payload. With the staged service, `prompt_wait_ms` and the per-layer
 samples count the wait for the up slices only; `staged_wait_ms` adds up the gate and down waits, and
-`staged_generations` counts the generations the worker served in stages.
+`staged_generations` counts the generations the worker served in stages. With the batched service the
+`l2` line adds `batched_generations`, `batches` (batch launches that read something),
+`batch_demoted` (ring hits read again to make room for two buffers) and `batch_wait_ms` (the batch
+launches' waits for their reads).
 
 ## What it costs
 
@@ -347,6 +439,10 @@ samples count the wait for the up slices only; `staged_wait_ms` adds up the gate
   demands from the file. The up reads of each layer stall the stream; the gate and down reads stall
   it only for the part the preceding multiplication does not cover. Two more small wait kernels per
   routed layer.
+- With the batched service, per kind and routed layer of a prompt ubatch: the batch launches the
+  graph holds (the most the ubatch can demand over half the class ring) with a wait and a done
+  kernel each, and one table copy kernel per layer; an unused batch launch returns at once. The
+  first launch no longer waits for the reads, so only the first batch's reads stall a kind.
 - The SSD reads share the host I/O bandwidth with the GPU's reads of host memory, so the reads that
   overlap a multiplication slow it somewhat.
 - One worker thread, spinning on the mailbox, pinned to one logical CPU.
@@ -360,6 +456,14 @@ samples count the wait for the up slices only; `staged_wait_ms` adds up the gate
   files and has its backing checked when its load ends.
 - **Windows and HIP only**, for the unbuffered read queue and the address reservation. The validator
   refuses the option elsewhere before the model loads.
+- **A small ring means many batch launches.** Each batch launch multiplies at most half the class
+  ring, so a ring of a few slots splits a layer's file residents into many short launches; their
+  efficiency on the GPU is not measured. A prompt ubatch of at most 8 rows whose demand can exceed
+  the ring runs MMQ instead of the vector kernels, so its rounding differs from the unbatched path.
+- **The three kinds keep one slot per expert.** The kinds of a batch are read into the same slot of
+  their own arenas, so a ring byte budget is split over the kinds; a ring shared by the kinds at the
+  largest pitch would give each kind larger batches but wastes the pitch difference and was
+  estimated to pay only for rings of a few hundred MiB.
 - **The up reads of a layer are not overlapped.** The staged service hides the gate and down reads
   behind the up and gate multiplications, but a layer's routing is known only just before its up
   multiplication, so its up reads always stall the stream. There is no next-layer prefetch, and a
@@ -371,8 +475,8 @@ samples count the wait for the up slices only; `staged_wait_ms` adds up the gate
   about 4.0..5.2 GiB at L2 40..24 GiB against 2.8 GiB, est.), a factor above 1 multiplies that as far
   as the budget allows, and without a stored profile each floor is `min(E, U * n_ubatch)` slots. The
   ring sizes are fixed at load: there is no sizing by measured reuse and no resizing at install.
-- **The ring is sized for the worst possible distinct demand of one ubatch**, so a large ubatch
-  reserves a large ring. When the ring is smaller than what one prompt ubatch reads from the file,
+- **Without the batched service the ring is sized for the worst possible distinct demand of one
+  ubatch**, so a large ubatch reserves a large ring. When the ring is smaller than what one prompt ubatch reads from the file,
   and a prompt reads that set in layer order once per ubatch, a slice has been rotated out by the
   time it is wanted again, so ring reuse during prompt processing is close to zero.
 - **The prompt swap's boundary install reads from the SSD** with a finite tier, so the swap costs
@@ -404,9 +508,18 @@ samples count the wait for the up slices only; `staged_wait_ms` adds up the gate
   unbuffered read queue.
 - `test-expert-plan` covers the four-location transaction, including promotions out of the file.
 - `test-expert-l2-gpu` is an optional HIP target that drives a shifted ring slice through MMQ, which
-  is the check that the shift and the cleared tail are right on the device.
+  is the check that the shift and the cleared tail are right on the device. It also runs the batched
+  service end to end (the worker reading a file, the batch launches of MMQ_ID with their waits and
+  done reports) for rings from two slots up and the three prompt fill rules, and requires the output to be
+  bit-identical to one launch over all experts.
+- `test-expert-l2` replays the batch plan: every non-resident expert in the first launch or in one
+  batch, balanced batches, two buffers of distinct slots, the ledger's final occupants, the read
+  order against a GPU that runs the kinds in any order without overwriting a slot in use, leases
+  across layers, the prompt fill rules and the demotion of hits.
 - `RANMA_EXPERT_L2_VERIFY=1` re-reads every payload through a buffered path and checks ownership
   after each install; `RANMA_EXPERT_TRACE=8` reports what each interval read from each tier.
+- The batched service changes no output: a server with `RANMA_EXPERT_L2_BATCHED=0` and one with the
+  default must give the same greedy replies, and `batched_generations` shows that the batched path ran.
 - The staged service changes no byte a kernel reads: `llama-perplexity` with `RANMA_EXPERT_L2_STAGED=0`
   and with the default must print identical values, and `staged_generations` in the trace shows that
   the staged path ran.

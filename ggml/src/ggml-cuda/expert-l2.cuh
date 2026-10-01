@@ -76,6 +76,9 @@ static constexpr bool l2_staged_default = true;
 // fills and hits of a prompt ubatch when RANMA_EXPERT_L2_PROMPT_FILL is not set.
 static constexpr bool l2_batched_default = true;
 static constexpr l2_prompt_fill l2_prompt_fill_default = l2_prompt_fill::lru;
+// The ring factor of the batched service when RANMA_EXPERT_L2_RING_FACTOR is not set: each class ring
+// is this share of its prompt floor (as far as the budget allows, never below the minimum).
+static constexpr double l2_batched_ring_factor = 0.6;
 
 // What the tier reports every so often under GGML_EXPERT_LOG_L2.
 struct l2_counters {

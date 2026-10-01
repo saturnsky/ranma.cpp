@@ -214,21 +214,24 @@ static l2_config l2_debug_config(const ggml_expert_config & cfg, bool verify_all
     // The staging ring lives in the per storage class host arenas, next to the residents and at
     // their pitch.
     out.class_layout = true;
+    // Batched service: 1 (default) serves prompt ubatches in batches and sizes the rings by the budget;
+    // 0 restores the prompt floor rings, unbatched.
+    out.batched = number("RANMA_EXPERT_L2_BATCHED", l2_batched_default ? 1 : 0, 0, 1) != 0;
     // Class layout: each storage class ring is this many times its floor, as far as the budget
-    // allows; 1 = the floors. A real number of at least 1.
+    // allows. A real number of at least 1 (1 = the floors) for the prompt floor rings; with the
+    // batched service the floors are no minimum and the number may be below 1.
+    out.ring_factor = out.batched ? l2_batched_ring_factor : 1.0;
     if (const char * text = getenv("RANMA_EXPERT_L2_RING_FACTOR"); text != nullptr && *text != '\0') {
         char * end = nullptr;
         errno = 0;
         const double value = strtod(text, &end);
-        if (errno || end == text || *end || !(value >= 1.0) || !(value <= 1024.0)) {
+        if (errno || end == text || *end || !(value >= (out.batched ? 0.01 : 1.0)) || !(value <= 1024.0)) {
             GGML_LOG_WARN("expert cache: ignoring invalid RANMA_EXPERT_L2_RING_FACTOR='%s'\n", text);
         } else {
             out.ring_factor = value;
             GGML_LOG_INFO("expert cache: RANMA_EXPERT_L2_RING_FACTOR sets %g\n", value);
         }
     }
-    // Batched service: 1 (default) serves prompt ubatches in batches; 0 the unbatched service.
-    out.batched = number("RANMA_EXPERT_L2_BATCHED", l2_batched_default ? 1 : 0, 0, 1) != 0;
     out.vec_rows = MMVQ_MAX_BATCH_SIZE;
     out.prompt_fill = out.batched ? l2_prompt_fill_default : l2_prompt_fill::mru;
     if (const char * text = getenv("RANMA_EXPERT_L2_PROMPT_FILL"); text != nullptr && *text != '\0') {
@@ -2009,12 +2012,36 @@ private:
             in.budget_bytes = cfg_.l2_bytes - base_fixed - ring_bytes(ring);
             return plan_host_tier(in);
         };
+        const bool batched = tier_->batched();
+        // whether the budget holds these rings with the tables, spares and (inclusive) VRAM payload
+        auto fits = [&](const std::vector<int> & r) {
+            const auto minimum = minimum_host_budget(geo_, capacities_, base_fixed + ring_bytes(r), inclusive);
+            return minimum.valid && cfg_.l2_bytes >= minimum.bytes;
+        };
+        // The batched service needs a ring per storage class that holds what a decode ubatch can demand
+        // and two batches of one expert; a class whose kinds do not all run MMQ keeps the prompt bound.
+        std::vector<int> mins(n, bound);
+        if (batched) {
+            const int decode = storage_demand_bound(geo_.n_experts, cfg_.l2_experts_used, cfg_.l2_decode_rows);
+            std::vector<uint8_t> mmq(n, 1);
+            for (int l = 0; l < geo_.n_layers; ++l) {
+                const int c = geo_.layer_class[l];
+                if (c >= 0 && !layer_mmq(l, (int64_t) cfg_.l2_prefill_rows)) { mmq[st.storage_of[c]] = 0; }
+            }
+            for (int s = 0; s < n; ++s) {
+                if (mmq[s]) { mins[s] = std::max(2, decode); }
+            }
+        }
         std::vector<int> ring(n, bound);
         tier_plan base;
         if (!tier_scores_.empty()) {
             std::fill(ring.begin(), ring.end(), 0);
             for (int round = 0; round < 1024; ++round) {
-                require(ring);
+                if (batched) {
+                    if (!fits(ring)) { break; }   // the automatic size below shrinks the rings to fit
+                } else {
+                    require(ring);
+                }
                 base = cut(ring);
                 if (!base.valid) { disable_locked(base.reason.c_str()); return false; }
                 const std::vector<int> need = storage_floors(geo_, st, &tier_vram_, &base.selected, bound);
@@ -2026,10 +2053,13 @@ private:
             }
         }
         const std::vector<int> floors = ring;
+        // the least each class's ring may be: the floors, or with the batched service the minimum
+        const std::vector<int> least = batched ? mins : floors;
         // Without a stored profile the floors are the per ubatch bound, already the most one layer
         // can demand; the factor applies only to floors that come from a seed plan.
         const bool seeded = !tier_scores_.empty();
-        const double factor = seeded ? tier_->ring_factor() : 1.0;
+        // a factor below 1 (batched service) shrinks the per ubatch bound as well
+        const double factor = seeded || tier_->ring_factor() < 1.0 ? tier_->ring_factor() : 1.0;
         std::string note;
         if (!seeded && tier_->ring_factor() > 1.0 && cfg_.l2_prefill_ring_bytes == 0) {
             char text[64];
@@ -2054,9 +2084,26 @@ private:
                 }
                 demand[s] += uint64_t(geo_.n_experts - resident)*geo_.class_total_bytes(c);
             }
-            ring = split_ring(st, floors, demand, limit, requested);
-            if (ring_bytes(floors) > requested) {
-                note = "the requested ring of " + std::to_string(requested/(1024*1024)) + " MiB was raised to its floors";
+            ring = split_ring(st, least, demand, limit, requested);
+            if (ring_bytes(least) > requested) {
+                note = "the requested ring of " + std::to_string(requested/(1024*1024)) + " MiB was raised to its " +
+                    (batched ? "minimum" : "floors");
+            }
+        } else if (batched) {
+            // The floors times the factor, as far as the budget allows, never below the minimum: the
+            // batched service holds no plan to the rings. Below the minimum the budget is refused.
+            std::vector<int> want(n, 0);
+            for (int s = 0; s < n; ++s) {
+                int limit = 0;
+                for (int c : st.members[s]) { limit += geo_.class_layers[c]*geo_.n_experts; }
+                want[s] = std::max(mins[s], std::min(limit, int(std::ceil(double(floors[s])*factor))));
+            }
+            require(mins);
+            const auto at_minimum = minimum_host_budget(geo_, capacities_, base_fixed + ring_bytes(mins), inclusive);
+            ring = shrink_rings(st, mins, want, cfg_.l2_bytes - at_minimum.bytes);
+            if (ring != want) {
+                note = "the budget gives the rings " + ring_text(ring) + " slots instead of " + ring_text(want) +
+                    ", between the minimum " + ring_text(mins) + " and the floors times the factor";
             }
         } else if (factor > 1.0) {
             // factor x floor per class, as far as the budget left above the minimum (the floors) allows
@@ -2097,8 +2144,12 @@ private:
         if (cfg_.l2_phase_rings && cfg_.l2_decode_ring_bytes != cfg_.l2_prefill_ring_bytes) {
             note += std::string(note.empty() ? "" : "; ") + "the class layout keeps one ring size in both phases, the decode ring size is not used";
         }
-        file_cap_.assign(classes, 0);
-        for (size_t c = 0; c < classes; ++c) { file_cap_[c] = ring[st.storage_of[c]]; }
+        // the batched service serves any number of file residents per layer: no plan is held to the rings
+        file_cap_.clear();
+        if (!batched) {
+            file_cap_.assign(classes, 0);
+            for (size_t c = 0; c < classes; ++c) { file_cap_[c] = ring[st.storage_of[c]]; }
+        }
         require(ring);
         base = cut(ring);
         if (!base.valid) { disable_locked(base.reason.c_str()); return false; }
@@ -2109,7 +2160,7 @@ private:
         std::vector<int> residents(classes);
         for (size_t c = 0; c < classes; ++c) { residents[c] = host_capacities_base_[c] + cfg_.spare_slots; }
         if (!st.place(residents, ring)) { disable_locked("the SSD tier could not place its storage slots"); return false; }
-        st.floor = floors;
+        st.floor = least;
         st.factor = requested != 0 ? 0.0 : factor;
         tier_->set_storage(st);
         if (!tier_->sized()) {
@@ -2117,10 +2168,11 @@ private:
             disable_locked("the SSD tier refused its storage class layout");
             return false;
         }
-        GGML_LOG_INFO("expert cache: SSD tier budget %zu MiB (class layout): ring %zu MiB (slots %s, floors %s, "
+        GGML_LOG_INFO("expert cache: SSD tier budget %zu MiB (class layout): ring %zu MiB (slots %s, floors %s%s%s, "
                       "factor %g%s, per ubatch bound %d%s), tables %zu MiB, spares %zu MiB, host residents %zu MiB, "
                       "%zu slices / %zu MiB left in the file\n",
             cfg_.l2_bytes/(1024*1024), st.ring_bytes()/(1024*1024), ring_text(ring).c_str(), ring_text(floors).c_str(),
+            batched ? ", batched, minimum " : "", batched ? ring_text(mins).c_str() : "",
             factor, requested != 0 ? " not used, explicit total" : "", bound, tier_scores_.empty() ? ", no seed profile" : "", tier_->metadata_bytes()/(1024*1024),
             spares/(1024*1024), base.resident_bytes/(1024*1024), base.ssd_slices, base.ssd_bytes/(1024*1024));
         if (!note.empty()) {
