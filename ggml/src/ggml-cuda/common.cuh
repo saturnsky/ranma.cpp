@@ -1277,6 +1277,9 @@ struct ggml_cuda_graph {
     bool warmup_complete = false;
     uint64_t uid = 0;
     int64_t last_used_time = 0;
+    // generation of the device memory pools when the graph was captured; a pool that released
+    // memory since then may have freed a scratch buffer the instance still points to
+    uint64_t pool_generation = 0;
     struct node_properties {
         ggml_tensor node;
         void *   node_src_data_ptrs[GGML_MAX_SRC];
@@ -1291,6 +1294,29 @@ struct ggml_cuda_graph {
     }
 #endif
 };
+
+// Key of a stored graph: the first node of the ggml graph and, with GGML_CUDA_GRAPH_PER_SHAPE, a
+// signature of its shape. llama rebuilds a graph of a different batch size in the same metadata
+// buffer, so the first node alone gives every batch size the same key. shape is 0 when the
+// per-shape keying is off, which is the plain first-node keying.
+struct ggml_cuda_graph_key {
+    const void * node0 = nullptr;
+    uint64_t     shape = 0;
+
+    bool operator==(const ggml_cuda_graph_key & other) const {
+        return node0 == other.node0 && shape == other.shape;
+    }
+};
+
+struct ggml_cuda_graph_key_hash {
+    size_t operator()(const ggml_cuda_graph_key & key) const {
+        return std::hash<const void *>()(key.node0) ^ (size_t) (key.shape * 0x9E3779B97F4A7C15ull);
+    }
+};
+
+// maximum number of stored graphs per context with the per-shape keying, 0 if it is off
+// (GGML_CUDA_GRAPH_PER_SHAPE, read once)
+int ggml_cuda_graph_per_shape_max();
 
 struct ggml_cuda_concurrent_event {
     std::vector<cudaEvent_t> join_events;
@@ -1482,11 +1508,21 @@ struct ggml_backend_cuda_context {
 #ifdef USE_CUDA_GRAPH
     // Map from first_node_ptr to cuda_graph - allows multiple graphs per context
     // when the computation is split across CPU/GPU (e.g., with --n-cpu-moe)
-    std::unordered_map<const void *, std::unique_ptr<ggml_cuda_graph>> cuda_graphs;
+    // (with GGML_CUDA_GRAPH_PER_SHAPE also one graph per batch shape, see ggml_cuda_graph_key)
+    std::unordered_map<ggml_cuda_graph_key, std::unique_ptr<ggml_cuda_graph>, ggml_cuda_graph_key_hash> cuda_graphs;
 
     int64_t last_graph_eviction_sweep = 0;
 
-    ggml_cuda_graph * cuda_graph(const void * first_node_ptr) {
+    // per-shape keying statistics, logged when the context is destroyed
+    struct {
+        int64_t captures      = 0; // graph captures
+        int64_t returns       = 0; // rebuilt ggml graphs that matched a stored instance, launched without capture
+        int64_t cap_evictions = 0; // entries dropped because the per-context limit was reached
+        size_t  max_entries   = 0; // largest number of stored graphs
+        bool    shared_logged = false;
+    } graph_stats;
+
+    ggml_cuda_graph * cuda_graph(const ggml_cuda_graph_key & key) {
         const int64_t time_now = ggml_time_us();
 
         // sweep every 5s, evicting cuda graphs unused for >=10s
@@ -1501,9 +1537,40 @@ struct ggml_backend_cuda_context {
             }
         }
 
-        auto it = cuda_graphs.find(first_node_ptr);
+        auto it = cuda_graphs.find(key);
         if (it == cuda_graphs.end()) {
-            it = cuda_graphs.emplace(first_node_ptr, std::make_unique<ggml_cuda_graph>()).first;
+            const int max_entries = key.shape != 0 ? ggml_cuda_graph_per_shape_max() : 0;
+            if (max_entries > 0 && cuda_graphs.size() >= (size_t) max_entries) {
+                // drop the least recently used graph; its instance may still be queued on the stream
+                auto lru = cuda_graphs.begin();
+                for (auto jt = cuda_graphs.begin(); jt != cuda_graphs.end(); ++jt) {
+                    if (jt->second->last_used_time < lru->second->last_used_time) {
+                        lru = jt;
+                    }
+                }
+                if (streams[device][0] != nullptr) {
+                    CUDA_CHECK(cudaStreamSynchronize(streams[device][0]));
+                }
+                cuda_graphs.erase(lru);
+                if (graph_stats.cap_evictions++ == 0) {
+                    GGML_LOG_DEBUG("%s: %d stored graphs, evicting the least recently used\n", __func__, max_entries);
+                }
+            }
+            if (key.shape != 0 && !graph_stats.shared_logged) {
+                for (const auto & [other, graph] : cuda_graphs) {
+                    if (other.node0 == key.node0) {
+                        graph_stats.shared_logged = true;
+                        GGML_LOG_DEBUG("%s: first node %p is used by graphs of different shapes, keyed per shape\n",
+                                       __func__, key.node0);
+                        break;
+                    }
+                }
+            }
+            it = cuda_graphs.emplace(key, std::make_unique<ggml_cuda_graph>()).first;
+            if (key.shape != 0 && cuda_graphs.size() > graph_stats.max_entries) {
+                graph_stats.max_entries = cuda_graphs.size();
+                GGML_LOG_DEBUG("%s: %zu stored graphs\n", __func__, cuda_graphs.size());
+            }
         }
         it->second->last_used_time = time_now;
         return it->second.get();
