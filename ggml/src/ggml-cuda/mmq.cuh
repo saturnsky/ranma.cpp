@@ -956,6 +956,19 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
 }
 
 
+// ranma expert cache, batched SSD tier service: one MUL_MAT_ID runs as several launches over subsets
+// of the experts. With `map` null a channel is its expert. With `key` >= 0 the launch keeps the grid
+// of the full launch and runs only the experts whose map entry is `key` (the tiles, and for stream-k
+// the partition of the work, are those of the full launch). With `key` < 0 the grid has one channel
+// per map entry and the entry names the expert, -1 for none. Returns the expert, -1 to skip.
+static __device__ __forceinline__ int ggml_cuda_mmq_expert(const int32_t * map, const int key, const int channel) {
+    if (map == nullptr) {
+        return channel;
+    }
+    const int value = map[channel];
+    return key < 0 ? value : (value == key ? channel : -1);
+}
+
 // The mul_mat_q kernel implements "stream-k" work partitioning as described in https://arxiv.org/abs/2301.03598
 
 template <ggml_type type, int J, bool fallback, ggml_prec prec_src1 = GGML_PREC_Q8>
@@ -966,6 +979,7 @@ static __global__ void mul_mat_q(
         const float * __restrict__ y_scale,
         const char * __restrict__ x_cache, const int32_t * __restrict__ x_cache_slots,
         const int32_t * __restrict__ x_host_slots, const uint64_t * __restrict__ x_host_addresses,
+        const int32_t * __restrict__ expert_map, const int expert_key,
         const uint3 blocks_per_ne00, const int nrows_x, const int ncols_dst, const int stride_row_x, const int ncols_y, const int stride_col_dst,
         const uint3 channel_ratio, const uint3 nchannels_y, const int64_t stride_channel_x_bytes, const int stride_channel_y, const int stride_channel_dst,
         const uint3 sample_ratio, const uint3 nsamples_y, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
@@ -1004,6 +1018,7 @@ static __global__ void mul_mat_q(
         const uint2 tmp2 = fast_div_modulo(blockIdx.z, nchannels_y);
         const int wt = tmp2.x;
         const int zt = tmp2.y;
+        const int ze = ids_dst ? ggml_cuda_mmq_expert(expert_map, expert_key, zt) : zt;
         const int jt = blockIdx.y;
         const int it = blockIdx.x;
 
@@ -1021,8 +1036,8 @@ static __global__ void mul_mat_q(
         }
 
         if (ids_dst) {
-            col_low  = expert_bounds[zt + 0];
-            col_high = expert_bounds[zt + 1];
+            col_low  = ze < 0 ? 0 : expert_bounds[ze + 0];
+            col_high = ze < 0 ? 0 : expert_bounds[ze + 1];
             col_diff = col_high - col_low;
 
             offset_y   = 0;
@@ -1062,7 +1077,7 @@ static __global__ void mul_mat_q(
 
         // ranma expert cache: a resident expert is read from its arena slot instead of the tensor.
         // The channel base is a 64-bit byte offset: a multi-GiB arena overflows a block index.
-        const ggml_cuda_expert_source x_src = ggml_cuda_expert_cache_select(x, x_cache, x_cache_slots, fastdiv(zt, channel_ratio), x_host_slots, x_host_addresses);
+        const ggml_cuda_expert_source x_src = ggml_cuda_expert_cache_select(x, x_cache, x_cache_slots, fastdiv(ze, channel_ratio), x_host_slots, x_host_addresses);
         const char * x_channel = (const char *) x_src.data + (int64_t) x_src.channel*stride_channel_x_bytes;
         const int offset_x = fastdiv(wt, sample_ratio)*stride_sample_x + it*I*stride_row_x;
 
@@ -1094,6 +1109,7 @@ static __global__ void mul_mat_q(
         tmp = tmp2.x;
         tmp2 = fast_div_modulo(tmp, nchannels_y);
         const int zt = tmp2.y;
+        const int ze = ids_dst ? ggml_cuda_mmq_expert(expert_map, expert_key, zt) : zt;
         tmp = tmp2.x;
         tmp2 = fast_div_modulo(tmp, nsamples_y);
         const int wt = tmp2.y;
@@ -1113,8 +1129,8 @@ static __global__ void mul_mat_q(
         }
 
         if (ids_dst) {
-            col_low  = expert_bounds[zt + 0];
-            col_high = expert_bounds[zt + 1];
+            col_low  = ze < 0 ? 0 : expert_bounds[ze + 0];
+            col_high = ze < 0 ? 0 : expert_bounds[ze + 1];
             col_diff = col_high - col_low;
 
             offset_y   = 0;
@@ -1160,7 +1176,7 @@ static __global__ void mul_mat_q(
 
         // ranma expert cache: a resident expert is read from its arena slot instead of the tensor.
         // The channel base is a 64-bit byte offset: a multi-GiB arena overflows a block index.
-        const ggml_cuda_expert_source x_src = ggml_cuda_expert_cache_select(x, x_cache, x_cache_slots, fastdiv(zt, channel_ratio), x_host_slots, x_host_addresses);
+        const ggml_cuda_expert_source x_src = ggml_cuda_expert_cache_select(x, x_cache, x_cache_slots, fastdiv(ze, channel_ratio), x_host_slots, x_host_addresses);
         const char * x_channel = (const char *) x_src.data + (int64_t) x_src.channel*stride_channel_x_bytes;
         const int offset_x = fastdiv(wt, sample_ratio)*stride_sample_x + it*I*stride_row_x;
 
@@ -1187,6 +1203,7 @@ static __global__ void mul_mat_q(
     tmp = tmp2.x;
     tmp2 = fast_div_modulo(tmp, nchannels_y);
     const int zt = tmp2.y;
+    const int ze = ids_dst ? ggml_cuda_mmq_expert(expert_map, expert_key, zt) : zt;
     tmp = tmp2.x;
     tmp2 = fast_div_modulo(tmp, nsamples_y);
     const int wt = tmp2.y;
@@ -1206,8 +1223,8 @@ static __global__ void mul_mat_q(
     }
 
     if (ids_dst) {
-        col_low  = expert_bounds[zt + 0];
-        col_high = expert_bounds[zt + 1];
+        col_low  = ze < 0 ? 0 : expert_bounds[ze + 0];
+        col_high = ze < 0 ? 0 : expert_bounds[ze + 1];
         col_diff = col_high - col_low;
 
         offset_y   = 0;
@@ -1248,7 +1265,7 @@ static __global__ void mul_mat_q(
 
     // ranma expert cache: a resident expert is read from its arena slot instead of the tensor.
     // The channel base is a 64-bit byte offset: a multi-GiB arena overflows a block index.
-    const ggml_cuda_expert_source x_src = ggml_cuda_expert_cache_select(x, x_cache, x_cache_slots, fastdiv(zt, channel_ratio), x_host_slots, x_host_addresses);
+    const ggml_cuda_expert_source x_src = ggml_cuda_expert_cache_select(x, x_cache, x_cache_slots, fastdiv(ze, channel_ratio), x_host_slots, x_host_addresses);
     const char * x_channel = (const char *) x_src.data + (int64_t) x_src.channel*stride_channel_x_bytes;
     const int offset_x = fastdiv(wt, sample_ratio)*stride_sample_x + it*I*stride_row_x;
 
@@ -1265,7 +1282,7 @@ static __global__ void mul_mat_q_stream_k_fixup(
         const int32_t * __restrict__ ids_dst, const int32_t * __restrict__ expert_bounds, float * __restrict__ dst,
         float * __restrict__ tmp_last_tile, const uint3 blocks_per_ne00, const int nrows_x, const int ncols_dst,
         const int stride_col_dst, const uint3 nchannels_y, const int stride_channel_dst, const uint3 nsamples_y,
-        const int stride_sample_dst, const uint3 ntx) {
+        const int stride_sample_dst, const uint3 ntx, const int32_t * __restrict__ expert_map, const int expert_key) {
     constexpr int warp_size       = ggml_cuda_get_physical_warp_size();
     constexpr int nwarps          = (ggml_cuda_mmq_get_nthreads(type, J, fallback, prec_src1) / 2) / warp_size;
     constexpr int I               = ggml_cuda_mmq_get_I(type, J, fallback, prec_src1);
@@ -1338,6 +1355,7 @@ static __global__ void mul_mat_q_stream_k_fixup(
     tmp = tmp2.x;
     tmp2 = fast_div_modulo(tmp, nchannels_y);
     const int zt = tmp2.y;
+    const int ze = ids_dst ? ggml_cuda_mmq_expert(expert_map, expert_key, zt) : zt;
     tmp = tmp2.x;
     tmp2 = fast_div_modulo(tmp, nsamples_y);
     const int wt = tmp2.y;
@@ -1366,9 +1384,12 @@ static __global__ void mul_mat_q_stream_k_fixup(
         return;
     }
 
+    if (ze < 0) {
+        return;   // an expert another launch runs
+    }
     __shared__ int ids_dst_shared[J];
-    const int col_low  = expert_bounds[zt + 0];
-    const int col_high = expert_bounds[zt + 1];
+    const int col_low  = expert_bounds[ze + 0];
+    const int col_high = expert_bounds[ze + 1];
     const int col_diff = col_high - col_low;
 
     for (int j = threadIdx.y*warp_size + threadIdx.x; j < J; j += nwarps*warp_size) {
@@ -1409,6 +1430,13 @@ struct mmq_args {
     int64_t nsamples_x; int64_t nsamples_y; int64_t stride_sample_x; int64_t stride_sample_y; int64_t stride_sample_dst;
     int64_t ncols_max;
     int64_t ncols_opt; // value to optimize the tile size against, launch grid still uses ncols_max
+    // ranma expert cache, batched SSD tier service (ggml_cuda_mmq_expert): `expert_of` [expert] the launch
+    // of each expert, `expert_batch` the launch this is; a batch launch (> 0) of a tiling configuration
+    // runs over `expert_list` [expert_list_n] instead, -1 entries empty. Null: every expert.
+    const int32_t * expert_of = nullptr;
+    int expert_batch = 0;
+    const int32_t * expert_list = nullptr;
+    int expert_list_n = 0;
 };
 
 static size_t mmq_get_nbytes_shared(const ggml_cuda_mmq_config & config, const int cc) {
@@ -1435,19 +1463,35 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, J, false, prec_src1>), nbytes_shared);
     CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, J,  true, prec_src1>), nbytes_shared);
 
+    // A subset launch of the batched expert cache service: a tiling configuration runs over the list,
+    // a stream-k one keeps the grid and the partition of the full launch and masks the other experts.
+    const int32_t * expert_map = nullptr;
+    int expert_key = 0;
+    int64_t nchannels_x = args.nchannels_x, nchannels_y = args.nchannels_y;
+    if (args.expert_of != nullptr) {
+        if (!config.stream_k && args.expert_batch > 0 && args.expert_list != nullptr) {
+            expert_map  = args.expert_list;
+            expert_key  = -1;
+            nchannels_x = nchannels_y = args.expert_list_n;
+        } else {
+            expert_map = args.expert_of;
+            expert_key = args.expert_batch;
+        }
+    }
+
     const int nty  = (args.nrows_x   + config.I - 1) / config.I;
     const int ntx  = (args.ncols_max + config.J - 1) / config.J;
-    const int ntzw = args.nchannels_y * args.nsamples_y;
+    const int ntzw = nchannels_y * args.nsamples_y;
     const dim3 block_nums_xy_tiling(nty, ntx, ntzw);
 
-    GGML_ASSERT(args.nchannels_y % args.nchannels_x == 0);
+    GGML_ASSERT(nchannels_y % nchannels_x == 0);
     GGML_ASSERT(args.nsamples_y  % args.nsamples_x  == 0);
-    const int channel_ratio = args.nchannels_y / args.nchannels_x;
+    const int channel_ratio = nchannels_y / nchannels_x;
     const int sample_ratio  = args.nsamples_y  / args.nsamples_x;
 
     const uint3 blocks_per_ne00_fd = init_fastdiv_values(args.ncols_x / ggml_cuda_type_traits<type>::qk);
     const uint3 ntx_fd             = init_fastdiv_values(ntx);
-    const uint3 nchannels_y_fd     = init_fastdiv_values(args.nchannels_y);
+    const uint3 nchannels_y_fd     = init_fastdiv_values(nchannels_y);
     const uint3 nsamples_y_fd      = init_fastdiv_values(args.nsamples_y);
     const uint3 channel_ratio_fd   = init_fastdiv_values(channel_ratio);
     const uint3 sample_ratio_fd    = init_fastdiv_values(sample_ratio);
@@ -1455,7 +1499,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     if (!config.stream_k) {
         mul_mat_q<type, J, fallback, prec_src1><<<block_nums_xy_tiling, block_dims, nbytes_shared, stream>>>
             (args.x, args.y, args.ids_dst, args.expert_bounds, args.dst, nullptr, args.y_scale,
-             args.x_cache, args.x_cache_slots, args.x_host_slots, args.x_host_addresses,
+             args.x_cache, args.x_cache_slots, args.x_host_slots, args.x_host_addresses, expert_map, expert_key,
              blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
              channel_ratio_fd, nchannels_y_fd, args.stride_channel_x_bytes, args.stride_channel_y, args.stride_channel_dst,
              sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
@@ -1485,7 +1529,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
 
     mul_mat_q<type, J, fallback, prec_src1><<<block_nums_stream_k, block_dims, nbytes_shared, stream>>>
         (args.x, args.y, args.ids_dst, args.expert_bounds, args.dst, tmp_fixup.ptr, args.y_scale,
-         args.x_cache, args.x_cache_slots, args.x_host_slots, args.x_host_addresses,
+         args.x_cache, args.x_cache_slots, args.x_host_slots, args.x_host_addresses, expert_map, expert_key,
          blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
          channel_ratio_fd, nchannels_y_fd, args.stride_channel_x_bytes, args.stride_channel_y, args.stride_channel_dst,
          sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
@@ -1499,7 +1543,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     mul_mat_q_stream_k_fixup<type, J, fallback, prec_src1><<<block_nums_fixup, block_dims_fixup, 0, stream>>>
         (args.ids_dst, args.expert_bounds, args.dst, tmp_fixup.ptr, blocks_per_ne00_fd, args.nrows_x, args.ncols_dst,
          args.nrows_dst, nchannels_y_fd, args.stride_channel_dst, nsamples_y_fd, args.stride_sample_dst,
-         ntx_fd);
+         ntx_fd, expert_map, expert_key);
 }
 
 template <ggml_type type, bool fallback, ggml_prec prec_src1 = GGML_PREC_Q8>

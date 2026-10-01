@@ -1193,7 +1193,7 @@ int main(int argc, char ** argv) {
     CUDA_CHECK(hipMemcpyAsync(before.data(), copy, before.size(), hipMemcpyDeviceToHost, stream));
     // Channel zero resolves directly to the selected expert in mapped ring memory.
     mul_mat_q<GGML_TYPE_Q5_1, J, false><<<grid, block, mmq_get_nbytes_shared(config, cc), stream>>>(
-        nullptr, y, nullptr, nullptr, dst, nullptr, nullptr, copy, slots, slots, tier.addresses(0, 2) + selected,
+        nullptr, y, nullptr, nullptr, dst, nullptr, nullptr, copy, slots, slots, tier.addresses(0, 2) + selected, nullptr, 0,
         init_fastdiv_values(K/32), M, N, K/32, N, M, one, one, slice, 0, 0, one, one, 0, 0, 0, init_fastdiv_values(ntx));
     CUDA_CHECK(hipGetLastError());
     tier.mark_done(0, stream);
