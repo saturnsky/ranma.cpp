@@ -336,6 +336,21 @@ struct common_params_speculative_draft {
 
     bool backend_sampling = true; // offload draft sampling to the backend (default: on)
 
+    // the user gave these options (command line or environment); see common_speculative_smart_resolve()
+    bool n_max_explicit      = false;
+    bool p_min_explicit      = false;
+    bool p_continue_explicit = false;
+
+    // ranma: --spec-smart (draft-mtp in llama-server), docs/ranma/spec-smart.md
+    bool        smart          = true;  // choose the draft length per step (--no-spec-smart: the p_min / p_continue rule)
+    bool        smart_explicit = false; // --spec-smart / --no-spec-smart was given
+    bool        smart_on       = false; // set by common_speculative_smart_resolve(): the controller runs
+    int32_t     smart_n_max    = 7;     // upper bound of the draft length when --spec-draft-n-max is not given
+    std::string smart_store;            // file of the cost / acceptance estimates across restarts (empty: none)
+    std::string smart_key;              // set by the server: model files + build + cache settings of the store
+    float       smart_half_life = 250.0f; // confidence of every estimate halves every this many rounds
+    std::string smart_log;              // one JSON line per round, for diagnosis (empty: none)
+
     float p_min_at(int pos) const {
         GGML_ASSERT(pos >= 0);
         return p_min.empty() ? 0.0f : p_min[std::min<size_t>((size_t) pos, p_min.size() - 1)];
