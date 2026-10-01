@@ -56,7 +56,7 @@ static int bitmap_test() {
             }
         }
         CUDA_CHECK(hipMemcpy(ids, input.data(), input.size()*sizeof(int32_t), hipMemcpyHostToDevice));
-        l2_publish_kernel<<<1, 128>>>(device, device_bits, device_serve, ids, rows, used, stride, experts);
+        l2_publish_kernel<<<1, 128, words*sizeof(uint32_t)>>>(device, device_bits, device_serve, ids, rows, used, stride, experts);
         CUDA_CHECK(hipDeviceSynchronize());
         CHECK(host->published == uint32_t(pattern + 1));
         CHECK(bool(host->invalid) == (pattern == 3));
@@ -87,18 +87,18 @@ static int serve_test() {
     const int routed = input[0], absent = experts - 1;   // rows*used = 32 < absent
     CUDA_CHECK(hipMemcpy(ids, input.data(), input.size()*sizeof(int32_t), hipMemcpyHostToDevice));
 
-    l2_publish_kernel<<<1, 128>>>(device, device_bits, device_serve, ids, rows, used, stride, experts);
+    l2_publish_kernel<<<1, 128, words*sizeof(uint32_t)>>>(device, device_bits, device_serve, ids, rows, used, stride, experts);
     CUDA_CHECK(hipDeviceSynchronize());
     CHECK(host->published == 1 && host->need == 0 && host->ready == host->generation);
 
     serve[routed/32] |= 1u << (routed%32);
-    l2_publish_kernel<<<1, 128>>>(device, device_bits, device_serve, ids, rows, used, stride, experts);
+    l2_publish_kernel<<<1, 128, words*sizeof(uint32_t)>>>(device, device_bits, device_serve, ids, rows, used, stride, experts);
     CUDA_CHECK(hipDeviceSynchronize());
     CHECK(host->published == 2 && host->need == 1 && host->ready == 0);
 
     serve[routed/32] &= ~(1u << (routed%32));
     serve[absent/32] |= 1u << (absent%32);
-    l2_publish_kernel<<<1, 128>>>(device, device_bits, device_serve, ids, rows, used, stride, experts);
+    l2_publish_kernel<<<1, 128, words*sizeof(uint32_t)>>>(device, device_bits, device_serve, ids, rows, used, stride, experts);
     CUDA_CHECK(hipDeviceSynchronize());
     CHECK(host->published == 3 && host->need == 0 && host->ready == host->generation);
 
