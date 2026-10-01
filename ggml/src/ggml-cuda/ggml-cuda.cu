@@ -715,6 +715,10 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
                       "at most %zu stored, %" PRId64 " evicted at the limit, %" PRId64 " dropped unused\n", name.c_str(),
                       graph_stats.captures, graph_stats.returns, graph_stats.max_entries, graph_stats.cap_evictions,
                       graph_stats.swept);
+        if (graph_stats.quick > 0) {
+            GGML_LOG_INFO("%s: per-shape graphs: %" PRId64 " changed graphs captured without a direct call, %" PRId64
+                          " of them changed again before a replay\n", name.c_str(), graph_stats.quick, graph_stats.quick_wasted);
+        }
     }
 
     // dropped graphs wait for the work queued before the drop, while the streams still exist
@@ -3310,6 +3314,42 @@ static uint64_t ggml_cuda_graph_shape_signature(const ggml_cgraph * cgraph) {
     return h != 0 ? h : 1; // 0 means per-shape keying off
 }
 
+static bool ggml_cuda_graph_quick_capture() {
+    // GGML_CUDA_GRAPH_QUICK_CAPTURE: 1 = a graph whose properties changed (e.g. the KV view of a width grew by a
+    // padding step, which makes llama build it again) is captured on that call instead of running once directly
+    // first, if a graph of the same family was captured and replayed in the same context before; 0 = always warm
+    // up with a direct call. Default 1; it needs the per-shape keying, which is on by default in HIP builds only.
+    static const bool enabled = [] {
+        bool v = true;
+        const char * env = getenv("GGML_CUDA_GRAPH_QUICK_CAPTURE");
+        if (env != nullptr) {
+            v = atoi(env) != 0;
+        }
+        v = v && ggml_cuda_graph_per_shape_max() > 0;
+        if (env != nullptr) {
+            GGML_LOG_INFO("%s: quick capture of changed graphs of a replayed family %s (GGML_CUDA_GRAPH_QUICK_CAPTURE)\n",
+                          __func__, v ? "on" : "off");
+        }
+        return v;
+    }();
+    return enabled;
+}
+
+// Family of a graph for GGML_CUDA_GRAPH_QUICK_CAPTURE: the shape signature of its key (node count, shape of the
+// first and the last node, which carry the batch width) and the op and type of every node. Graphs of one family
+// run the same kernels in the same order; only views sized by the KV cache and addresses differ. The loop over
+// the nodes only runs when a graph is captured or when a changed graph is about to be warmed up.
+static uint64_t ggml_cuda_graph_family(const ggml_cgraph * cgraph, const ggml_cuda_graph_key & key) {
+    uint64_t h = key.shape ^ 0x84222325cbf29ce4ull;
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const ggml_tensor * node = cgraph->nodes[i];
+        h ^= ((uint64_t) node->op << 8) | (uint64_t) node->type;
+        h *= 0x100000001b3ull;
+        h ^= h >> 29;
+    }
+    return h != 0 ? h : 1;
+}
+
 static ggml_cuda_graph_key ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
     ggml_cuda_graph_key key;
     key.node0 = cgraph->nodes[0];
@@ -5213,6 +5253,39 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 }
 
 #ifdef USE_CUDA_GRAPH
+// GGML_CUDA_GRAPH_QUICK_CAPTURE: whether the changed graph of this call is captured at once instead of running
+// directly first. Only a family that was captured and replayed in this context qualifies: a width seen for the
+// first time, a family any of whose captures issued BLAS calls and a context whose memory pool released memory
+// since the ready capture keep the direct warmup call. A quick capture that changes again before it is replayed
+// makes its family wait for a regular warmup and replay again, so a graph that changes on every call is not
+// captured every call.
+static bool ggml_cuda_graph_try_quick_capture(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph,
+                                              const ggml_cuda_graph_key & graph_key, ggml_cuda_graph * graph,
+                                              uint64_t & family) {
+    if (!ggml_cuda_graph_quick_capture() || graph_key.shape == 0) {
+        return false;
+    }
+    if (graph->quick && !graph->replayed) {
+        graph->quick = false;
+        cuda_ctx->graph_stats.quick_wasted++;
+        auto it = cuda_ctx->graph_families.find(graph->family);
+        if (it != cuda_ctx->graph_families.end()) {
+            it->second.ready = false;
+        }
+        return false;
+    }
+    family = ggml_cuda_graph_family(cgraph, graph_key);
+    auto it = cuda_ctx->graph_families.find(family);
+    if (it == cuda_ctx->graph_families.end() || !it->second.ready ||
+        it->second.pool_generation != ggml_cuda_pool_generation.load(std::memory_order_relaxed)) {
+        return false;
+    }
+    if (cuda_ctx->graph_stats.quick++ == 0) {
+        GGML_LOG_DEBUG("%s: changed graph of a replayed family captured without a direct call\n", __func__);
+    }
+    return true;
+}
+
 static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, const ggml_cuda_graph_key & graph_key) {
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
 
@@ -5239,6 +5312,10 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_cuda_graph_key graph_key;
 
 #ifdef USE_CUDA_GRAPH
+    bool     quick       = false; // captured without the direct warmup call
+    uint64_t family      = 0;     // family of the graph if ggml_cuda_graph_try_quick_capture computed it
+    uint64_t blas_calls0 = 0;
+
     graph_key = ggml_cuda_graph_get_key(cgraph);
 
     ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
@@ -5256,14 +5333,27 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                     GGML_LOG_DEBUG("%s: CUDA graph warmup complete\n", __func__);
                     use_cuda_graph = true;
                     cuda_graph_update_required = true;
+                } else if (ggml_cuda_graph_try_quick_capture(cuda_ctx, cgraph, graph_key, graph, family)) {
+                    // a changed graph of a replayed family: capture now instead of running it directly first
+                    graph->warmup_complete = true;
+                    use_cuda_graph = true;
+                    cuda_graph_update_required = true;
+                    quick = true;
                 }
                 // else: properties changed or first call - execute directly (use_cuda_graph stays false)
             } else {
                 // Post-warmup: normal CUDA graph operation
                 if (properties_changed) {
-                    // Properties changed - reset warmup, execute directly until stable again
-                    graph->warmup_complete = false;
-                    GGML_LOG_DEBUG("%s: CUDA graph warmup reset\n", __func__);
+                    if (ggml_cuda_graph_try_quick_capture(cuda_ctx, cgraph, graph_key, graph, family)) {
+                        // capture again at once, the instance is updated in place if the topology allows it
+                        use_cuda_graph = true;
+                        cuda_graph_update_required = true;
+                        quick = true;
+                    } else {
+                        // Properties changed - reset warmup, execute directly until stable again
+                        graph->warmup_complete = false;
+                        GGML_LOG_DEBUG("%s: CUDA graph warmup reset\n", __func__);
+                    }
                 } else {
                     use_cuda_graph = true;
                     cuda_graph_update_required = graph->instance == nullptr;
@@ -5282,6 +5372,22 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     if (use_cuda_graph && cuda_graph_update_required) {
         graph->pool_generation = ggml_cuda_pool_generation.load(std::memory_order_relaxed);
         cuda_ctx->graph_stats.captures++;
+        graph->quick    = quick;
+        graph->replayed = false;
+        graph->family   = 0;
+        if (ggml_cuda_graph_quick_capture() && graph_key.shape != 0) {
+            graph->family = family != 0 ? family : ggml_cuda_graph_family(cgraph, graph_key);
+        }
+        blas_calls0 = cuda_ctx->blas_calls;
+    } else if (use_cuda_graph && !graph->replayed) {
+        // first replay of this capture: its family is ready for quick captures if no capture of the family issued
+        // a BLAS call (a BLAS library may prepare kernels or workspaces for a new problem size on its first call)
+        graph->replayed = true;
+        if (graph->family != 0 && !graph->family_blas) {
+            auto & fam = cuda_ctx->graph_families[graph->family];
+            fam.ready           = !fam.blas;
+            fam.pool_generation = graph->pool_generation;
+        }
     }
 #endif // USE_CUDA_GRAPH
 
@@ -5298,6 +5404,16 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
 
 #ifdef USE_CUDA_GRAPH
+    if (use_cuda_graph && cuda_graph_update_required) {
+        graph->family_blas = cuda_ctx->blas_calls != blas_calls0;
+        if (graph->family_blas && graph->family != 0) {
+            // known only after the capture: later changes of this family keep the direct warmup call
+            auto & fam = cuda_ctx->graph_families[graph->family];
+            fam.blas  = true;
+            fam.ready = false;
+        }
+    }
+
     // destroy a dropped graph whose queued work has finished; the work of this call is already submitted
     if (!cuda_ctx->retired_graphs.empty()) {
         cuda_ctx->free_retired_graphs(false);
