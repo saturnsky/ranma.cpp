@@ -1280,6 +1280,12 @@ struct ggml_cuda_graph {
     // generation of the device memory pools when the graph was captured; a pool that released
     // memory since then may have freed a scratch buffer the instance still points to
     uint64_t pool_generation = 0;
+    // GGML_CUDA_GRAPH_QUICK_CAPTURE: the family of the last capture (0 = none recorded), whether that capture issued
+    // BLAS calls, whether it was taken without the direct warmup call, and whether it has been replayed since
+    uint64_t family      = 0;
+    bool     family_blas = false;
+    bool     quick       = false;
+    bool     replayed    = false;
     struct node_properties {
         ggml_tensor node;
         void *   node_src_data_ptrs[GGML_MAX_SRC];
@@ -1607,6 +1613,17 @@ struct ggml_backend_cuda_context {
 
     int64_t last_graph_eviction_sweep = 0;
 
+    // Families of graphs (shape signature and op sequence) that were captured and replayed in this context, with
+    // the pool generation of that capture. A changed graph of a ready family is captured without the direct
+    // warmup call (GGML_CUDA_GRAPH_QUICK_CAPTURE): its kernels, BLAS-free, have run and been replayed here. A family
+    // with a capture that issued BLAS calls is marked blas and never becomes ready again in this context.
+    struct graph_family_state {
+        uint64_t pool_generation = 0;
+        bool     ready           = false;
+        bool     blas            = false;
+    };
+    std::unordered_map<uint64_t, graph_family_state> graph_families;
+
     // GGML_CUDA_GRAPH_DEFER_FREE: dropped graphs waiting to be destroyed, with an event recorded on the stream when
     // the graph was dropped (nullptr: nothing queued can still use it); see free_retired_graphs()
     struct retired_graph {
@@ -1670,6 +1687,8 @@ struct ggml_backend_cuda_context {
         int64_t returns       = 0; // rebuilt ggml graphs that matched a stored instance, launched without capture
         int64_t cap_evictions = 0; // entries dropped because the per-context limit was reached
         int64_t swept         = 0; // entries dropped because they were unused for GGML_CUDA_GRAPH_EVICT_SECONDS
+        int64_t quick         = 0; // changed graphs captured without the direct warmup call
+        int64_t quick_wasted  = 0; // of those, graphs that changed again before they were replayed
         size_t  max_entries   = 0; // largest number of stored graphs
         bool    shared_logged = false;
     } graph_stats;
@@ -1787,7 +1806,11 @@ struct ggml_backend_cuda_context {
 
     ggml_cuda_stream_context & stream_context() { return concurrent_stream_context; }
 
+    // calls that asked for a BLAS handle, i.e. BLAS work issued by this context (GGML_CUDA_GRAPH_QUICK_CAPTURE)
+    uint64_t blas_calls = 0;
+
     cublasHandle_t cublas_handle() {
+        blas_calls++;
         if (cublas_handles[device][curr_stream_no] == nullptr) {
             ggml_cuda_set_device(device);
             CUBLAS_CHECK(cublasCreate(&cublas_handles[device][curr_stream_no]));
