@@ -25,6 +25,7 @@ for equivalence checks, or a diagnostic.
 | name | default | effect |
 | --- | --- | --- |
 | `GGML_CUDA_TOP_K_STABLE_TIES` | off | `1` makes the top-k pick the smallest columns among tied values, so selections and outputs can be compared between runs. Option for reproducible runs. |
+| `LLAMA_QSA_SCORE_FUSE` | `1` | `0` rectifies, sums, scales and masks the indexer head scores with separate relu, cont, add and scale ops; `2` uses the fused op but not its fusion with the score product. Reference paths. |
 | `GGML_CUDA_FATTN_SPARSE` | on | `0` keeps the dense flash-attention kernel. Reference path. |
 | `GGML_CUDA_FATTN_SPARSE_MIN_KV` | 4096 | the floor of the cell count at which the gather is used. |
 | `GGML_CUDA_FATTN_COMPACT_PARALLEL` | on | `0` always builds an index list with the serial kernel. Reference path. |

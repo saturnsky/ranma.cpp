@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <cinttypes>
+#include <cstdlib>
 
 // Batched prefetch of the per-layer embedding rows of one ubatch.
 //
@@ -864,20 +865,42 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_sel(
             ext_factor, attn_factor, beta_fast, beta_slow);
     cb(q, "indexer_q", il);
 
+    // LLAMA_QSA_SCORE_FUSE: 0 rectifies, sums, scales and masks the head scores with relu, cont, add, scale and add
+    // ops; 1 (default) does it in one op that a backend may also compute in the kernel of the product; 2 is 1 without
+    // that fusion. The op adds the heads in the order of the add ops, then scales and adds the mask, each rounded on
+    // its own, so the scores round the same.
+    static const int score_fuse = []() {
+        const char * value = std::getenv("LLAMA_QSA_SCORE_FUSE");
+        const int mode = value ? std::atoi(value) : 1;
+        if (value != nullptr) {
+            LLAMA_LOG_INFO("qwen4exp: LLAMA_QSA_SCORE_FUSE=%d, indexer score %s\n", mode,
+                    mode == 1 ? "through relu_sum_heads, fusable with the product" :
+                    mode == 2 ? "through relu_sum_heads" : "through relu, cont, add and scale ops");
+        }
+        return mode;
+    }();
+
     // the reference sums the rectified head scores unweighted, scaled by 1/sqrt(head_dim)
     // one product for all heads, then the heads are summed as slices, so nothing is transposed
     ggml_tensor * kq = ggml_mul_mat(ctx0,
             ggml_reshape_2d(ctx0, pooled, idx_dim, n_pool),
             ggml_reshape_2d(ctx0, q, idx_dim, n_idx_h*n_tokens)); // [n_pool, n_idx_h*n_tokens]
-    kq = ggml_relu(ctx0, ggml_reshape_3d(ctx0, kq, n_pool, n_idx_h, n_tokens));
 
     ggml_tensor * score = nullptr;
-    for (int64_t h = 0; h < n_idx_h; ++h) {
-        ggml_tensor * slice = ggml_view_2d(ctx0, kq, n_pool, n_tokens, kq->nb[2], h*kq->nb[1]);
-        score = score ? ggml_add(ctx0, score, slice) : ggml_cont(ctx0, slice);
+    if (score_fuse == 1 || score_fuse == 2) {
+        // the heads of token t are rows t*n_idx_h .. t*n_idx_h + n_idx_h - 1 of the product
+        score = ggml_relu_sum_heads(ctx0, kq, inp_kpool->pool_mask, (int32_t) n_idx_h, 1.0f/sqrtf((float) idx_dim),
+                score_fuse == 1 ? 1 : 0); // [n_pool, n_tokens]
+    } else {
+        kq = ggml_relu(ctx0, ggml_reshape_3d(ctx0, kq, n_pool, n_idx_h, n_tokens));
+
+        for (int64_t h = 0; h < n_idx_h; ++h) {
+            ggml_tensor * slice = ggml_view_2d(ctx0, kq, n_pool, n_tokens, kq->nb[2], h*kq->nb[1]);
+            score = score ? ggml_add(ctx0, score, slice) : ggml_cont(ctx0, slice);
+        }
+        score = ggml_scale(ctx0, score, 1.0f/sqrtf((float) idx_dim));
+        score = ggml_add(ctx0, score, inp_kpool->pool_mask); // [n_pool, n_tokens]
     }
-    score = ggml_scale(ctx0, score, 1.0f/sqrtf((float) idx_dim));
-    score = ggml_add(ctx0, score, inp_kpool->pool_mask); // [n_pool, n_tokens]
     cb(score, "indexer_score", il);
 
     const int64_t n_top_pool = std::min<int64_t>(n_pool, hparams.indexer_top_k / kpool);

@@ -9243,6 +9243,148 @@ struct test_diag : public test_case {
     }
 };
 
+// GGML_OP_RELU_SUM_HEADS
+// The op rectifies, adds, scales and adds, each step rounded on its own, so every backend has to match the CPU exactly.
+struct test_relu_sum_heads : public test_case {
+    const int64_t n;
+    const int64_t n_head;
+    const int64_t n_tok;
+    const int64_t n_stream;
+    const bool    bias;
+    const float   scale;
+
+    std::string vars() override {
+        return VARS_TO_STR6(n, n_head, n_tok, n_stream, bias, scale);
+    }
+
+    double max_err() override {
+        return 0.0;
+    }
+
+    double err(const float * a, const float * b, size_t n) override {
+        double max_abs = 0.0;
+        for (size_t i = 0; i < n; i++) {
+            max_abs = std::max(max_abs, (double) std::fabs(a[i] - b[i]));
+        }
+        return max_abs;
+    }
+
+    test_relu_sum_heads(int64_t n = 2049, int64_t n_head = 4, int64_t n_tok = 1, int64_t n_stream = 1, bool bias = true,
+            float scale = 1.0f)
+        : n(n), n_head(n_head), n_tok(n_tok), n_stream(n_stream), bias(bias), scale(scale) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, n, n_head*n_tok, n_stream, 1);
+        ggml_set_name(a, "a");
+
+        ggml_tensor * b = nullptr;
+        if (bias) {
+            b = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, n, n_tok, n_stream, 1);
+            ggml_set_name(b, "b");
+        }
+
+        ggml_tensor * out = ggml_relu_sum_heads(ctx, a, b, (int32_t) n_head, scale, 0);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+};
+
+// GGML_OP_MUL_MAT + GGML_OP_RELU_SUM_HEADS: the indexer score of a block-pooled key cache,
+// score[b, t] = (sum_h relu(k[:, b] . q[:, h, t])) * scale + bias[b, t]
+// With identity = true the graph returns the difference between the score through the op (fusable with the product)
+// and the score through the relu, cont, add and scale ops, each from its own product. It must be exactly 0 on every
+// backend.
+struct test_indexer_score : public test_case {
+    const int64_t n_embd;
+    const int64_t n_blocks;
+    const int64_t n_head;
+    const int64_t n_tok;
+    const int64_t n_stream;
+    const bool    bias;
+    const int     flags;
+    const bool    identity;
+    const float   scale;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return identity ? "INDEXER_SCORE_IDENTITY" : "INDEXER_SCORE";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR8(n_embd, n_blocks, n_head, n_tok, n_stream, bias, flags, scale);
+    }
+
+    double max_err() override {
+        return identity ? 0.0 : max_nmse_err();
+    }
+
+    double err(const float * a, const float * b, size_t n) override {
+        if (!identity) {
+            return test_case::err(a, b, n);
+        }
+        double max_abs = 0.0;
+        for (size_t i = 0; i < n; i++) {
+            max_abs = std::max(max_abs, (double) std::fabs(a[i] - b[i]));
+        }
+        return max_abs;
+    }
+
+    uint64_t op_flops(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return (identity ? 2 : 1) * 2 * n_embd * n_blocks * n_head * n_tok * n_stream;
+    }
+
+    test_indexer_score(int64_t n_embd = 128, int64_t n_blocks = 2049, int64_t n_head = 4, int64_t n_tok = 1,
+            int64_t n_stream = 1, bool bias = true, int flags = 1, bool identity = false, float scale = 0.08838834764f)
+        : n_embd(n_embd), n_blocks(n_blocks), n_head(n_head), n_tok(n_tok), n_stream(n_stream), bias(bias),
+          flags(flags), identity(identity), scale(scale) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * k = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, n_blocks, n_stream);
+        ggml_set_name(k, "k");
+
+        ggml_tensor * q = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, n_head*n_tok, n_stream);
+        ggml_set_name(q, "q");
+
+        ggml_tensor * b = nullptr;
+        if (bias) {
+            b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_blocks, n_tok, n_stream);
+            ggml_set_name(b, "b");
+        }
+
+        ggml_tensor * fused = ggml_relu_sum_heads(ctx, ggml_mul_mat(ctx, k, q), b, (int32_t) n_head, scale, flags);
+        ggml_set_name(fused, "fused");
+
+        if (!identity) {
+            ggml_set_name(fused, "out");
+            return fused;
+        }
+
+        // the op chain of the model graph
+        ggml_tensor * score = ggml_reshape_4d(ctx, ggml_mul_mat(ctx, k, q), n_blocks, n_head, n_tok, n_stream);
+        score = ggml_relu(ctx, score);
+        ggml_tensor * summed = nullptr;
+        for (int64_t h = 0; h < n_head; ++h) {
+            ggml_tensor * slice = ggml_view_3d(ctx, score, n_blocks, n_tok, n_stream,
+                    score->nb[2], score->nb[3], h*score->nb[1]);
+            summed = summed ? ggml_add(ctx, summed, slice) : ggml_cont(ctx, slice);
+        }
+        summed = ggml_scale(ctx, summed, scale);
+        if (b) {
+            summed = ggml_add(ctx, summed, b);
+        }
+        ggml_set_name(summed, "chain");
+
+        ggml_tensor * out = ggml_sub(ctx, fused, summed);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+};
+
 // GGML_OP_LIGHTNING_INDEXER
 struct test_lightning_indexer : public test_case {
     const int64_t hsk; // indexer K head size
@@ -12407,6 +12549,41 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // relu_sum_heads and the indexer score of qwen4exp (128-wide keys, 4 heads, one pooled block per 4 cells, scaled by
+    // 1/sqrt(128)): decode (1-2 tokens, MMVF fusion) and prompt (512 tokens) at 8K and 64K cells; 2112 and 16448 are
+    // pool counts padded to 64 as the k-pool graph pads them
+    for (int64_t n : { 2049, 16385 }) {
+        for (int64_t n_tok : { 1, 512 }) {
+            for (bool bias : { false, true }) {
+                for (float scale : { 1.0f, 0.08838834764f }) {
+                    test_cases.emplace_back(new test_relu_sum_heads(n, 4, n_tok, 1, bias, scale));
+                }
+            }
+        }
+    }
+    test_cases.emplace_back(new test_relu_sum_heads(1000, 4, 2, 2, true, 0.08838834764f));
+    test_cases.emplace_back(new test_relu_sum_heads(1000, 3, 5, 1, true, 0.3f));
+    for (bool identity : { false, true }) {
+        for (int64_t n_blocks : { 2112, 16448 }) {
+            test_cases.emplace_back(new test_indexer_score(128, n_blocks, 4, 1, 1, true, 1, identity));
+            test_cases.emplace_back(new test_indexer_score(128, n_blocks, 4, 1, 1, true, 1, identity, 1.0f));
+        }
+        for (int64_t n_blocks : { 2049, 16385 }) {
+            for (int64_t n_tok : { 1, 2 }) {
+                for (int flags : { 0, 1 }) {
+                    test_cases.emplace_back(new test_indexer_score(128, n_blocks, 4, n_tok, 1, true, flags, identity));
+                }
+            }
+            test_cases.emplace_back(new test_indexer_score(128, n_blocks, 4, 1, 1, false, 1, identity));
+            test_cases.emplace_back(new test_indexer_score(128, n_blocks, 4, 1, 2, true, 1, identity));
+        }
+        for (int64_t n_blocks : { 2176, 16512 }) {
+            test_cases.emplace_back(new test_indexer_score(128, n_blocks, 4, 512, 1, true, 1, identity));
+        }
+        test_cases.emplace_back(new test_indexer_score(128, 2176, 4, 512, 1, false, 1, identity));
+        test_cases.emplace_back(new test_indexer_score(128, 777, 4, 3, 1, true, 1, identity));
+    }
+
     return test_cases;
 }
 #ifdef _MSC_VER
@@ -12966,6 +13143,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 512, 1));  // 4h PP-512
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 1024, 1)); // 4h PP-1024
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 64, 1, 1, false, true)); // KDA PP-64
+
+    // indexer score of qwen4exp at 8K and 64K cells: decode and a 512-token prompt ubatch
+    for (int64_t n_blocks : { 2049, 16385 }) {
+        for (int flags : { 0, 1 }) {
+            test_cases.emplace_back(new test_indexer_score(128, n_blocks, 4, 1, 1, true, flags, false));
+        }
+    }
+    for (int64_t n_blocks : { 2176, 16512 }) {
+        test_cases.emplace_back(new test_indexer_score(128, n_blocks, 4, 512, 1, true, 1, false));
+        test_cases.emplace_back(new test_relu_sum_heads(n_blocks, 4, 512, 1, true));
+    }
 
     // lightning_indexer
     for (int kv : { 256, 4096, 65536 }) {
