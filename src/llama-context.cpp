@@ -82,6 +82,25 @@ static const llm_fused_op_probe llm_fused_op_dsv4_hc_post_probe = {
     /*.n_tokens_per_seq =*/ 1,
 };
 
+// Stored batch shapes per context when LLAMA_GRAPH_REUSE_SHAPES is not set: a speculative server uses up to 16
+// verification widths, and the rest leaves room for a second graph variant of a width.
+static constexpr int LLAMA_GRAPH_REUSE_SHAPES_DEFAULT = 24;
+
+// LLAMA_GRAPH_REUSE_SHAPES, read once per process: 0 = off (one graph per output class, rebuilt on every batch
+// shape change), 1 = on with up to 8 stored batch shapes per context, N > 1 = on with up to N (at most 64).
+// -1 = not set, which means LLAMA_GRAPH_REUSE_SHAPES_DEFAULT.
+static int llama_graph_reuse_shapes_env() {
+    static const int n = [] {
+        const char * env = getenv("LLAMA_GRAPH_REUSE_SHAPES");
+        if (env == nullptr) {
+            return -1;
+        }
+        const int v = atoi(env);
+        return v <= 0 ? 0 : v == 1 ? 8 : std::min(v, 64);
+    }();
+    return n;
+}
+
 llama_context::llama_context(
         const llama_model & model,
               llama_context_params params) :
@@ -514,6 +533,13 @@ llama_context::~llama_context() {
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
 
+    if (graph_reuse_shapes > 0) {
+        LLAMA_LOG_INFO("%s: graph reuse across batch shapes: %lld built, %lld made current again, %lld rebuilt after a "
+                "buffer change, %lld evicted, %zu stored\n", __func__,
+                (long long) n_graph_built, (long long) n_graph_resumed, (long long) n_graph_stale,
+                (long long) n_graph_evicted, gf_res_shapes.size());
+    }
+
     // ranma expert cache: this context's compute backend is freed below
     if (expert_iface && expert_backend && expert_iface->attach_backend) {
         expert_iface->attach_backend(expert_backend, nullptr);
@@ -670,6 +696,8 @@ void llama_context::sched_reserve() {
     for (auto & res : gf_res_prev) {
         res.reset();
     }
+    gf_res_shapes.clear();
+    graph_reuse_shapes = 0;
     gf_res_reserve.reset(new llm_graph_result(max_nodes));
     gf_res_prev_active = nullptr;
 
@@ -797,10 +825,50 @@ void llama_context::sched_reserve() {
                 val(n_input_tensors_pp, n_input_tensors_tg).c_str());
     }
 
+    // graph reuse across batch shapes [LLAMA_GRAPH_REUSE_SHAPES]
+    {
+        const bool is_default = llama_graph_reuse_shapes_env() < 0;
+        const int  n          = is_default ? LLAMA_GRAPH_REUSE_SHAPES_DEFAULT : llama_graph_reuse_shapes_env();
+
+        const char * graph_opt = getenv("GGML_CUDA_GRAPH_OPT");
+        const char * reason = nullptr;
+        if (n > 0) {
+            if (graph_reuse_disable) {
+                reason = "graph reuse is disabled";
+            } else if (model.hparams.no_alloc) {
+                reason = "no_alloc";
+            } else if (graph_opt != nullptr && atoi(graph_opt) == 1) {
+                // the backend keeps the stream plan of the last optimized graph only
+                reason = "GGML_CUDA_GRAPH_OPT=1";
+            } else if (!ggml_backend_sched_set_graph_slots(sched.get(), n)) {
+                reason = "pipeline parallelism";
+            }
+        }
+
+        if (n > 0 && reason == nullptr) {
+            graph_reuse_shapes = n;
+            LLAMA_LOG_INFO("%s: graph reuse across batch shapes on, up to %d graphs (LLAMA_GRAPH_REUSE_SHAPES%s)\n",
+                    __func__, n, is_default ? " not set: the default, 0 turns it off" : "");
+        } else if (n > 0) {
+            LLAMA_LOG_INFO("%s: graph reuse across batch shapes off: %s\n", __func__, reason);
+        } else {
+            LLAMA_LOG_INFO("%s: graph reuse across batch shapes off (LLAMA_GRAPH_REUSE_SHAPES)\n", __func__);
+        }
+    }
+
     const int64_t t_end_us = ggml_time_us();
 
     LLAMA_LOG_INFO("%s: reserve took %.2f ms, sched copies = %d\n",
             __func__, (t_end_us - t_start_us)/1000.0, ggml_backend_sched_get_n_copies(sched.get()));
+}
+
+void llama_context::graph_reuse_invalidate() {
+    for (auto & slot : gf_res_shapes) {
+        if (slot.res) {
+            slot.res->reset();
+        }
+        slot.allocated = false;
+    }
 }
 
 void llama_context::synchronize() {
@@ -913,6 +981,7 @@ bool llama_context::memory_update(bool optimize) {
                 res->reset();
             }
         }
+        graph_reuse_invalidate();
         gf_res_prev_active = nullptr;
 
         if (!mctx->apply()) {
@@ -1454,14 +1523,79 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         return nullptr;
     }
 
-    auto * res = get_gf_res_prev();
-    auto * gf  = res->get_gf();
+    // graph reuse across batch shapes: set when the previous graph or a stored graph of this shape is made current
+    // again (a stored graph whose allocation was gone is built again)
+    bool shape_reused = false;
+
+    llm_graph_result * res = nullptr;
+    gf_res_shape * shape = nullptr;
+
+    if (graph_reuse_shapes > 0) {
+        // the shape slot of the previous graph first, then any stored graph of this shape
+        llm_graph_params gparams_find = graph_params(nullptr, ubatch, mctx, gtype);
+
+        for (auto & slot : gf_res_shapes) {
+            if (slot.res.get() == gf_res_prev_active && slot.allocated && slot.res->can_reuse(gparams_find)) {
+                shape = &slot;
+                shape_reused = true;
+                break;
+            }
+        }
+        if (shape == nullptr) {
+            for (auto & slot : gf_res_shapes) {
+                if (slot.res.get() == gf_res_prev_active || !slot.allocated || !slot.res->can_reuse(gparams_find)) {
+                    continue;
+                }
+                shape = &slot;
+                if (ggml_backend_sched_resume_graph(sched.get(), slot.res->get_gf())) {
+                    shape_reused = true;
+                    gf_res_prev_active = slot.res.get();
+                    n_graph_resumed++;
+                } else {
+                    // the buffers were planned again since: build it again in the same slot
+                    n_graph_stale++;
+                }
+                break;
+            }
+        }
+        if (shape == nullptr) {
+            // a free slot, a new one, or the least recently used one
+            for (auto & slot : gf_res_shapes) {
+                if (!slot.allocated && (shape == nullptr || slot.last_use < shape->last_use)) {
+                    shape = &slot;
+                }
+            }
+            if (shape == nullptr && (int) gf_res_shapes.size() < graph_reuse_shapes) {
+                gf_res_shapes.emplace_back();
+                shape = &gf_res_shapes.back();
+                shape->res.reset(new llm_graph_result(gf_res_reserve->get_max_nodes()));
+            }
+            if (shape == nullptr) {
+                for (auto & slot : gf_res_shapes) {
+                    if (shape == nullptr || slot.last_use < shape->last_use) {
+                        shape = &slot;
+                    }
+                }
+                n_graph_evicted++;
+            }
+        }
+
+        shape->last_use = ++graph_reuse_clock;
+        res = shape->res.get();
+    } else {
+        res = get_gf_res_prev();
+    }
+
+    auto * gf = res->get_gf();
 
     // the new graph parameters
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
 
-    if (!graph_reuse_disable && gf_res_prev_active == res && res->can_reuse(gparams)) {
+    if (graph_reuse_shapes > 0 && shape_reused) {
+        // can_reuse() of the chosen graph has already bound it to the memory context of this ubatch
+        n_reused++;
+    } else if (graph_reuse_shapes == 0 && !graph_reuse_disable && gf_res_prev_active == res && res->can_reuse(gparams)) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
         // with pipeline parallelism, the previous graph_compute_async may still be running
@@ -1476,7 +1610,14 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         gf_res_prev_active = nullptr;
         res->reset();
 
-        ggml_backend_sched_reset(sched.get());
+        if (shape != nullptr) {
+            shape->allocated = false;
+            n_graph_built++;
+            // the scheduler keeps the split and the allocation of this graph in its own slot
+            ggml_backend_sched_reset_graph(sched.get(), res->get_gf());
+        } else {
+            ggml_backend_sched_reset(sched.get());
+        }
         ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
 
         //const auto t_start_us = ggml_time_us();
@@ -1495,6 +1636,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
+        }
+
+        if (shape != nullptr) {
+            shape->allocated = true;
         }
 
         gf_res_prev_active = res;
@@ -2621,6 +2766,7 @@ ggml_cgraph * llama_context::graph_reserve(
             res->reset();
         }
     }
+    graph_reuse_invalidate();
     gf_res_prev_active = nullptr;
 
     // store the n_outputs as it is, and restore it afterwards
@@ -3833,6 +3979,7 @@ void llama_context::opt_epoch_iter(
 
             // the optimizer graph is allocated outside sched, so the next decode must rebuild
             gf_res_prev_active = nullptr;
+            graph_reuse_invalidate();
             res->reset();
 
             auto * gf = model.build_graph(gparams);

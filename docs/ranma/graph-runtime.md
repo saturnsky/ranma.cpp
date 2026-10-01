@@ -2,7 +2,8 @@
 
 Changes to the machinery that turns a graph into work for a backend: the compute
 buffers the graph allocator keeps, the way the scheduler gets the inputs of a
-graph onto the device, and the nodes a LoRA adapter adds to a graph.
+graph onto the device, the nodes a LoRA adapter adds to a graph, and the graphs
+that llama and the HIP backend keep per batch shape.
 
 ## Compute buffer regrowth headroom
 
@@ -255,6 +256,11 @@ its instantiated graph directly.
 | --- | --- | --- | --- |
 | `GGML_CUDA_GRAPH_PER_SHAPE` | env | `1` in HIP builds, `0` in CUDA builds | `0` keys the stored graphs by the first node only, the upstream keying; `1` keys them by first node and batch shape with at most 32 graphs per context; `N > 1` allows at most `N` (capped at 256). Read once per process. |
 
+The default bound was 16 until the llama graph per batch shape (next section)
+was turned on by default. Each llama graph it keeps is a graph of its own for
+the backend, so with 24 stored llama graphs and 16 backend graphs the backend
+dropped and captured graphs again at its bound; 32 leaves room for them.
+
 ### Limits
 
 - The graphs of one context are bounded. When the bound is reached, the least
@@ -275,3 +281,73 @@ its instantiated graph directly.
 - The backend context logs `per-shape graphs: ... evicted at the limit` when it
   is destroyed; a count that grows with the run means the bound is too small for
   the widths in use.
+
+
+## One llama graph per batch shape
+
+### What it is
+
+llama keeps one built graph per output class and builds, splits and allocates a
+new one whenever the batch shape changes. A speculative verification changes
+its width from round to round (1 to n-max + 1 tokens), so the call after every
+width change paid the build, the scheduler split and the allocation again, and
+the HIP backend compared the properties of the whole graph against the one it
+had stored. With the reuse on, a context keeps the built graph of each batch
+shape in a graph slot of the scheduler, together with its split and its
+allocation. A width seen before is made current again: no build, no split, no
+allocation, and the backend finds the same split and replays its stored graph.
+
+A stored graph stays valid until the compute buffers are planned again (a
+reserve, or a buffer that has to grow). Then the slots are dropped and each
+shape is built again the next time it is used. When all slots are in use, the
+least recently used shape is evicted.
+
+### Options
+
+| Name | Kind | Default | Effect |
+| --- | --- | --- | --- |
+| `LLAMA_GRAPH_REUSE_SHAPES` | env | `24` when not set | `0` keeps one graph per output class, the behaviour before this change; `1` keeps up to 8 batch shapes per context; `N > 1` keeps up to `N` (capped at 64). Read once per process. |
+
+24 covers the up to 16 verification widths of a speculative server and leaves
+room for a second graph variant of a width (DeepSeek V4 Flash alternates two
+graph plans at some widths).
+
+### Limits
+
+- It switches itself off, and logs the reason, when graph reuse is disabled
+  (`LLAMA_GRAPH_REUSE_DISABLE`), for a model loaded with `no_alloc`, with
+  `GGML_CUDA_GRAPH_OPT=1` (the backend keeps the stream plan of the last
+  optimized graph only) and with pipeline parallelism (more than one scheduler
+  copy).
+- Host memory: every slot keeps the split and the graph copy of its shape. In
+  the server rows below the peak private bytes rose by 0.85 to 0.97 GiB with
+  both defaults (24 llama graphs, 32 backend graphs); VRAM did not change,
+  since all slots share the compute buffers.
+- The graphs are still rebuilt when the compute buffers are planned again, for
+  example when the KV cache view of a graph crosses a padding step of 256
+  cells. That cost is paid once per step and per width in use, not per width
+  change.
+
+### How to verify it
+
+- The context logs `graph reuse across batch shapes on, up to N graphs` at
+  every reserve, or `off` with the reason. When it is destroyed it logs how many
+  graphs were built, made current again, rebuilt after a buffer change and
+  evicted.
+- Measured on 2026-09-29 (the build
+  also carried a per-round speculative log, used for the switch cost below, and
+  diagnostics that were off), Radeon AI PRO R9700, 128 GB host memory, English roleplay (17
+  requests), MTP `--spec-draft-n-max 7 --spec-draft-p-min 0.7` with the joint
+  cache, expert cache exclusive 20480 MiB and an unlimited host tier, warm
+  profile, one run per row with a 300 s rest. A = `LLAMA_GRAPH_REUSE_SHAPES=0`
+  and `GGML_CUDA_GRAPH_PER_SHAPE=16` (the previous defaults), B = 24 and 32
+  (the defaults now):
+
+  | model | A decode t/s | B decode t/s | B against A | replies | acceptance |
+  | --- | ---: | ---: | ---: | --- | ---: |
+  | Qwen3.8-Flash-Next UD-Q4_K_XL (prefill swap on) | 46.52 | 51.67 | +11.1 % | 17/17 identical | 77.9 % both |
+  | DeepSeek V4 Flash UD-IQ3_XXS | 28.97 | 31.45 | +8.6 % | 17/17 identical | 68.8 % both |
+
+  The extra time of the call after a width change and of the call after it
+  (from the per-round log) was +3.6 to +9.8 ms in A and about 0 (within
+  +-0.8 ms) in B.
