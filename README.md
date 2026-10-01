@@ -177,6 +177,10 @@ applies, how to switch it, and its limits.
 - **Stable top-k tie selection for reproducible runs** - `GGML_CUDA_TOP_K_STABLE_TIES=1` makes the radix top-k
   select the smallest columns among exactly tied values, so selections and outputs can be compared between runs.
   Off by default. [docs/ranma/qwen-sparse-attention.md](docs/ranma/qwen-sparse-attention.md)
+- **Attention reads only the selected cells** - on HIP the tile flash attention gathers the selected K/V rows
+  through the compacted index list of its query tile instead of scanning the KV cache. It applies to tiles of up
+  to four query rows, from a cache length that depends on the selection budget. `GGML_CUDA_FATTN_SPARSE=0` keeps
+  the dense kernel. Same page.
 
 ## Building
 
