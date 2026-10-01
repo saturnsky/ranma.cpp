@@ -234,3 +234,44 @@ it when the tool moves on to the next model.
   exactly.
 - A kernel trace with an adapter attached shows the scale launches disappear, and
   for a single-token decode the `B` matmul and the add appear as one kernel.
+
+
+## One HIP graph per batch shape
+
+### What it is
+
+The CUDA/HIP backend keeps the graphs it captured per context and used to key
+them by the first node of the ggml graph. llama builds the graph of another
+batch width in the same metadata buffer, so every width shared one stored
+graph: a speculative verification whose width changes between rounds ran each
+changed call without a graph and captured again on the next call. With
+per-shape keying the key also holds a shape signature - the node count and the
+shape and op of the first and the last node - so a width that returns launches
+its instantiated graph directly.
+
+### Options
+
+| Name | Kind | Default | Effect |
+| --- | --- | --- | --- |
+| `GGML_CUDA_GRAPH_PER_SHAPE` | env | `1` in HIP builds, `0` in CUDA builds | `0` keys the stored graphs by the first node only, the upstream keying; `1` keys them by first node and batch shape with at most 32 graphs per context; `N > 1` allows at most `N` (capped at 256). Read once per process. |
+
+### Limits
+
+- The graphs of one context are bounded. When the bound is reached, the least
+  recently used graph is dropped after a synchronization of the stream, because
+  its instance may still be queued.
+- A graph captured before the memory pool returned memory to the driver is
+  captured again.
+
+### How to verify it
+
+- The backend logs `per-shape graphs on, at most N per context` once per
+  process when the keying is on, and `per-shape graphs off` when the variable
+  turns it off.
+- Measured on DeepSeek V4 Flash with a DSpark drafter (verification widths 1 to
+  4): the extra time of the second call after a width change dropped from 9..13
+  ms to 0..3 ms per round, and the replies were identical with the switch on and
+  off.
+- The backend context logs `per-shape graphs: ... evicted at the limit` when it
+  is destroyed; a count that grows with the run means the bound is too small for
+  the widths in use.
