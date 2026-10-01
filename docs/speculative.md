@@ -242,7 +242,8 @@ Use exactly one of these options:
                                         HuggingFace repository for the draft model
                                         (env: LLAMA_ARG_SPEC_DRAFT_HF_REPO)
 --spec-draft-n-max                      N
-                                        number of tokens to draft for speculative decoding (default: 3)
+                                        number of tokens to draft for speculative decoding; with --spec-smart
+                                        the upper bound of the draft length (default: 3, with --spec-smart: 7)
                                         (env: LLAMA_ARG_SPEC_DRAFT_N_MAX)
 --spec-draft-n-min                      N
                                         minimum number of draft tokens to use for speculative decoding (default: 0)
@@ -253,14 +254,16 @@ Use exactly one of these options:
 --spec-draft-p-min, --draft-p-min       P0,P1,...
                                         minimum draft token probability per draft position, comma-separated;
                                         a token below the value for its position is dropped and drafting stops;
-                                        a short list repeats its last value (default: 0.00)
+                                        a short list repeats its last value; giving it turns --spec-smart off
+                                        (default: 0.00)
                                         (env: LLAMA_ARG_SPEC_DRAFT_P_MIN)
 --spec-draft-p-continue                 P0,P1,...
                                         minimum draft token probability per draft position to keep drafting
                                         after a kept token, comma-separated; below it the token is kept but
                                         drafting stops; applies to drafters that draft one token per step
                                         (draft-simple, draft-eagle3, draft-mtp);
-                                        a short list repeats its last value (default: off)
+                                        a short list repeats its last value; giving it turns --spec-smart off
+                                        (default: off)
                                         (env: LLAMA_ARG_SPEC_DRAFT_P_CONTINUE)
 --spec-draft-ngl, -ngld, --gpu-layers-draft, --n-gpu-layers-draft  N
                                         max. number of draft model layers to store in VRAM, either an exact number, 'auto', or 'all' (default: auto)
@@ -277,6 +280,10 @@ position. Positions are 0-based and use the same numbering as the server metric
 `spec_decode_num_accepted_tokens_per_pos_total{position="i"}`: position 0 is the first drafted token. A list
 shorter than the draft length repeats its last value, so a single value applies to every position, which is what
 `--spec-draft-p-min 0.8` did before.
+
+With `draft-mtp`, llama-server chooses the draft length with `--spec-smart` by default
+([ranma/spec-smart.md](ranma/spec-smart.md)); giving either threshold turns it off with a warning, and
+`--no-spec-smart` turns it off without one.
 
 At draft position `i`, the top-1 probability of the drafted token is compared against both gates:
 
