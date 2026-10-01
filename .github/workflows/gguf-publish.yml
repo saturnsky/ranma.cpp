@@ -12,11 +12,6 @@ name: Upload Python Package
 
 on:
   workflow_dispatch:
-  push:
-    # Pattern matched against refs/tags
-    tags:
-      - 'gguf-v*'           # Push events to every version tag
-
 
 jobs:
   deploy:

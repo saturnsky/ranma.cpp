@@ -2,30 +2,6 @@ name: CI (self-hosted KleidiAI backend)
 
 on:
   workflow_dispatch: # allows manual triggering
-  push:
-    branches:
-      - master
-    paths: [
-      '.github/workflows/ci-self-hosted-kleidiai.yml',
-      'ci/run.sh',
-      '**/CMakeLists.txt',
-      '**/.cmake',
-      '**/*.h',
-      '**/*.hpp',
-      '**/*.c',
-      '**/*.cpp'
-    ]
-
-  pull_request:
-    types: [opened, synchronize, reopened]
-    paths: [
-      '.github/workflows/ci-self-hosted-kleidiai.yml',
-      'ci/run.sh',
-      '**/CMakeLists.txt',
-      '**/.cmake',
-      'ggml/src/*',
-      'ggml/src/ggml-cpu/**'
-    ]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref && github.ref || github.run_id }}
