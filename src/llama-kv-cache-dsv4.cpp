@@ -1025,6 +1025,15 @@ void llama_dsv4_comp_state::clear(llama_seq_id seq_id, bool data) {
     if (seq_id >= 0) {
         GGML_ASSERT((uint32_t) seq_id < n_stream);
 
+        if (n_stream == 1) {
+            // every plane belongs to this sequence: one clear per buffer instead of one
+            // synchronous memset per layer, plane and tensor
+            for (auto & [_, buf] : ctxs_bufs) {
+                ggml_backend_buffer_clear(buf.get(), 0);
+            }
+            return;
+        }
+
         for (const auto & layer : layers) {
             for (uint32_t d = 0; d <= n_rs_seq; ++d) {
                 const uint32_t stream = d*n_stream + (uint32_t) seq_id;
