@@ -357,6 +357,18 @@ extern "C" {
     // The correct way to use this API is to discard the deallocated tensors and create new ones.
     GGML_API void                 ggml_backend_sched_reset(ggml_backend_sched_t sched);
 
+    // Graph slots (off by default): keep the split and the allocation of up to n_slots graphs, identified by the
+    // graph pointer, so that a graph computed before can be made current again without splitting and allocating it
+    // again. All graphs share the compute buffers and must run one after the other. Not available with pipeline
+    // parallelism (n_copies > 1); returns false then. n_slots = 0 turns the slots off (the plain behaviour).
+    GGML_API bool                 ggml_backend_sched_set_graph_slots(ggml_backend_sched_t sched, int n_slots);
+    // like ggml_backend_sched_reset, but with graph slots on the scheduler switches to the slot of the graph that is
+    // going to be built (any previous split of that graph is dropped); without slots it is ggml_backend_sched_reset
+    GGML_API void                 ggml_backend_sched_reset_graph(ggml_backend_sched_t sched, const struct ggml_cgraph * graph);
+    // with graph slots on: make the stored split and allocation of the graph current again, as after
+    // ggml_backend_sched_alloc_graph; false if the graph is not stored or its allocation is no longer valid
+    GGML_API bool                 ggml_backend_sched_resume_graph(ggml_backend_sched_t sched, const struct ggml_cgraph * graph);
+
     // Set a callback to be called for each resulting node during graph compute
     GGML_API void                 ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backend_sched_eval_callback callback, void * user_data);
 
