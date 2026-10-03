@@ -104,6 +104,11 @@ static inline bool ggml_impl_is_view(const struct ggml_tensor * t) {
     return t->view_src != NULL;
 }
 
+// a matrix product that selects a matrix of src[0] per row with the expert ids in src[2]
+static inline bool ggml_op_is_expert_matmul(const struct ggml_tensor * op) {
+    return op->op == GGML_OP_MUL_MAT_ID || (op->op == GGML_OP_MUL_MAT_HAD && op->src[2] != NULL);
+}
+
 static inline float ggml_compute_softplus_f32(float input) {
     return (input > 20.0f) ? input : logf(1 + expf(input));
 }
