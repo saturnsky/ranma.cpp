@@ -537,6 +537,7 @@ extern "C" {
 
         GGML_OP_MUL_MAT,
         GGML_OP_MUL_MAT_ID,
+        GGML_OP_MUL_MAT_HAD,
         GGML_OP_OUT_PROD,
 
         GGML_OP_SCALE,
@@ -1524,6 +1525,22 @@ extern "C" {
             struct ggml_tensor  * as,
             struct ggml_tensor  * b,
             struct ggml_tensor  * ids);
+
+    // matrix multiplication between Hadamard rotations: rot_out * H(a^T H(rot_in * b))
+    // H is the normalized Sylvester Hadamard over blocks of `had` (a power of 2, <= 512) along K and along N
+    // a: [K, N] or [K, N, E], any 128-row view of it; EXL3 types need had = 128 and cannot be used in ggml_mul_mat
+    // b: F32, as in ggml_mul_mat (ids == NULL) or ggml_mul_mat_id (ids: I32 [n_expert_used, n_tokens])
+    // rot_in: F16/F32 [K] or [K, E], rot_out: F16/F32 [N] or [N, E]; result: F32 as for ggml_mul_mat(_id)
+    // sources: a, b, ids (NULL without ids, the place of the ids of ggml_mul_mat_id), rot_in, rot_out
+    // precision of b: ggml_prec_set_src(result, GGML_PREC_F32, 1) keeps it, F16 lets the backend round H(rot_in * b) to F16
+    GGML_API struct ggml_tensor * ggml_mul_mat_had(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b,
+            struct ggml_tensor  * rot_in,
+            struct ggml_tensor  * rot_out,
+            struct ggml_tensor  * ids,
+            int                   had);
 
     // A: m columns, n rows,
     // B: p columns, n rows,

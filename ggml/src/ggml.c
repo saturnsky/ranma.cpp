@@ -1089,6 +1089,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
 
     "MUL_MAT",
     "MUL_MAT_ID",
+    "MUL_MAT_HAD",
     "OUT_PROD",
 
     "SCALE",
@@ -1171,7 +1172,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
+static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1207,6 +1208,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
 
     "X*Y",
     "X[i]*Y",
+    "rot(X*rot(Y))",
     "X*Y",
 
     "x*v",
@@ -1289,7 +1291,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
+static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -3394,6 +3396,7 @@ bool ggml_prec_set_src(
     switch (a->op) {
         case GGML_OP_MUL_MAT:
         case GGML_OP_MUL_MAT_ID:
+        case GGML_OP_MUL_MAT_HAD:
             {
                 if (idx != 1) {
                     return false;
@@ -3426,6 +3429,7 @@ struct ggml_tensor * ggml_mul_mat(
         struct ggml_tensor  * b) {
     GGML_ASSERT(ggml_can_mul_mat(a, b));
     GGML_ASSERT(!ggml_is_transposed(a));
+    GGML_ASSERT(!ggml_is_exl3(a->type) && "EXL3 weights need ggml_mul_mat_had");
 
     const int64_t ne[4] = { a->ne[1], b->ne[1], b->ne[2], b->ne[3] };
     struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
@@ -3477,6 +3481,7 @@ struct ggml_tensor * ggml_mul_mat_id(
         struct ggml_tensor  * b,
         struct ggml_tensor  * ids) {
     GGML_ASSERT(!ggml_is_transposed(as));
+    GGML_ASSERT(!ggml_is_exl3(as->type) && "EXL3 weights need ggml_mul_mat_had");
     GGML_ASSERT(ids->type == GGML_TYPE_I32);
 
     GGML_ASSERT(as->ne[3] == 1); // as is 3d (one matrix per expert)
@@ -3493,6 +3498,62 @@ struct ggml_tensor * ggml_mul_mat_id(
     result->src[0] = as;
     result->src[1] = b;
     result->src[2] = ids;
+
+    return result;
+}
+
+// ggml_mul_mat_had
+
+static bool ggml_mul_mat_had_rot(const struct ggml_tensor * rot, int64_t n, int64_t n_exp) {
+    return (rot->type == GGML_TYPE_F32 || rot->type == GGML_TYPE_F16) && rot->nb[0] == ggml_type_size(rot->type) &&
+        rot->ne[0] == n && rot->ne[1] == n_exp && rot->ne[2] == 1 && rot->ne[3] == 1;
+}
+
+struct ggml_tensor * ggml_mul_mat_had(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * b,
+        struct ggml_tensor  * rot_in,
+        struct ggml_tensor  * rot_out,
+        struct ggml_tensor  * ids,
+        int                   had) {
+    const int64_t k     = a->ne[0];
+    const int64_t n     = a->ne[1];
+    const int64_t n_exp = a->ne[2];
+
+    GGML_ASSERT(had >= 2 && had <= 512 && (had & (had - 1)) == 0);
+    GGML_ASSERT(k % had == 0 && n % had == 0);
+    GGML_ASSERT(a->type == GGML_TYPE_F32 || a->type == GGML_TYPE_F16 || ggml_is_exl3(a->type));
+    GGML_ASSERT(a->ne[3] == 1 && a->nb[0] == ggml_type_size(a->type) && a->nb[1] == ggml_row_size(a->type, k) && a->nb[2] >= n*a->nb[1]);
+    if (ggml_is_exl3(a->type)) {
+        // rows are stored in groups of 128, and the group is the H128 output block
+        GGML_ASSERT(had == 128);
+        GGML_ASSERT(a->view_offs % (128*a->nb[1]) == 0 && a->nb[2] % (128*a->nb[1]) == 0);
+    }
+    GGML_ASSERT(b->type == GGML_TYPE_F32 && b->ne[0] == k);
+    GGML_ASSERT(ggml_mul_mat_had_rot(rot_in, k, n_exp) && ggml_mul_mat_had_rot(rot_out, n, n_exp));
+
+    int64_t ne[4] = { n, b->ne[1], b->ne[2], b->ne[3] };
+    if (ids) {
+        GGML_ASSERT(ids->type == GGML_TYPE_I32 && ids->ne[2] == 1 && ids->ne[3] == 1);
+        GGML_ASSERT(ids->ne[1] == b->ne[2] && b->ne[3] == 1);
+        GGML_ASSERT(ids->ne[0] % b->ne[1] == 0);
+        ne[1] = ids->ne[0];
+    } else {
+        GGML_ASSERT(b->ne[2] % n_exp == 0);
+    }
+
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    ggml_set_op_params_i32(result, 0, had);
+
+    // src[2] = ids as in ggml_mul_mat_id, so code that reads the expert ids of an op finds them in the same place
+    result->op     = GGML_OP_MUL_MAT_HAD;
+    result->src[0] = a;
+    result->src[1] = b;
+    result->src[2] = ids;
+    result->src[3] = rot_in;
+    result->src[4] = rot_out;
 
     return result;
 }
