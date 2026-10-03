@@ -150,6 +150,7 @@ inline std::vector<plan_candidate> sorted_candidates(const geometry & geo, const
 // hold no experts, and counting them would give every class a fraction of its
 // share and leave the rest to the greedy loop below, which favours the
 // smallest slice class. The loop only places the rounding remainder.
+// A VRAM slot costs geometry::class_vram_bytes: the weights and the aux rows that move with them.
 inline std::vector<int> allocate_cold_capacities(const geometry & geo, size_t remaining) {
     const int n_classes = (int) geo.class_bytes.size();
     std::vector<int> capacity(n_classes, 0);
@@ -162,7 +163,7 @@ inline std::vector<int> allocate_cold_capacities(const geometry & geo, size_t re
     }
     size_t used = 0;
     for (int cls = 0; cls < n_classes; ++cls) {
-        const size_t bytes = geo.class_total_bytes(cls);
+        const size_t bytes = geo.class_vram_bytes(cls);
         const size_t share = remaining*(size_t) geo.class_layers[cls]/routed;
         capacity[cls] = std::min<int>(geo.class_layers[cls]*geo.n_experts, bytes == 0 ? 0 : int(share/bytes));
         used += (size_t) capacity[cls]*bytes;
@@ -171,9 +172,9 @@ inline std::vector<int> allocate_cold_capacities(const geometry & geo, size_t re
     while (true) {
         int best = -1;
         for (int cls = 0; cls < n_classes; ++cls) {
-            const size_t bytes = geo.class_total_bytes(cls);
+            const size_t bytes = geo.class_vram_bytes(cls);
             if (capacity[cls] < geo.class_layers[cls]*geo.n_experts && bytes <= remaining &&
-                    (best < 0 || bytes < geo.class_total_bytes(best))) {
+                    (best < 0 || bytes < geo.class_vram_bytes(best))) {
                 best = cls;
             }
         }
@@ -181,7 +182,7 @@ inline std::vector<int> allocate_cold_capacities(const geometry & geo, size_t re
             break;
         }
         ++capacity[best];
-        remaining -= geo.class_total_bytes(best);
+        remaining -= geo.class_vram_bytes(best);
     }
     return capacity;
 }
@@ -231,7 +232,7 @@ inline placement plan_placement(const placement_inputs & in) {
         result.capacities.resize(geo.class_bytes.size(), 0);
         std::vector<int> used(result.capacities.size(), 0);
         for (const detail::plan_candidate & c : candidates) {
-            const size_t bytes = geo.class_total_bytes(c.cls);
+            const size_t bytes = geo.class_vram_bytes(c.cls);
             result.stats.total_bytes += c.count*bytes;
             if ((!in.exclusive && c.count == 0) || used[c.cls] >= result.capacities[c.cls]) {
                 continue;
@@ -253,7 +254,7 @@ inline placement plan_placement(const placement_inputs & in) {
         // resulting per-class slot counts become the fixed class capacities.
         size_t remaining = in.budget_bytes;
         for (const detail::plan_candidate & c : candidates) {
-            const size_t bytes = geo.class_total_bytes(c.cls);
+            const size_t bytes = geo.class_vram_bytes(c.cls);
             result.stats.total_bytes += c.count*bytes;
             if ((c.count != 0 || in.exclusive) && bytes <= remaining) {
                 result.selected[c.layer].push_back(c.expert);

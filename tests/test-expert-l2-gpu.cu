@@ -832,7 +832,10 @@ struct host_fixture_geo {
     geometry geo;
     ggml_tensor tensors[layers][3] = {};
     std::vector<char> values[layers][3];
-    host_fixture_geo() {
+    // with aux: rot_in / rot_out rows per expert (EXL3), other strides in each class
+    ggml_tensor aux_tensors[layers][3][2] = {};
+    std::vector<char> aux_values[layers][3][2];
+    explicit host_fixture_geo(bool aux = false) {
         geo.n_layers = layers; geo.n_experts = experts;
         geo.layer_class = {0, 0, 1}; geo.class_layers = {2, 1};
         geo.class_bytes = {{70*1024 + 64, 70*1024 + 64, 90*1024 + 128}, {50*1024, 50*1024, 110*1024 + 256}};
@@ -844,6 +847,87 @@ struct host_fixture_geo {
             auto & t = tensors[l][k]; t.type = GGML_TYPE_F32; t.ne[0] = 32; t.ne[1] = 1; t.ne[2] = experts; t.ne[3] = 1;
             t.data = values[l][k].data(); geo.tensors[l][k] = &t; geo.nb2[l][k] = stride;
         }
+        if (!aux) { return; }
+        const size_t rows[2][3][2] = {{{4096, 2048}, {4096, 2048}, {2048, 4096}}, {{1024, 6144}, {1024, 6144}, {6144, 1024}}};
+        geo.aux.assign(layers, expert_aux_tensors{});
+        geo.aux_nb.assign(layers, expert_aux_bytes{});
+        geo.class_aux.assign(2, expert_aux_bytes{});
+        for (int l = 0; l < layers; ++l) for (int k = 0; k < 3; ++k) for (int a = 0; a < 2; ++a) {
+            const int c = geo.layer_class[l];
+            const size_t nb = rows[c][k][a];
+            aux_values[l][k][a].resize(experts*nb);
+            for (int e = 0; e < experts; ++e) for (size_t i = 0; i < nb; ++i) { aux_values[l][k][a][e*nb + i] = redraw_byte(l + 7*a, k + 3, e, i); }
+            auto & t = aux_tensors[l][k][a]; t.type = GGML_TYPE_F16; t.ne[0] = int64_t(nb/2); t.ne[1] = experts; t.ne[2] = 1; t.ne[3] = 1;
+            t.nb[0] = 2; t.nb[1] = nb; t.nb[2] = t.nb[3] = nb*experts;
+            t.data = aux_values[l][k][a].data();
+            geo.aux[l][k][a] = &t; geo.aux_nb[l][k][a] = nb; geo.class_aux[c][k][a] = nb;
+        }
+    }
+};
+
+// With aux rows: the owner records and the bytes of every VRAM resident (verify_aux), and the rows read at the slot
+// through the lookup's aux bases the way the kernels read them (a graph captured before any redraw when `exec` is
+// set, else direct launches), equal their tensor rows.
+struct aux_check {
+    const host_fixture_geo & f;
+    l1_arena & gpu;
+    std::vector<size_t> off;
+    size_t bytes = 0;
+    char * out = nullptr;
+    aux_check(const host_fixture_geo & f, l1_arena & gpu) : f(f), gpu(gpu) {
+        for (int l = 0; l < f.layers; ++l) for (int k = 0; k < 3; ++k) for (int a = 0; a < 2; ++a) {
+            off.push_back(bytes); bytes += f.experts*f.geo.aux_nb[l][k][a];
+        }
+        CUDA_CHECK(hipMalloc(&out, bytes));
+    }
+    ~aux_check() { (void) hipFree(out); }
+    void launch(hipStream_t stream) {
+        for (int l = 0; l < f.layers; ++l) for (int k = 0; k < 3; ++k) {
+            const ggml_cuda_expert_lookup lk = gpu.lookup(l, k);
+            for (int a = 0; a < 2; ++a) {
+                redraw_gather<<<f.experts, 256, 0, stream>>>((const char *) lk.aux[a], lk.slots, nullptr, nullptr,
+                    f.geo.aux_nb[l][k][a], out + off[(l*3 + k)*2 + a]);
+            }
+        }
+    }
+    bool lookups_ok(const char * when) {
+        for (int l = 0; l < f.layers; ++l) for (int k = 0; k < 3; ++k) {
+            const ggml_cuda_expert_lookup lk = gpu.lookup(l, k);
+            for (int a = 0; a < 2; ++a) {
+                if (lk.aux[a] == nullptr || lk.aux_src[a] != &f.aux_tensors[l][k][a]) {
+                    printf("FAIL %s: lookup of layer %d kind %d has no aux %d\n", when, l, k, a); return false;
+                }
+            }
+        }
+        return true;
+    }
+    bool equal(const char * when, hipGraphExec_t exec = nullptr, hipStream_t stream = nullptr) {
+        std::string reason;
+        const long checked = gpu.verify_aux(reason);
+        if (checked < 0) { printf("FAIL %s: verify_aux: %s\n", when, reason.c_str()); return false; }
+        if (exec != nullptr) {
+            CUDA_CHECK(hipGraphLaunch(exec, stream)); CUDA_CHECK(hipStreamSynchronize(stream));
+        } else {
+            if (!lookups_ok(when)) { return false; }
+            launch(nullptr); CUDA_CHECK(hipDeviceSynchronize());
+        }
+        std::vector<char> back(bytes);
+        CUDA_CHECK(hipMemcpy(back.data(), out, bytes, hipMemcpyDeviceToHost));
+        long resident = 0;
+        for (int l = 0; l < f.layers; ++l) for (int e = 0; e < f.experts; ++e) {
+            if (gpu.host_slots()[l][e] < 0) { continue; }
+            ++resident;
+            for (int k = 0; k < 3; ++k) for (int a = 0; a < 2; ++a) {
+                const size_t nb = f.geo.aux_nb[l][k][a];
+                if (memcmp(back.data() + off[(l*3 + k)*2 + a] + e*nb, f.aux_values[l][k][a].data() + e*nb, nb) != 0) {
+                    printf("FAIL %s: layer %d kind %d expert %d (slot %d): aux %d at the slot differs from its tensor\n", when, l, k,
+                        e, gpu.host_slots()[l][e], a);
+                    return false;
+                }
+            }
+        }
+        if (resident != checked) { printf("FAIL %s: verify_aux checked %ld of %ld residents\n", when, checked, resident); return false; }
+        return true;
     }
 };
 
@@ -867,11 +951,12 @@ static bool select_all_equal(const host_fixture_geo & f, l1_arena & gpu, bool us
 }
 
 static int host_table_test() {
-    host_fixture_geo f;
+    host_fixture_geo f(true);
     const geometry & geo = f.geo;
     constexpr int E = host_fixture_geo::experts;
     const int spares = 2;
     const std::vector<int> caps = {10, 6}, host_caps = {2*E - 10, E - 6};
+    size_t aux_rows = 0;
     for (int table = 0; table < 2; ++table) {
         host_arena host(geo);
         if (table) { host.enable_addresses(); }
@@ -884,6 +969,13 @@ static int host_table_test() {
         for (int l = 0; l < f.layers; ++l) for (int k = 0; k < 3; ++k) {
             CHECK(gpu.logical_io(l, k, f.values[l][k].data(), 0, f.values[l][k].size(), true));
         }
+        // the assignment above published tables before the rows existed: none were copied
+        CHECK(!gpu.aux_enabled() && gpu.aux_rows_copied() == 0);
+        gpu.start_aux();
+        CHECK(gpu.aux_enabled() && gpu.aux_rows_copied() == 16);
+        CHECK(gpu.aux_device_bytes() == size_t(caps[0] + spares)*3*(4096 + 2048) + size_t(caps[1] + spares)*3*(1024 + 6144));
+        aux_check rows(f, gpu);
+        CHECK(rows.equal("after start_aux"));
         CHECK(host.map());
         auto check_table = [&](const char * when) {
             for (int l = 0; l < f.layers; ++l) for (int k = 0; k < 3; ++k) {
@@ -917,15 +1009,20 @@ static int host_table_test() {
             l1_install_stats st;
             CHECK(gpu.install(sel, true, st));
             CHECK(check_table("after an install"));
+            CHECK(rows.equal("after an install"));
+            CHECK(st.aux_rows <= st.copied);
+            aux_rows += st.aux_rows;
         }
     }
+    CHECK(aux_rows > 0);
     printf("PASS: host address table (exclusive, unlimited host): off = no table; on = host_data + slot x stride per host "
-           "resident, 0 in VRAM, follows installs; the select reads the same bytes with and without it\n");
+           "resident, 0 in VRAM, follows installs; the select reads the same bytes with and without it; the aux rows of every "
+           "VRAM resident are at its slot after the load and every spare-rotation install (%zu rows copied by them)\n", aux_rows);
     return 0;
 }
 
 static int host_redraw_test() {
-    host_fixture_geo f;
+    host_fixture_geo f(true);
     const geometry & geo = f.geo;
     constexpr int layers = host_fixture_geo::layers, E = host_fixture_geo::experts;
     const int spares = 2;
@@ -949,9 +1046,37 @@ static int host_redraw_test() {
     for (int l = 0; l < layers; ++l) for (int k = 0; k < 3; ++k) {
         CHECK(gpu.logical_io(l, k, f.values[l][k].data(), 0, f.values[l][k].size(), true));
     }
+    gpu.start_aux();
     CHECK(host.map());
+    // the staging slots of the aux arenas are backed and keep what their writer puts there
+    std::vector<std::vector<char>> staged;
+    for (int c = 0; c < 2; ++c) for (int k = 0; k < 3; ++k) for (int a = 0; a < 2; ++a) {
+        const size_t nb = geo.class_aux[c][k][a];
+        std::vector<char> rowv(nb);
+        for (size_t i = 0; i < nb; ++i) { rowv[i] = char(0x40 + c*16 + k*4 + a + int(i % 7)); }
+        for (int s = 0; s < stage[c]; ++s) {
+            char * at = gpu.aux_slice_address(c, k, a, gpu.stage_base(c) + s);
+            CHECK(at != nullptr);
+            CUDA_CHECK(hipMemcpy(at, rowv.data(), nb, hipMemcpyHostToDevice));
+        }
+        staged.push_back(rowv);
+    }
+    auto staging_kept = [&](const char * when) {
+        size_t i = 0;
+        for (int c = 0; c < 2; ++c) for (int k = 0; k < 3; ++k) for (int a = 0; a < 2; ++a, ++i) {
+            const size_t nb = geo.class_aux[c][k][a];
+            std::vector<char> back(nb);
+            for (int s = 0; s < stage[c]; ++s) {
+                CUDA_CHECK(hipMemcpy(back.data(), gpu.aux_slice_address(c, k, a, gpu.stage_base(c) + s), nb, hipMemcpyDeviceToHost));
+                if (back != staged[i]) { printf("FAIL %s: aux staging slot %d of class %d changed\n", when, s, c); return false; }
+            }
+        }
+        return true;
+    };
     // one graph over every (layer, kind), captured before any redraw, through the kernels' select
     hipStream_t stream; CUDA_CHECK(hipStreamCreate(&stream));
+    aux_check rows(f, gpu);
+    CHECK(rows.lookups_ok("before the first redraw"));
     size_t out_bytes = 0;
     std::vector<size_t> out_off;
     for (int l = 0; l < layers; ++l) for (int k = 0; k < 3; ++k) {
@@ -965,6 +1090,7 @@ static int host_redraw_test() {
         select_gather<<<E, 256, 0, stream>>>((const char *) lk.host_data, (const char *) lk.data, lk.slots, lk.host_slots,
             lk.host_addresses, geo.class_bytes[geo.layer_class[l]][k], out + out_off[l*3 + k]);
     }
+    rows.launch(stream);
     CUDA_CHECK(hipStreamEndCapture(stream, &graph));
     CUDA_CHECK(hipGraphInstantiate(&exec, graph, nullptr, nullptr, 0));
     std::vector<char> back(out_bytes);
@@ -992,7 +1118,8 @@ static int host_redraw_test() {
         size_t chunks = 0;
         for (int c = 0; c < 2; ++c) { chunks += 3*size_t(host_chunks_for(host.capacities()[c] + spares, host.chunk_slots(c))); }
         if (chunks != host.chunk_count()) { printf("FAIL %s: %zu chunks, want %zu\n", when, host.chunk_count(), chunks); return false; }
-        return select_all_equal(f, gpu, true, when);
+        // the aux rows: the same graph read them at the slots, and the staging slots kept theirs
+        return select_all_equal(f, gpu, true, when) && rows.equal(when, exec, stream) && staging_kept(when);
     };
     CHECK(check_all("before the first redraw"));
     uint64_t rng = 4242;
@@ -1087,8 +1214,10 @@ static int host_redraw_test() {
     CUDA_CHECK(hipFree(out)); CUDA_CHECK(hipStreamDestroy(stream));
     printf("PASS: exclusive L1 redraw with chunked host arenas (no finite tier): %zu redraws both ways (one to a zero static "
            "class), %zu chunks added, %zu released, %zu host residents compacted; every expert equals its source through its "
-           "one home after every step, the graph captured before replays across them, slack %zu bytes\n",
-        splits.size(), added, released, moved, host.slack_bytes());
+           "one home after every step, the graph captured before replays across them, slack %zu bytes; the aux rows of every "
+           "VRAM resident are at its slot through the same graph after every step (%zu rows copied, %zu bytes of aux arenas "
+           "now), the aux staging slots keep their rows\n",
+        splits.size(), added, released, moved, host.slack_bytes(), gpu.aux_rows_copied(), gpu.aux_device_bytes());
     return 0;
 }
 
