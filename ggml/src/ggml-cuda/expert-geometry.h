@@ -154,16 +154,6 @@ inline bool build_geometry_tensors(const std::vector<const ggml_tensor *> & tens
     int64_t experts = -1;
 
     char message[512];
-    // EXL3 expert weights (MUL_MAT_HAD, with rot_in/rot_out beside them) are not cached yet
-    for (const ggml_tensor * tensor : tensors) {
-        int layer = -1;
-        int kind  = -1;
-        if (parse_expert_tensor_name(ggml_get_name(tensor), layer, kind) && ggml_is_exl3(tensor->type)) {
-            snprintf(message, sizeof(message), "expert tensor '%s' is EXL3, which the expert cache does not support yet", ggml_get_name(tensor));
-            reason = message;
-            return false;
-        }
-    }
     for (const ggml_tensor * tensor : tensors) {
         int layer = -1;
         int kind  = -1;

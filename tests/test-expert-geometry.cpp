@@ -220,6 +220,85 @@ int main() {
         CHECK(!reason.empty());
     }
 
+    // The other tensors of a bank are not experts: an EXL3 bank with rot_in / rot_out (and a bias), a gpt-oss bank
+    // with biases, an NVFP4 bank with per-expert scale and input_scale. The geometry holds the weights only; an EXL3
+    // weight is a quantized bank like any other, and its type id makes the signature differ from a GGUF bank of
+    // the same shape.
+    {
+        auto add_bank = [](ggml_context * ctx, int layer, ggml_type type, int64_t emb, int64_t ff, int64_t experts,
+                bool rot, bool bias, bool scale) {
+            const char * kinds[3] = { "ffn_up_exps", "ffn_gate_exps", "ffn_down_exps" };
+            for (int k = 0; k < 3; ++k) {
+                const int64_t ne0 = k == 2 ? ff : emb;
+                const int64_t ne1 = k == 2 ? emb : ff;
+                char name[128];
+                snprintf(name, sizeof(name), "blk.%d.%s.%s", layer, kinds[k], "weight");
+                ggml_set_name(ggml_new_tensor_3d(ctx, type, ne0, ne1, experts), name);
+                if (rot) {
+                    snprintf(name, sizeof(name), "blk.%d.%s.rot_in", layer, kinds[k]);
+                    ggml_set_name(ggml_new_tensor_2d(ctx, GGML_TYPE_F16, ne0, experts), name);
+                    snprintf(name, sizeof(name), "blk.%d.%s.rot_out", layer, kinds[k]);
+                    ggml_set_name(ggml_new_tensor_2d(ctx, GGML_TYPE_F16, ne1, experts), name);
+                }
+                if (bias) {
+                    snprintf(name, sizeof(name), "blk.%d.%s.bias", layer, kinds[k]);
+                    ggml_set_name(ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne1, experts), name);
+                }
+                if (scale) {
+                    snprintf(name, sizeof(name), "blk.%d.%s.scale", layer, kinds[k]);
+                    ggml_set_name(ggml_new_tensor_1d(ctx, GGML_TYPE_F32, experts), name);
+                    snprintf(name, sizeof(name), "blk.%d.%s.input_scale", layer, kinds[k]);
+                    ggml_set_name(ggml_new_tensor_1d(ctx, GGML_TYPE_F32, experts), name);
+                }
+            }
+        };
+        struct bank_case { ggml_type type; bool rot, bias, scale; };
+        const bank_case cases[] = {
+            { GGML_TYPE_EXL3_M3, true,  false, false },
+            { GGML_TYPE_EXL3_M3, true,  true,  false },
+            { GGML_TYPE_MXFP4,   false, true,  false },
+            { GGML_TYPE_NVFP4,   false, false, true  },
+        };
+        std::string exl3_signature;
+        for (const bank_case & c : cases) {
+            context_holder holder;
+            CHECK(holder.ctx != nullptr);
+            for (int layer = 0; layer < 4; ++layer) {
+                add_bank(holder.ctx, layer, c.type, 512, 256, 16, c.rot, c.bias, c.scale);
+            }
+            geometry geo;
+            CHECK(build_geometry(holder.ctx, geo, reason));
+            CHECK(reason.empty());
+            CHECK(geo.n_layers == 4 && geo.n_experts == 16 && geo.class_bytes.size() == 1);
+            for (int layer = 0; layer < 4; ++layer) {
+                for (int kind = 0; kind < geometry::n_kinds; ++kind) {
+                    const ggml_tensor * t = geo.tensors[layer][kind];
+                    CHECK(t != nullptr && t->type == c.type);
+                    const std::string name = ggml_get_name(t);
+                    CHECK(name.size() > 7 && name.compare(name.size() - 7, 7, ".weight") == 0);
+                    CHECK(geo.nb2[layer][kind] == t->nb[2]);
+                }
+            }
+            if (c.type == GGML_TYPE_EXL3_M3) {
+                char line[64];
+                snprintf(line, sizeof(line), "\n0,0,%d,512,256,", (int) GGML_TYPE_EXL3_M3);
+                CHECK(geo.signature().find(line) != std::string::npos);
+                // bias or no bias, the same bank
+                CHECK(exl3_signature.empty() || geo.signature() == exl3_signature);
+                exl3_signature = geo.signature();
+            }
+        }
+        // the same shapes as a Q4_K bank: another profile key
+        context_holder holder;
+        CHECK(holder.ctx != nullptr);
+        for (int layer = 0; layer < 4; ++layer) {
+            add_bank(holder.ctx, layer, GGML_TYPE_Q4_K, 512, 256, 16, false, false, false);
+        }
+        geometry geo;
+        CHECK(build_geometry(holder.ctx, geo, reason));
+        CHECK(geo.signature() != exl3_signature);
+    }
+
     // No MoE at all is a success with an empty geometry.
     {
         context_holder holder;
@@ -236,6 +315,6 @@ int main() {
         CHECK(geo.class_bytes.empty());
     }
 
-    printf("PASS: parse/build/class/signature checks on qwen-like, glm-like, mixed and malformed contexts\n");
+    printf("PASS: parse/build/class/signature checks on qwen-like, glm-like, mixed, companion-tensor and malformed contexts\n");
     return 0;
 }
