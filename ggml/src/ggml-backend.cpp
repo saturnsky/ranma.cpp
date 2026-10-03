@@ -1123,7 +1123,7 @@ static int ggml_backend_sched_backend_id(ggml_backend_sched_t sched, ggml_backen
 
 // Like ggml_backend_supports_buft, but a device may also accept a weight that stays in its own host buffer. The backend declares that through the
 // optional "ggml_backend_host_direct_op" proc address, resolved once per backend in ggml_backend_sched_new.
-// The decision is per op, not per graph: all MUL_MAT_ID nodes of one graph share ne[2], so a token count limit in the device callback picks the same
+// The decision is per op, not per graph: all expert matmul nodes of one graph share ne[2], so a token count limit in the device callback picks the same
 // path for the whole graph. The reserve graph is built at the largest batch size, so it takes the copy path and sizes the compute buffer for it.
 static bool ggml_backend_sched_buft_supported(ggml_backend_sched_t sched, int backend_id, ggml_backend_buffer_type_t buft,
         const struct ggml_tensor * tensor, const struct ggml_tensor * op) {
