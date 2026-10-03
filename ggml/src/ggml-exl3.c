@@ -1,5 +1,5 @@
-// EXL3 trellis weights (mul1 codebook)
-// format and codebook: ExLlamaV3, Copyright (c) 2025 Turboderp, MIT license
+// EXL3 trellis weights (mul1, mcg and 3inst codebooks)
+// format and codebooks: ExLlamaV3, Copyright (c) 2025 Turboderp, MIT license
 //
 // A weight is ne = [K, N(, E)] with ne0 = input. EXL3 stores 16x16 tiles of 256 states each.
 // The bytes of a tile are the original bytes. Only the tile order changes: the N rows are split in
@@ -9,7 +9,8 @@
 // A tile is a tail-biting ring of 256 positions in a stream of 32-bit little-endian words, read
 // MSB first. Position p ends at bit ((p + 1)*bits2) >> 1, bits2 = 2*bits: integer rates use bits per
 // position, half rates alternate floor(bits) (even p) and floor(bits) + 1 (odd p). The state of p
-// is the 16-bit window that ends there, wrapped around the ring.
+// is the 16-bit window that ends there, wrapped around the ring. The codebook of the type maps a state to
+// its fp16 value; half rates exist only with mul1.
 
 #include "ggml-impl.h"
 
@@ -17,12 +18,14 @@
 #include <string.h>
 
 bool ggml_is_exl3(enum ggml_type type) {
-    return type >= GGML_TYPE_EXL3_M1 && type <= GGML_TYPE_EXL3_M3H;
+    return (type >= GGML_TYPE_EXL3_M1 && type <= GGML_TYPE_EXL3_M3H) ||
+           (type >= GGML_TYPE_EXL3_G1 && type <= GGML_TYPE_EXL3_G8) ||
+           (type >= GGML_TYPE_EXL3_T1 && type <= GGML_TYPE_EXL3_T8);
 }
 
 // twice the bits per weight
 static int ggml_exl3_bits2(enum ggml_type type) {
-    const int code = (int) type - GGML_TYPE_EXL3_M1;
+    const int code = ((int) type - GGML_TYPE_EXL3_M1) % 16;
     return code < 8 ? 2*(code + 1) : 2*(code - 7) + 1;
 }
 
@@ -39,6 +42,21 @@ static ggml_fp16_t ggml_exl3_mul1(uint32_t state) {
     return GGML_FP32_TO_FP16((float) (1024 + sum) * k_inv + k_bias);
 }
 
+// mcg and 3inst: the hashed state as two fp16 halves (sign and low bits kept, exponent 12..15), added in fp16
+// (exact in fp32, then rounded once)
+static ggml_fp16_t ggml_exl3_half_sum(uint32_t x) {
+    x = (x & 0x8fff8fffu) ^ 0x3b603b60u;
+    return GGML_FP32_TO_FP16(GGML_FP16_TO_FP32((ggml_fp16_t) (x & 0xffff)) + GGML_FP16_TO_FP32((ggml_fp16_t) (x >> 16)));
+}
+
+static ggml_fp16_t ggml_exl3_mcg(uint32_t state) {
+    return ggml_exl3_half_sum(state * 0xCBAC1FEDu);
+}
+
+static ggml_fp16_t ggml_exl3_3inst(uint32_t state) {
+    return ggml_exl3_half_sum(state * 89226354u + 64248484u);
+}
+
 // position of tile element (r = row in K, c = column in N)
 static int ggml_exl3_position(int r, int c) {
     return ((c % 8)*4 + (r % 8)/2)*8 + r % 2 + (r >= 8 ? 2 : 0) + (c >= 8 ? 4 : 0);
@@ -49,6 +67,8 @@ void ggml_exl3_decode_group(enum ggml_type type, const void * group, int64_t k, 
     GGML_ASSERT(k > 0 && k % 16 == 0);
 
     const int bits2      = ggml_exl3_bits2(type);
+    const int codebook   = ((int) type - GGML_TYPE_EXL3_M1) / 16;
+    ggml_fp16_t (*const decode)(uint32_t) = codebook == 0 ? ggml_exl3_mul1 : codebook == 1 ? ggml_exl3_mcg : ggml_exl3_3inst;
     const int ring_bits  = 128*bits2;
     const int n_words    = ring_bits/32;
     const int tile_bytes = 16*bits2;
@@ -70,7 +90,7 @@ void ggml_exl3_decode_group(enum ggml_type type, const void * group, int64_t k, 
                 const int start = (end - 16 + ring_bits) % ring_bits;
                 const int w     = start / 32;
                 const uint64_t window = ((uint64_t) ggml_exl3_word(tile + 4*w) << 32) | ggml_exl3_word(tile + 4*((w + 1) % n_words));
-                values[p] = ggml_exl3_mul1((uint32_t) (window >> (48 - start % 32)) & 0xffff);
+                values[p] = decode((uint32_t) (window >> (48 - start % 32)) & 0xffff);
             }
             for (int r = 0; r < 16; ++r) {
                 for (int c = 0; c < 16; ++c) {

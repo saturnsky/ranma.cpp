@@ -431,8 +431,8 @@ extern "C" {
         GGML_TYPE_Q1_0    = 41,
         GGML_TYPE_Q2_0    = 42,
         // 43 .. 255 are left to upstream and are not registered here
-        // EXL3 trellis: 256 + 16*codebook + code, codebook 0 = mul1 (1 = mcg, 2 = 3inst are reserved)
-        // code 0..7 = 1..8 bits, 8..10 = 1.5/2.5/3.5 bits; 304 .. 319 are reserved for EXL3 row codecs
+        // EXL3 trellis: 256 + 16*codebook + code, codebook 0 = mul1, 1 = mcg, 2 = 3inst
+        // code 0..7 = 1..8 bits, 8..10 = 1.5/2.5/3.5 bits (mul1 only); 304 .. 319 are reserved for EXL3 row codecs
         GGML_TYPE_EXL3_M1  = 256,
         GGML_TYPE_EXL3_M2  = 257,
         GGML_TYPE_EXL3_M3  = 258,
@@ -444,7 +444,23 @@ extern "C" {
         GGML_TYPE_EXL3_M1H = 264,
         GGML_TYPE_EXL3_M2H = 265,
         GGML_TYPE_EXL3_M3H = 266,
-        GGML_TYPE_COUNT    = 267,
+        GGML_TYPE_EXL3_G1  = 272,
+        GGML_TYPE_EXL3_G2  = 273,
+        GGML_TYPE_EXL3_G3  = 274,
+        GGML_TYPE_EXL3_G4  = 275,
+        GGML_TYPE_EXL3_G5  = 276,
+        GGML_TYPE_EXL3_G6  = 277,
+        GGML_TYPE_EXL3_G7  = 278,
+        GGML_TYPE_EXL3_G8  = 279,
+        GGML_TYPE_EXL3_T1  = 288,
+        GGML_TYPE_EXL3_T2  = 289,
+        GGML_TYPE_EXL3_T3  = 290,
+        GGML_TYPE_EXL3_T4  = 291,
+        GGML_TYPE_EXL3_T5  = 292,
+        GGML_TYPE_EXL3_T6  = 293,
+        GGML_TYPE_EXL3_T7  = 294,
+        GGML_TYPE_EXL3_T8  = 295,
+        GGML_TYPE_COUNT    = 296,
     };
 
     // [TAG_GGML_PREC]
