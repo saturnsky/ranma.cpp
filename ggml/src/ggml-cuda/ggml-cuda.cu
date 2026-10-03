@@ -36,6 +36,7 @@
 #include "ggml-cuda/mapped-host.cuh"
 #include "ggml-cuda/expert-controller.cuh"
 #include "ggml-cuda/moe-weighted-reduction.cuh"
+#include "ggml-cuda/mul-mat-had.cuh"
 #include "ggml-cuda/norm.cuh"
 #include "ggml-cuda/opt-step-adamw.cuh"
 #include "ggml-cuda/opt-step-sgd.cuh"
@@ -1559,9 +1560,9 @@ ggml_backend_buffer_type_t ggml_backend_cuda_host_buffer_type() {
 //}
 
 // Host-direct MoE admission: may a kernel read this weight in place from the mapped host buffer?
-// Only an immutable quantized MUL_MAT_ID weight qualifies, so the input reallocation race that corrupted integrated
-// host buffers (#15034) cannot apply here. The token count limit keeps the op on the MMVQ MUL_MAT_ID kernels, which
-// beat a copy to VRAM at this batch size.
+// Only an immutable quantized expert weight qualifies (MUL_MAT_ID, or MUL_MAT_HAD with ids and also its rot_in/rot_out),
+// so the input reallocation race that corrupted integrated host buffers (#15034) cannot apply here. The token count
+// limit keeps the op on the MMVQ MUL_MAT_ID kernels, or the MUL_MAT_HAD GEMV, which beat a copy to VRAM at this batch size.
 static bool ggml_cuda_host_direct_allowed(const ggml_backend_cuda_device_context * dev_ctx,
         const ggml_tensor * op, const ggml_tensor * src) {
 #if defined(GGML_USE_HIP)
@@ -1569,7 +1570,11 @@ static bool ggml_cuda_host_direct_allowed(const ggml_backend_cuda_device_context
         return false;
     }
 
-    if (op->op != GGML_OP_MUL_MAT_ID || src != op->src[0] || !ggml_is_quantized(src->type)) {
+    if (!ggml_op_is_expert_matmul(op)) {
+        return false;
+    }
+    const bool had_rot = op->op == GGML_OP_MUL_MAT_HAD && (src == op->src[3] || src == op->src[4]);
+    if (!had_rot && (src != op->src[0] || !ggml_is_quantized(src->type))) {
         return false;
     }
 
@@ -1584,6 +1589,12 @@ static bool ggml_cuda_host_direct_allowed(const ggml_backend_cuda_device_context
         return false;
     }
 #endif
+
+    // every MUL_MAT_HAD kernel reads through the mapped alias; the default limit is the token count of its GEMV
+    if (op->op == GGML_OP_MUL_MAT_HAD) {
+        const int64_t max_batch = dev_ctx->host_direct_max_batch > 0 ? dev_ctx->host_direct_max_batch : 8;
+        return op->ne[2] <= max_batch;
+    }
 
     const int cc = ggml_cuda_info().devices[dev_ctx->device].cc;
     // the token count up to which ggml_cuda_mul_mat_id dispatches to MMVQ, for weights read from host memory
@@ -2823,6 +2834,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_MUL_MAT_ID:
             ggml_cuda_mul_mat_id(ctx, dst);
+            break;
+        case GGML_OP_MUL_MAT_HAD:
+            ggml_cuda_mul_mat_had(ctx, dst);
             break;
         case GGML_OP_OUT_PROD:
             ggml_cuda_out_prod(ctx, dst);
@@ -6505,6 +6519,12 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                     return false;
             }
             break;
+        case GGML_OP_MUL_MAT_HAD:
+            // the exclusive expert cache gives src0 logical addresses only, which MUL_MAT_HAD cannot read
+            if (op->src[0]->buffer && ggml_cuda_expert_is_exclusive_buffer_type(ggml_backend_buffer_get_type(op->src[0]->buffer))) {
+                return false;
+            }
+            return ggml_cuda_mul_mat_had_supported(dev_ctx->device, op);
         case GGML_OP_MUL_MAT:
         case GGML_OP_MUL_MAT_ID:
             {
@@ -6943,6 +6963,8 @@ static int64_t get_op_batch_size(const ggml_tensor * op) {
         case GGML_OP_ROPE:
         case GGML_OP_ROPE_BACK:
             return op->ne[2];
+        case GGML_OP_MUL_MAT_HAD:
+            return ggml_op_is_expert_matmul(op) ? op->ne[2] : op->ne[1];
         default:
             return ggml_nrows(op);
     }
