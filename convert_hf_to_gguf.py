@@ -171,8 +171,9 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
-        "--exl3-ngram", choices=["refuse", "omit"], default="refuse",
-        help="EXL3 source with n-gram row codec tables (Qwen3.8): refuse (default) or convert without the table and its PLE keys",
+        "--exl3-ngram", choices=["table", "omit"], default="table",
+        help="EXL3 source with an n-gram row codec table (Qwen3.8): write it as the EXL3 row codec type (default), "
+             "or omit (development) the table, its PLE module and its PLE keys",
     )
 
     args = parser.parse_args()
