@@ -5965,6 +5965,18 @@ class GGMLQuantizationType(IntEnum):
     NVFP4   = 40
     Q1_0    = 41
     Q2_0    = 42
+    # EXL3 trellis (mul1 codebook), see exl3.py; 43 .. 255 are left to upstream
+    EXL3_M1  = 256
+    EXL3_M2  = 257
+    EXL3_M3  = 258
+    EXL3_M4  = 259
+    EXL3_M5  = 260
+    EXL3_M6  = 261
+    EXL3_M7  = 262
+    EXL3_M8  = 263
+    EXL3_M1H = 264
+    EXL3_M2H = 265
+    EXL3_M3H = 266
 
 
 class ExpertGatingFuncType(IntEnum):
@@ -6170,6 +6182,17 @@ GGML_QUANT_SIZES: dict[GGMLQuantizationType, tuple[int, int]] = {
     GGMLQuantizationType.NVFP4:   (64, 4 + 32),
     GGMLQuantizationType.Q1_0:    (128, 2 + 16),
     GGMLQuantizationType.Q2_0:    (64, 2 + 16),
+    GGMLQuantizationType.EXL3_M1:  (128, 16),
+    GGMLQuantizationType.EXL3_M2:  (128, 32),
+    GGMLQuantizationType.EXL3_M3:  (128, 48),
+    GGMLQuantizationType.EXL3_M4:  (128, 64),
+    GGMLQuantizationType.EXL3_M5:  (128, 80),
+    GGMLQuantizationType.EXL3_M6:  (128, 96),
+    GGMLQuantizationType.EXL3_M7:  (128, 112),
+    GGMLQuantizationType.EXL3_M8:  (128, 128),
+    GGMLQuantizationType.EXL3_M1H: (128, 24),
+    GGMLQuantizationType.EXL3_M2H: (128, 40),
+    GGMLQuantizationType.EXL3_M3H: (128, 56),
 }
 
 
