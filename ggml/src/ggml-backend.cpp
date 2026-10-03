@@ -1109,7 +1109,7 @@ static int ggml_backend_sched_backend_id(ggml_backend_sched_t sched, ggml_backen
 
 // Like ggml_backend_supports_buft, but a device may also accept a weight that stays in its own host buffer. The backend declares that through the
 // optional "ggml_backend_host_direct_op" proc address, resolved once per backend in ggml_backend_sched_new.
-// The decision is per op, not per graph: all MUL_MAT_ID nodes of one graph share ne[2], so a token count limit in the device callback picks the same
+// The decision is per op, not per graph: all expert matmul nodes of one graph share ne[2], so a token count limit in the device callback picks the same
 // path for the whole graph. The reserve graph is built at the largest batch size, so it takes the copy path and sizes the compute buffer for it.
 static bool ggml_backend_sched_buft_supported(ggml_backend_sched_t sched, int backend_id, ggml_backend_buffer_type_t buft,
         const struct ggml_tensor * tensor, const struct ggml_tensor * op) {
@@ -2185,12 +2185,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                 if (split->graph.n_nodes > 0 &&
                     ggml_backend_buffer_get_usage(input->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
                     ggml_backend_buffer_is_host(input->buffer) && (
-                    (node->src[0] == input_cpy && node->op == GGML_OP_MUL_MAT_ID)
+                    (node->src[0] == input_cpy && ggml_op_is_expert_matmul(node))
                     //|| (node->src[1] == input_cpy && node->op == GGML_OP_ADD_ID) /* GGML_OP_ADD_ID weights are small and not worth splitting */
                     )) {
 
-                    const int64_t n_expert   = node->op == GGML_OP_MUL_MAT_ID ? input->ne[2] : input->ne[1];
-                    const size_t expert_size = node->op == GGML_OP_MUL_MAT_ID ? input->nb[2] : input->nb[1];
+                    const int64_t n_expert   = ggml_op_is_expert_matmul(node) ? input->ne[2] : input->ne[1];
+                    const size_t expert_size = ggml_op_is_expert_matmul(node) ? input->nb[2] : input->nb[1];
 
                     ggml_backend_synchronize(input_backend);
 
