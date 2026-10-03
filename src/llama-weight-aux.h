@@ -34,5 +34,16 @@ ggml_tensor * llama_weight_aux_mul_mat(
         ggml_tensor                * cur,
         ggml_tensor                * ids);
 
+// rows of an embedding table that holds n_heads row ranges: ggml_get_rows(table, rows), rows = I32 [n_heads * n_tokens]
+// with the head as the fastest index; returns F32 [ne0, n_heads * n_tokens]
+// an EXL3 row codec table (ggml_is_exl3_row) needs bias = [ne0, n_heads]: its rows are the official reconstruction
+// fp16(row + bias[head]); any other table takes bias = nullptr and is gathered as is
+ggml_tensor * llama_weight_aux_get_rows(
+        ggml_context * ctx,
+        ggml_tensor  * table,
+        ggml_tensor  * bias,
+        ggml_tensor  * rows,
+        int64_t        n_heads);
+
 // the op that runs weight w, to select its buffer type: mul_mat (n_ids = 0) or mul_mat_id with n_ids experts per token
 ggml_tensor * llama_weight_aux_test_op(ggml_context * ctx, ggml_tensor * w, int n_ids);
