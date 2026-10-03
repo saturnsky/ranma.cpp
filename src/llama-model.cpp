@@ -1518,6 +1518,16 @@ void llama_model_base::load_hparams(llama_model_loader & ml) {
         hparams.use_alibi = true;
     }
 
+    // EXL3 conversion keeps the Q/K rows of the source, which need NEOX rope instead of NORM
+    std::string rope_style;
+    if (ml.get_key(LLM_KV_ROPE_STYLE, rope_style, false)) {
+        const llama_rope_type rope_type = llama_model_rope_type(this);
+        if (rope_style != "neox" || (rope_type != LLAMA_ROPE_TYPE_NORM && rope_type != LLAMA_ROPE_TYPE_NEOX)) {
+            throw std::runtime_error(format("rope.style '%s' is not supported for rope type %d", rope_style.c_str(), rope_type));
+        }
+        hparams.rope_neox = true;
+    }
+
     hparams.rope_type = llama_model_rope_type(this);
 }
 
@@ -3137,6 +3147,10 @@ int32_t llama_n_head(const llama_model * model) {
 }
 
 llama_rope_type llama_model_rope_type(const llama_model * model) {
+    if (model->hparams.rope_neox) {
+        return LLAMA_ROPE_TYPE_NEOX;
+    }
+
     switch (model->arch) {
         // these models do not use RoPE
         case LLM_ARCH_CLIP:
