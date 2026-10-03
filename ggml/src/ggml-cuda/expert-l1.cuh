@@ -5,6 +5,15 @@
 // -1). The kernels read the table and the arena base through ggml_cuda_expert_lookup. Arena and
 // table addresses never change after allocate(), because captured graphs hold them; only the slot
 // contents and the tables are rewritten, and only by install() while nothing computes.
+//
+// A bank with aux rows (the rot_in / rot_out of EXL3, expert-geometry.h) gets one more arena per
+// size class, kind and aux tensor, with the same slot numbers: slot s of an aux arena holds the rows
+// of the expert whose weight slice is at slot s. The rows never change, so they are not moved with
+// the weights copy by copy: every slot-table publish first copies, from the aux tensor, the rows of
+// each slot the table names whose rows are not already there (a per-slot owner record). A kernel can
+// therefore only reach a slot through a table that was published after its rows arrived, whichever
+// path (install, exchange, evacuation) moved the weight. The VRAM staging of early-route
+// layers writes the rows of its own slots next to their weights.
 
 #include "common.cuh"
 #include "expert-geometry.h"
@@ -27,6 +36,12 @@ struct ggml_cuda_expert_lookup {
     const void    * host_data      = nullptr;
     const int32_t * host_slots     = nullptr;
     const uint64_t * host_addresses = nullptr;
+    // The aux rows of the bank (rot_in, rot_out of EXL3; expert-geometry.h): arenas slot-major with the tensor's
+    // nb[1], which hold the rows of the expert whose weight is at the same slot. A kernel reads them there when the
+    // table gives a slot and from the tensor by expert id otherwise. aux_src is the tensor an arena mirrors, for the
+    // caller to check that its op reads that tensor. Null without aux rows.
+    const void        * aux[2]     = {nullptr, nullptr};
+    const ggml_tensor * aux_src[2] = {nullptr, nullptr};
 };
 
 namespace ggml_cuda_expert {
@@ -36,6 +51,8 @@ struct l1_install_stats {
     size_t copied   = 0;   // slices (layer, expert) copied, all kinds
     size_t bytes    = 0;   // bytes written into the VRAM arena
     size_t d2h_bytes = 0;  // exclusive only: bytes written back to the host arena
+    size_t aux_rows  = 0;  // experts whose aux rows were copied to their slot
+    size_t aux_bytes = 0;
     double ms       = 0.0;
 };
 
@@ -138,6 +155,28 @@ public:
     bool read_gpu_slice(int cls, int kind, int slot, void * dst);
     // Only the GPU fixture reads an arena slot back directly.
     char * gpu_slice_address(int cls, int kind, int slot) const { return gpu_slice(cls, kind, slot); }
+
+    // Aux rows (see the top of this file). Off until start_aux(): the tables published before it (an
+    // exclusive assignment, before the loader has written the aux tensors) bring no rows.
+    //   - start_aux: the aux tensors hold their final bytes; the rows of every slot the current tables
+    //     name are copied, and every later publish keeps the slots it names complete;
+    //   - refresh_aux: the aux tensors of some layers were (re)written (a model joined): every slot's
+    //     rows are copied again.
+    void start_aux();
+    bool refresh_aux();
+    bool aux_enabled() const { return aux_on_; }
+    // Null when the class has no rows of that kind / aux tensor (or no arena).
+    char * aux_slice_address(int cls, int kind, int which, int slot) const;
+    const char * aux_host_address(int layer, int kind, int which, int expert) const;
+    size_t aux_device_bytes() const { return aux_allocated_bytes_; }
+    // Cumulative rows copied by the publishes (experts, bytes).
+    size_t aux_rows_copied() const { return aux_rows_; }
+    size_t aux_bytes_copied() const { return aux_bytes_; }
+    // Every slot the host mirror names holds exactly the rows of its expert (read back and compared
+    // with the aux tensors), and the owner record agrees. `layers` (null = all) limits the check to the
+    // layers marked 1 (a joint model that has not loaded has no rows yet). Returns the experts checked,
+    // -1 on a mismatch.
+    long verify_aux(std::string & reason, const std::vector<uint8_t> * layers = nullptr) const;
     bool   sync_copies();
 
     // Exclusive mode, once: gives every routed expert a home. `selected` gets the VRAM slots in
@@ -201,7 +240,15 @@ public:
     bool read_device_tables(std::vector<std::vector<int32_t>> & out) const;
 
 private:
+    // Arena parts of a class: the weight kinds, then the aux rows (kind-major, rot_in then rot_out).
+    static constexpr int n_parts = geometry::n_kinds*(1 + geometry::n_aux);
+    static int aux_part(int kind, int which) { return geometry::n_kinds + kind*geometry::n_aux + which; }
+    size_t part_bytes(int cls, int part) const;
+    size_t part_tail(int cls, int part) const;
+
     bool publish_tables(const std::vector<std::vector<int32_t>> & slots);
+    // Before a table goes to the device: the rows of every slot it names that does not hold them yet.
+    bool sync_aux(const std::vector<std::vector<int32_t>> & slots);
     char * gpu_slice(int cls, int kind, int slot) const {
         return static_cast<char *>(class_data_[cls][kind]) + size_t(slot)*geo_.class_bytes[cls][kind];
     }
@@ -213,8 +260,13 @@ private:
     std::vector<int> slots_;                           // [class] slot counts once set_static_capacities ran
     std::vector<int> retire_;                          // [class] slot count the next install leaves
     bool unequal_ = false;
-    std::vector<std::array<void *, 3>> class_data_;    // [class][kind]
+    std::vector<std::array<void *, n_parts>> class_data_; // [class][part]
     std::vector<int32_t *> layer_slots_;               // [layer] device tables
+    // aux rows
+    bool aux_on_ = false;
+    std::vector<std::vector<int32_t>> aux_owner_;      // [class][slot] layer*n_experts + expert whose rows the slot holds, or -1
+    size_t aux_allocated_bytes_ = 0;
+    size_t aux_rows_ = 0, aux_bytes_ = 0;
     std::vector<std::vector<int32_t>> host_slots_;     // [layer][expert] mirror of the device tables
     std::vector<std::vector<int32_t>> selected_;       // [layer] sorted resident expert ids
     size_t allocated_bytes_ = 0;

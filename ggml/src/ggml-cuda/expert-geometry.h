@@ -17,27 +17,71 @@
 
 namespace ggml_cuda_expert {
 
+// Per expert rows that a bank's kernels read next to the weight, by expert id: the rot_in / rot_out of an EXL3 bank,
+// one row of nb[1] bytes per expert. The VRAM tier keeps them in arenas of their own, at the slot of the weight.
+using expert_aux_tensors = std::array<std::array<const ggml_tensor *, 2>, 3>; // [kind][0 = rot_in, 1 = rot_out]
+using expert_aux_bytes   = std::array<std::array<size_t, 2>, 3>;              // [kind][aux] bytes per expert, 0 = none
+
 struct geometry {
     int n_layers  = 0;                // routed layer index span = max routed layer + 1
     int n_experts = 0;
     static constexpr int n_kinds = 3; // 0 = up, 1 = gate, 2 = down
+    static constexpr int n_aux   = 2; // 0 = rot_in, 1 = rot_out
 
     std::vector<std::array<size_t, 3>> nb2;                  // [layer][kind] bytes per expert; 0 when the layer is not routed
     std::vector<int>                   layer_class;          // [layer] size class index or -1
     std::vector<std::array<const ggml_tensor *, 3>> tensors; // [layer][kind], nullptr when not routed
     std::vector<std::array<size_t, 3>> class_bytes;          // [class][kind]
     std::vector<int>                   class_layers;         // [class] number of layers in the class
+    // aux rows (EXL3 rotations); empty, or null / 0 entries, for other banks and for geometries built by hand
+    std::vector<expert_aux_tensors>    aux;                  // [layer]
+    std::vector<expert_aux_bytes>      aux_nb;               // [layer]
+    std::vector<expert_aux_bytes>      class_aux;            // [class]
 
     size_t n_counts() const {
         return (size_t) n_layers*(size_t) n_experts;
     }
 
+    // Weight bytes of one expert of the class, all kinds: what the host and file tiers hold.
     size_t class_total_bytes(int cls) const {
         size_t result = 0;
         for (int kind = 0; kind < n_kinds; ++kind) {
             result += class_bytes[cls][kind];
         }
         return result;
+    }
+
+    size_t class_aux_bytes(int cls, int kind, int which) const {
+        return cls >= 0 && (size_t) cls < class_aux.size() ? class_aux[cls][kind][which] : 0;
+    }
+
+    size_t class_aux_total_bytes(int cls) const {
+        size_t result = 0;
+        for (int kind = 0; kind < n_kinds; ++kind) {
+            for (int which = 0; which < n_aux; ++which) {
+                result += class_aux_bytes(cls, kind, which);
+            }
+        }
+        return result;
+    }
+
+    // VRAM bytes of one resident expert of the class: its weights and the aux rows that move with them. Equal to
+    // class_total_bytes for a bank without aux rows.
+    size_t class_vram_bytes(int cls) const {
+        return class_total_bytes(cls) + class_aux_total_bytes(cls);
+    }
+
+    const ggml_tensor * aux_tensor(int layer, int kind, int which) const {
+        return layer >= 0 && (size_t) layer < aux.size() ? aux[layer][kind][which] : nullptr;
+    }
+
+    bool has_aux() const {
+        for (size_t cls = 0; cls < class_aux.size(); ++cls) {
+            if (class_aux_total_bytes((int) cls) != 0) {
+                return true;
+            }
+        }
+        return false;
     }
 
     int n_routed_layers() const {
@@ -51,7 +95,9 @@ struct geometry {
     }
 
     // Compatibility key for a stored profile: anything that would change the
-    // meaning of a per-(layer, expert) score has to change this string.
+    // meaning of a per-(layer, expert) score has to change this string. The aux
+    // rows are not in it: they change what a resident expert costs, not what a
+    // score counts, and a bank that has them (EXL3) already differs by its type.
     std::string signature() const {
         std::string text = "ranma-expert-geometry-v1\n";
         char line[256];
@@ -99,6 +145,42 @@ inline bool parse_expert_tensor_name(const char * name, int & layer, int & kind)
     return true;
 }
 
+// Accepts "blk.<layer>.ffn_{up,gate,down}_exps.rot_{in,out}": the aux rows of an EXL3 bank.
+inline bool parse_expert_aux_name(const char * name, int & layer, int & kind, int & which) {
+    if (name == nullptr || strncmp(name, "blk.", 4) != 0) {
+        return false;
+    }
+    char * end = nullptr;
+    const long parsed_layer = strtol(name + 4, &end, 10);
+    if (end == name + 4 || parsed_layer < 0) {
+        return false;
+    }
+    static const char * const kinds[3] = { ".ffn_up_exps.", ".ffn_gate_exps.", ".ffn_down_exps." };
+    static const char * const auxes[2] = { "rot_in", "rot_out" };
+    for (int k = 0; k < 3; ++k) {
+        const size_t n = strlen(kinds[k]);
+        if (strncmp(end, kinds[k], n) != 0) {
+            continue;
+        }
+        for (int a = 0; a < 2; ++a) {
+            if (strcmp(end + n, auxes[a]) == 0) {
+                layer = (int) parsed_layer;
+                kind  = k;
+                which = a;
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+// An aux tensor the VRAM tier can move with its expert: F16 or F32 rows, one per expert of the bank, packed with the
+// stride nb[1]. Anything else stays where it is and is read by expert id, as without the cache.
+inline bool expert_aux_usable(const ggml_tensor * t, int64_t experts) {
+    return t != nullptr && t->view_src == nullptr && (t->type == GGML_TYPE_F16 || t->type == GGML_TYPE_F32) &&
+        t->ne[1] == experts && t->ne[2] == 1 && t->ne[3] == 1 && ggml_is_contiguous(t) && t->nb[1] != 0;
+}
+
 // Size classes. The reference implementation compared kind bytes plus type/ne0/ne1 of a reference
 // layer; generalized here to compare (type, ne0, ne1, nb2) per kind, which is the same predicate
 // expressed without a reference-layer lookup and without relying on the byte size alone. Classes
@@ -106,7 +188,12 @@ inline bool parse_expert_tensor_name(const char * name, int & layer, int & kind)
 inline void assign_size_classes(geometry & out) {
     out.class_bytes.clear();
     out.class_layers.clear();
+    out.class_aux.clear();
     out.layer_class.assign(out.n_layers, -1);
+    // the aux rows are part of a layer's slice layout: two layers share a class only with the same aux strides
+    auto aux_of = [&](int layer) {
+        return (size_t) layer < out.aux_nb.size() ? out.aux_nb[layer] : expert_aux_bytes{};
+    };
     std::vector<int> reference;
     for (int layer = 0; layer < out.n_layers; ++layer) {
         if (out.tensors[layer][0] == nullptr) {
@@ -122,6 +209,7 @@ inline void assign_size_classes(geometry & out) {
                 same = same && a->type == b->type && a->ne[0] == b->ne[0] && a->ne[1] == b->ne[1] &&
                     out.nb2[ref][kind] == out.nb2[layer][kind];
             }
+            same = same && aux_of(ref) == aux_of(layer);
             if (same) {
                 cls = i;
                 break;
@@ -130,6 +218,7 @@ inline void assign_size_classes(geometry & out) {
         if (cls < 0) {
             reference.push_back(layer);
             out.class_bytes.push_back(out.nb2[layer]);
+            out.class_aux.push_back(aux_of(layer));
             out.class_layers.push_back(0);
             cls = (int) reference.size() - 1;
         }
@@ -150,6 +239,11 @@ inline bool build_geometry_tensors(const std::vector<const ggml_tensor *> & tens
         const ggml_tensor * tensor = nullptr;
     };
     std::vector<found> routed;
+    struct found_aux {
+        int layer = -1, kind = -1, which = -1;
+        const ggml_tensor * tensor = nullptr;
+    };
+    std::vector<found_aux> auxes;
     int max_layer = -1;
     int64_t experts = -1;
 
@@ -158,6 +252,10 @@ inline bool build_geometry_tensors(const std::vector<const ggml_tensor *> & tens
         int layer = -1;
         int kind  = -1;
         if (!parse_expert_tensor_name(ggml_get_name(tensor), layer, kind)) {
+            int which = -1;
+            if (parse_expert_aux_name(ggml_get_name(tensor), layer, kind, which)) {
+                auxes.push_back({layer, kind, which, tensor});
+            }
             continue;
         }
         if (tensor->view_src != nullptr) {
@@ -218,6 +316,17 @@ inline bool build_geometry_tensors(const std::vector<const ggml_tensor *> & tens
         out.tensors[item.layer][item.kind] = item.tensor;
         out.nb2[item.layer][item.kind]     = item.tensor->nb[2];
     }
+    // the aux rows of a routed weight (of a duplicate name, the first one)
+    out.aux.assign(out.n_layers, expert_aux_tensors{});
+    out.aux_nb.assign(out.n_layers, expert_aux_bytes{});
+    for (const found_aux & item : auxes) {
+        if (item.layer >= out.n_layers || out.tensors[item.layer][item.kind] == nullptr ||
+                out.aux[item.layer][item.kind][item.which] != nullptr || !expert_aux_usable(item.tensor, experts)) {
+            continue;
+        }
+        out.aux[item.layer][item.kind][item.which]    = item.tensor;
+        out.aux_nb[item.layer][item.kind][item.which] = item.tensor->nb[1];
+    }
     for (int layer = 0; layer < out.n_layers; ++layer) {
         int present = 0;
         for (int kind = 0; kind < geometry::n_kinds; ++kind) {
@@ -268,6 +377,12 @@ inline bool concat_geometry(const std::vector<const geometry *> & parts, geometr
         out.n_layers += part->n_layers;
         out.nb2.insert(out.nb2.end(), part->nb2.begin(), part->nb2.end());
         out.tensors.insert(out.tensors.end(), part->tensors.begin(), part->tensors.end());
+        std::vector<expert_aux_tensors> aux    = part->aux;
+        std::vector<expert_aux_bytes>   aux_nb = part->aux_nb;
+        aux.resize(part->n_layers);
+        aux_nb.resize(part->n_layers);
+        out.aux.insert(out.aux.end(), aux.begin(), aux.end());
+        out.aux_nb.insert(out.aux_nb.end(), aux_nb.begin(), aux_nb.end());
     }
     assign_size_classes(out);
     return true;

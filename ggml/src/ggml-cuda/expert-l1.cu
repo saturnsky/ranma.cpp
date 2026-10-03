@@ -29,6 +29,19 @@ size_t arena_tail_bytes(const geometry & geo, int cls, int kind) {
     return std::max(pad, arena_tail_floor);
 }
 
+size_t l1_arena::part_bytes(int cls, int part) const {
+    if (part < geometry::n_kinds) {
+        return geo_.class_bytes[cls][part];
+    }
+    const int aux = part - geometry::n_kinds;
+    return geo_.class_aux_bytes(cls, aux/geometry::n_aux, aux%geometry::n_aux);
+}
+
+// The aux rows are read within their row: no tail.
+size_t l1_arena::part_tail(int cls, int part) const {
+    return part < geometry::n_kinds ? arena_tail_bytes(geo_, cls, part) : 0;
+}
+
 size_t arena_tail_total(const geometry & geo) {
     size_t total = 0;
     for (int cls = 0; cls < (int) geo.class_bytes.size(); ++cls) {
@@ -76,13 +89,17 @@ bool l1_arena::allocate(const std::vector<int> & capacities, int device, int spa
     ggml_cuda_set_device(device_);
     CUDA_CHECK(cudaStreamCreateWithFlags(&copy_stream_, cudaStreamNonBlocking));
     capacities_ = capacities;
-    class_data_.assign(capacities.size(), {nullptr, nullptr, nullptr});
+    class_data_.assign(capacities.size(), {});
+    aux_owner_.assign(capacities.size(), {});
     for (size_t c = 0; c < capacities.size(); ++c) {
         const int stage = stage_slots != nullptr ? std::max((*stage_slots)[c], 0) : 0;
+        aux_owner_[c].assign(size_t(capacities[c] + spare_slots), -1);
         if (capacities[c] == 0 && spare_slots == 0 && stage == 0) { continue; }
-        for (int k = 0; k < geometry::n_kinds; ++k) {
-            const size_t bytes = size_t(capacities[c] + spare_slots + stage)*geo_.class_bytes[c][k] +
-                arena_tail_bytes(geo_, (int) c, k);
+        for (int k = 0; k < n_parts; ++k) {
+            if (k >= geometry::n_kinds && part_bytes((int) c, k) == 0) {
+                continue;
+            }
+            const size_t bytes = size_t(capacities[c] + spare_slots + stage)*part_bytes((int) c, k) + part_tail((int) c, k);
             if (cudaMalloc(&class_data_[c][k], bytes) != cudaSuccess) {
                 (void) cudaGetLastError();
                 class_data_[c][k] = nullptr;
@@ -90,6 +107,7 @@ bool l1_arena::allocate(const std::vector<int> & capacities, int device, int spa
             }
             CUDA_CHECK(cudaMemsetAsync(class_data_[c][k], 0, bytes, copy_stream_));
             allocated_bytes_ += bytes;
+            aux_allocated_bytes_ += k >= geometry::n_kinds ? bytes : 0;
         }
     }
     layer_slots_.assign(geo_.n_layers, nullptr);
@@ -126,6 +144,10 @@ ggml_cuda_expert_lookup l1_arena::lookup(int layer, int kind) const noexcept {
     out.data  = class_data_[cls][kind] ? class_data_[cls][kind] :
         (host_ && host_->mapped() ? host_->device_data(cls, kind) : nullptr);
     out.slots = layer_slots_[layer];
+    for (int which = 0; aux_on_ && which < geometry::n_aux; ++which) {
+        out.aux[which]     = class_data_[cls][aux_part(kind, which)];
+        out.aux_src[which] = out.aux[which] != nullptr ? geo_.aux_tensor(layer, kind, which) : nullptr;
+    }
     if (addresses_) {
         out.host_addresses = addresses_(layer, kind);
     }
@@ -314,6 +336,10 @@ bool l1_arena::verify_current_assignment(std::string & reason) const {
 }
 
 bool l1_arena::publish_tables(const std::vector<std::vector<int32_t>> & slots) {
+    // stream order: the rows land before the table that names their slot
+    if (!sync_aux(slots)) {
+        return false;
+    }
     for (int l = 0; l < geo_.n_layers; ++l) {
         if (layer_slots_[l] == nullptr) {
             continue;
@@ -325,6 +351,161 @@ bool l1_arena::publish_tables(const std::vector<std::vector<int32_t>> & slots) {
     return true;
 }
 
+char * l1_arena::aux_slice_address(int cls, int kind, int which, int slot) const {
+    if (cls < 0 || (size_t) cls >= class_data_.size() || slot < 0) {
+        return nullptr;
+    }
+    char * base = static_cast<char *>(class_data_[cls][aux_part(kind, which)]);
+    return base == nullptr ? nullptr : base + size_t(slot)*geo_.class_aux_bytes(cls, kind, which);
+}
+
+const char * l1_arena::aux_host_address(int layer, int kind, int which, int expert) const {
+    const ggml_tensor * t = geo_.aux_tensor(layer, kind, which);
+    return t == nullptr || t->data == nullptr ? nullptr : static_cast<const char *>(t->data) + size_t(expert)*t->nb[1];
+}
+
+// Each slot the table names whose owner record differs gets the rows of the expert the table puts there, from the
+// aux tensors (host memory that never changes after the load), on the copy stream ahead of the table. Slots past the
+// static range (the VRAM staging of early-route layers) keep the rows their own writer put there.
+bool l1_arena::sync_aux(const std::vector<std::vector<int32_t>> & slots) {
+    if (!aux_on_) {
+        return true;
+    }
+    for (int l = 0; l < geo_.n_layers; ++l) {
+        const int cls = geo_.layer_class[l];
+        if (cls < 0 || layer_slots_[l] == nullptr || geo_.class_aux_total_bytes(cls) == 0) {
+            continue;
+        }
+        std::vector<int32_t> & owner = aux_owner_[(size_t) cls];
+        for (int e = 0; e < geo_.n_experts; ++e) {
+            const int32_t slot = slots[l][e];
+            const int32_t id   = l*geo_.n_experts + e;
+            if (slot < 0 || (size_t) slot >= owner.size() || owner[(size_t) slot] == id) {
+                continue;
+            }
+            // a joint member that is not allocated yet has no rows to give; it cannot compute either, and
+            // refresh_aux copies them once it has joined
+            bool ready = true;
+            for (int kind = 0; kind < geometry::n_kinds; ++kind) {
+                for (int which = 0; which < geometry::n_aux; ++which) {
+                    if (geo_.class_aux_bytes(cls, kind, which) != 0 && aux_host_address(l, kind, which, e) == nullptr) {
+                        ready = false;
+                    }
+                }
+            }
+            if (!ready) {
+                owner[(size_t) slot] = -1;
+                continue;
+            }
+            for (int kind = 0; kind < geometry::n_kinds; ++kind) {
+                for (int which = 0; which < geometry::n_aux; ++which) {
+                    const size_t bytes = geo_.class_aux_bytes(cls, kind, which);
+                    if (bytes == 0) {
+                        continue;
+                    }
+                    char * dst = aux_slice_address(cls, kind, which, slot);
+                    if (dst == nullptr) {
+                        return false;
+                    }
+                    CUDA_CHECK(cudaMemcpyAsync(dst, aux_host_address(l, kind, which, e), bytes, cudaMemcpyHostToDevice,
+                        copy_stream_));
+                    aux_bytes_ += bytes;
+                }
+            }
+            owner[(size_t) slot] = id;
+            ++aux_rows_;
+        }
+    }
+    return true;
+}
+
+void l1_arena::start_aux() {
+    if (!allocated() || !geo_.has_aux()) {
+        return;
+    }
+    aux_on_ = true;
+    (void) refresh_aux();
+}
+
+bool l1_arena::refresh_aux() {
+    if (!aux_on_) {
+        return true;
+    }
+    ggml_cuda_set_device(device_);
+    for (std::vector<int32_t> & owner : aux_owner_) {
+        std::fill(owner.begin(), owner.end(), -1);
+    }
+    if (!sync_aux(host_slots_)) {
+        return false;
+    }
+    CUDA_CHECK(cudaStreamSynchronize(copy_stream_));
+    return true;
+}
+
+long l1_arena::verify_aux(std::string & reason, const std::vector<uint8_t> * layers) const {
+    long checked = 0;
+    if (!aux_on_) {
+        return checked;
+    }
+    ggml_cuda_set_device(device_);
+    const std::vector<int> counts = slot_counts();
+    std::vector<char> back;
+    char message[256];
+    for (int cls = 0; cls < (int) class_data_.size(); ++cls) {
+        if (geo_.class_aux_total_bytes(cls) == 0) {
+            continue;
+        }
+        const std::vector<int32_t> & owner = aux_owner_[(size_t) cls];
+        auto checked_layer = [&](int l) {
+            return geo_.layer_class[l] == cls && (layers == nullptr || ((size_t) l < layers->size() && (*layers)[(size_t) l]));
+        };
+        // the owner record first: every resident of the class is the owner of its slot
+        for (int l = 0; l < geo_.n_layers; ++l) {
+            if (!checked_layer(l)) {
+                continue;
+            }
+            for (int e = 0; e < geo_.n_experts; ++e) {
+                const int32_t slot = host_slots_[l][e];
+                if (slot >= 0 && ((size_t) slot >= owner.size() || slot >= counts[(size_t) cls] ||
+                        owner[(size_t) slot] != l*geo_.n_experts + e)) {
+                    snprintf(message, sizeof(message), "layer %d expert %d at slot %d: the owner record of the slot names another expert",
+                        l, e, slot);
+                    reason = message;
+                    return -1;
+                }
+                checked += slot >= 0 ? 1 : 0;
+            }
+        }
+        // then the bytes, one read of the backed slot range per aux arena
+        for (int kind = 0; kind < geometry::n_kinds; ++kind) {
+            for (int which = 0; which < geometry::n_aux; ++which) {
+                const size_t bytes = geo_.class_aux_bytes(cls, kind, which);
+                if (bytes == 0 || counts[(size_t) cls] == 0) {
+                    continue;
+                }
+                back.resize(size_t(counts[(size_t) cls])*bytes);
+                CUDA_CHECK(cudaMemcpyAsync(back.data(), aux_slice_address(cls, kind, which, 0), back.size(),
+                    cudaMemcpyDeviceToHost, copy_stream_));
+                CUDA_CHECK(cudaStreamSynchronize(copy_stream_));
+                for (int l = 0; l < geo_.n_layers; ++l) {
+                    if (!checked_layer(l)) {
+                        continue;
+                    }
+                    for (int e = 0; e < geo_.n_experts; ++e) {
+                        const int32_t slot = host_slots_[l][e];
+                        if (slot >= 0 && memcmp(back.data() + size_t(slot)*bytes, aux_host_address(l, kind, which, e), bytes) != 0) {
+                            snprintf(message, sizeof(message), "layer %d kind %d expert %d at slot %d: %s differs from its tensor",
+                                l, kind, e, slot, which == 0 ? "rot_in" : "rot_out");
+                            reason = message;
+                            return -1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return checked;
+}
 
 bool l1_arena::read_device_tables(std::vector<std::vector<int32_t>> & out) const {
     if (!allocated()) {
@@ -579,8 +760,11 @@ bool l1_arena::publish(const l1_transaction & tx) {
 
 bool l1_arena::install(const expert_slot_table & selected, bool retain, l1_install_stats & stats) {
     const auto t0 = std::chrono::steady_clock::now();
+    const size_t aux_rows = aux_rows_, aux_bytes = aux_bytes_;
     const auto tx = stage(selected, retain);
     if (!tx.valid || !execute(tx.install) || !publish(tx)) { return false; }
+    stats.aux_rows  = aux_rows_ - aux_rows;
+    stats.aux_bytes = aux_bytes_ - aux_bytes;
     stats.retained = tx.install.retained_gpu;
     stats.copied = tx.install.h2d_slices; stats.bytes = tx.install.h2d_bytes;
     stats.d2h_bytes = tx.install.d2h_bytes;
