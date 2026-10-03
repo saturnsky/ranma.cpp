@@ -5378,7 +5378,7 @@ static bool validate_e_e8m0(uint8_t e, size_t i) {
     }
 
 bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbytes) {
-    if (type < 0 || type >= GGML_TYPE_COUNT) {
+    if (type < 0 || type >= GGML_TYPE_COUNT || ggml_type_size(type) == 0) {
         fprintf(stderr, "%s: invalid type %d\n", __func__, type);
         return false;
     }
@@ -5626,6 +5626,19 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
         case GGML_TYPE_I32:
         case GGML_TYPE_I64:
             // nothing to validate
+            break;
+        case GGML_TYPE_EXL3_M1:
+        case GGML_TYPE_EXL3_M2:
+        case GGML_TYPE_EXL3_M3:
+        case GGML_TYPE_EXL3_M4:
+        case GGML_TYPE_EXL3_M5:
+        case GGML_TYPE_EXL3_M6:
+        case GGML_TYPE_EXL3_M7:
+        case GGML_TYPE_EXL3_M8:
+        case GGML_TYPE_EXL3_M1H:
+        case GGML_TYPE_EXL3_M2H:
+        case GGML_TYPE_EXL3_M3H:
+            // every state decodes to a finite value; the rot_in/rot_out scales are F16 tensors of their own
             break;
         default:
             {

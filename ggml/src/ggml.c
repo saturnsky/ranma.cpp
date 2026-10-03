@@ -943,6 +943,73 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .type_size                = 0,
         .is_quantized             = false,
     },
+    // EXL3 trellis (ggml-exl3.c): a block is 128 weights of a row, but rows are only stored in groups of 128
+    [GGML_TYPE_EXL3_M1] = {
+        .type_name                = "exl3_m1",
+        .blck_size                = 128,
+        .type_size                = 16,
+        .is_quantized             = true,
+    },
+    [GGML_TYPE_EXL3_M2] = {
+        .type_name                = "exl3_m2",
+        .blck_size                = 128,
+        .type_size                = 32,
+        .is_quantized             = true,
+    },
+    [GGML_TYPE_EXL3_M3] = {
+        .type_name                = "exl3_m3",
+        .blck_size                = 128,
+        .type_size                = 48,
+        .is_quantized             = true,
+    },
+    [GGML_TYPE_EXL3_M4] = {
+        .type_name                = "exl3_m4",
+        .blck_size                = 128,
+        .type_size                = 64,
+        .is_quantized             = true,
+    },
+    [GGML_TYPE_EXL3_M5] = {
+        .type_name                = "exl3_m5",
+        .blck_size                = 128,
+        .type_size                = 80,
+        .is_quantized             = true,
+    },
+    [GGML_TYPE_EXL3_M6] = {
+        .type_name                = "exl3_m6",
+        .blck_size                = 128,
+        .type_size                = 96,
+        .is_quantized             = true,
+    },
+    [GGML_TYPE_EXL3_M7] = {
+        .type_name                = "exl3_m7",
+        .blck_size                = 128,
+        .type_size                = 112,
+        .is_quantized             = true,
+    },
+    [GGML_TYPE_EXL3_M8] = {
+        .type_name                = "exl3_m8",
+        .blck_size                = 128,
+        .type_size                = 128,
+        .is_quantized             = true,
+    },
+    [GGML_TYPE_EXL3_M1H] = {
+        .type_name                = "exl3_m1h",
+        .blck_size                = 128,
+        .type_size                = 24,
+        .is_quantized             = true,
+    },
+    [GGML_TYPE_EXL3_M2H] = {
+        .type_name                = "exl3_m2h",
+        .blck_size                = 128,
+        .type_size                = 40,
+        .is_quantized             = true,
+    },
+    [GGML_TYPE_EXL3_M3H] = {
+        .type_name                = "exl3_m3h",
+        .blck_size                = 128,
+        .type_size                = 56,
+        .is_quantized             = true,
+    },
 };
 
 const struct ggml_type_traits * ggml_get_type_traits(enum ggml_type type) {
@@ -1777,7 +1844,7 @@ static struct ggml_tensor * ggml_new_tensor_impl(
         struct ggml_tensor  * view_src,
         size_t                view_offs) {
 
-    GGML_ASSERT(type >= 0 && type < GGML_TYPE_COUNT);
+    GGML_ASSERT(type >= 0 && type < GGML_TYPE_COUNT && ggml_blck_size(type) > 0);
     GGML_ASSERT(n_dims >= 1 && n_dims <= GGML_MAX_DIMS);
 
     // find the base tensor and absolute offset

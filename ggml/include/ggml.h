@@ -430,7 +430,21 @@ extern "C" {
         GGML_TYPE_NVFP4   = 40, // NVFP4 (4 blocks, E4M3 scale)
         GGML_TYPE_Q1_0    = 41,
         GGML_TYPE_Q2_0    = 42,
-        GGML_TYPE_COUNT   = 43,
+        // 43 .. 255 are left to upstream and are not registered here
+        // EXL3 trellis: 256 + 16*codebook + code, codebook 0 = mul1 (1 = mcg, 2 = 3inst are reserved)
+        // code 0..7 = 1..8 bits, 8..10 = 1.5/2.5/3.5 bits; 304 .. 319 are reserved for EXL3 row codecs
+        GGML_TYPE_EXL3_M1  = 256,
+        GGML_TYPE_EXL3_M2  = 257,
+        GGML_TYPE_EXL3_M3  = 258,
+        GGML_TYPE_EXL3_M4  = 259,
+        GGML_TYPE_EXL3_M5  = 260,
+        GGML_TYPE_EXL3_M6  = 261,
+        GGML_TYPE_EXL3_M7  = 262,
+        GGML_TYPE_EXL3_M8  = 263,
+        GGML_TYPE_EXL3_M1H = 264,
+        GGML_TYPE_EXL3_M2H = 265,
+        GGML_TYPE_EXL3_M3H = 266,
+        GGML_TYPE_COUNT    = 267,
     };
 
     // [TAG_GGML_PREC]
@@ -778,6 +792,11 @@ extern "C" {
     GGML_API size_t  ggml_element_size(const struct ggml_tensor * tensor);
 
     GGML_API bool    ggml_is_quantized(enum ggml_type type);
+
+    // EXL3 trellis weights have no row API (to_float is NULL): rows are stored in groups of 128
+    GGML_API bool    ggml_is_exl3(enum ggml_type type);
+    // decodes the raw codebook values of one 128-row group into dst[128][k]
+    GGML_API void    ggml_exl3_decode_group(enum ggml_type type, const void * group, int64_t k, ggml_fp16_t * dst);
 
     // TODO: temporary until model loading of ggml examples is refactored
     GGML_API enum ggml_type ggml_ftype_to_ggml_type(enum ggml_ftype ftype);
