@@ -12,6 +12,7 @@
 // is the 16-bit window that ends there, wrapped around the ring. The codebook of the type maps a state to
 // its fp16 value; half rates exist only with mul1.
 
+#include "ggml-exl3.h"
 #include "ggml-impl.h"
 
 #include <stdint.h>
@@ -100,3 +101,62 @@ void ggml_exl3_decode_group(enum ggml_type type, const void * group, int64_t k, 
         }
     }
 }
+
+// EXL3 row codec (ExLlamaV3 exl3_ngram_trellis, modules/quant/exl3_lib/ngram_codec.py)
+//
+// A row of 160 values is a tail-biting ring over the mul1 codebook: an fp16 scale (2 bytes), then 160*bits bits in
+// little-endian 16-bit words, read LSB first. Position i owns stream bits [i*bits, (i+1)*bits), and its state is the
+// 16 ring bits that end there: its own bits low, then those of i-1, i-2, ... (mod 160). Each row decodes alone.
+// The value is the fp16 codebook value times the scale, in f32 (both are fp16, so the product is exact). The official
+// reconstruction then adds a per-head bias and rounds to fp16; that is the graph's job, not the row's.
+
+bool ggml_is_exl3_row(enum ggml_type type) {
+    return type >= GGML_TYPE_EXL3R_M1 && type <= GGML_TYPE_EXL3R_M8;
+}
+
+static void ggml_exl3r_dequantize(const uint8_t * x, float * y, int64_t k, int bits) {
+    enum { ROW = 160 };
+    GGML_ASSERT(k % ROW == 0);
+    const int64_t row_bytes = 2 + ROW*bits/8;
+    const uint32_t mask = (1u << bits) - 1;
+
+    for (int64_t r = 0; r < k/ROW; ++r) {
+        const uint8_t * src = x + r*row_bytes;
+        float         * dst = y + r*ROW;
+
+        const float scale = GGML_FP16_TO_FP32((ggml_fp16_t) (src[0] | (src[1] << 8)));
+        const uint8_t * stream = src + 2;
+
+        uint32_t code[ROW];
+        for (int i = 0; i < ROW; ++i) {
+            const int b0 = i*bits;
+            // the bits of position i span at most 2 bytes (bits <= 8); the last position has no byte after it
+            uint32_t w = stream[b0 >> 3];
+            if ((b0 >> 3) + 1 < ROW*bits/8) {
+                w |= (uint32_t) stream[(b0 >> 3) + 1] << 8;
+            }
+            code[i] = (w >> (b0 & 7)) & mask;
+        }
+        for (int i = 0; i < ROW; ++i) {
+            uint32_t state = 0;
+            for (int j = 0; j*bits < 16; ++j) {
+                state |= code[(i - j + ROW) % ROW] << (j*bits);
+            }
+            dst[i] = GGML_FP16_TO_FP32(ggml_exl3_mul1(state & 0xffff)) * scale;
+        }
+    }
+}
+
+#define GGML_EXL3R_DEQUANTIZE(bits) \
+    void dequantize_row_exl3r_m##bits(const void * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) { \
+        ggml_exl3r_dequantize((const uint8_t *) x, y, k, bits); \
+    }
+
+GGML_EXL3R_DEQUANTIZE(1)
+GGML_EXL3R_DEQUANTIZE(2)
+GGML_EXL3R_DEQUANTIZE(3)
+GGML_EXL3R_DEQUANTIZE(4)
+GGML_EXL3R_DEQUANTIZE(5)
+GGML_EXL3R_DEQUANTIZE(6)
+GGML_EXL3R_DEQUANTIZE(7)
+GGML_EXL3R_DEQUANTIZE(8)

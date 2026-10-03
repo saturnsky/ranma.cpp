@@ -432,7 +432,8 @@ extern "C" {
         GGML_TYPE_Q2_0    = 42,
         // 43 .. 255 are left to upstream and are not registered here
         // EXL3 trellis: 256 + 16*codebook + code, codebook 0 = mul1, 1 = mcg, 2 = 3inst
-        // code 0..7 = 1..8 bits, 8..10 = 1.5/2.5/3.5 bits (mul1 only); 304 .. 319 are reserved for EXL3 row codecs
+        // code 0..7 = 1..8 bits, 8..10 = 1.5/2.5/3.5 bits (mul1 only)
+        // 304 .. 319: EXL3 row codecs, 304 + bits - 1 = mul1 ring rows of 160 (312 .. 319 are reserved)
         GGML_TYPE_EXL3_M1  = 256,
         GGML_TYPE_EXL3_M2  = 257,
         GGML_TYPE_EXL3_M3  = 258,
@@ -460,7 +461,15 @@ extern "C" {
         GGML_TYPE_EXL3_T6  = 293,
         GGML_TYPE_EXL3_T7  = 294,
         GGML_TYPE_EXL3_T8  = 295,
-        GGML_TYPE_COUNT    = 296,
+        GGML_TYPE_EXL3R_M1 = 304,
+        GGML_TYPE_EXL3R_M2 = 305,
+        GGML_TYPE_EXL3R_M3 = 306,
+        GGML_TYPE_EXL3R_M4 = 307,
+        GGML_TYPE_EXL3R_M5 = 308,
+        GGML_TYPE_EXL3R_M6 = 309,
+        GGML_TYPE_EXL3R_M7 = 310,
+        GGML_TYPE_EXL3R_M8 = 311,
+        GGML_TYPE_COUNT    = 312,
     };
 
     // [TAG_GGML_PREC]
@@ -813,6 +822,8 @@ extern "C" {
     GGML_API bool    ggml_is_exl3(enum ggml_type type);
     // decodes the raw codebook values of one 128-row group into dst[128][k]
     GGML_API void    ggml_exl3_decode_group(enum ggml_type type, const void * group, int64_t k, ggml_fp16_t * dst);
+    // EXL3 row codec rows (n-gram embedding tables) decode alone with to_float; they are read with ggml_get_rows only
+    GGML_API bool    ggml_is_exl3_row(enum ggml_type type);
 
     // TODO: temporary until model loading of ggml examples is refactored
     GGML_API enum ggml_type ggml_ftype_to_ggml_type(enum ggml_ftype ftype);
