@@ -1,5 +1,5 @@
 // GGML_OP_MUL_MAT_HAD: y = rot_out * H(W^T H(rot_in * x)), see ggml_mul_mat_had()
-// EXL3 trellis format and mul1 codebook: ExLlamaV3, Copyright (c) 2025 Turboderp, MIT license
+// EXL3 trellis format and codebooks (mul1, mcg, 3inst): ExLlamaV3, Copyright (c) 2025 Turboderp, MIT license
 //
 // 1. prologue: one block per output row (token, or token x expert slot with ids) writes H(rot_in * x) once: F32 for
 //    the GEMV, or for the WMMA GEMM in fp16, scaled by a power of 2 that keeps the values in the fp16 normal range.
@@ -367,14 +367,69 @@ static __device__ __forceinline__ uint32_t mmh_mul1_pair(const uint32_t s0, cons
     return mmh_as_u32(__hfma2(mmh_as_half2(h), mmh_as_half2(0x1EEE1EEEu), mmh_as_half2(0xC931C931u)));
 }
 
+// mcg and 3inst hashes of x < 2^16: x*0xCBAC1FED and x*89226354 + 64248484 mod 2^32, 24-bit multiplies as above
+static __device__ __forceinline__ uint32_t mmh_mcg_hash(const uint32_t x) {
+#if defined(GGML_USE_HIP)
+    uint32_t lo;
+    uint32_t hi;
+    asm("v_mul_u32_u24 %0, 0xac1fed, %1" : "=v"(lo) : "v"(x));
+    asm("v_mul_u32_u24 %0, 0xcb, %1" : "=v"(hi) : "v"(x));
+    return lo + (hi << 24);
+#else
+    return x*0xCBAC1FEDu;
+#endif // defined(GGML_USE_HIP)
+}
+
+static __device__ __forceinline__ uint32_t mmh_3inst_hash(const uint32_t x) {
+#if defined(GGML_USE_HIP)
+    uint32_t lo;
+    uint32_t hi;
+    asm("v_mul_u32_u24 %0, 0x517c72, %1" : "=v"(lo) : "v"(x));
+    asm("v_mul_u32_u24 %0, 0x5, %1" : "=v"(hi) : "v"(x));
+    return lo + (hi << 24) + 64248484u;
+#else
+    return x*89226354u + 64248484u;
+#endif // defined(GGML_USE_HIP)
+}
+
+// two mcg or 3inst codebook values as half2: each hash keeps its sign and low bits as two fp16 halves of exponent
+// 12..15, which are added in fp16
+static __device__ __forceinline__ uint32_t mmh_half_sum_pair(uint32_t p0, uint32_t p1) {
+    p0 = (p0 & 0x8FFF8FFFu) ^ 0x3B603B60u;
+    p1 = (p1 & 0x8FFF8FFFu) ^ 0x3B603B60u;
+#if defined(GGML_USE_HIP)
+    const uint32_t lo = __builtin_amdgcn_perm(p1, p0, 0x05040100u);
+    const uint32_t hi = __builtin_amdgcn_perm(p1, p0, 0x07060302u);
+#else
+    const uint32_t lo = __byte_perm(p0, p1, 0x5410);
+    const uint32_t hi = __byte_perm(p0, p1, 0x7632);
+#endif // defined(GGML_USE_HIP)
+    return mmh_as_u32(__hadd2(mmh_as_half2(lo), mmh_as_half2(hi)));
+}
+
+// EXL3 types: twice the bits (0 for other types) and the codebook (0 = mul1, 1 = mcg, 2 = 3inst)
+static constexpr bool mmh_is_exl3(const ggml_type type) {
+    return (type >= GGML_TYPE_EXL3_M1 && type <= GGML_TYPE_EXL3_M3H) || (type >= GGML_TYPE_EXL3_G1 && type <= GGML_TYPE_EXL3_G8) ||
+           (type >= GGML_TYPE_EXL3_T1 && type <= GGML_TYPE_EXL3_T8);
+}
+
+static constexpr int mmh_exl3_b2(const ggml_type type) {
+    return !mmh_is_exl3(type) ? 0 : (type - GGML_TYPE_EXL3_M1) % 16 < 8 ? 2*((type - GGML_TYPE_EXL3_M1) % 16 + 1) :
+        2*((type - GGML_TYPE_EXL3_M1) % 16 - 7) + 1;
+}
+
+static constexpr int mmh_exl3_codebook(const ggml_type type) {
+    return mmh_is_exl3(type) ? (type - GGML_TYPE_EXL3_M1)/16 : -1;
+}
+
 // one lane's share of the 16x16 tile (kt, nt) of a 128-row group, as half2 over k, k + 1:
 // out[0] = (c0, r0), out[1] = (c0, r0 + 8), out[2] = (c0 + 8, r0), out[3] = (c0 + 8, r0 + 8), r0 = 2*(lane%4)
 // F32 weights give k in out and k + 1 in lo, as F32. fetch() only loads, so the loads can be issued ahead.
 template <ggml_type type>
 struct mmh_weight {
-    static constexpr int b2 = type == GGML_TYPE_EXL3_M1H ? 3 : type == GGML_TYPE_EXL3_M2H ? 5 : type == GGML_TYPE_EXL3_M3H ? 7 :
-        (type >= GGML_TYPE_EXL3_M1 && type <= GGML_TYPE_EXL3_M8) ? 2*(type - GGML_TYPE_EXL3_M1 + 1) : 0;
-    static constexpr bool is_exl3 = b2 > 0;
+    static constexpr int  b2       = mmh_exl3_b2(type);
+    static constexpr int  codebook = mmh_exl3_codebook(type);
+    static constexpr bool is_exl3  = b2 > 0;
     static constexpr int  n_raw   = is_exl3 ? 3 : type == GGML_TYPE_F16 ? 4 : 8;
 
     struct raw {
@@ -442,7 +497,13 @@ struct mmh_weight {
             }
 #pragma unroll
             for (int i = 0; i < 4; ++i) {
-                out[i] = mmh_mul1_pair(st[2*i], st[2*i + 1]);
+                if constexpr (codebook == 0) {
+                    out[i] = mmh_mul1_pair(st[2*i], st[2*i + 1]);
+                } else if constexpr (codebook == 1) {
+                    out[i] = mmh_half_sum_pair(mmh_mcg_hash(st[2*i] & 0xFFFFu), mmh_mcg_hash(st[2*i + 1] & 0xFFFFu));
+                } else {
+                    out[i] = mmh_half_sum_pair(mmh_3inst_hash(st[2*i] & 0xFFFFu), mmh_3inst_hash(st[2*i + 1] & 0xFFFFu));
+                }
             }
             GGML_UNUSED(lo);
         } else if constexpr (type == GGML_TYPE_F16) {
@@ -1184,6 +1245,22 @@ void ggml_cuda_mul_mat_had(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         case GGML_TYPE_EXL3_M1H: mmh_launch_prec<GGML_TYPE_EXL3_M1H>(ctx, p, wd, n, inline_rows, f16); break;
         case GGML_TYPE_EXL3_M2H: mmh_launch_prec<GGML_TYPE_EXL3_M2H>(ctx, p, wd, n, inline_rows, f16); break;
         case GGML_TYPE_EXL3_M3H: mmh_launch_prec<GGML_TYPE_EXL3_M3H>(ctx, p, wd, n, inline_rows, f16); break;
+        case GGML_TYPE_EXL3_G1:  mmh_launch_prec<GGML_TYPE_EXL3_G1> (ctx, p, wd, n, inline_rows, f16); break;
+        case GGML_TYPE_EXL3_G2:  mmh_launch_prec<GGML_TYPE_EXL3_G2> (ctx, p, wd, n, inline_rows, f16); break;
+        case GGML_TYPE_EXL3_G3:  mmh_launch_prec<GGML_TYPE_EXL3_G3> (ctx, p, wd, n, inline_rows, f16); break;
+        case GGML_TYPE_EXL3_G4:  mmh_launch_prec<GGML_TYPE_EXL3_G4> (ctx, p, wd, n, inline_rows, f16); break;
+        case GGML_TYPE_EXL3_G5:  mmh_launch_prec<GGML_TYPE_EXL3_G5> (ctx, p, wd, n, inline_rows, f16); break;
+        case GGML_TYPE_EXL3_G6:  mmh_launch_prec<GGML_TYPE_EXL3_G6> (ctx, p, wd, n, inline_rows, f16); break;
+        case GGML_TYPE_EXL3_G7:  mmh_launch_prec<GGML_TYPE_EXL3_G7> (ctx, p, wd, n, inline_rows, f16); break;
+        case GGML_TYPE_EXL3_G8:  mmh_launch_prec<GGML_TYPE_EXL3_G8> (ctx, p, wd, n, inline_rows, f16); break;
+        case GGML_TYPE_EXL3_T1:  mmh_launch_prec<GGML_TYPE_EXL3_T1> (ctx, p, wd, n, inline_rows, f16); break;
+        case GGML_TYPE_EXL3_T2:  mmh_launch_prec<GGML_TYPE_EXL3_T2> (ctx, p, wd, n, inline_rows, f16); break;
+        case GGML_TYPE_EXL3_T3:  mmh_launch_prec<GGML_TYPE_EXL3_T3> (ctx, p, wd, n, inline_rows, f16); break;
+        case GGML_TYPE_EXL3_T4:  mmh_launch_prec<GGML_TYPE_EXL3_T4> (ctx, p, wd, n, inline_rows, f16); break;
+        case GGML_TYPE_EXL3_T5:  mmh_launch_prec<GGML_TYPE_EXL3_T5> (ctx, p, wd, n, inline_rows, f16); break;
+        case GGML_TYPE_EXL3_T6:  mmh_launch_prec<GGML_TYPE_EXL3_T6> (ctx, p, wd, n, inline_rows, f16); break;
+        case GGML_TYPE_EXL3_T7:  mmh_launch_prec<GGML_TYPE_EXL3_T7> (ctx, p, wd, n, inline_rows, f16); break;
+        case GGML_TYPE_EXL3_T8:  mmh_launch_prec<GGML_TYPE_EXL3_T8> (ctx, p, wd, n, inline_rows, f16); break;
         default:
             GGML_ABORT("unsupported MUL_MAT_HAD weight type %s", ggml_type_name(w->type));
     }

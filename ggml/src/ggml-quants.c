@@ -5638,6 +5638,22 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
         case GGML_TYPE_EXL3_M1H:
         case GGML_TYPE_EXL3_M2H:
         case GGML_TYPE_EXL3_M3H:
+        case GGML_TYPE_EXL3_G1:
+        case GGML_TYPE_EXL3_G2:
+        case GGML_TYPE_EXL3_G3:
+        case GGML_TYPE_EXL3_G4:
+        case GGML_TYPE_EXL3_G5:
+        case GGML_TYPE_EXL3_G6:
+        case GGML_TYPE_EXL3_G7:
+        case GGML_TYPE_EXL3_G8:
+        case GGML_TYPE_EXL3_T1:
+        case GGML_TYPE_EXL3_T2:
+        case GGML_TYPE_EXL3_T3:
+        case GGML_TYPE_EXL3_T4:
+        case GGML_TYPE_EXL3_T5:
+        case GGML_TYPE_EXL3_T6:
+        case GGML_TYPE_EXL3_T7:
+        case GGML_TYPE_EXL3_T8:
             // every state decodes to a finite value; the rot_in/rot_out scales are F16 tensors of their own
             break;
         default:
