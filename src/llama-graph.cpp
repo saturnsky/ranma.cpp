@@ -1525,6 +1525,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     mctx             (params.mctx),
     cross            (params.cross),
     prec_policy      (params.prec_policy),
+    waux             (params.waux),
     samplers         (params.samplers),
     cb_func          (params.cb),
     res              (params.res),
@@ -1547,11 +1548,18 @@ ggml_tensor * llm_graph_context::build_cvec(
     return cvec->apply_to(ctx0, cur, il);
 }
 
+ggml_tensor * llm_graph_context::build_mm(
+          ggml_tensor * w,
+          ggml_tensor * cur) const {
+    ggml_tensor * res = llama_weight_aux_mul_mat(ctx0, waux, w, cur, nullptr);
+    return res ? res : ggml_mul_mat(ctx0, w, cur);
+}
+
 ggml_tensor * llm_graph_context::build_lora_mm(
           ggml_tensor * w,
           ggml_tensor * cur,
           ggml_tensor * w_s) const {
-    ggml_tensor * res = ggml_mul_mat(ctx0, w, cur);
+    ggml_tensor * res = build_mm(w, cur);
 
     if (prec_policy) {
         prec_policy->apply(res);
@@ -1608,7 +1616,10 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
           ggml_tensor * cur, // ggml_tensor * b
           ggml_tensor * ids,
           ggml_tensor * w_s) const {
-    ggml_tensor * res = ggml_mul_mat_id(ctx0, w, cur, ids);
+    ggml_tensor * res = llama_weight_aux_mul_mat(ctx0, waux, w, cur, ids);
+    if (res == nullptr) {
+        res = ggml_mul_mat_id(ctx0, w, cur, ids);
+    }
 
     if (prec_policy) {
         prec_policy->apply(res);

@@ -649,6 +649,9 @@ struct llama_model {
     // per-tensor activation precision policy
     llama_prec_policy prec_policy;
 
+    // tensors that weights need beside their data (EXL3 rot_in / rot_out)
+    llama_weight_aux_map waux;
+
     // for classifier models
     std::vector<std::string> classifier_labels;
 
