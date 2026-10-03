@@ -202,6 +202,7 @@ add_library(ggml-base
             ggml-backend.cpp
             ggml-backend-meta.cpp
             ggml-exl3.c
+            ggml-exl3.h
             ggml-opt.cpp
             ggml-threading.cpp
             ggml-threading.h
