@@ -91,7 +91,7 @@ inline redraw_params redraw_params_from(const std::function<const char *(const c
 inline size_t redraw_static_bytes(const geometry & geo, const std::vector<int> & capacities) {
     size_t bytes = 0;
     for (size_t c = 0; c < capacities.size() && c < geo.class_bytes.size(); ++c) {
-        bytes += size_t(std::max(capacities[c], 0))*geo.class_total_bytes(int(c));
+        bytes += size_t(std::max(capacities[c], 0))*geo.class_vram_bytes(int(c));
     }
     return bytes;
 }
@@ -100,7 +100,7 @@ inline size_t redraw_static_bytes(const geometry & geo, const std::vector<int> &
 inline size_t redraw_moved_bytes(const geometry & geo, const std::vector<int> & current, const std::vector<int> & next) {
     size_t bytes = 0;
     for (size_t c = 0; c < current.size() && c < next.size(); ++c) {
-        if (next[c] < current[c]) { bytes += size_t(current[c] - next[c])*geo.class_total_bytes(int(c)); }
+        if (next[c] < current[c]) { bytes += size_t(current[c] - next[c])*geo.class_vram_bytes(int(c)); }
     }
     return bytes;
 }
@@ -127,7 +127,7 @@ inline std::vector<int> redraw_capacities(const geometry & geo, const uint64_t *
         hi[c] = std::max(0, std::min(ceiling[c], geo.class_layers[c]*geo.n_experts));
         lo[c] = std::max(0, std::min(floor[c], hi[c]));
         caps[c] = lo[c];
-        reserved += size_t(lo[c])*geo.class_total_bytes(int(c));
+        reserved += size_t(lo[c])*geo.class_vram_bytes(int(c));
     }
     if (reserved > budget) {
         return current;
@@ -136,7 +136,7 @@ inline std::vector<int> redraw_capacities(const geometry & geo, const uint64_t *
     const std::vector<detail::plan_candidate> candidates = detail::sorted_candidates(geo, counts);
     std::vector<int> rank(classes, 0);
     for (const detail::plan_candidate & cand : candidates) {
-        const size_t bytes = geo.class_total_bytes(cand.cls);
+        const size_t bytes = geo.class_vram_bytes(cand.cls);
         if (++rank[cand.cls] <= lo[cand.cls]) {
             continue;
         }
@@ -146,7 +146,7 @@ inline std::vector<int> redraw_capacities(const geometry & geo, const uint64_t *
         }
     }
     for (size_t c = 0; c < classes; ++c) {
-        const size_t bytes = geo.class_total_bytes(int(c));
+        const size_t bytes = geo.class_vram_bytes(int(c));
         if (caps[c] < current[c] && bytes != 0) {
             const int back = (int) std::min<size_t>(size_t(std::min(current[c], hi[c]) - caps[c]), remaining/bytes);
             caps[c] += std::max(back, 0);
@@ -224,7 +224,7 @@ inline redraw_estimate redraw_estimate_of(const geometry & geo, const uint64_t *
     for (int l = 0; l < geo.n_layers && size_t(l) < now.size() && size_t(l) < next.size(); ++l) {
         const int c = geo.layer_class[l];
         if (c < 0) { continue; }
-        const size_t bytes = geo.class_total_bytes(c);
+        const size_t bytes = geo.class_vram_bytes(c);
         auto has = [](const std::vector<int32_t> & v, int e) { return std::binary_search(v.begin(), v.end(), e); };
         for (int e = 0; e < geo.n_experts; ++e) {
             const bool a = has(now[l], e), b = has(next[l], e);
