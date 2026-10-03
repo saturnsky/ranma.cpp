@@ -1334,7 +1334,7 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention_impl(
 
     out = ggml_reshape_3d(ctx0, out, o_group_dim, n_groups, nt);
     out = ggml_permute(ctx0, out, 0, 2, 1, 3);
-    ggml_tensor * oa = ggml_mul_mat(ctx0, layer.wo_a, out);
+    ggml_tensor * oa = build_mm(layer.wo_a, out);
     cb(oa, "attn_wo_a", il);
     oa = ggml_permute(ctx0, oa, 0, 2, 1, 3);
     oa = ggml_cont_2d(ctx0, oa, o_lora_rank*n_groups, nt);
@@ -1476,7 +1476,7 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
 
-    cur = ggml_mul_mat(ctx0, model.output, cur);
+    cur = build_mm(model.output, cur);
     cb(cur, "result_output", -1);
     res->t_logits = cur;
 
@@ -1619,7 +1619,7 @@ llama_model_deepseek4::graph_mtp::graph_mtp(const llama_model & model, const llm
 
     ggml_tensor * head_w = layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model.output;
     GGML_ASSERT(head_w && "DEEPSEEK4 MTP missing LM head");
-    cur = ggml_mul_mat(ctx0, head_w, cur);
+    cur = build_mm(head_w, cur);
     cb(cur, "result_output", -1);
 
     res->t_logits = cur;
