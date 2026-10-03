@@ -329,6 +329,7 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
     { LLM_KV_ROPE_FREQ_BASE_SWA,             "%s.rope.freq_base_swa"                   },
     { LLM_KV_ROPE_SCALE_LINEAR,              "%s.rope.scale_linear"                    },
     { LLM_KV_ROPE_SCALING_TYPE,              "%s.rope.scaling.type"                    },
+    { LLM_KV_ROPE_STYLE,                     "%s.rope.style"                           },
     { LLM_KV_ROPE_SCALING_FACTOR,            "%s.rope.scaling.factor"                  },
     { LLM_KV_ROPE_SCALING_ALPHA,             "%s.rope.scaling.alpha"                   },
     { LLM_KV_ROPE_SCALING_ATTN_FACTOR,       "%s.rope.scaling.attn_factor"             },
