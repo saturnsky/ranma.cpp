@@ -581,6 +581,8 @@ public:
             if (!finalize_delegate_buffer_locked(exclusive_buffer_)) {
                 abort_locked("delegate buffer finalization failed");
             }
+            // the aux tensors (EXL3 rotations) are in the delegate buffer and final now: the VRAM slots get their rows
+            l1_->start_aux();
             // The loader has written every slice to its home; register the host arenas as coarse
             // mapped memory so the kernels can read them, and the cache is live.
             if (!host_->map()) {
@@ -600,6 +602,7 @@ public:
                 l1_->device_bytes()/(1024*1024), resident_slices_locked(),
                 size_t(geo_.n_routed_layers())*size_t(geo_.n_experts),
                 host_->host_bytes()/(1024*1024), cfg_.spare_slots);
+            log_aux_locked("at model load");
             if (tier_) {
                 report_tier_plan_locked("at model load");
             }
@@ -648,6 +651,8 @@ public:
         }
         redraw_started_locked(counts == nullptr);
         allocate_stage_locked();
+        // every member is loaded: the installs bring the aux rows (EXL3 rotations) of the slots they fill
+        l1_->start_aux();
         l1_install_stats stats;
         if (!l1_->install(initial.selected, /*retain=*/false, stats)) {
             disable_locked("initial install failed");
@@ -670,6 +675,7 @@ public:
         GGML_LOG_INFO("expert cache: installed %zu MiB in VRAM (%zu slices, %.1f ms); tables and profiler %zu KiB%s\n",
             l1_->device_bytes()/(1024*1024), stats.copied, stats.ms,
             (table_bytes + (profiler_ ? profiler_->device_bytes() : 0))/1024, models_text_locked().c_str());
+        log_aux_locked("at model load");
         log_members_locked("at model load");
         return true;
     }
@@ -952,16 +958,17 @@ public:
         }
         if (l1_->owns_host_storage()) {
             GGML_LOG_INFO("expert cache: installed plan %u of bank '%s': mode=%s retained=%zu exchanged=%zu "
-                          "h2d_bytes=%zu MiB d2h_bytes=%zu MiB in %.1f ms\n",
+                          "h2d_bytes=%zu MiB d2h_bytes=%zu MiB in %.1f ms%s\n",
                 id, banks_[plan.bank].label.c_str(), mode_name(), stats.retained, stats.copied,
-                stats.bytes/(1024*1024), stats.d2h_bytes/(1024*1024), stats.ms);
+                stats.bytes/(1024*1024), stats.d2h_bytes/(1024*1024), stats.ms, aux_text(stats).c_str());
             std::string reason;
             if (!l1_->verify_current_assignment(reason)) {
                 GGML_ABORT("expert cache: exclusive assignment is inconsistent after a swap: %s", reason.c_str());
             }
         } else {
-            GGML_LOG_INFO("expert cache: installed plan %u of bank '%s': retained=%zu copied=%zu bytes=%zu MiB in %.1f ms\n",
-                id, banks_[plan.bank].label.c_str(), stats.retained, stats.copied, stats.bytes/(1024*1024), stats.ms);
+            GGML_LOG_INFO("expert cache: installed plan %u of bank '%s': retained=%zu copied=%zu bytes=%zu MiB in %.1f ms%s\n",
+                id, banks_[plan.bank].label.c_str(), stats.retained, stats.copied, stats.bytes/(1024*1024), stats.ms,
+                aux_text(stats).c_str());
         }
         if (cfg_.log_mask & GGML_EXPERT_LOG_L2) {
             GGML_LOG_INFO("expert_metrics {\"kind\":\"install\",\"bank\":\"%s\",\"plan\":%u,\"install_ms\":%.6f,"
@@ -1375,9 +1382,20 @@ private:
             drop_member_locked(m);
             return -1;
         }
+        // the aux rows are not in the signature: their layout must match the file's as well
+        if (geo.aux_nb != mb.geo.aux_nb) {
+            GGML_LOG_WARN("expert cache: model %s: the aux rows of the loaded model differ from the layout read from %s; "
+                          "it is not cached\n", mb.key.c_str(), mb.path.c_str());
+            drop_member_locked(m);
+            return -1;
+        }
         for (int l = 0; l < geo.n_layers; ++l) {
             for (int k = 0; k < geometry::n_kinds; ++k) {
                 geo_.tensors[mb.offset + l][k] = geo.tensors[l][k];
+            }
+            // the joint geometry held the file's metadata tensors until now; they are freed below
+            if ((size_t) (mb.offset + l) < geo_.aux.size() && (size_t) l < geo.aux.size()) {
+                geo_.aux[mb.offset + l] = geo.aux[l];
             }
         }
         mb.geo   = std::move(geo);
@@ -1444,6 +1462,10 @@ private:
         }
         // the device must see the loader's writes to the mapped host arena
         CUDA_CHECK(cudaDeviceSynchronize());
+        // the joined model's aux tensors are final now; slots published while it loaded may name its experts
+        if (!l1_->refresh_aux()) {
+            abort_locked("the aux rows of a joined model could not be copied");
+        }
         std::string reason;
         if (tier_) {
             // the joined model's files: open them and check its backing like at the first load,
@@ -1568,7 +1590,7 @@ private:
         const size_t budget = redraw_static_bytes(geo_, capacities_);
         redraw_max_static_.assign(geo_.class_bytes.size(), 0);
         for (size_t c = 0; c < redraw_max_static_.size(); ++c) {
-            const size_t bytes = geo_.class_total_bytes((int) c);
+            const size_t bytes = geo_.class_vram_bytes((int) c);
             const size_t n = bytes == 0 ? 0 : budget/bytes;
             redraw_max_static_[c] = (int) std::min<size_t>(n, size_t(geo_.class_layers[c])*size_t(geo_.n_experts));
         }
@@ -2480,6 +2502,22 @@ private:
         if (!verify_all_ || !l1_) {
             return;
         }
+        if (l1_->aux_enabled()) {
+            const auto t0 = std::chrono::steady_clock::now();
+            // a joined model that has not loaded yet (or was dropped) has no rows
+            std::vector<uint8_t> layers((size_t) geo_.n_layers, 1);
+            for (int l = 0; joint_ && l < geo_.n_layers; ++l) {
+                const member_state & mb = members_[(size_t) member_of_layer(l)];
+                layers[(size_t) l] = mb.loaded && !mb.dropped ? 1 : 0;
+            }
+            std::string reason;
+            const long checked = l1_->verify_aux(reason, &layers);
+            if (checked < 0) {
+                GGML_ABORT("expert cache: aux rows: %s", reason.c_str());
+            }
+            GGML_LOG_INFO("expert cache: verified the aux rows of %ld VRAM residents against their tensors in %.1f ms\n", checked,
+                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+        }
         const auto t0 = std::chrono::steady_clock::now();
         if (l1_->owns_host_storage()) {
             size_t vram = 0;
@@ -2549,6 +2587,40 @@ private:
         return bytes;
     }
 
+    // The same in VRAM, where a slot also holds the aux rows.
+    size_t vram_spare_bytes_locked() const {
+        size_t bytes = 0;
+        for (int cls = 0; cls < (int) geo_.class_bytes.size(); ++cls) {
+            bytes += size_t(cfg_.spare_slots)*geo_.class_vram_bytes(cls);
+        }
+        return bytes;
+    }
+
+    // " aux_rows=<n> aux_bytes=<KiB> KiB" for an install line of a bank with aux rows, else nothing.
+    std::string aux_text(const l1_install_stats & stats) const {
+        if (!l1_ || !l1_->aux_enabled()) {
+            return "";
+        }
+        return " aux_rows=" + std::to_string(stats.aux_rows) + " aux_bytes=" + std::to_string(stats.aux_bytes/1024) + " KiB";
+    }
+
+    // The aux arenas of a bank with aux rows: their VRAM, what one resident expert adds, and the rows copied so far.
+    void log_aux_locked(const char * what) const {
+        if (!l1_ || !l1_->aux_enabled()) {
+            return;
+        }
+        std::string per;
+        for (int cls = 0; cls < (int) geo_.class_bytes.size(); ++cls) {
+            char item[96];
+            snprintf(item, sizeof(item), "%s%zu+%zu", cls ? "," : "", geo_.class_total_bytes(cls), geo_.class_aux_total_bytes(cls));
+            per += item;
+        }
+        GGML_LOG_INFO("expert cache: aux rows (EXL3 rotations) %s: %.1f MiB of VRAM arenas at the weight slots, bytes per "
+                      "expert (weights+aux) by class %s, %zu experts' rows copied (%.1f MiB)\n", what,
+            double(l1_->aux_device_bytes())/(1024.0*1024.0), per.c_str(), l1_->aux_rows_copied(),
+            double(l1_->aux_bytes_copied())/(1024.0*1024.0));
+    }
+
     // The host arena's spare slots; with the class layout at the storage pitch.
     size_t host_spare_bytes_locked() const {
         if (!tier_ || !tier_->class_layout()) { return spare_bytes_locked(); }
@@ -2565,7 +2637,7 @@ private:
     // Everything inside the budget that is not an expert slice.
     size_t budget_overhead_locked(bool owns_host) const {
         return table_bytes_locked(owns_host) + arena_tail_total(geo_) +
-            (owns_host ? spare_bytes_locked() : 0) +
+            (owns_host ? vram_spare_bytes_locked() : 0) +
             (profiling_enabled() ? geo_.n_counts()*sizeof(uint32_t)*max_banks : 0);
     }
 
@@ -2690,7 +2762,7 @@ private:
             stage_index_[(size_t) l] = (int) stage_layer_.size();
             stage_layer_.push_back(l);
             per_class[(size_t) cls] += stage_slots_;
-            bytes += size_t(stage_slots_)*geo_.class_total_bytes(cls);
+            bytes += size_t(stage_slots_)*geo_.class_vram_bytes(cls);
         }
         if (stage_layer_.empty()) {
             hash_mode_.vram = false;
@@ -2834,6 +2906,18 @@ private:
                     CUDA_CHECK(cudaMemcpyAsync(l1_->gpu_slice_address(cls, kind, first + c.second), src, bytes,
                         cudaMemcpyHostToDevice, stage_stream_));
                     stage_bytes_ += bytes;
+                    // the aux rows of the slot, before the publish below names it
+                    for (int which = 0; l1_->aux_enabled() && which < geometry::n_aux; ++which) {
+                        const size_t aux_bytes = geo_.class_aux_bytes(cls, kind, which);
+                        if (aux_bytes == 0) {
+                            continue;
+                        }
+                        const char * aux_src = l1_->aux_host_address(w.layer, kind, which, c.first);
+                        GGML_ASSERT(aux_src != nullptr);
+                        CUDA_CHECK(cudaMemcpyAsync(l1_->aux_slice_address(cls, kind, which, first + c.second), aux_src,
+                            aux_bytes, cudaMemcpyHostToDevice, stage_stream_));
+                        stage_bytes_ += aux_bytes;
+                    }
                 }
             }
             stage_copies_ += (uint64_t) w.plan.copies.size();
@@ -2886,6 +2970,19 @@ private:
                     CUDA_CHECK(cudaMemcpy(back.data(), l1_->gpu_slice_address(cls, kind, slot), bytes, cudaMemcpyDeviceToHost));
                     if (memcmp(back.data(), l1_->host_address(layer, kind, e), bytes) != 0) {
                         GGML_ABORT("expert cache: VRAM staging of layer %d expert %d kind %d differs from its host bytes", layer, e, kind);
+                    }
+                    for (int which = 0; l1_->aux_enabled() && which < geometry::n_aux; ++which) {
+                        const size_t aux_bytes = geo_.class_aux_bytes(cls, kind, which);
+                        if (aux_bytes == 0) {
+                            continue;
+                        }
+                        back.resize(aux_bytes);
+                        CUDA_CHECK(cudaMemcpy(back.data(), l1_->aux_slice_address(cls, kind, which, slot), aux_bytes,
+                            cudaMemcpyDeviceToHost));
+                        if (memcmp(back.data(), l1_->aux_host_address(layer, kind, which, e), aux_bytes) != 0) {
+                            GGML_ABORT("expert cache: VRAM staging of layer %d expert %d kind %d: aux row %d differs from its tensor",
+                                layer, e, kind, which);
+                        }
                     }
                     ++stage_verified_;
                 }

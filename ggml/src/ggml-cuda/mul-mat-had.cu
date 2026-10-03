@@ -69,11 +69,15 @@ struct mmh_params {
     float hscale;    // 1/sqrt(had)
 
     // expert cache (expert-l1.cuh), as for MUL_MAT_ID: the weight matrix of expert e is read from its arena slot, in
-    // exclusive mode a miss from the host slot of e; null without the cache. rot_in / rot_out stay indexed by e.
+    // exclusive mode a miss from the host slot of e; null without the cache. rot_in / rot_out of a resident expert are
+    // read from the cache's rotation arenas at the same slot (rin_cache / rout_cache, null when the cache has none),
+    // of any other expert from the tensor by e.
     const void     * w_cache;
     const int32_t  * w_slots;
     const int32_t  * w_host_slots;
     const uint64_t * w_host_addresses;
+    const char     * rin_cache;
+    const char     * rout_cache;
 };
 
 static __device__ __forceinline__ int mmh_expert(const mmh_params & p, const int r) {
@@ -130,6 +134,18 @@ static __device__ __forceinline__ const char * mmh_weight_matrix(const mmh_param
 #else
     return (const char *) (uintptr_t) a;
 #endif // defined(GGML_USE_HIP)
+}
+
+// the rot_in / rot_out row of expert e (wave-uniform): the rotation arena slot of a resident expert, else the tensor row
+static __device__ __forceinline__ const char * mmh_rot_row(const mmh_params & p, const char * rot, const char * cache,
+        const int64_t nb1, const int e) {
+    if (cache != nullptr) {
+        const int slot = mmh_uniform(p.w_slots[e]);
+        if (slot >= 0) {
+            return cache + slot*nb1;
+        }
+    }
+    return rot + e*nb1;
 }
 
 static __device__ __forceinline__ half2 mmh_as_half2(const uint32_t v) {
@@ -220,7 +236,7 @@ static __global__ void __launch_bounds__(256) mmh_prologue(const mmh_params p, h
 
     const int e = mmh_expert(p, r);
     const float * src = mmh_src_row(p, r);
-    const char  * rin = p.rot_in + e*p.rin_nb1;
+    const char  * rin = mmh_rot_row(p, p.rot_in, p.rin_cache, p.rin_nb1, e);
 
     float s = 1.0f;
     if constexpr (!frag) {
@@ -639,7 +655,7 @@ static __global__ void __launch_bounds__(1024) mmh_gemv(const mmh_params p, cons
     const int ke      = min(kslices, kb + per);
 
     const wtype wl(mmh_weight_matrix(p, w, e) + (int64_t) g*MMH_NG*p.nb01, p.nb01, lane);
-    const char * rout = p.rot_out + e*p.rout_nb1 + (int64_t) g*MMH_NG*p.rout_nb0;
+    const char * rout = mmh_rot_row(p, p.rot_out, p.rout_cache, p.rout_nb1, e) + (int64_t) g*MMH_NG*p.rout_nb0;
 
     for (int i0 = 0; i0 < nr; i0 += rows) {
         const int nc = min(rows, nr - i0);
@@ -935,7 +951,7 @@ static __global__ void __launch_bounds__(256, 2) mmh_gemm(const mmh_params p, co
         }
     }
 
-    const char * rout = p.rot_out + e*p.rout_nb1 + (int64_t) g*MMH_NG*p.rout_nb0;
+    const char * rout = mmh_rot_row(p, p.rot_out, p.rout_cache, p.rout_nb1, e) + (int64_t) g*MMH_NG*p.rout_nb0;
     // output Hadamard, rot_out and the row scale of row i of the item
     auto finish = [&](const int i, float v[4]) {
         const int r = rows_sorted[start + i];
@@ -1191,6 +1207,14 @@ static const char * mmh_data(const ggml_tensor * t) {
     return (const char *) t->data;
 }
 
+#if defined(GGML_USE_HIP)
+// the rotation arena of the expert cache for the rows `rot` (base, nb[1]) of the op, when it mirrors that tensor
+static const char * mmh_rot_cache(const ggml_cuda_expert_lookup & cached, const int which, const char * rot, const int64_t nb1) {
+    const ggml_tensor * src = cached.aux_src[which];
+    return src != nullptr && mmh_data(src) == rot && (int64_t) src->nb[1] == nb1 ? (const char *) cached.aux[which] : nullptr;
+}
+#endif // defined(GGML_USE_HIP)
+
 // the weight base for the kernels; with ids, a routed expert weight of the expert cache also fills the cache fields
 // of p (MUL_MAT_ID rule: a weight in a mapped host buffer or in the exclusive buffer, whose tensor has logical
 // addresses only and is read through the lookup alone)
@@ -1200,6 +1224,8 @@ static const char * mmh_weight_data(ggml_backend_cuda_context & ctx, const ggml_
     p.w_slots          = nullptr;
     p.w_host_slots     = nullptr;
     p.w_host_addresses = nullptr;
+    p.rin_cache        = nullptr;
+    p.rout_cache       = nullptr;
 #if defined(GGML_USE_HIP)
     const bool exclusive = w->buffer && ggml_cuda_expert_is_exclusive_buffer_type(ggml_backend_buffer_get_type(w->buffer));
     GGML_ASSERT(!exclusive || ids);
@@ -1214,6 +1240,9 @@ static const char * mmh_weight_data(ggml_backend_cuda_context & ctx, const ggml_
         if (cached.host_data != nullptr) {
             data = (const char *) cached.host_data;
         }
+        // the rotations move with the expert (D8 stage 2) when the op reads the tensors the cache mirrors
+        p.rin_cache  = mmh_rot_cache(cached, 0, p.rot_in,  p.rin_nb1);
+        p.rout_cache = mmh_rot_cache(cached, 1, p.rot_out, p.rout_nb1);
         GGML_ASSERT(!exclusive || p.w_host_slots != nullptr);
     }
     return data;
