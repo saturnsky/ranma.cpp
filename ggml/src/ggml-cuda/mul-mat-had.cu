@@ -20,6 +20,7 @@
 
 #include "mul-mat-had.cuh"
 #include "mapped-host.cuh"
+#include "expert-controller.cuh"
 
 #include <cfloat>
 
@@ -66,6 +67,13 @@ struct mmh_params {
     int rout_f16;
     int had;
     float hscale;    // 1/sqrt(had)
+
+    // expert cache (expert-l1.cuh), as for MUL_MAT_ID: the weight matrix of expert e is read from its arena slot, in
+    // exclusive mode a miss from the host slot of e; null without the cache. rot_in / rot_out stay indexed by e.
+    const void     * w_cache;
+    const int32_t  * w_slots;
+    const int32_t  * w_host_slots;
+    const uint64_t * w_host_addresses;
 };
 
 static __device__ __forceinline__ int mmh_expert(const mmh_params & p, const int r) {
@@ -108,6 +116,19 @@ static __device__ __forceinline__ int mmh_uniform(const int v) {
     return __builtin_amdgcn_readfirstlane(v);
 #else
     return v;
+#endif // defined(GGML_USE_HIP)
+}
+
+// the weight matrix of expert e (wave-uniform): the tensor, or the expert cache slot that holds it
+static __device__ __forceinline__ const char * mmh_weight_matrix(const mmh_params & p, const char * w, const int e) {
+    const ggml_cuda_expert_source src =
+        ggml_cuda_expert_cache_select(w, p.w_cache, p.w_slots, e, p.w_host_slots, p.w_host_addresses);
+    const uint64_t a = (uint64_t) (uintptr_t) src.data + (uint64_t) src.channel*p.nb02;
+#if defined(GGML_USE_HIP)
+    return (const char *) (uintptr_t) (((uint64_t) __builtin_amdgcn_readfirstlane((uint32_t) (a >> 32)) << 32) |
+        (uint32_t) __builtin_amdgcn_readfirstlane((uint32_t) a));
+#else
+    return (const char *) (uintptr_t) a;
 #endif // defined(GGML_USE_HIP)
 }
 
@@ -617,7 +638,7 @@ static __global__ void __launch_bounds__(1024) mmh_gemv(const mmh_params p, cons
     const int kb      = (kz*ksplit + ksp)*per;
     const int ke      = min(kslices, kb + per);
 
-    const wtype wl(w + e*p.nb02 + (int64_t) g*MMH_NG*p.nb01, p.nb01, lane);
+    const wtype wl(mmh_weight_matrix(p, w, e) + (int64_t) g*MMH_NG*p.nb01, p.nb01, lane);
     const char * rout = p.rot_out + e*p.rout_nb1 + (int64_t) g*MMH_NG*p.rout_nb0;
 
     for (int i0 = 0; i0 < nr; i0 += rows) {
@@ -834,7 +855,7 @@ static __global__ void __launch_bounds__(256, 2) mmh_gemm(const mmh_params p, co
         xdst[t] = i*xst + 8*part;
     }
 
-    const wtype wl(w + e*p.nb02 + (int64_t) g*MMH_NG*p.nb01, p.nb01, lane);
+    const wtype wl(mmh_weight_matrix(p, w, e) + (int64_t) g*MMH_NG*p.nb01, p.nb01, lane);
     const int c0 = lane/4;
     const int r0 = 2*(lane % 4);
 
@@ -1170,6 +1191,38 @@ static const char * mmh_data(const ggml_tensor * t) {
     return (const char *) t->data;
 }
 
+// the weight base for the kernels; with ids, a routed expert weight of the expert cache also fills the cache fields
+// of p (MUL_MAT_ID rule: a weight in a mapped host buffer or in the exclusive buffer, whose tensor has logical
+// addresses only and is read through the lookup alone)
+static const char * mmh_weight_data(ggml_backend_cuda_context & ctx, const ggml_tensor * w, const ggml_tensor * ids,
+        mmh_params & p) {
+    p.w_cache          = nullptr;
+    p.w_slots          = nullptr;
+    p.w_host_slots     = nullptr;
+    p.w_host_addresses = nullptr;
+#if defined(GGML_USE_HIP)
+    const bool exclusive = w->buffer && ggml_cuda_expert_is_exclusive_buffer_type(ggml_backend_buffer_get_type(w->buffer));
+    GGML_ASSERT(!exclusive || ids);
+    const char * data = mmh_data(w);
+    if (ids && (exclusive || (w->buffer && ggml_backend_buffer_is_host(w->buffer)))) {
+        const ggml_cuda_expert_lookup cached = ggml_cuda_expert_lookup_tensor(w);
+        ggml_cuda_expert_before_read(ctx, w);
+        p.w_cache          = cached.data;
+        p.w_slots          = cached.slots;
+        p.w_host_slots     = cached.host_slots;
+        p.w_host_addresses = cached.host_addresses;
+        if (cached.host_data != nullptr) {
+            data = (const char *) cached.host_data;
+        }
+        GGML_ASSERT(!exclusive || p.w_host_slots != nullptr);
+    }
+    return data;
+#else
+    GGML_UNUSED_VARS(ctx, ids);
+    return mmh_data(w);
+#endif // defined(GGML_USE_HIP)
+}
+
 void ggml_cuda_mul_mat_had(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * w       = dst->src[0];
     const ggml_tensor * x       = dst->src[1];
@@ -1182,6 +1235,15 @@ void ggml_cuda_mul_mat_had(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     GGML_ASSERT(!ids || ids->type == GGML_TYPE_I32);
 
     const int had = ggml_get_op_params_i32(dst, 0);
+
+#if defined(GGML_USE_HIP)
+    // expert cache: the SSD tier may reuse the layer's ring slots once its last kind is read (as MUL_MAT_ID)
+    struct done_guard {
+        ggml_backend_cuda_context & ctx;
+        const ggml_tensor * w;
+        ~done_guard() { ggml_cuda_expert_layer_done(ctx, w); }
+    } done{ctx, w};
+#endif // defined(GGML_USE_HIP)
 
     mmh_params p;
     p.k        = w->ne[0];
@@ -1218,7 +1280,7 @@ void ggml_cuda_mul_mat_had(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         return;
     }
 
-    const char * wd = mmh_data(w);
+    const char * wd = mmh_weight_data(ctx, w, ids, p);
     const int64_t n = w->ne[1];
 
     // without a routing pass: few tokens (ids) or few rows per weight matrix; with WMMA a dense matrix of more than
