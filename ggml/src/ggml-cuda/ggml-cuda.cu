@@ -6704,8 +6704,10 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             }
             break;
         case GGML_OP_MUL_MAT_HAD:
-            // the exclusive expert cache gives src0 logical addresses only, which MUL_MAT_HAD cannot read
-            if (op->src[0]->buffer && ggml_cuda_expert_is_exclusive_buffer_type(ggml_backend_buffer_get_type(op->src[0]->buffer))) {
+            // the exclusive expert cache gives src0 logical addresses only: like MUL_MAT_ID, MUL_MAT_HAD reads them
+            // through the cache lookup, which needs the expert ids
+            if (op->src[2] == nullptr && op->src[0]->buffer &&
+                    ggml_cuda_expert_is_exclusive_buffer_type(ggml_backend_buffer_get_type(op->src[0]->buffer))) {
                 return false;
             }
             return ggml_cuda_mul_mat_had_supported(dev_ctx->device, op);
@@ -7164,6 +7166,12 @@ static int64_t get_op_batch_size(const ggml_tensor * op) {
 
 static bool ggml_backend_cuda_device_offload_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
+
+    // MUL_MAT_HAD with ids: the CPU backend has only the reference implementation (seconds per call for a large
+    // expert bank), so a host expert weight that is not read in place is copied (used experts only) at any batch
+    if (op->op == GGML_OP_MUL_MAT_HAD && ggml_op_is_expert_matmul(op)) {
+        return true;
+    }
 
     return get_op_batch_size(op) >= dev_ctx->op_offload_min_batch_size;
 }
