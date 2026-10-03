@@ -6,6 +6,7 @@
 #include "llama-arch.h"
 #include "llama-hparams.h"
 #include "llama-mmap.h"
+#include "llama-weight-aux.h"
 
 #include "ggml-cpp.h"
 
@@ -243,6 +244,12 @@ struct llama_model_loader {
     struct ggml_tensor * create_tensor(
         const llama_hparams & hparams, const buft_list_t * buft_list_cpu, const buft_list_t * buft_list_input, const buft_list_t * buft_list_output,
         const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags);
+
+    // rot_in / rot_out of the EXL3 weights, created next to them (llama-weight-aux.cpp)
+    llama_weight_aux_map waux;
+    void create_weight_aux(ggml_context * ctx, ggml_tensor * w, const std::string & name, const std::initializer_list<int64_t> & ne, bool duplicated);
+    void skip_weight_aux(const ggml_tensor * w, const std::string & name);
+    void check_weight_aux(const ggml_tensor * w) const;
 
     void done_getting_tensors(bool partial = false) const;
 
