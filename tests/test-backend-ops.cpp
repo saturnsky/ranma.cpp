@@ -11410,7 +11410,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     // batched and broadcast b without ids, 128-row views, zero-padded K/N; src1 precision F32 and F16
     for (ggml_prec prec : { GGML_PREC_F32, GGML_PREC_F16 }) {
         for (ggml_type type_a : { GGML_TYPE_EXL3_M1, GGML_TYPE_EXL3_M2, GGML_TYPE_EXL3_M3, GGML_TYPE_EXL3_M4, GGML_TYPE_EXL3_M5, GGML_TYPE_EXL3_M6,
-                                  GGML_TYPE_EXL3_M7, GGML_TYPE_EXL3_M8, GGML_TYPE_EXL3_M1H, GGML_TYPE_EXL3_M2H, GGML_TYPE_EXL3_M3H }) {
+                                  GGML_TYPE_EXL3_M7, GGML_TYPE_EXL3_M8, GGML_TYPE_EXL3_M1H, GGML_TYPE_EXL3_M2H, GGML_TYPE_EXL3_M3H,
+                                  GGML_TYPE_EXL3_G1, GGML_TYPE_EXL3_G2, GGML_TYPE_EXL3_G3, GGML_TYPE_EXL3_G4, GGML_TYPE_EXL3_G5, GGML_TYPE_EXL3_G6,
+                                  GGML_TYPE_EXL3_G7, GGML_TYPE_EXL3_G8, GGML_TYPE_EXL3_T1, GGML_TYPE_EXL3_T2, GGML_TYPE_EXL3_T3, GGML_TYPE_EXL3_T4,
+                                  GGML_TYPE_EXL3_T5, GGML_TYPE_EXL3_T6, GGML_TYPE_EXL3_T7, GGML_TYPE_EXL3_T8 }) {
             test_cases.emplace_back(new test_mul_mat_had(type_a, GGML_TYPE_F16, 256, 256, 3, 1, 0, false, 128, 0, 0, prec));
         }
         for (ggml_type type_a : { GGML_TYPE_F32, GGML_TYPE_F16 }) {
@@ -11430,12 +11433,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_mul_mat_had(type_a, GGML_TYPE_F16, 384, 256, 4, 2, 3, false, 128, 0, 56, prec)); // padded, ids
         }
         // sizes of the other GPU kernel paths: GEMV with a k split, GEMM with 64-row tiles, routed GEMM with 16-row tiles
-        for (ggml_type type_a : { GGML_TYPE_EXL3_M2, GGML_TYPE_EXL3_M3, GGML_TYPE_EXL3_M5, GGML_TYPE_EXL3_M8, GGML_TYPE_EXL3_M2H, GGML_TYPE_F16 }) {
+        for (ggml_type type_a : { GGML_TYPE_EXL3_M2, GGML_TYPE_EXL3_M3, GGML_TYPE_EXL3_M5, GGML_TYPE_EXL3_M8, GGML_TYPE_EXL3_M2H,
+                                  GGML_TYPE_EXL3_G2, GGML_TYPE_EXL3_G4, GGML_TYPE_EXL3_T2, GGML_TYPE_EXL3_T4, GGML_TYPE_F16 }) {
             test_cases.emplace_back(new test_mul_mat_had(type_a, GGML_TYPE_F16, 1024, 256, 1, 1, 0, false, 128, 0, 0, prec));
             test_cases.emplace_back(new test_mul_mat_had(type_a, GGML_TYPE_F16, 512, 256, 40, 1, 0, false, 128, 0, 0, prec));
             test_cases.emplace_back(new test_mul_mat_had(type_a, GGML_TYPE_F16, 512, 384, 20, 8, 4, false, 128, 0, 0, prec));
         }
         test_cases.emplace_back(new test_mul_mat_had(GGML_TYPE_EXL3_M3, GGML_TYPE_F32, 256, 384, 24, 4, 3, true, 128, 0, 0, prec)); // ids, broadcast b
+        test_cases.emplace_back(new test_mul_mat_had(GGML_TYPE_EXL3_G3, GGML_TYPE_F16, 256, 384, 5, 4, 6, false, 128, 0, 0, prec)); // duplicate ids
+        test_cases.emplace_back(new test_mul_mat_had(GGML_TYPE_EXL3_T3, GGML_TYPE_F16, 256, 384, 5, 4, 6, false, 128, 0, 0, prec));
         test_cases.emplace_back(new test_mul_mat_had(GGML_TYPE_EXL3_M4, GGML_TYPE_F16, 256, 256, 24, 3, 2, false, 128, 640, 0, prec)); // view of experts
         test_cases.emplace_back(new test_mul_mat_had(GGML_TYPE_EXL3_M3, GGML_TYPE_F16, 384, 256, 30, 1, 0, false, 128, 0, 72, prec)); // padded K/N
         test_cases.emplace_back(new test_mul_mat_had(GGML_TYPE_F16, GGML_TYPE_F32, 512, 256, 40, 1, 0, false, 64, 0, 0, prec));

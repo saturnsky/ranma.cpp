@@ -1,9 +1,10 @@
 # EXL3 trellis weights (GGML_TYPE_EXL3_*), see ggml/src/ggml-exl3.c
-# format and mul1 codebook: ExLlamaV3, Copyright (c) 2025 Turboderp, MIT license
+# format and codebooks (mul1, mcg, 3inst): ExLlamaV3, Copyright (c) 2025 Turboderp, MIT license
 #
 # The official tensor `trellis` is int16 [K/16, N/16, 16*bits] (K = in, N = out) in 16x16 tiles.
 # GGUF keeps the tile bytes and only changes the tile order to [N/128][K/16][8][tile], so that a ggml
-# tensor ne = [K, N(, E)] has the usual row stride K*bits/8 at 128-row boundaries.
+# tensor ne = [K, N(, E)] has the usual row stride K*bits/8 at 128-row boundaries. The type also names the
+# codebook: an official tensor with a `mul1` marker is mul1, with `mcg` mcg, without a marker 3inst.
 
 from __future__ import annotations
 
@@ -25,22 +26,40 @@ QTYPE_BY_BITS: dict[float, GGMLQuantizationType] = {
     3.5: GGMLQuantizationType.EXL3_M3H,
 }
 
-QTYPES = frozenset(QTYPE_BY_BITS.values())
+CODEBOOKS = ("mul1", "mcg", "3inst")
+
+# mcg and 3inst have integer bitrates only
+QTYPE_BY_CODEBOOK_BITS: dict[tuple[str, float], GGMLQuantizationType] = {
+    **{("mul1", bits): t for bits, t in QTYPE_BY_BITS.items()},
+    **{("mcg", bits): GGMLQuantizationType[f"EXL3_G{bits}"] for bits in range(1, 9)},
+    **{("3inst", bits): GGMLQuantizationType[f"EXL3_T{bits}"] for bits in range(1, 9)},
+}
+
+QTYPES = frozenset(QTYPE_BY_CODEBOOK_BITS.values())
 
 
 def bits2(qtype: GGMLQuantizationType) -> int:
     """Twice the bits per weight."""
-    for bits, t in QTYPE_BY_BITS.items():
+    for (_, bits), t in QTYPE_BY_CODEBOOK_BITS.items():
         if t == qtype:
             return int(bits * 2)
     raise ValueError(f"{qtype!r} is not an EXL3 trellis type")
 
 
-def qtype_for_tile(tile_words: int) -> GGMLQuantizationType:
-    """Type for an official trellis whose last dim has `tile_words` int16 words (16*bits)."""
-    if tile_words % 8 != 0 or (tile_words // 8) not in [bits2(t) for t in QTYPES]:
-        raise ValueError(f"unsupported EXL3 tile size of {tile_words} words")
-    return QTYPE_BY_BITS[tile_words / 16 if tile_words % 16 else tile_words // 16]
+def codebook(qtype: GGMLQuantizationType) -> str:
+    """Codebook name of an EXL3 type."""
+    for (cb, _), t in QTYPE_BY_CODEBOOK_BITS.items():
+        if t == qtype:
+            return cb
+    raise ValueError(f"{qtype!r} is not an EXL3 trellis type")
+
+
+def qtype_for_tile(tile_words: int, codebook: str = "mul1") -> GGMLQuantizationType:
+    """Type for an official trellis whose last dim has `tile_words` int16 words (16*bits) and its codebook."""
+    bits = tile_words / 16 if tile_words % 16 else tile_words // 16
+    if tile_words % 8 != 0 or (codebook, bits) not in QTYPE_BY_CODEBOOK_BITS:
+        raise ValueError(f"unsupported EXL3 tile size of {tile_words} words for the {codebook} codebook")
+    return QTYPE_BY_CODEBOOK_BITS[(codebook, bits)]
 
 
 def to_ggml(trellis: np.ndarray) -> np.ndarray:
@@ -48,7 +67,8 @@ def to_ggml(trellis: np.ndarray) -> np.ndarray:
     *lead, kt, nt, words = trellis.shape
     if trellis.dtype not in (np.int16, np.uint16) or nt % 8 != 0 or kt % 8 != 0:
         raise ValueError(f"unsupported EXL3 trellis {trellis.dtype} {trellis.shape}: K and N must be multiples of 128")
-    qtype_for_tile(words)
+    if words % 8 != 0 or words // 8 not in (2, 3, 4, 5, 6, 7, 8, 10, 12, 14, 16):
+        raise ValueError(f"unsupported EXL3 tile size of {words} words")
     t = trellis.reshape(*lead, kt, nt // 8, 8, words)
     t = np.ascontiguousarray(np.swapaxes(t, -4, -3))
     return t.view(np.uint8).reshape(*lead, nt * 16, kt * words // 8)
@@ -83,6 +103,26 @@ def mul1(states: np.ndarray) -> np.ndarray:
     return ((1024 + s).astype(np.float32) * k_inv + k_bias).astype(np.float16)
 
 
+def _half_sum(x: np.ndarray) -> np.ndarray:
+    x = ((x & 0x8FFF8FFF) ^ 0x3B603B60).astype(np.uint32)
+    lo = (x & 0xFFFF).astype(np.uint16).view(np.float16).astype(np.float32)
+    hi = (x >> 16).astype(np.uint16).view(np.float16).astype(np.float32)
+    return (lo + hi).astype(np.float16)
+
+
+def mcg(states: np.ndarray) -> np.ndarray:
+    """mcg codebook, fp16."""
+    return _half_sum((states.astype(np.uint64) * 0xCBAC1FED) & 0xFFFFFFFF)
+
+
+def inst3(states: np.ndarray) -> np.ndarray:
+    """3inst codebook, fp16."""
+    return _half_sum((states.astype(np.uint64) * 89226354 + 64248484) & 0xFFFFFFFF)
+
+
+CODEBOOK_FUNCTIONS = {"mul1": mul1, "mcg": mcg, "3inst": inst3}
+
+
 def decode_raw(data: np.ndarray, qtype: GGMLQuantizationType, k: int, n: int) -> np.ndarray:
     """Raw codebook values W_raw as fp16 [..., N, K] (ggml orientation, row = output channel)."""
     b2 = bits2(qtype)
@@ -96,7 +136,7 @@ def decode_raw(data: np.ndarray, qtype: GGMLQuantizationType, k: int, n: int) ->
     hi = (lo + 1) % (ring // 32)
     window = (w[..., lo] << np.uint64(32)) | w[..., hi]
     states = (window >> (48 - start % 32).astype(np.uint64)) & np.uint64(0xffff)
-    values = mul1(states)[..., _positions()]  # [B, kt, nt, r, c]
+    values = CODEBOOK_FUNCTIONS[codebook(qtype)](states)[..., _positions()]  # [B, kt, nt, r, c]
     out = np.transpose(values, (0, 2, 4, 1, 3))  # [B, nt, c, kt, r]
     return out.reshape(*lead, n, k)
 

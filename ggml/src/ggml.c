@@ -1010,6 +1010,102 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .type_size                = 56,
         .is_quantized             = true,
     },
+    [GGML_TYPE_EXL3_G1] = {
+        .type_name                = "exl3_g1",
+        .blck_size                = 128,
+        .type_size                = 16,
+        .is_quantized             = true,
+    },
+    [GGML_TYPE_EXL3_G2] = {
+        .type_name                = "exl3_g2",
+        .blck_size                = 128,
+        .type_size                = 32,
+        .is_quantized             = true,
+    },
+    [GGML_TYPE_EXL3_G3] = {
+        .type_name                = "exl3_g3",
+        .blck_size                = 128,
+        .type_size                = 48,
+        .is_quantized             = true,
+    },
+    [GGML_TYPE_EXL3_G4] = {
+        .type_name                = "exl3_g4",
+        .blck_size                = 128,
+        .type_size                = 64,
+        .is_quantized             = true,
+    },
+    [GGML_TYPE_EXL3_G5] = {
+        .type_name                = "exl3_g5",
+        .blck_size                = 128,
+        .type_size                = 80,
+        .is_quantized             = true,
+    },
+    [GGML_TYPE_EXL3_G6] = {
+        .type_name                = "exl3_g6",
+        .blck_size                = 128,
+        .type_size                = 96,
+        .is_quantized             = true,
+    },
+    [GGML_TYPE_EXL3_G7] = {
+        .type_name                = "exl3_g7",
+        .blck_size                = 128,
+        .type_size                = 112,
+        .is_quantized             = true,
+    },
+    [GGML_TYPE_EXL3_G8] = {
+        .type_name                = "exl3_g8",
+        .blck_size                = 128,
+        .type_size                = 128,
+        .is_quantized             = true,
+    },
+    [GGML_TYPE_EXL3_T1] = {
+        .type_name                = "exl3_t1",
+        .blck_size                = 128,
+        .type_size                = 16,
+        .is_quantized             = true,
+    },
+    [GGML_TYPE_EXL3_T2] = {
+        .type_name                = "exl3_t2",
+        .blck_size                = 128,
+        .type_size                = 32,
+        .is_quantized             = true,
+    },
+    [GGML_TYPE_EXL3_T3] = {
+        .type_name                = "exl3_t3",
+        .blck_size                = 128,
+        .type_size                = 48,
+        .is_quantized             = true,
+    },
+    [GGML_TYPE_EXL3_T4] = {
+        .type_name                = "exl3_t4",
+        .blck_size                = 128,
+        .type_size                = 64,
+        .is_quantized             = true,
+    },
+    [GGML_TYPE_EXL3_T5] = {
+        .type_name                = "exl3_t5",
+        .blck_size                = 128,
+        .type_size                = 80,
+        .is_quantized             = true,
+    },
+    [GGML_TYPE_EXL3_T6] = {
+        .type_name                = "exl3_t6",
+        .blck_size                = 128,
+        .type_size                = 96,
+        .is_quantized             = true,
+    },
+    [GGML_TYPE_EXL3_T7] = {
+        .type_name                = "exl3_t7",
+        .blck_size                = 128,
+        .type_size                = 112,
+        .is_quantized             = true,
+    },
+    [GGML_TYPE_EXL3_T8] = {
+        .type_name                = "exl3_t8",
+        .blck_size                = 128,
+        .type_size                = 128,
+        .is_quantized             = true,
+    },
 };
 
 const struct ggml_type_traits * ggml_get_type_traits(enum ggml_type type) {
