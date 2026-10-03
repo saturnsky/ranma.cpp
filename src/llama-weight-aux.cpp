@@ -65,6 +65,32 @@ ggml_tensor * llama_weight_aux_mul_mat(
     return res;
 }
 
+ggml_tensor * llama_weight_aux_get_rows(
+        ggml_context * ctx,
+        ggml_tensor  * table,
+        ggml_tensor  * bias,
+        ggml_tensor  * rows,
+        int64_t        n_heads) {
+    ggml_tensor * res = ggml_get_rows(ctx, table, rows);
+    if (!ggml_is_exl3_row(table->type)) {
+        GGML_ASSERT(bias == nullptr);
+        return res;
+    }
+
+    const int64_t dim = table->ne[0];
+    GGML_ASSERT(bias != nullptr && bias->ne[0] == dim && bias->ne[1] == n_heads && ggml_nrows(bias) == n_heads);
+    GGML_ASSERT(ggml_nelements(rows) % n_heads == 0);
+    const int64_t n = ggml_nelements(rows) / n_heads;
+
+    // ExLlamaV3 ngram_dequant: fp16(codebook * scale + bias[head]), the sum in f32
+    // get_rows gives codebook * scale in f32 (exact), F16 -> F32 of the bias is exact, the add rounds once in f32
+    res = ggml_reshape_3d(ctx, res, dim, n_heads, n);
+    res = ggml_add(ctx, res, bias->type == GGML_TYPE_F32 ? bias : ggml_cast(ctx, bias, GGML_TYPE_F32));
+    res = ggml_cast(ctx, ggml_cast(ctx, res, GGML_TYPE_F16), GGML_TYPE_F32);
+
+    return ggml_reshape_2d(ctx, res, dim, n_heads * n);
+}
+
 ggml_tensor * llama_weight_aux_test_op(ggml_context * ctx, ggml_tensor * w, int n_ids) {
     ggml_tensor * rot_in  = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, w->ne[0], w->ne[2]);
     ggml_tensor * rot_out = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, w->ne[1], w->ne[2]);

@@ -267,6 +267,11 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
 
         per_layer_tok_embd = create_tensor(tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight"),
                                            { hparams.ple_head_dim, ple_rows }, TENSOR_READ_LAZY);
+        // an EXL3 row codec table comes with its per-head bias
+        if (per_layer_tok_embd && ggml_is_exl3_row(per_layer_tok_embd->type)) {
+            per_layer_tok_embd_b = create_tensor(tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "bias"),
+                                                 { hparams.ple_head_dim, hparams.ple_n_heads }, 0);
+        }
     }
 
     auto load_block = [&](int il, int flags) {
@@ -1417,7 +1422,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_inp_ple(
     res->add_input(std::move(ple_inp));
 
     // gather then flatten the heads: get_rows lays the head dimension out slowest, as the reference does
-    ggml_tensor * emb = ggml_get_rows(ctx0, model.per_layer_tok_embd, rows);
+    ggml_tensor * emb = llama_weight_aux_get_rows(ctx0, model.per_layer_tok_embd, model.per_layer_tok_embd_b, rows, n_heads);
     emb = ggml_reshape_2d(ctx0, emb, hparams.ple_head_dim * n_heads, n_tokens);
     cb(emb, "ple_embd", -1);
 
