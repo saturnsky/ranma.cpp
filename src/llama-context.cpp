@@ -2915,7 +2915,9 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
         return false;
     }
     const ggml_tensor * node = ggml_graph_node(graph, 0);
-    if (node->op != GGML_OP_MUL_MAT_ID || node->src[0] != dst) {
+    // MUL_MAT_HAD with ids selects its experts like MUL_MAT_ID (ggml_op_is_expert_matmul in ggml-impl.h)
+    const bool expert_matmul = node->op == GGML_OP_MUL_MAT_ID || (node->op == GGML_OP_MUL_MAT_HAD && node->src[2] != nullptr);
+    if (!expert_matmul || node->src[0] != dst) {
         return false;
     }
 
