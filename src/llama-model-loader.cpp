@@ -70,6 +70,7 @@ const char * llama_ftype_name(llama_ftype ftype) {
         case LLAMA_FTYPE_MOSTLY_IQ4_XS:    name = LLAMA_FTYPE_PREFIX "IQ4_XS - 4.25 bpw"; break;
         case LLAMA_FTYPE_MOSTLY_IQ3_S:     name = LLAMA_FTYPE_PREFIX "IQ3_S - 3.4375 bpw"; break;
         case LLAMA_FTYPE_MOSTLY_IQ3_M:     name = LLAMA_FTYPE_PREFIX "IQ3_S mix - 3.66 bpw"; break;
+        case LLAMA_FTYPE_MOSTLY_EXL3:      name = LLAMA_FTYPE_PREFIX "EXL3"; break;
         default:                           name = LLAMA_FTYPE_PREFIX "unknown, may not work"; break;
     }
     return (ftype & LLAMA_FTYPE_GUESSED) ? name : name + guessed_prefix_len;
@@ -816,6 +817,10 @@ llama_model_loader::llama_model_loader(
             case GGML_TYPE_Q2_0:    ftype = LLAMA_FTYPE_MOSTLY_Q2_0;    break;
             default:
                 {
+                    if (ggml_is_exl3(type_max)) {
+                        ftype = LLAMA_FTYPE_MOSTLY_EXL3;
+                        break;
+                    }
                     LLAMA_LOG_WARN("%s: unknown type %s\n", __func__, ggml_type_name(type_max));
                     ftype = LLAMA_FTYPE_ALL_F32;
                 } break;
@@ -940,7 +945,8 @@ const struct ggml_tensor * llama_model_loader::check_tensor_dims(
         }
     } else {
         for (size_t i = 0; i < GGML_MAX_DIMS; ++i) {
-            if ((i < ne.size() && ne[i] != cur->ne[i]) || (i >= ne.size() && cur->ne[i] != 1)) {
+            const bool exl3_pad = i < 2 && i < ne.size() && ggml_is_exl3(cur->type) && cur->ne[i] == llama_weight_aux_pad(ne[i]);
+            if ((i < ne.size() && ne[i] != cur->ne[i] && !exl3_pad) || (i >= ne.size() && cur->ne[i] != 1)) {
                 is_ok = false;
                 break;
             }
@@ -954,6 +960,8 @@ const struct ggml_tensor * llama_model_loader::check_tensor_dims(
                     llama_format_tensor_shape(ne).c_str(),
                     llama_format_tensor_shape(cur).c_str()));
     }
+
+    check_weight_aux(cur);
 
     return cur;
 }
@@ -987,6 +995,10 @@ static bool weight_buft_supported(const llama_hparams & hparams, ggml_tensor * w
             } break;
         case GGML_OP_MUL_MAT:
             {
+                if (ggml_is_exl3(w->type)) {
+                    op_tensor = llama_weight_aux_test_op(ctx, w, 0);
+                    break;
+                }
                 ggml_tensor * b = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, w->ne[0], 512, w->ne[2], w->ne[3]);
                 op_tensor = ggml_mul_mat(ctx, w, b);
             } break;
@@ -995,6 +1007,10 @@ static bool weight_buft_supported(const llama_hparams & hparams, ggml_tensor * w
                 // Used for either MoE expert routing or embedded adapter routing
                 const int n_ids_used = hparams.router_layer >= 0 ? 1 : hparams.n_expert_used_max();
                 GGML_ASSERT(n_ids_used > 0);
+                if (ggml_is_exl3(w->type)) {
+                    op_tensor = llama_weight_aux_test_op(ctx, w, n_ids_used);
+                    break;
+                }
                 ggml_tensor * b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, w->ne[0], n_ids_used, 512);
                 ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_ids_used, 512);
                 op_tensor = ggml_mul_mat_id(ctx, w, b, ids);
@@ -1216,6 +1232,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
 
             size_data -= nbytes;
             n_created++;
+            skip_weight_aux(t_meta, tn.str());
 
             return nullptr;
         }
@@ -1348,6 +1365,9 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         t_meta.type = type;
         for (size_t dim = 0; dim < GGML_MAX_DIMS; dim++) {
             t_meta.ne[dim] = dim < ne.size() ? ne.begin()[dim] : 1;
+            if (ggml_is_exl3(type) && dim < 2) {
+                t_meta.ne[dim] = llama_weight_aux_pad(t_meta.ne[dim]);
+            }
             GGML_ASSERT(t_meta.ne[dim] >= 1);
             if (dim == 0) {
                 t_meta.nb[dim] = ggml_type_size(type);
@@ -1365,6 +1385,9 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         ggml_context * ctx = ctx_for_buft(buft);
         ggml_tensor * ret = ggml_dup_tensor(ctx, &t_meta);
         ggml_set_name(ret, tn.str().c_str());
+        if (ggml_is_exl3(type)) {
+            create_weight_aux(ctx, ret, tn.str(), ne, false);
+        }
         return ret;
     }
 
@@ -1419,6 +1442,10 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         size_data += ggml_nbytes(&t_meta);
     } else {
         n_created++;
+    }
+
+    if (ggml_is_exl3(tensor->type)) {
+        create_weight_aux(ctx, tensor, tn.str(), ne, duplicated);
     }
 
     return tensor;
