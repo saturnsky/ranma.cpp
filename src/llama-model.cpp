@@ -1869,6 +1869,8 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     ml.done_getting_tensors();
 
+    waux = std::move(ml.waux);
+
     if (per_layer_tok_embd && ml.lazy.has(per_layer_tok_embd)) {
         LLAMA_LOG_INFO("%s: enabling prefetch for '%s'\n", __func__, per_layer_tok_embd->name);
 
