@@ -161,3 +161,47 @@ def effective_weight(data: np.ndarray, qtype: GGMLQuantizationType, k: int, n: i
     raw = decode_raw(data, qtype, k, n).astype(np.float64)
     w = hadamard_128(hadamard_128(raw, axis=-1), axis=-2)
     return w * np.asarray(rot_out, dtype=np.float64)[..., :, None] * np.asarray(rot_in, dtype=np.float64)[..., None, :]
+
+
+# ---- row codec (GGML_TYPE_EXL3R_M*: ExLlamaV3 exl3_ngram_trellis tables) ------------------------------------------
+#
+# A row of ROW_DIM = 160 values is (1 + 10*bits) little-endian uint16 words, the official packed row: word 0 is the fp16
+# scale, then a ring of 160*bits bits read LSB first. Position i owns bits [i*bits, (i+1)*bits); its state is the 16 ring
+# bits that end there. Value = fp16 mul1(state) * scale (f32, exact). The table's per-head bias and the final fp16
+# rounding of the official reconstruction are applied by the graph, not by the row.
+
+ROW_DIM = 160
+
+ROW_QTYPES: dict[int, GGMLQuantizationType] = {bits: GGMLQuantizationType[f"EXL3R_M{bits}"] for bits in range(1, 9)}
+
+
+def row_bits(qtype: GGMLQuantizationType) -> int:
+    if qtype not in ROW_QTYPES.values():
+        raise ValueError(f"{qtype.name} is not an EXL3 row codec type")
+    return int(qtype) - int(GGMLQuantizationType.EXL3R_M1) + 1
+
+
+def row_qtype_for_words(words: int) -> GGMLQuantizationType:
+    """Type of an official packed row of `words` int16 words (1 + ROW_DIM*bits/16)."""
+    bits = (words - 1) * 16 // ROW_DIM
+    if bits not in ROW_QTYPES or words != 1 + ROW_DIM * bits // 16:
+        raise ValueError(f"an EXL3 n-gram row of {words} words is not 1 + 10*bits with bits 1..8")
+    return ROW_QTYPES[bits]
+
+
+def row_states(data: np.ndarray, bits: int) -> tuple[np.ndarray, np.ndarray]:
+    """Rows [n, 2 + 20*bits] uint8 -> (states [n, 160] uint32, scales [n] float16)."""
+    data = np.ascontiguousarray(data, dtype=np.uint8).reshape(-1, 2 + ROW_DIM * bits // 8)
+    scales = data[:, :2].copy().view("<f2").reshape(-1)
+    stream = np.unpackbits(data[:, 2:], axis=1, bitorder="little").astype(np.uint32)  # [n, 160*bits]
+    i = np.arange(ROW_DIM).reshape(-1, 1)
+    m = np.arange(16).reshape(1, -1)
+    src = ((i - m // bits) % ROW_DIM) * bits + m % bits                                  # [160, 16]
+    states = (stream[:, src] << m.astype(np.uint32)).sum(axis=-1, dtype=np.uint32)
+    return states, scales
+
+
+def decode_rows(data: np.ndarray, qtype: GGMLQuantizationType) -> np.ndarray:
+    """to_float of a row codec type: rows [n, 2 + 20*bits] uint8 -> float32 [n, 160] (no bias, no fp16 rounding)."""
+    states, scales = row_states(data, row_bits(qtype))
+    return mul1(states).astype(np.float32) * scales.astype(np.float32)[:, None]
