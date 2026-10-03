@@ -6415,6 +6415,10 @@ struct test_mul_mat_id_shared_unit : public test_case {
 // The output holds the op and, behind it on dim 3, the same product built from ordinary ops:
 // mul(rot_in) -> Hadamard matmul (hint) -> mul_mat(_id) of the F32 weight -> Hadamard matmul -> mul(rot_out).
 // err() compares the tested op with the composite and with the op of the reference backend.
+// prec is the src1 precision of the op: GGML_PREC_F32 must keep fp32 grade (NMSE 1e-9). GGML_PREC_F16 allows one fp16
+// rounding of H(rot_in * b), relative rms <= 2^-11/sqrt(3) (NMSE 7.9e-8); the limit 4.8e-7 is the bound of the 6 fp16
+// roundings of the official ExLlamaV3 path (3 of the input, 3 of the output). Not set (def): the backend chooses (the
+// HIP default is F16, so these cases have the F16 limit).
 struct test_mul_mat_had : public test_case {
     const ggml_type type_a;
     const ggml_type type_rot;
@@ -6427,9 +6431,11 @@ struct test_mul_mat_had : public test_case {
     const int had;
     const int64_t n_v;     // rows of a in memory; for n_v > n the op reads a view at row 128
     const int64_t pad;     // b is zero-padded from k - pad, the output is cut to n - pad rows
+    const ggml_prec prec;  // src1 precision
 
     std::string vars() override {
-        return VARS_TO_STR11(type_a, type_rot, k, n, m, n_exp, n_used, bcast, had, n_v, pad);
+        return VARS_TO_STR11(type_a, type_rot, k, n, m, n_exp, n_used, bcast, had, n_v, pad) +
+            ",prec=" + (prec == GGML_PREC_F16 ? "f16" : var_to_str(prec));
     }
 
     std::string op_desc(ggml_tensor * t) override {
@@ -6440,7 +6446,7 @@ struct test_mul_mat_had : public test_case {
     bool run_whole_graph() override { return true; }
 
     double max_nmse_err() override {
-        return 1e-9;
+        return prec == GGML_PREC_F32 ? 1e-9 : 4.8e-7;
     }
 
     double err(const float * a, const float * b, size_t n_all) override {
@@ -6450,9 +6456,9 @@ struct test_mul_mat_had : public test_case {
 
     test_mul_mat_had(ggml_type type_a = GGML_TYPE_F32, ggml_type type_rot = GGML_TYPE_F16,
             int64_t k = 256, int64_t n = 256, int64_t m = 3, int n_exp = 1, int n_used = 0,
-            bool bcast = false, int had = 128, int64_t n_v = 0, int64_t pad = 0)
+            bool bcast = false, int had = 128, int64_t n_v = 0, int64_t pad = 0, ggml_prec prec = GGML_PREC_F32)
         : type_a(type_a), type_rot(type_rot), k(k), n(n), m(m), n_exp(n_exp), n_used(n_used),
-            bcast(bcast), had(had), n_v(n_v), pad(pad) {
+            bcast(bcast), had(had), n_v(n_v), pad(pad), prec(prec) {
             GGML_ASSERT(n_v == 0 || n_v >= n + 128);
             GGML_ASSERT(n_used > 0 || !bcast || n_exp == 1);
         }
@@ -6506,6 +6512,9 @@ struct test_mul_mat_had : public test_case {
 
         ggml_tensor * out = ggml_mul_mat_had(ctx, a, b, rot_in, rot_out, ids, had);
         ggml_set_name(out, "out_had");
+        if (prec != GGML_PREC_UNDEFINED) {
+            ggml_prec_set_src(out, prec, 1);
+        }
 
         ggml_tensor * rin  = ggml_cast(ctx, rot_in, GGML_TYPE_F32);
         ggml_tensor * rout = ggml_cast(ctx, rot_out, GGML_TYPE_F32);
@@ -11588,27 +11597,44 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F16, 1024, 7, 1024));  // many rows
 
     // MUL_MAT_HAD: EXL3 types, F16/F32 weights and other Hadamard sizes, ids with duplicates and broadcast b,
-    // batched and broadcast b without ids, 128-row views, zero-padded K/N
-    for (ggml_type type_a : { GGML_TYPE_EXL3_M1, GGML_TYPE_EXL3_M2, GGML_TYPE_EXL3_M3, GGML_TYPE_EXL3_M4, GGML_TYPE_EXL3_M5, GGML_TYPE_EXL3_M6,
-                              GGML_TYPE_EXL3_M7, GGML_TYPE_EXL3_M8, GGML_TYPE_EXL3_M1H, GGML_TYPE_EXL3_M2H, GGML_TYPE_EXL3_M3H }) {
-        test_cases.emplace_back(new test_mul_mat_had(type_a, GGML_TYPE_F16, 256, 256, 3));
-    }
-    for (ggml_type type_a : { GGML_TYPE_F32, GGML_TYPE_F16 }) {
-        for (int had : { 64, 128, 256 }) {
-            test_cases.emplace_back(new test_mul_mat_had(type_a, GGML_TYPE_F32, 512, 256, 4, 1, 0, false, had));
+    // batched and broadcast b without ids, 128-row views, zero-padded K/N; src1 precision F32 and F16
+    for (ggml_prec prec : { GGML_PREC_F32, GGML_PREC_F16 }) {
+        for (ggml_type type_a : { GGML_TYPE_EXL3_M1, GGML_TYPE_EXL3_M2, GGML_TYPE_EXL3_M3, GGML_TYPE_EXL3_M4, GGML_TYPE_EXL3_M5, GGML_TYPE_EXL3_M6,
+                                  GGML_TYPE_EXL3_M7, GGML_TYPE_EXL3_M8, GGML_TYPE_EXL3_M1H, GGML_TYPE_EXL3_M2H, GGML_TYPE_EXL3_M3H }) {
+            test_cases.emplace_back(new test_mul_mat_had(type_a, GGML_TYPE_F16, 256, 256, 3, 1, 0, false, 128, 0, 0, prec));
         }
+        for (ggml_type type_a : { GGML_TYPE_F32, GGML_TYPE_F16 }) {
+            for (int had : { 64, 128, 256 }) {
+                test_cases.emplace_back(new test_mul_mat_had(type_a, GGML_TYPE_F32, 512, 256, 4, 1, 0, false, had, 0, 0, prec));
+            }
+        }
+        for (ggml_type type_a : { GGML_TYPE_EXL3_M3, GGML_TYPE_F16 }) {
+            test_cases.emplace_back(new test_mul_mat_had(type_a, GGML_TYPE_F16, 256, 384, 5, 4, 2, false, 128, 0, 0, prec)); // ids
+            test_cases.emplace_back(new test_mul_mat_had(type_a, GGML_TYPE_F16, 256, 384, 5, 4, 6, false, 128, 0, 0, prec)); // duplicate ids
+            test_cases.emplace_back(new test_mul_mat_had(type_a, GGML_TYPE_F32, 256, 384, 5, 4, 3, true, 128, 0, 0, prec)); // ids, broadcast b
+            test_cases.emplace_back(new test_mul_mat_had(type_a, GGML_TYPE_F16, 384, 256, 2, 1, 0, true, 128, 0, 0, prec)); // broadcast b
+            test_cases.emplace_back(new test_mul_mat_had(type_a, GGML_TYPE_F16, 384, 256, 2, 3, 0, false, 128, 0, 0, prec)); // batched
+            test_cases.emplace_back(new test_mul_mat_had(type_a, GGML_TYPE_F16, 256, 256, 3, 1, 0, false, 128, 512, 0, prec)); // 128-row view
+            test_cases.emplace_back(new test_mul_mat_had(type_a, GGML_TYPE_F16, 256, 256, 3, 3, 2, false, 128, 640, 0, prec)); // view of experts
+            test_cases.emplace_back(new test_mul_mat_had(type_a, GGML_TYPE_F16, 384, 256, 3, 1, 0, false, 128, 0, 72, prec)); // padded K/N
+            test_cases.emplace_back(new test_mul_mat_had(type_a, GGML_TYPE_F16, 384, 256, 4, 2, 3, false, 128, 0, 56, prec)); // padded, ids
+        }
+        // sizes of the other GPU kernel paths: GEMV with a k split, GEMM with 64-row tiles, routed GEMM with 16-row tiles
+        for (ggml_type type_a : { GGML_TYPE_EXL3_M2, GGML_TYPE_EXL3_M3, GGML_TYPE_EXL3_M5, GGML_TYPE_EXL3_M8, GGML_TYPE_EXL3_M2H, GGML_TYPE_F16 }) {
+            test_cases.emplace_back(new test_mul_mat_had(type_a, GGML_TYPE_F16, 1024, 256, 1, 1, 0, false, 128, 0, 0, prec));
+            test_cases.emplace_back(new test_mul_mat_had(type_a, GGML_TYPE_F16, 512, 256, 40, 1, 0, false, 128, 0, 0, prec));
+            test_cases.emplace_back(new test_mul_mat_had(type_a, GGML_TYPE_F16, 512, 384, 20, 8, 4, false, 128, 0, 0, prec));
+        }
+        test_cases.emplace_back(new test_mul_mat_had(GGML_TYPE_EXL3_M3, GGML_TYPE_F32, 256, 384, 24, 4, 3, true, 128, 0, 0, prec)); // ids, broadcast b
+        test_cases.emplace_back(new test_mul_mat_had(GGML_TYPE_EXL3_M4, GGML_TYPE_F16, 256, 256, 24, 3, 2, false, 128, 640, 0, prec)); // view of experts
+        test_cases.emplace_back(new test_mul_mat_had(GGML_TYPE_EXL3_M3, GGML_TYPE_F16, 384, 256, 30, 1, 0, false, 128, 0, 72, prec)); // padded K/N
+        test_cases.emplace_back(new test_mul_mat_had(GGML_TYPE_F16, GGML_TYPE_F32, 512, 256, 40, 1, 0, false, 64, 0, 0, prec));
+        test_cases.emplace_back(new test_mul_mat_had(GGML_TYPE_F32, GGML_TYPE_F16, 512, 256, 40, 1, 0, false, 128, 0, 0, prec));
     }
-    for (ggml_type type_a : { GGML_TYPE_EXL3_M3, GGML_TYPE_F16 }) {
-        test_cases.emplace_back(new test_mul_mat_had(type_a, GGML_TYPE_F16, 256, 384, 5, 4, 2));                     // ids
-        test_cases.emplace_back(new test_mul_mat_had(type_a, GGML_TYPE_F16, 256, 384, 5, 4, 6));                     // duplicate ids
-        test_cases.emplace_back(new test_mul_mat_had(type_a, GGML_TYPE_F32, 256, 384, 5, 4, 3, true));               // ids, broadcast b
-        test_cases.emplace_back(new test_mul_mat_had(type_a, GGML_TYPE_F16, 384, 256, 2, 1, 0, true));               // broadcast b
-        test_cases.emplace_back(new test_mul_mat_had(type_a, GGML_TYPE_F16, 384, 256, 2, 3));                        // batched
-        test_cases.emplace_back(new test_mul_mat_had(type_a, GGML_TYPE_F16, 256, 256, 3, 1, 0, false, 128, 512));    // 128-row view
-        test_cases.emplace_back(new test_mul_mat_had(type_a, GGML_TYPE_F16, 256, 256, 3, 3, 2, false, 128, 640));    // view of experts
-        test_cases.emplace_back(new test_mul_mat_had(type_a, GGML_TYPE_F16, 384, 256, 3, 1, 0, false, 128, 0, 72)); // padded K/N
-        test_cases.emplace_back(new test_mul_mat_had(type_a, GGML_TYPE_F16, 384, 256, 4, 2, 3, false, 128, 0, 56)); // padded, ids
-    }
+    // backend default precision (not set; F16 on HIP)
+    test_cases.emplace_back(new test_mul_mat_had(GGML_TYPE_EXL3_M3, GGML_TYPE_F16, 1024, 256, 1, 1, 0, false, 128, 0, 0, GGML_PREC_UNDEFINED));
+    test_cases.emplace_back(new test_mul_mat_had(GGML_TYPE_EXL3_M3, GGML_TYPE_F16, 512, 256, 40, 1, 0, false, 128, 0, 0, GGML_PREC_UNDEFINED));
+    test_cases.emplace_back(new test_mul_mat_had(GGML_TYPE_EXL3_M3, GGML_TYPE_F16, 512, 384, 20, 8, 4, false, 128, 0, 0, GGML_PREC_UNDEFINED));
 
     // FP4 activation precision (default = native W4A4, src1 GGML_PREC_Q8 = W4A8)
     test_cases.emplace_back(new test_mul_mat_w4a8(GGML_TYPE_NVFP4, GGML_TYPE_F32, 32,  1, 256));
