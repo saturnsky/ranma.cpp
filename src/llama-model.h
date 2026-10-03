@@ -724,6 +724,8 @@ struct llama_model {
     llama_prec_policy prec_policy;
 
     llama_hadamard hdmd;
+    // tensors that weights need beside their data (EXL3 rot_in / rot_out)
+    llama_weight_aux_map waux;
 
     // see llama_model_set_attn_rot
     bool attn_rot = true;

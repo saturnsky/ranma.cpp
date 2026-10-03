@@ -41,6 +41,7 @@ set(LLAMA_CORE_SOURCES
     llama-quant.cpp
     llama-sampler.cpp
     llama-vocab.cpp
+    llama-weight-aux.cpp
     unicode-data.cpp
     unicode.cpp
 )
