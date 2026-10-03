@@ -5839,6 +5839,15 @@ class GGMLQuantizationType(IntEnum):
     EXL3_T6  = 293
     EXL3_T7  = 294
     EXL3_T8  = 295
+    # EXL3 row codec (n-gram tables), see exl3.py; 312 .. 319 are reserved
+    EXL3R_M1 = 304
+    EXL3R_M2 = 305
+    EXL3R_M3 = 306
+    EXL3R_M4 = 307
+    EXL3R_M5 = 308
+    EXL3R_M6 = 309
+    EXL3R_M7 = 310
+    EXL3R_M8 = 311
 
 
 class ExpertGatingFuncType(IntEnum):
@@ -6062,6 +6071,14 @@ GGML_QUANT_SIZES: dict[GGMLQuantizationType, tuple[int, int]] = {
     GGMLQuantizationType.EXL3_T6:  (128, 96),
     GGMLQuantizationType.EXL3_T7:  (128, 112),
     GGMLQuantizationType.EXL3_T8:  (128, 128),
+    GGMLQuantizationType.EXL3R_M1: (160, 22),
+    GGMLQuantizationType.EXL3R_M2: (160, 42),
+    GGMLQuantizationType.EXL3R_M3: (160, 62),
+    GGMLQuantizationType.EXL3R_M4: (160, 82),
+    GGMLQuantizationType.EXL3R_M5: (160, 102),
+    GGMLQuantizationType.EXL3R_M6: (160, 122),
+    GGMLQuantizationType.EXL3R_M7: (160, 142),
+    GGMLQuantizationType.EXL3R_M8: (160, 162),
 }
 
 

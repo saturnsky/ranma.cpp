@@ -10,6 +10,7 @@
 
 // FIXME: required here for quantization functions
 #include "ggml-quants.h"
+#include "ggml-exl3.h"
 
 #ifdef GGML_USE_CPU_HBM
 #include <hbwmalloc.h>
@@ -1105,6 +1106,62 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .blck_size                = 128,
         .type_size                = 128,
         .is_quantized             = true,
+    },    // EXL3 row codec (ggml-exl3.c): a row of 160 is an fp16 scale and a ring of 160*bits bits
+    [GGML_TYPE_EXL3R_M1] = {
+        .type_name                = "exl3r_m1",
+        .blck_size                = 160,
+        .type_size                = 22,
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_exl3r_m1,
+    },
+    [GGML_TYPE_EXL3R_M2] = {
+        .type_name                = "exl3r_m2",
+        .blck_size                = 160,
+        .type_size                = 42,
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_exl3r_m2,
+    },
+    [GGML_TYPE_EXL3R_M3] = {
+        .type_name                = "exl3r_m3",
+        .blck_size                = 160,
+        .type_size                = 62,
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_exl3r_m3,
+    },
+    [GGML_TYPE_EXL3R_M4] = {
+        .type_name                = "exl3r_m4",
+        .blck_size                = 160,
+        .type_size                = 82,
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_exl3r_m4,
+    },
+    [GGML_TYPE_EXL3R_M5] = {
+        .type_name                = "exl3r_m5",
+        .blck_size                = 160,
+        .type_size                = 102,
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_exl3r_m5,
+    },
+    [GGML_TYPE_EXL3R_M6] = {
+        .type_name                = "exl3r_m6",
+        .blck_size                = 160,
+        .type_size                = 122,
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_exl3r_m6,
+    },
+    [GGML_TYPE_EXL3R_M7] = {
+        .type_name                = "exl3r_m7",
+        .blck_size                = 160,
+        .type_size                = 142,
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_exl3r_m7,
+    },
+    [GGML_TYPE_EXL3R_M8] = {
+        .type_name                = "exl3r_m8",
+        .blck_size                = 160,
+        .type_size                = 162,
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_exl3r_m8,
     },
 };
 
@@ -3526,6 +3583,7 @@ struct ggml_tensor * ggml_mul_mat(
     GGML_ASSERT(ggml_can_mul_mat(a, b));
     GGML_ASSERT(!ggml_is_transposed(a));
     GGML_ASSERT(!ggml_is_exl3(a->type) && "EXL3 weights need ggml_mul_mat_had");
+    GGML_ASSERT(!ggml_is_exl3_row(a->type) && "EXL3 row codec tables are read with ggml_get_rows");
 
     const int64_t ne[4] = { a->ne[1], b->ne[1], b->ne[2], b->ne[3] };
     struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
@@ -3578,6 +3636,7 @@ struct ggml_tensor * ggml_mul_mat_id(
         struct ggml_tensor  * ids) {
     GGML_ASSERT(!ggml_is_transposed(as));
     GGML_ASSERT(!ggml_is_exl3(as->type) && "EXL3 weights need ggml_mul_mat_had");
+    GGML_ASSERT(!ggml_is_exl3_row(as->type) && "EXL3 row codec tables are read with ggml_get_rows");
     GGML_ASSERT(ids->type == GGML_TYPE_I32);
 
     GGML_ASSERT(as->ne[3] == 1); // as is 3d (one matrix per expert)

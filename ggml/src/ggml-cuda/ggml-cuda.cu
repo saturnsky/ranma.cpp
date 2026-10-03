@@ -941,7 +941,8 @@ static size_t ggml_backend_cuda_buffer_type_get_alloc_size(ggml_backend_buffer_t
     int64_t ne0 = tensor->ne[0];
 
     // [TAG_ALLOC_SIZE_EXPAND]
-    if (ggml_is_quantized(tensor->type)) {
+    // (EXL3 row codec rows are only gathered: no tile reads past the last row, and 160 does not divide the padding)
+    if (ggml_is_quantized(tensor->type) && !ggml_is_exl3_row(tensor->type)) {
         if (ne0 % MATRIX_ROW_PADDING != 0) {
             GGML_ASSERT(tensor->nb[0] == ggml_element_size(tensor));
             size += ggml_row_size(tensor->type, MATRIX_ROW_PADDING - ne0 % MATRIX_ROW_PADDING);
@@ -1464,7 +1465,7 @@ static size_t ggml_backend_cuda_host_buffer_type_get_alloc_size(ggml_backend_buf
     const ggml_backend_cuda_device_context * dev_ctx = (const ggml_backend_cuda_device_context *) buft->device->context;
 
     size_t size = ggml_nbytes(tensor);
-    if (dev_ctx->host_direct && ggml_is_quantized(tensor->type)) {
+    if (dev_ctx->host_direct && ggml_is_quantized(tensor->type) && !ggml_is_exl3_row(tensor->type)) {
         const int64_t ne0 = tensor->ne[0];
         if (ne0 % MATRIX_ROW_PADDING != 0) {
             GGML_ASSERT(tensor->nb[0] == ggml_element_size(tensor));

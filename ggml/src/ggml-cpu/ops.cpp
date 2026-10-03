@@ -5401,6 +5401,14 @@ void ggml_compute_forward_get_rows(
         case GGML_TYPE_IQ4_XS:
         case GGML_TYPE_IQ3_S:
         case GGML_TYPE_IQ2_S:
+        case GGML_TYPE_EXL3R_M1:
+        case GGML_TYPE_EXL3R_M2:
+        case GGML_TYPE_EXL3R_M3:
+        case GGML_TYPE_EXL3R_M4:
+        case GGML_TYPE_EXL3R_M5:
+        case GGML_TYPE_EXL3R_M6:
+        case GGML_TYPE_EXL3R_M7:
+        case GGML_TYPE_EXL3R_M8:
             {
                 ggml_compute_forward_get_rows_q(params, dst);
             } break;
@@ -6195,6 +6203,14 @@ void ggml_compute_forward_clamp(
         case GGML_TYPE_EXL3_T6:
         case GGML_TYPE_EXL3_T7:
         case GGML_TYPE_EXL3_T8:
+        case GGML_TYPE_EXL3R_M1:
+        case GGML_TYPE_EXL3R_M2:
+        case GGML_TYPE_EXL3R_M3:
+        case GGML_TYPE_EXL3R_M4:
+        case GGML_TYPE_EXL3R_M5:
+        case GGML_TYPE_EXL3R_M6:
+        case GGML_TYPE_EXL3R_M7:
+        case GGML_TYPE_EXL3R_M8:
         case GGML_TYPE_COUNT:
             {
                 GGML_ABORT("fatal error");

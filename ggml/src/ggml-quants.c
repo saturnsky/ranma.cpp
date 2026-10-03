@@ -5656,6 +5656,24 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
         case GGML_TYPE_EXL3_T8:
             // every state decodes to a finite value; the rot_in/rot_out scales are F16 tensors of their own
             break;
+        case GGML_TYPE_EXL3R_M1:
+        case GGML_TYPE_EXL3R_M2:
+        case GGML_TYPE_EXL3R_M3:
+        case GGML_TYPE_EXL3R_M4:
+        case GGML_TYPE_EXL3R_M5:
+        case GGML_TYPE_EXL3R_M6:
+        case GGML_TYPE_EXL3R_M7:
+        case GGML_TYPE_EXL3R_M8:
+            {
+                // every state decodes to a finite value; the row starts with its fp16 scale
+                const size_t row_size = ggml_type_size(type);
+                for (size_t i = 0; i < nb; ++i) {
+                    const uint8_t * row = (const uint8_t *) data + i*row_size;
+                    if (!validate_fp16((ggml_fp16_t) (row[0] | (row[1] << 8)), i)) {
+                        return false;
+                    }
+                }
+            } break;
         default:
             {
                 fprintf(stderr, "%s: invalid type %d\n", __func__, type);

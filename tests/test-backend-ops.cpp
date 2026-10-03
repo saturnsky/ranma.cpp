@@ -2540,6 +2540,67 @@ struct test_get_rows : public test_case {
     }
 };
 
+// GGML_OP_GET_ROWS of an EXL3 row codec table (no quantizer: the rows are random rings with finite fp16 scales)
+// with heads > 0 also the n-gram reconstruction of llama_weight_aux_get_rows: + bias[head], fp16 rounding, f32
+struct test_get_rows_exl3r : public test_case {
+    const ggml_type type;
+    const int n;     // values per row (a multiple of 160)
+    const int m;     // table rows
+    const int r;     // gathered rows
+    const int heads; // 0: get_rows only
+
+    std::string vars() override {
+        return VARS_TO_STR5(type, n, m, r, heads);
+    }
+
+    test_get_rows_exl3r(ggml_type type = GGML_TYPE_EXL3R_M5, int n = 160, int m = 64, int r = 32, int heads = 0)
+        : type(type), n(n), m(m), r(r), heads(heads) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * in = ggml_new_tensor_2d(ctx, type, n, m);
+        ggml_set_name(in, "in");
+        ggml_tensor * rows = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, r);
+        ggml_set_name(rows, "rows");
+        ggml_tensor * out = ggml_get_rows(ctx, in, rows);
+        if (heads > 0) {
+            ggml_tensor * bias = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, n, heads);
+            ggml_set_name(bias, "bias");
+            out = ggml_reshape_3d(ctx, out, n, heads, r/heads);
+            out = ggml_add(ctx, out, ggml_cast(ctx, bias, GGML_TYPE_F32));
+            out = ggml_cast(ctx, ggml_cast(ctx, out, GGML_TYPE_F16), GGML_TYPE_F32);
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 rng(1234);
+        std::uniform_real_distribution<float> scale(-2.0f, 2.0f);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_I32) {
+                std::vector<int> data(ggml_nelements(t));
+                for (size_t i = 0; i < data.size(); i++) {
+                    data[i] = rng() % m;
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(int));
+            } else if (ggml_is_exl3_row(t->type)) {
+                std::vector<uint8_t> data(ggml_nbytes(t));
+                for (auto & b : data) {
+                    b = (uint8_t) rng();
+                }
+                const size_t block = ggml_type_size(t->type);
+                for (size_t off = 0; off < data.size(); off += block) {
+                    const ggml_fp16_t h = ggml_fp32_to_fp16(scale(rng));
+                    memcpy(data.data() + off, &h, sizeof(h));
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size());
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // GGML_OP_GET_ROWS_BACK
 struct test_get_rows_back : public test_case {
     const ggml_type type;
@@ -11348,6 +11409,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F16, 4096, 1, 4096));
     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F16, 8192, 1, 8192));
     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F16, 1024, 7, 1024));  // many rows
+
+    // EXL3 row codec tables: every bitrate, several rows per call, the n-gram head bias and fp16 rounding
+    for (ggml_type type : { GGML_TYPE_EXL3R_M1, GGML_TYPE_EXL3R_M2, GGML_TYPE_EXL3R_M3, GGML_TYPE_EXL3R_M4,
+                            GGML_TYPE_EXL3R_M5, GGML_TYPE_EXL3R_M6, GGML_TYPE_EXL3R_M7, GGML_TYPE_EXL3R_M8 }) {
+        test_cases.emplace_back(new test_get_rows_exl3r(type, 160, 64, 32));
+        test_cases.emplace_back(new test_get_rows_exl3r(type, 160, 300, 16*24, 16));
+    }
+    test_cases.emplace_back(new test_get_rows_exl3r(GGML_TYPE_EXL3R_M5, 320, 50, 7));
+    test_cases.emplace_back(new test_get_rows_exl3r(GGML_TYPE_EXL3R_M6, 160, 5000, 16*512, 16));
 
     // MUL_MAT_HAD: EXL3 types, F16/F32 weights and other Hadamard sizes, ids with duplicates and broadcast b,
     // batched and broadcast b without ids, 128-row views, zero-padded K/N; src1 precision F32 and F16
