@@ -49,8 +49,12 @@ int main() {
         int layer = -1, kind = -1;
         CHECK(parse_expert_tensor_name("blk.7.ffn_up_exps.weight", layer, kind));
         CHECK(layer == 7 && kind == 0);
-        CHECK(parse_expert_tensor_name("blk.0.ffn_gate_exps", layer, kind));
+        CHECK(parse_expert_tensor_name("blk.0.ffn_gate_exps.weight", layer, kind));
         CHECK(layer == 0 && kind == 1);
+        CHECK(!parse_expert_tensor_name("blk.0.ffn_gate_exps", layer, kind));
+        CHECK(!parse_expert_tensor_name("blk.0.ffn_gate_exps.rot_in", layer, kind));
+        CHECK(!parse_expert_tensor_name("blk.0.ffn_up_exps.rot_out", layer, kind));
+        CHECK(!parse_expert_tensor_name("blk.0.ffn_down_exps.bias", layer, kind));
         CHECK(parse_expert_tensor_name("blk.123.ffn_down_exps.weight", layer, kind));
         CHECK(layer == 123 && kind == 2);
         CHECK(!parse_expert_tensor_name("blk.x.ffn_up_exps", layer, kind));

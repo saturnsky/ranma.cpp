@@ -74,9 +74,9 @@ struct geometry {
     }
 };
 
-// Accepts "blk.<layer>.ffn_{up,gate,down}_exps" with any suffix. Same matching
-// rule as the reference implementation, minus its global n_layers upper bound (this
-// header has no global model state).
+// Accepts "blk.<layer>.ffn_{up,gate,down}_exps.weight" only: other tensors of a bank (.bias, .scale, the
+// .rot_in / .rot_out of EXL3) are not expert weights. No global n_layers upper bound (this header has no
+// global model state).
 inline bool parse_expert_tensor_name(const char * name, int & layer, int & kind) {
     if (name == nullptr || strncmp(name, "blk.", 4) != 0) {
         return false;
@@ -86,11 +86,11 @@ inline bool parse_expert_tensor_name(const char * name, int & layer, int & kind)
     if (end == name + 4 || parsed_layer < 0) {
         return false;
     }
-    if (strstr(end, ".ffn_up_exps") != nullptr) {
+    if (strcmp(end, ".ffn_up_exps.weight") == 0) {
         kind = 0;
-    } else if (strstr(end, ".ffn_gate_exps") != nullptr) {
+    } else if (strcmp(end, ".ffn_gate_exps.weight") == 0) {
         kind = 1;
-    } else if (strstr(end, ".ffn_down_exps") != nullptr) {
+    } else if (strcmp(end, ".ffn_down_exps.weight") == 0) {
         kind = 2;
     } else {
         return false;
