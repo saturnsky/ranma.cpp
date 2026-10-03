@@ -1,4 +1,6 @@
 #include "expert-geometry.h"
+#include "expert-plan.h"
+#include "expert-redraw.h"
 
 #include "ggml.h"
 
@@ -299,6 +301,133 @@ int main() {
         CHECK(geo.signature() != exl3_signature);
     }
 
+    // The aux rows of an EXL3 bank (rot_in / rot_out) move with their expert in VRAM (D8 stage 2): the geometry knows
+    // their per expert stride (nb[1]), a class holds layers of equal aux strides, a VRAM slot costs the weights and the
+    // rows, and the signature (profile key) does not change with them.
+    {
+        int layer = -1, kind = -1, which = -1;
+        CHECK(parse_expert_aux_name("blk.3.ffn_gate_exps.rot_in", layer, kind, which));
+        CHECK(layer == 3 && kind == 1 && which == 0);
+        CHECK(parse_expert_aux_name("blk.40.ffn_down_exps.rot_out", layer, kind, which));
+        CHECK(layer == 40 && kind == 2 && which == 1);
+        CHECK(parse_expert_aux_name("blk.0.ffn_up_exps.rot_in", layer, kind, which));
+        CHECK(layer == 0 && kind == 0 && which == 0);
+        CHECK(!parse_expert_aux_name("blk.0.ffn_up_exps.weight", layer, kind, which));
+        CHECK(!parse_expert_aux_name("blk.0.ffn_up_exps.rot_in.x", layer, kind, which));
+        CHECK(!parse_expert_aux_name("blk.0.ffn_up_exps.bias", layer, kind, which));
+        CHECK(!parse_expert_aux_name("blk.0.ffn_up.rot_in", layer, kind, which));
+        CHECK(!parse_expert_aux_name("blk.0.attn_q.rot_in", layer, kind, which));
+        CHECK(!parse_expert_aux_name("blk.x.ffn_up_exps.rot_in", layer, kind, which));
+        CHECK(!parse_expert_aux_name(nullptr, layer, kind, which));
+
+        const char * kinds[3] = { "ffn_up_exps", "ffn_gate_exps", "ffn_down_exps" };
+        // emb 512, ff 256, 16 experts: up/gate rot_in 512, rot_out 256 values; down the other way round
+        auto add_exl3 = [&](ggml_context * ctx, int layer, ggml_type rot_type, bool rot, int64_t rot_experts) {
+            for (int k = 0; k < 3; ++k) {
+                const int64_t ne0 = k == 2 ? 256 : 512;
+                const int64_t ne1 = k == 2 ? 512 : 256;
+                char name[128];
+                snprintf(name, sizeof(name), "blk.%d.%s.weight", layer, kinds[k]);
+                ggml_set_name(ggml_new_tensor_3d(ctx, GGML_TYPE_EXL3_M3, ne0, ne1, 16), name);
+                if (rot) {
+                    snprintf(name, sizeof(name), "blk.%d.%s.rot_in", layer, kinds[k]);
+                    ggml_set_name(ggml_new_tensor_2d(ctx, rot_type, ne0, rot_experts), name);
+                    snprintf(name, sizeof(name), "blk.%d.%s.rot_out", layer, kinds[k]);
+                    ggml_set_name(ggml_new_tensor_2d(ctx, rot_type, ne1, rot_experts), name);
+                }
+            }
+        };
+        const size_t rot_f16 = 3*(512 + 256)*2;   // bytes of one expert's rows, all kinds
+
+        context_holder holder;
+        CHECK(holder.ctx != nullptr);
+        for (int l = 0; l < 4; ++l) { add_exl3(holder.ctx, l, GGML_TYPE_F16, true, 16); }
+        geometry geo;
+        CHECK(build_geometry(holder.ctx, geo, reason));
+        CHECK(geo.class_bytes.size() == 1 && geo.has_aux());
+        for (int l = 0; l < 4; ++l) {
+            for (int k = 0; k < 3; ++k) {
+                for (int a = 0; a < 2; ++a) {
+                    const ggml_tensor * t = geo.aux_tensor(l, k, a);
+                    CHECK(t != nullptr);
+                    char name[128];
+                    snprintf(name, sizeof(name), "blk.%d.%s.%s", l, kinds[k], a == 0 ? "rot_in" : "rot_out");
+                    CHECK(std::string(ggml_get_name(t)) == name);
+                    CHECK(geo.aux_nb[l][k][a] == t->nb[1]);
+                    CHECK(geo.class_aux_bytes(0, k, a) == t->nb[1]);
+                }
+            }
+        }
+        CHECK(geo.class_aux_bytes(0, 0, 0) == 512*2 && geo.class_aux_bytes(0, 0, 1) == 256*2);
+        CHECK(geo.class_aux_bytes(0, 2, 0) == 256*2 && geo.class_aux_bytes(0, 2, 1) == 512*2);
+        CHECK(geo.class_aux_total_bytes(0) == rot_f16);
+        CHECK(geo.class_vram_bytes(0) == geo.class_total_bytes(0) + rot_f16);
+
+        // the profile key does not change with the rows
+        context_holder bare;
+        CHECK(bare.ctx != nullptr);
+        for (int l = 0; l < 4; ++l) { add_exl3(bare.ctx, l, GGML_TYPE_F16, false, 16); }
+        geometry no_rot;
+        CHECK(build_geometry(bare.ctx, no_rot, reason));
+        CHECK(!no_rot.has_aux() && no_rot.class_vram_bytes(0) == no_rot.class_total_bytes(0));
+        CHECK(no_rot.signature() == geo.signature());
+
+        // F32 rows in layers 2 and 3: another slot layout, another class
+        context_holder mixed;
+        CHECK(mixed.ctx != nullptr);
+        for (int l = 0; l < 4; ++l) { add_exl3(mixed.ctx, l, l < 2 ? GGML_TYPE_F16 : GGML_TYPE_F32, true, 16); }
+        geometry two;
+        CHECK(build_geometry(mixed.ctx, two, reason));
+        CHECK(two.class_bytes.size() == 2 && two.layer_class[0] == 0 && two.layer_class[1] == 0 &&
+            two.layer_class[2] == 1 && two.layer_class[3] == 1);
+        CHECK(two.class_aux_total_bytes(0) == rot_f16 && two.class_aux_total_bytes(1) == 2*rot_f16);
+        CHECK(two.class_total_bytes(0) == two.class_total_bytes(1));
+
+        // rows that do not have one row per expert, and rows of a layer without routed weights, stay out
+        context_holder odd;
+        CHECK(odd.ctx != nullptr);
+        add_exl3(odd.ctx, 0, GGML_TYPE_F16, true, 16);
+        add_exl3(odd.ctx, 1, GGML_TYPE_F16, true, 8);
+        ggml_set_name(ggml_new_tensor_2d(odd.ctx, GGML_TYPE_F16, 512, 16), "blk.7.ffn_up_exps.rot_in");
+        geometry partial;
+        CHECK(build_geometry(odd.ctx, partial, reason));
+        CHECK(partial.n_layers == 2 && partial.class_bytes.size() == 2);
+        CHECK(partial.aux_tensor(0, 0, 0) != nullptr && partial.aux_tensor(1, 0, 0) == nullptr);
+        CHECK(partial.class_aux_total_bytes(partial.layer_class[1]) == 0);
+        CHECK(partial.aux_tensor(7, 0, 0) == nullptr);
+
+        // a joint cache keeps every part's rows at its joint layers
+        std::vector<int> offsets;
+        geometry joint;
+        CHECK(concat_geometry({&geo, &no_rot}, joint, offsets, reason));
+        CHECK(joint.n_layers == 8 && offsets[1] == 4 && joint.class_bytes.size() == 2);
+        CHECK(joint.aux_tensor(1, 2, 1) == geo.aux_tensor(1, 2, 1) && joint.aux_tensor(5, 2, 1) == nullptr);
+        CHECK(joint.layer_class[0] != joint.layer_class[4]);
+
+        // budget: the VRAM plan places as many experts as weights + rows fit (cold split and warm greedy), the
+        // redraw counts the same bytes; a bank without rows is planned on its weight bytes as before
+        const size_t vram = geo.class_vram_bytes(0);
+        placement_inputs in;
+        in.geo          = &geo;
+        in.budget_bytes = 40*vram + vram/2;
+        in.exclusive    = true;
+        placement cold = plan_placement(in);
+        CHECK(cold.capacities.size() == 1 && cold.capacities[0] == 40);
+        std::vector<uint64_t> counts(geo.n_counts(), 0);
+        for (size_t i = 0; i < counts.size(); ++i) { counts[i] = 1 + i % 7; }
+        in.counts = counts.data();
+        placement warm = plan_placement(in);
+        CHECK(warm.capacities[0] == 40);
+        CHECK(redraw_static_bytes(geo, warm.capacities) == 40*vram);
+        placement_inputs plain = in;
+        plain.geo = &no_rot;
+        plain.budget_bytes = 40*no_rot.class_total_bytes(0) + no_rot.class_total_bytes(0)/2;
+        CHECK(plan_placement(plain).capacities[0] == 40);
+        plain.budget_bytes = in.budget_bytes;
+        CHECK(plan_placement(plain).capacities[0] == (int) (in.budget_bytes/no_rot.class_total_bytes(0)));
+        CHECK(plan_placement(plain).capacities[0] > 40);
+    }
+
     // No MoE at all is a success with an empty geometry.
     {
         context_holder holder;
@@ -315,6 +444,6 @@ int main() {
         CHECK(geo.class_bytes.empty());
     }
 
-    printf("PASS: parse/build/class/signature checks on qwen-like, glm-like, mixed, companion-tensor and malformed contexts\n");
+    printf("PASS: parse/build/class/signature checks on qwen-like, glm-like, mixed, companion-tensor, aux-row and malformed contexts\n");
     return 0;
 }
