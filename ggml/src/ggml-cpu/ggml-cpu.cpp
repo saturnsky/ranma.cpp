@@ -429,6 +429,16 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
         return true;
     }
 
+    // EXL3 weights have no row API (to_float, vec_dot)
+    if (ggml_is_exl3(op->type)) {
+        return false;
+    }
+    for (int i = 0; i < GGML_MAX_SRC; i++) {
+        if (op->src[i] && ggml_is_exl3(op->src[i]->type)) {
+            return false;
+        }
+    }
+
     // check extra buffer types
     // note: only the first sources are checked for extra buffer types to reduce overhead, increase if necessary
     for (int i = 0; i < 4; i++) {
