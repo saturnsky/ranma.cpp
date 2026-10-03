@@ -13,6 +13,12 @@ and codebook (gguf.exl3, tile bytes kept, tiles in 128-row strips), plus `<base>
 
 Model classes that permute the Q/K rows for RoPE (undo_permute) run without that permutation, and the file says
 `<arch>.rope.style = "neox"`: the unpermuted (HF) rows with NEOX rope are the same operation.
+
+An n-gram embedding table (Qwen3.8 PLE, `<module>.ngram_embedding`: `.trellis` or `.shard_N.trellis` int16 rows of
+1 + 10*bits words, `.head_bias` F16 [heads, 160], int64 hash constants) is written with its packed row bytes unchanged as
+the EXL3 row codec type of its bitrate (gguf.exl3 ROW_QTYPES) under the existing table name (per_layer_token_embd), with
+the head bias as `<table>.bias` F16 [160, heads] and the hash constants as the model class's existing PLE keys.
+`--exl3-ngram omit` (development) drops the table and its PLE module instead.
 """
 
 from __future__ import annotations
@@ -45,6 +51,12 @@ class Exl3Error(ValueError):
 
 class Exl3MtpUnsupported(Exl3Error):
     """The MTP layers of the model cannot be stored as EXL3: convert again with no_mtp."""
+
+
+def read_metadata(path: Path) -> dict[str, str]:
+    with open(path, "rb") as f:
+        n, = struct.unpack("<Q", f.read(8))
+        return json.loads(f.read(n)).get("__metadata__") or {}
 
 
 def is_exl3(hparams: dict[str, Any]) -> bool:
@@ -433,11 +445,12 @@ class Exl3Tensor:
 @dataclass
 class Exl3State:
     dir_model: Path
-    ngram: str = "refuse"
+    ngram: str = "table"
     dry: bool = False  # check the EXL3 weights the class writes, write nothing (MTP check)
     sources: list[Source] = field(default_factory=list)
     source_dtypes: dict[str, str] = field(default_factory=dict)
     ngram_tensors: list[str] = field(default_factory=list)
+    ngram_table: dict[str, Any] | None = None
     written: list[dict[str, Any]] = field(default_factory=list)
 
     def install(self, model: Any) -> None:
@@ -456,10 +469,9 @@ class Exl3State:
         # n-gram row codecs (Qwen3.8): a trellis without suh/svh
         rows = [n for n in renamed if n.endswith(".trellis") and not any(n[:-8] + s in renamed for s in (".suh", ".su"))]
         self.ngram_tensors = sorted(renamed[n] for n in rows)
-        if rows:
-            if self.ngram == "refuse":
-                raise Exl3Error(f"EXL3 n-gram row codec tensors ({len(rows)}, e.g. {renamed[rows[0]]!r}) need the EXL3 row codec "
-                                "type, which is not implemented yet; --exl3-ngram omit converts without the n-gram table")
+        if rows and self.ngram == "table":
+            self._install_ngram(model, entries, renamed, rows)
+        elif rows:
             base = {n.rsplit(".shard_", 1)[0] if ".shard_" in n else n[:-8] for n in rows}
             # the table belongs to a PLE module (`<layer>.ple.ple_embedding.ngram_embedding`): the module's own tensors
             # (key / value projections, norms, conv) are of no use without it, and the loader of a file without
@@ -516,6 +528,105 @@ class Exl3State:
             self.source_dtypes[key + ".weight"] = "EXL3"
         logger.info("EXL3: %d linear groups (%s)", len(self.sources),
                     ", ".join(f"{q.name} {c}" for q, c in sorted(self._type_counts().items())))
+
+    def _install_ngram(self, model: Any, entries: dict[str, StEntry], renamed: dict[str, str], rows: list[str]) -> None:
+        """Take the n-gram table out of the model class's tensors; prepare_tensors writes it (emit_ngram)."""
+        mt = model.model_tensors
+        bases = {n.rsplit(".shard_", 1)[0] if ".shard_" in n else n[:-len(".trellis")] for n in rows}
+        if len(bases) != 1:
+            raise Exl3Error(f"EXL3 n-gram tables: one table is supported, found {sorted(bases)}")
+        base = bases.pop()
+        if not base.endswith(".ngram_embedding"):
+            raise Exl3Error(f"EXL3 n-gram table {base!r} is not a `<module>.ngram_embedding`")
+        shards: dict[int, str] = {}
+        for n in rows:
+            if n == base + ".trellis":
+                shards[-1] = n
+            else:
+                idx = n[len(base) + len(".shard_"):-len(".trellis")]
+                if not idx.isdigit():
+                    raise Exl3Error(f"EXL3 n-gram table tensor {renamed[n]!r} is not `.trellis` or `.shard_N.trellis`")
+                shards[int(idx)] = n
+        if -1 in shards and len(shards) > 1:
+            raise Exl3Error(f"EXL3 n-gram table {base!r} has both a single table and shards")
+        if -1 not in shards and sorted(shards) != list(range(len(shards))):
+            raise Exl3Error(f"EXL3 n-gram table {base!r}: shards {sorted(shards)} are not 0..{len(shards) - 1}")
+        parts = [entries[renamed[shards[i]]] for i in sorted(shards)]
+        for e in parts:
+            if e.dtype != "I16" or len(e.shape) != 2 or e.shape[1] != parts[0].shape[1]:
+                raise Exl3Error(f"EXL3 n-gram table {base!r}: {e.dtype} {list(e.shape)}, expected I16 [rows, {parts[0].shape[1]}]")
+        # rows map to shards by a plain division (official NGramEmbedding.load): equal shards, the last may be short
+        if any(e.shape[0] != parts[0].shape[0] for e in parts[:-1]) or parts[-1].shape[0] > parts[0].shape[0]:
+            raise Exl3Error(f"EXL3 n-gram table {base!r}: shard row counts {[e.shape[0] for e in parts]}")
+        words = parts[0].shape[1]
+        try:
+            qtype = gexl3.row_qtype_for_words(words)
+        except ValueError as e:
+            raise Exl3Error(f"{base}: {e}") from e
+        bits = gexl3.row_bits(qtype)
+        n_rows = sum(e.shape[0] for e in parts)
+        for path in sorted({e.path for e in parts}):
+            meta = read_metadata(path)
+            want = {"format": "exl3_ngram_trellis", "codebook": "mul1", "row_dim": str(gexl3.ROW_DIM), "K": str(bits), "rows": str(n_rows)}
+            bad = {k: (meta.get(k), v) for k, v in want.items() if k in meta and meta[k] != v}
+            if meta.get("format") != "exl3_ngram_trellis" or bad:
+                raise Exl3Error(f"{path.name}: n-gram table metadata {bad or meta}, expected {want}")
+
+        def aux(suffix: str, dtype: str, shape: tuple[int, ...] | None = None) -> StEntry:
+            e = entries.get(renamed.get(base + suffix, ""))
+            if e is None or e.dtype != dtype or (shape is not None and e.shape != shape):
+                raise Exl3Error(f"EXL3 n-gram table {base!r} needs {base + suffix} {dtype}{list(shape) if shape else ''}, "
+                                f"found {None if e is None else (e.dtype, list(e.shape))}")
+            return e
+        offsets = aux(".head_offsets", "I64")
+        n_heads = offsets.shape[0]
+        sizes = aux(".head_vocab_sizes", "I64", (n_heads,))
+        aux(".layer_multipliers", "I64")
+        bias = aux(".head_bias", "F16", (n_heads, gexl3.ROW_DIM))
+        top = int((offsets.array("<i8") + sizes.array("<i8")).max())
+        if top > n_rows:
+            raise Exl3Error(f"EXL3 n-gram table {base!r}: the head ranges end at row {top}, the table has {n_rows}")
+
+        # the model class reads the hash constants under their HF names (`<module>.ple_embedding.<name>`)
+        hf = base[:-len(".ngram_embedding")]
+        for src, dst in ((".layer_multipliers", ".layer_multipliers"), (".head_offsets", ".ngram_heads_offsets"),
+                         (".head_vocab_sizes", ".ngram_heads_vocab_sizes")):
+            if hf + dst in mt:
+                raise Exl3Error(f"{hf + dst}: both an EXL3 n-gram constant and a source tensor")
+            mt[hf + dst] = mt.pop(base + src)
+        for n in [*rows, base + ".head_bias"]:
+            del mt[n]
+        # the class writes the per-layer input width from the table it saw (Qwen4ExpTextModel)
+        if hasattr(model, "_ple_row_dim"):
+            model._ple_row_dim = gexl3.ROW_DIM
+        self.ngram_table = dict(base=renamed[base + ".head_bias"][:-len(".head_bias")], parts=parts, bias=bias, qtype=qtype,
+                                rows=n_rows, heads=n_heads)
+        logger.info("EXL3: n-gram table %s, %d rows in %d tensor(s), %s, %d heads", self.ngram_table["base"], n_rows,
+                    len(parts), qtype.name, n_heads)
+
+    def emit_ngram(self, model: Any) -> None:
+        t = self.ngram_table
+        if t is None:
+            return
+        if gguf.MODEL_TENSOR.PER_LAYER_TOKEN_EMBD not in gguf.MODEL_TENSORS[model.model_arch]:
+            raise Exl3Error(f"EXL3 n-gram table: {model.model_arch.name} has no per-layer token embedding tensor")
+        name = gguf.TENSOR_NAMES[gguf.MODEL_TENSOR.PER_LAYER_TOKEN_EMBD]
+        row_bytes = 2 * t["parts"][0].shape[1]
+        step = max(1, CHUNK_BYTES // row_bytes)
+
+        def rows_of(e: StEntry, r0: int, r1: int) -> np.ndarray:
+            data = np.memmap(e.path, mode="r", dtype=np.uint8, offset=e.offset, shape=(e.shape[0], row_bytes))
+            out = np.array(data[r0:r1])
+            del data
+            return out
+
+        chunks = [lambda e=e, r0=r0: rows_of(e, r0, min(r0 + step, e.shape[0]))
+                  for e in t["parts"] for r0 in range(0, e.shape[0], step)]
+        model.gguf_writer.add_tensor(name + ".weight", gguf.LazyChunkedTensor(chunks, shape=(t["rows"], row_bytes), dtype=np.uint8),
+                                     raw_dtype=t["qtype"])
+        model.gguf_writer.add_tensor(name + ".bias", np.ascontiguousarray(t["bias"].array("<f2")))
+        logger.info(f"{name + '.weight,':<48} exl3 n-gram --> {t['qtype'].name}, shape = {{{gexl3.ROW_DIM}, {t['rows']}}}")
+        logger.info(f"{name + '.bias,':<48} exl3 n-gram --> F16, shape = {{{gexl3.ROW_DIM}, {t['heads']}}}")
 
     def _type_counts(self) -> dict[gguf.GGMLQuantizationType, int]:
         counts: dict[gguf.GGMLQuantizationType, int] = {}
@@ -671,7 +782,7 @@ class _Exl3Model:
     """Mixed in before the model class (see adapt())."""
 
     _exl3: Exl3State
-    _exl3_ngram: str = "refuse"
+    _exl3_ngram: str = "table"
     _exl3_rope_neox: bool = False
 
     def __init__(self, *args, **kwargs):
@@ -792,6 +903,7 @@ class _Exl3Model:
 
     def prepare_tensors(self):
         super().prepare_tensors()  # ty: ignore[unresolved-attribute]
+        self._exl3.emit_ngram(self)
         self._exl3.finish()
 
     def prepare_metadata(self, vocab_only: bool):
@@ -800,7 +912,7 @@ class _Exl3Model:
         self._exl3.add_metadata(self, self._exl3_rope_neox)
 
 
-def adapt(model_class: type, ngram: str = "refuse") -> type:
+def adapt(model_class: type, ngram: str = "table") -> type:
     """The model class with EXL3 weights; RoPE Q/K permutation off (NEOX key instead). The MTP layers follow the class
     (default, --no-mtp, --mtp); when they cannot be stored as EXL3, construction raises Exl3MtpUnsupported."""
     attrs: dict[str, Any] = dict(model_arch=model_class.model_arch, _exl3_ngram=ngram, _exl3_mtp_names=set())
