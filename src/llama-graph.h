@@ -4,6 +4,7 @@
 #include "llama-batch.h"
 #include "llama-hparams.h"
 #include "llama-adapter.h"
+#include "llama-weight-aux.h"
 
 #include <cstdint>
 #include <cstdlib>
@@ -792,6 +793,8 @@ struct llm_graph_params {
 
     const llama_prec_policy * prec_policy = nullptr;
 
+    const llama_weight_aux_map * waux = nullptr;
+
     std::map<llama_seq_id, llama_sampler *> samplers;
 
     static bool samplers_equal(
@@ -1034,6 +1037,8 @@ struct llm_graph_context {
 
     const llama_prec_policy * prec_policy;
 
+    const llama_weight_aux_map * waux;
+
     std::map<llama_seq_id, llama_sampler *> samplers;
 
     const llm_graph_cb & cb_func;
@@ -1055,6 +1060,11 @@ struct llm_graph_context {
     ggml_tensor * build_cvec(
              ggml_tensor * cur,
                      int   il) const;
+
+    // do mat_mul of a model weight, also for weights that need aux tensors (EXL3)
+    ggml_tensor * build_mm(
+              ggml_tensor * w,
+              ggml_tensor * cur) const;
 
     // do mat_mul, while optionally apply lora and per-tensor scale
     ggml_tensor * build_lora_mm(
