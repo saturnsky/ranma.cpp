@@ -1527,6 +1527,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     cross            (params.cross),
     moe_cache        (params.moe_cache),
     prec_policy      (params.prec_policy),
+    waux             (params.waux),
     samplers         (params.samplers),
     cb_func          (params.cb),
     res              (params.res),
@@ -1549,11 +1550,25 @@ ggml_tensor * llm_graph_context::build_cvec(
     return cvec->apply_to(ctx0, cur, il);
 }
 
+ggml_tensor * llm_graph_context::build_mm(
+          ggml_tensor * w,
+          ggml_tensor * cur) const {
+    // a draft that shares the target's tensors (DFlash/DSpark/EAGLE3 head via ctx_other) multiplies an EXL3
+    // weight whose rot_in / rot_out live in the target's aux map
+    const llama_weight_aux_map * map = waux;
+    if (ggml_is_exl3(w->type) && cparams.ctx_other != nullptr &&
+            (map == nullptr || map->find(w->view_src ? w->view_src : w) == map->end())) {
+        map = &llama_get_model(cparams.ctx_other)->waux;
+    }
+    ggml_tensor * res = llama_weight_aux_mul_mat(ctx0, map, w, cur, nullptr);
+    return res ? res : ggml_mul_mat(ctx0, w, cur);
+}
+
 ggml_tensor * llm_graph_context::build_lora_mm(
           ggml_tensor * w,
           ggml_tensor * cur,
           ggml_tensor * w_s) const {
-    ggml_tensor * res = ggml_mul_mat(ctx0, w, cur);
+    ggml_tensor * res = build_mm(w, cur);
 
     if (prec_policy) {
         prec_policy->apply(res);
@@ -1611,10 +1626,16 @@ ggml_tensor * llm_graph_context::build_lora_mm_id(
           ggml_tensor * ids,
           ggml_tensor * w_s,
           ggml_tensor * slots) const {
-    // the experts in the MoE cache are selected by their slots
-    ggml_tensor * res = slots == nullptr ?
-        ggml_mul_mat_id(ctx0, w, cur, ids) :
-        ggml_mul_mat_id(ctx0, moe_cache->get_experts(w), cur, slots);
+    ggml_tensor * res = nullptr;
+    if (slots == nullptr) {
+        res = llama_weight_aux_mul_mat(ctx0, waux, w, cur, ids);
+        if (res == nullptr) {
+            res = ggml_mul_mat_id(ctx0, w, cur, ids);
+        }
+    } else {
+        // the experts in the MoE cache are selected by their slots
+        res = ggml_mul_mat_id(ctx0, moe_cache->get_experts(w), cur, slots);
+    }
 
     if (prec_policy) {
         prec_policy->apply(res);
@@ -2456,7 +2477,8 @@ ggml_tensor * llm_graph_context::build_moe_cache_slots(
         return nullptr;
     }
     for (ggml_tensor * w : { up_exps, gate_exps, down_exps, gate_up_exps }) {
-        if (w != nullptr && moe_cache->get_experts(w) == nullptr) {
+        // EXL3 experts need their rotations (MUL_MAT_HAD), which the cached banks do not carry
+        if (w != nullptr && (moe_cache->get_experts(w) == nullptr || (waux != nullptr && waux->count(w) > 0))) {
             return nullptr;
         }
     }
