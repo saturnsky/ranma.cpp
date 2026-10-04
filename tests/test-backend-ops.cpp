@@ -4724,6 +4724,81 @@ struct test_dsv4_add_hc_post : public test_dsv4_hc {
     }
 };
 
+// low-rank gated residual of Qwen3.8 hyper-connections (src/models/qwen4exp.cpp), fused on CUDA/HIP:
+// pre:  MUL_MAT -> SCALE -> SILU -> MUL_MAT -> RESHAPE -> DSV4_HC_PRE
+struct test_hc_gated : public test_dsv4_hc {
+    const ggml_type type;
+    const int64_t   n_embd;
+    const int64_t   rank;
+    const int64_t   n_tokens;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "HC_GATED_PRE";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR4(type, n_embd, rank, n_tokens);
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    double max_nmse_err() override {
+        return 5e-6;
+    }
+
+    test_hc_gated(ggml_type type, int64_t n_embd, int64_t rank, int64_t n_tokens)
+        : type(type), n_embd(n_embd), rank(rank), n_tokens(n_tokens) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * xn = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd*hc, n_tokens);
+        ggml_set_name(xn, "x");
+
+        ggml_tensor * down = ggml_new_tensor_2d(ctx, type, n_embd*hc, rank);
+        ggml_set_name(down, "w_down");
+        ggml_tensor * up = ggml_new_tensor_2d(ctx, type, rank, n_embd*hc);
+        ggml_set_name(up, "w_up");
+
+        ggml_tensor * lo = ggml_silu(ctx, ggml_scale(ctx, ggml_mul_mat(ctx, down, xn), 1.0f/hc));
+        ggml_tensor * gate = ggml_mul_mat(ctx, up, lo);
+        out = ggml_dsv4_hc_pre_gated(ctx, ggml_reshape_3d(ctx, xn, n_embd, hc, n_tokens),
+                ggml_reshape_3d(ctx, gate, n_embd, hc, n_tokens), 1.0f/hc);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            const std::string name = ggml_get_name(t);
+            float lo;
+            float hi;
+            if (name == "w_down") {
+                lo = -0.05f; hi = 0.05f;
+            } else if (name == "w_up") {
+                lo = -0.2f; hi = 0.2f;
+            } else if (!tensor_range(name, lo, hi)) {
+                init_tensor_uniform(t);
+                continue;
+            }
+
+            std::mt19937 rng(tensor_seed(t));
+            std::uniform_real_distribution<float> dist(lo, hi);
+            std::vector<float> data(ggml_nelements(t));
+            for (float & v : data) {
+                v = dist(rng);
+            }
+            if (t->type == GGML_TYPE_F16) {
+                std::vector<ggml_fp16_t> h(data.size());
+                ggml_fp32_to_fp16_row(data.data(), h.data(), (int64_t) data.size());
+                ggml_backend_tensor_set(t, h.data(), 0, h.size()*sizeof(ggml_fp16_t));
+            } else {
+                GGML_ASSERT(t->type == GGML_TYPE_F32);
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(float));
+            }
+        }
+    }
+};
+
 // GGML_OP_CONCAT (kv) + GGML_OP_CONCAT (score) + GGML_OP_DSV4_COMPRESS: the compressor state rows
 // followed by the rows of the current tokens, as the DeepSeek V4 compressors build their sources
 struct test_dsv4_concat_compress : public test_case {
@@ -10481,6 +10556,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_add_hc_post(4096, 5));
     test_cases.emplace_back(new test_dsv4_add_hc_post(4096, 1, true));
     test_cases.emplace_back(new test_dsv4_add_hc_post(31, 17));
+
+    // Qwen3.8 hyper-connections: n_embd 2560, rank 320, decode batches (fused for up to 8 tokens)
+    for (int64_t n_tokens : { 1, 3, 8, 9 }) {
+        test_cases.emplace_back(new test_hc_gated(GGML_TYPE_F16, 2560, 320, n_tokens));
+    }
+    test_cases.emplace_back(new test_hc_gated(GGML_TYPE_F16, 72, 24, 2));
 
     // CSA / LID compressors (ratio 4, overlapping windows), HCA (ratio 128)
     test_cases.emplace_back(new test_dsv4_concat_compress(512,   4,   8,  1, 1, true,  false));
