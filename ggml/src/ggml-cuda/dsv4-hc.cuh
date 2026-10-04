@@ -19,5 +19,10 @@ void ggml_cuda_op_dsv4_row_copy(ggml_backend_cuda_context & ctx,
 
 bool ggml_cuda_hc_gated_pre_supported(const ggml_tensor * mm_down, const ggml_tensor * scale, const ggml_tensor * act,
         const ggml_tensor * mm_up, const ggml_tensor * gate, const ggml_tensor * pre);
+bool ggml_cuda_hc_gated_post_supported(const ggml_tensor * mm_inject, const ggml_tensor * scale0, const ggml_tensor * act,
+        const ggml_tensor * scale1, const ggml_tensor * post);
 void ggml_cuda_op_hc_gated_pre(ggml_backend_cuda_context & ctx, const ggml_tensor * mm_down, const ggml_tensor * scale,
         const ggml_tensor * mm_up, ggml_tensor * pre);
+// split: two launches, for a dst that overlaps the activation of the MUL_MAT
+void ggml_cuda_op_hc_gated_post(ggml_backend_cuda_context & ctx, const ggml_tensor * mm_inject, const ggml_tensor * scale0,
+        const ggml_tensor * scale1, ggml_tensor * post, bool split);

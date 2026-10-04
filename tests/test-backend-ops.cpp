@@ -4831,7 +4831,9 @@ struct test_dsv4_add_hc_post : public test_dsv4_hc {
 
 // low-rank gated residual of Qwen3.8 hyper-connections (src/models/qwen4exp.cpp), fused on CUDA/HIP:
 // pre:  MUL_MAT -> SCALE -> SILU -> MUL_MAT -> RESHAPE -> DSV4_HC_PRE
+// post: MUL_MAT -> SCALE -> SIGMOID -> SCALE -> DSV4_HC_POST
 struct test_hc_gated : public test_dsv4_hc {
+    const bool      post;
     const ggml_type type;
     const int64_t   n_embd;
     const int64_t   rank;
@@ -4839,7 +4841,7 @@ struct test_hc_gated : public test_dsv4_hc {
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
-        return "HC_GATED_PRE";
+        return post ? "HC_GATED_POST" : "HC_GATED_PRE";
     }
 
     std::string vars() override {
@@ -4852,22 +4854,35 @@ struct test_hc_gated : public test_dsv4_hc {
         return 5e-6;
     }
 
-    test_hc_gated(ggml_type type, int64_t n_embd, int64_t rank, int64_t n_tokens)
-        : type(type), n_embd(n_embd), rank(rank), n_tokens(n_tokens) {}
+    test_hc_gated(bool post, ggml_type type, int64_t n_embd, int64_t rank, int64_t n_tokens)
+        : post(post), type(type), n_embd(n_embd), rank(rank), n_tokens(n_tokens) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * xn = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd*hc, n_tokens);
         ggml_set_name(xn, "x");
 
-        ggml_tensor * down = ggml_new_tensor_2d(ctx, type, n_embd*hc, rank);
-        ggml_set_name(down, "w_down");
-        ggml_tensor * up = ggml_new_tensor_2d(ctx, type, rank, n_embd*hc);
-        ggml_set_name(up, "w_up");
+        if (!post) {
+            ggml_tensor * down = ggml_new_tensor_2d(ctx, type, n_embd*hc, rank);
+            ggml_set_name(down, "w_down");
+            ggml_tensor * up = ggml_new_tensor_2d(ctx, type, rank, n_embd*hc);
+            ggml_set_name(up, "w_up");
 
-        ggml_tensor * lo = ggml_silu(ctx, ggml_scale(ctx, ggml_mul_mat(ctx, down, xn), 1.0f/hc));
-        ggml_tensor * gate = ggml_mul_mat(ctx, up, lo);
-        out = ggml_dsv4_hc_pre_gated(ctx, ggml_reshape_3d(ctx, xn, n_embd, hc, n_tokens),
-                ggml_reshape_3d(ctx, gate, n_embd, hc, n_tokens), 1.0f/hc);
+            ggml_tensor * lo = ggml_silu(ctx, ggml_scale(ctx, ggml_mul_mat(ctx, down, xn), 1.0f/hc));
+            ggml_tensor * gate = ggml_mul_mat(ctx, up, lo);
+            out = ggml_dsv4_hc_pre_gated(ctx, ggml_reshape_3d(ctx, xn, n_embd, hc, n_tokens),
+                    ggml_reshape_3d(ctx, gate, n_embd, hc, n_tokens), 1.0f/hc);
+        } else {
+            ggml_tensor * inject = ggml_new_tensor_2d(ctx, type, n_embd*hc, hc);
+            ggml_set_name(inject, "w_inject");
+            ggml_tensor * y = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+            ggml_set_name(y, "residual");
+            ggml_tensor * residual = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, n_tokens);
+            ggml_set_name(residual, "residual");
+
+            ggml_tensor * w = ggml_sigmoid(ctx, ggml_scale(ctx, ggml_mul_mat(ctx, inject, xn), 1.0f/hc));
+            w = ggml_scale(ctx, w, 2.0f);
+            out = ggml_dsv4_hc_post(ctx, y, residual, w, nullptr);
+        }
         ggml_set_name(out, "out");
         return out;
     }
@@ -4877,7 +4892,7 @@ struct test_hc_gated : public test_dsv4_hc {
             const std::string name = ggml_get_name(t);
             float lo;
             float hi;
-            if (name == "w_down") {
+            if (name == "w_down" || name == "w_inject") {
                 lo = -0.05f; hi = 0.05f;
             } else if (name == "w_up") {
                 lo = -0.2f; hi = 0.2f;
@@ -10789,9 +10804,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     // Qwen3.8 hyper-connections: n_embd 2560, rank 320, decode batches (fused for up to 8 tokens)
     for (int64_t n_tokens : { 1, 3, 8, 9 }) {
-        test_cases.emplace_back(new test_hc_gated(GGML_TYPE_F16, 2560, 320, n_tokens));
+        test_cases.emplace_back(new test_hc_gated(false, GGML_TYPE_F16, 2560, 320, n_tokens));
+        test_cases.emplace_back(new test_hc_gated(true,  GGML_TYPE_F16, 2560, 320, n_tokens));
+        test_cases.emplace_back(new test_hc_gated(true,  GGML_TYPE_F32, 2560, 320, n_tokens));
     }
-    test_cases.emplace_back(new test_hc_gated(GGML_TYPE_F16, 72, 24, 2));
+    test_cases.emplace_back(new test_hc_gated(false, GGML_TYPE_F16, 72, 24, 2));
+    test_cases.emplace_back(new test_hc_gated(true,  GGML_TYPE_F16, 72, 24, 2));
 
     // CSA / LID compressors (ratio 4, overlapping windows), HCA (ratio 128)
     test_cases.emplace_back(new test_dsv4_concat_compress(512,   4,   8,  1, 1, true,  false));
