@@ -15,8 +15,9 @@
 // - GGML_PREC_F32: no GEMM; every row runs the GEMV with F32 input (after the routing pass in items of 8 rows), so
 //   the product keeps the fp32 grade.
 // - not set: MMH_PREC_DEFAULT; GGML_CUDA_MUL_MAT_HAD_PREC = f32 | f16 sets it for the process (to test the F32 path).
-// The GEMV keeps its F32 input in both modes (fp16 inputs did not make it faster), and the CPU backend always
-// computes the fp32 grade.
+// The GEMV with EXL3 weights takes fp16 inputs in the F16 mode (v_dot2; for mul1 the codebook's affine map is applied
+// once to the sums), except a dense op of one row; otherwise F32 inputs.
+// The CPU backend always computes the fp32 grade.
 
 #include "mul-mat-had.cuh"
 #include "mapped-host.cuh"
@@ -174,6 +175,21 @@ static __device__ __forceinline__ float mmh_fma2(const uint32_t w, const float x
     return fmaf(f.y, x1, fmaf(f.x, x0, c));
 }
 
+// c + w.x*x.x + w.y*x.y for half2 w and x, fp32 sum (v_dot2_f32_f16)
+static __device__ __forceinline__ float mmh_dot2(const uint32_t w, const uint32_t x, const float c) {
+#if defined(V_DOT2_F32_F16_AVAILABLE)
+    typedef _Float16 h2_t __attribute__((ext_vector_type(2)));
+    h2_t a;
+    h2_t b;
+    memcpy(&a, &w, sizeof(a));
+    memcpy(&b, &x, sizeof(b));
+    return __builtin_amdgcn_fdot2(a, b, c, false);
+#else
+    const float2 f = __half22float2(mmh_as_half2(x));
+    return mmh_fma2(w, f.x, f.y, c);
+#endif // defined(V_DOT2_F32_F16_AVAILABLE)
+}
+
 // in-place normalized Hadamard of 128 values, value c = 32*j + lane; blocks of `had` (32, 64 or 128)
 static __device__ __forceinline__ void mmh_fwht(float v[4], const int lane, const int had, const float scale) {
 #pragma unroll
@@ -206,6 +222,64 @@ static __device__ __forceinline__ void mmh_fwht(float v[4], const int lane, cons
     }
 }
 
+#if defined(GGML_USE_HIP) && (defined(RDNA2) || defined(RDNA3) || defined(RDNA4))
+#define MMH_DPP_SUMS
+#endif // defined(GGML_USE_HIP) && (defined(RDNA2) || defined(RDNA3) || defined(RDNA4))
+
+#if defined(MMH_DPP_SUMS)
+// v + v of lane ^ m inside each row of 16 lanes (DPP quad_perm for m = 1, 2, row_xmask for 4, 8)
+template <int m>
+static __device__ __forceinline__ float mmh_add_xor(const float v) {
+    constexpr int ctrl = m == 1 ? 0xB1 : m == 2 ? 0x4E : 0x160 + m;
+    return v + __int_as_float(__builtin_amdgcn_update_dpp(0, __float_as_int(v), ctrl, 0xF, 0xF, false));
+}
+#endif // defined(MMH_DPP_SUMS)
+
+// the sum over the 16 lanes of each half of the wave (xor butterfly, the same value in every lane)
+static __device__ __forceinline__ float mmh_sum16(float v) {
+#if defined(MMH_DPP_SUMS)
+    v = mmh_add_xor<1>(v);
+    v = mmh_add_xor<2>(v);
+    v = mmh_add_xor<4>(v);
+    return mmh_add_xor<8>(v);
+#else
+#pragma unroll
+    for (int m = 1; m < 16; m *= 2) {
+        v += __shfl_xor_sync(0xFFFFFFFF, v, m, 32);
+    }
+    return v;
+#endif // defined(MMH_DPP_SUMS)
+}
+
+// the sum over the 32 lanes of the wave, the same value in every lane
+static __device__ __forceinline__ float mmh_sum32(float v) {
+    v = mmh_sum16(v);
+#if defined(MMH_DPP_SUMS)
+    return v + __int_as_float(__builtin_amdgcn_permlanex16(0, __float_as_int(v), 0x76543210u, 0xFEDCBA98u, false, false));
+#else
+    return v + __shfl_xor_sync(0xFFFFFFFF, v, 16, 32);
+#endif // defined(MMH_DPP_SUMS)
+}
+
+// fp16 GEMV input: one 128-value block v (value c = 32*j + lane) rounded to fp16 (saturated to the finite range, NaN
+// kept) into the frag layout of halves at xd, and with sums the F32 sums of the rounded values of its 8 slices of 16
+// (k = 16*i .. 16*i + 15) at xs[i]
+template <bool sums>
+static __device__ __forceinline__ void mmh_store_h16(const float v[4], const int lane, half * xd, float * xs) {
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const int c = 32*j + lane;
+        const half h = __float2half_rn(fabsf(v[j]) > 65504.0f ? copysignf(65504.0f, v[j]) : v[j]);
+        xd[16*(c/16) + 4*((c % 8)/2) + 2*((c % 16)/8) + c % 2] = h;
+        if constexpr (sums) {
+            const float s = mmh_sum16(__half2float(h));
+            if (lane % 16 == 0) {
+                xs[2*j + lane/16] = s;
+            }
+        }
+    }
+}
+
 // max over the threads of the block, any block size up to 1024
 static __device__ __forceinline__ float mmh_block_max(float v, float * s_red) {
 #pragma unroll
@@ -225,14 +299,17 @@ static __device__ __forceinline__ float mmh_block_max(float v, float * s_red) {
 }
 
 // layouts of H(rot_in * x):
-// - frag (GEMV): F32, per row and 16 values of k, for g = 0..3: k = 2g, 2g + 1, 2g + 8, 2g + 9
+// - frag (GEMV): F32, per row and 16 values of k, for g = 0..3: k = 2g, 2g + 1, 2g + 8, 2g + 9; with f16 the same
+//   order in fp16 (mmh_store_h16, not scaled), and with xsum also the F32 sums of the rounded values of each row over
+//   the n_ranges k ranges of kper 16-value slices of the GEMV waves (xsum[n_ranges*row + range], from the slice sums in
+//   dynamic LDS)
 // - plain (GEMM, f16): fp16 values of the row scaled by a power of 2, K values per row; rscale holds the inverse scale
 // The prologue also clears the k-split tickets of the GEMV that follows it (zero, n_zero).
 template <bool frag, bool f16>
 static __global__ void __launch_bounds__(256) mmh_prologue(const mmh_params p, half * __restrict__ xh, float * __restrict__ rscale,
-        int * __restrict__ zero, const int n_zero) {
-    static_assert(frag != f16, "the GEMV input is F32, the GEMM input fp16");
+        int * __restrict__ zero, const int n_zero, float * __restrict__ xsum, const int n_ranges, const int kper) {
     __shared__ float s_red[8];
+    extern __shared__ float s_slice[]; // frag f16 with xsum: the sum of each 16 values of k
 
     const int r    = blockIdx.x;
     const int lane = threadIdx.x % 32;
@@ -274,6 +351,14 @@ static __global__ void __launch_bounds__(256) mmh_prologue(const mmh_params p, h
             v[j] = src[c]*mmh_rot(rin, p.rin_f16, c)*s;
         }
         mmh_fwht(v, lane, p.had, p.hscale);
+        if constexpr (frag && f16) {
+            if (xsum) {
+                mmh_store_h16<true>(v, lane, xh + p.k*r + c0, s_slice + c0/16);
+            } else {
+                mmh_store_h16<false>(v, lane, xh + p.k*r + c0, nullptr);
+            }
+            continue;
+        }
 #pragma unroll
         for (int j = 0; j < 4; ++j) {
             const int64_t c  = c0 + 32*j + lane;
@@ -281,6 +366,23 @@ static __global__ void __launch_bounds__(256) mmh_prologue(const mmh_params p, h
                 ((float *) xh)[p.k*r + 16*(c/16) + 4*((c % 8)/2) + 2*((c % 16)/8) + c % 2] = v[j];
             } else {
                 xh[p.k*r + c] = __float2half_rn(v[j]);
+            }
+        }
+    }
+
+    if constexpr (frag && f16) {
+        if (xsum) {
+            __syncthreads();
+            const int kslices = p.k/16;
+            for (int t = wave; t < n_ranges; t += blockDim.x/32) {
+                float sum = 0.0f;
+                for (int i = t*kper + lane; i < min(kslices, (t + 1)*kper); i += 32) {
+                    sum += s_slice[i];
+                }
+                sum = mmh_sum32(sum);
+                if (lane == 0) {
+                    xsum[(int64_t) n_ranges*r + t] = sum;
+                }
             }
         }
     }
@@ -426,16 +528,24 @@ static __device__ __forceinline__ uint32_t mmh_trellis_hash(const uint32_t s) {
 #endif // defined(GGML_USE_HIP)
 }
 
-// two mul1 codebook values as half2: fp16(byte_sum(state*0x83DCD12D) + 1024)*k_inv + k_bias, one fp16 rounding
-static __device__ __forceinline__ uint32_t mmh_mul1_pair(const uint32_t s0, const uint32_t s1) {
+// mul1 codebook: value = fp16(u*k_inv + k_bias) of u = byte_sum(state*0x83DCD12D) + 1024, an integer in [1024, 2044]
+#define MMH_MUL1_KINV 0.00676727294921875f // fp16 0x1EEE
+#define MMH_MUL1_BIAS (-10.3828125f)       // fp16 0xC931
+
+// two values u of the mul1 codebook as half2 (exact: 1024 + byte sum, the fp16 bit pattern 0x6400 + byte sum)
+static __device__ __forceinline__ uint32_t mmh_mul1_u_pair(const uint32_t s0, const uint32_t s1) {
     const uint32_t p0 = mmh_trellis_hash<0x83DCD12Du, 0>(s0);
     const uint32_t p1 = mmh_trellis_hash<0x83DCD12Du, 0>(s1);
 #if defined(GGML_USE_HIP)
-    const uint32_t h = __builtin_amdgcn_sad_hi_u8(p1, 0u, __builtin_amdgcn_sad_u8(p0, 0u, 0x64006400u));
+    return __builtin_amdgcn_sad_hi_u8(p1, 0u, __builtin_amdgcn_sad_u8(p0, 0u, 0x64006400u));
 #else
-    const uint32_t h = __dp4a(p0, 0x01010101u, 0x6400u) | (__dp4a(p1, 0x01010101u, 0x6400u) << 16);
+    return __dp4a(p0, 0x01010101u, 0x6400u) | (__dp4a(p1, 0x01010101u, 0x6400u) << 16);
 #endif
-    return mmh_as_u32(__hfma2(mmh_as_half2(h), mmh_as_half2(0x1EEE1EEEu), mmh_as_half2(0xC931C931u)));
+}
+
+// two mul1 codebook values as half2: fp16(u*k_inv + k_bias), one fp16 rounding
+static __device__ __forceinline__ uint32_t mmh_mul1_pair(const uint32_t s0, const uint32_t s1) {
+    return mmh_as_u32(__hfma2(mmh_as_half2(mmh_mul1_u_pair(s0, s1)), mmh_as_half2(0x1EEE1EEEu), mmh_as_half2(0xC931C931u)));
 }
 
 // two mcg or 3inst codebook values as half2: each hash keeps its sign and low bits as two fp16 halves of exponent
@@ -590,6 +700,8 @@ struct mmh_weight {
         }
     }
 
+    // u: mul1 gives the values u of the codebook (the affine map is applied by the caller), other types their values
+    template <bool u = false>
     __device__ __forceinline__ void decode(const raw & r, uint32_t out[4], uint32_t lo[4]) const {
         if constexpr (is_exl3) {
             uint32_t w0, w1, w2;
@@ -617,7 +729,7 @@ struct mmh_weight {
 #pragma unroll
             for (int i = 0; i < 4; ++i) {
                 if constexpr (codebook == 0) {
-                    out[i] = mmh_mul1_pair(st[2*i], st[2*i + 1]);
+                    out[i] = u ? mmh_mul1_u_pair(st[2*i], st[2*i + 1]) : mmh_mul1_pair(st[2*i], st[2*i + 1]);
                 } else if constexpr (codebook == 1) {
                     // mcg: x*0xCBAC1FED
                     out[i] = mmh_half_sum_pair(mmh_trellis_hash<0xCBAC1FEDu, 0>(st[2*i]), mmh_trellis_hash<0xCBAC1FEDu, 0>(st[2*i + 1]));
@@ -645,13 +757,18 @@ struct mmh_weight {
 };
 
 // one pass of the GEMV over the k range [kb, ke) of a wave for the rows rowp[0 .. nc - 1] (nc <= rows): stages the input
-// (fused), decodes each tile once for all rows and leaves the row sums of the wave's 16 columns in s_part[ksp]
-template <ggml_type type, int rows, bool fused, bool coal, int srows>
+// (fused), decodes each tile once for all rows and leaves the row sums of the wave's 16 columns in s_part[ksp].
+// h16: fp16 input (8 bytes per lane and 16 k) and v_dot2 products; mul1 then multiplies the codebook values u and
+// applies the affine map once to the sums: k_inv*sum(u*x) + k_bias*sum(x), sum(x) over [kb, ke) from the staged slice
+// sums (fused) or the range sums of the prologue (xsum: this wave's range of row 0, rows n_ranges apart).
+template <ggml_type type, int rows, bool fused, bool coal, int srows, bool h16>
 static __device__ __forceinline__ void mmh_gemv_pass(const mmh_params & p, const mmh_weight<type, coal> & wl,
-        const float4 * __restrict__ xh, float4 * s_xf, float (*s_part)[srows][MMH_NG], const int * rowp, const int nc,
-        const int e, const int kb, const int ke, const int kslices, const int koff, const int nks, const int lane,
-        const int wave, const int nt, const int ksp) {
+        const void * __restrict__ xh, const float * __restrict__ xsum, const int n_ranges, float4 * s_xf,
+        float (*s_part)[srows][MMH_NG], const int * rowp, const int nc, const int e, const int kb, const int ke,
+        const int kslices, const int koff, const int nks, const int lane, const int wave, const int nt, const int ksp) {
     typedef mmh_weight<type, coal> wtype;
+    typedef typename std::conditional<h16, uint2, float4>::type xtype;
+    constexpr bool defer = h16 && wtype::codebook == 0;
     constexpr int pf = rows <= 2 ? 4 : 2;
     // the first weight loads go out before the input (the fused staging does not wait for them). Tile indices past
     // the range are clamped to its last tile, so that the k loop below loads without conditions (its ring of pf
@@ -664,11 +781,13 @@ static __device__ __forceinline__ void mmh_gemv_pass(const mmh_params & p, const
         }
     }
 
-    // input row bases are wave-uniform, the lane adds its 16-byte group of each 16 k
-    const float4 * xr[rows];
+    // input row bases are wave-uniform, the lane adds its 16-byte (h16: 8-byte) group of each 16 k
+    const xtype * xr[rows];
+    float sx[rows]; // defer, prologue: the range sum of row i
     if constexpr (fused) {
-        // as mmh_prologue<true, false>: one 128-value block of one row per wave and pass; the waves of the block
-        // read the previous rows only before the barrier after their k loop
+        // as mmh_prologue<true, h16>: one 128-value block of one row per wave and pass; the waves of the block
+        // read the previous rows only before the barrier after their k loop. The slice sums follow the rows.
+        float * s_xs = (float *) ((char *) s_xf + (size_t) srows*nks*4*sizeof(xtype));
         const char * rin = mmh_rot_row(p, p.rot_in, p.rin_cache, p.rin_nb1, e);
         const int nch = nks/8;
         for (int t = wave; t < nc*nch; t += blockDim.x/32) {
@@ -683,22 +802,30 @@ static __device__ __forceinline__ void mmh_gemv_pass(const mmh_params & p, const
                 v[j] = src[c]*mmh_rot(rc, p.rin_f16, c);
             }
             mmh_fwht(v, lane, p.had, p.hscale);
-            float * xd = (float *) s_xf + (16*nks*i + 128*ch);
+            if constexpr (h16) {
+                mmh_store_h16<defer>(v, lane, (half *) s_xf + (16*nks*i + 128*ch), s_xs + (nks*i + 8*ch));
+            } else {
+                float * xd = (float *) s_xf + (16*nks*i + 128*ch);
 #pragma unroll
-            for (int j = 0; j < 4; ++j) {
-                const int c = 32*j + lane;
-                xd[16*(c/16) + 4*((c % 8)/2) + 2*((c % 16)/8) + c % 2] = v[j];
+                for (int j = 0; j < 4; ++j) {
+                    const int c = 32*j + lane;
+                    xd[16*(c/16) + 4*((c % 8)/2) + 2*((c % 16)/8) + c % 2] = v[j];
+                }
             }
         }
         __syncthreads();
 #pragma unroll
         for (int i = 0; i < rows; ++i) {
-            xr[i] = s_xf + 4*nks*(i < nc ? i : 0) + lane % 4;
+            xr[i] = (const xtype *) s_xf + 4*nks*(i < nc ? i : 0) + lane % 4;
         }
     } else {
 #pragma unroll
         for (int i = 0; i < rows; ++i) {
-            xr[i] = xh + (int64_t) mmh_uniform(rowp[i < nc ? i : 0])*(4*kslices) + lane % 4;
+            const int64_t r = mmh_uniform(rowp[i < nc ? i : 0]);
+            xr[i] = (const xtype *) xh + r*(4*kslices) + lane % 4;
+            if constexpr (defer) {
+                sx[i] = xsum[r*n_ranges];
+            }
         }
     }
 
@@ -712,7 +839,7 @@ static __device__ __forceinline__ void mmh_gemv_pass(const mmh_params & p, const
     // the input of the next xpf steps (slot d % xpf holds step kt + d): staged in LDS (fused) for several rows only one
     // step ahead, from global memory (prologue) two steps ahead; fewer registers than the ring of pf weight loads
     constexpr int xpf = fused ? (rows > 1 ? 1 : pf) : 2;
-    float4 xv[xpf][rows];
+    xtype xv[xpf][rows];
     if (kb < ke) {
 #pragma unroll
         for (int d = 0; d < xpf; ++d) {
@@ -726,17 +853,22 @@ static __device__ __forceinline__ void mmh_gemv_pass(const mmh_params & p, const
     }
 
     // one k step: decode the tile and add its products to the rows
-    auto step = [&](const typename wtype::raw & cw, const float4 (&cx)[rows]) {
+    auto step = [&](const typename wtype::raw & cw, const xtype (&cx)[rows]) {
         uint32_t wf[4];
         uint32_t wlo[4];
-        wl.decode(cw, wf, wlo);
+        wl.template decode<defer>(cw, wf, wlo);
 #pragma unroll
         for (int i = 0; i < rows; ++i) {
             if (rows == 1 || i < nc) {
-                const float4 x = cx[i];
+                const xtype x = cx[i];
                 float a0 = acc[i][0];
                 float a1 = acc[i][1];
-                if constexpr (type == GGML_TYPE_F32) {
+                if constexpr (h16) {
+                    a0 = mmh_dot2(wf[0], x.x, a0);
+                    a0 = mmh_dot2(wf[1], x.y, a0);
+                    a1 = mmh_dot2(wf[2], x.x, a1);
+                    a1 = mmh_dot2(wf[3], x.y, a1);
+                } else if constexpr (type == GGML_TYPE_F32) {
                     a0 = fmaf(__uint_as_float(wf[0]),  x.x, a0);
                     a0 = fmaf(__uint_as_float(wlo[0]), x.y, a0);
                     a0 = fmaf(__uint_as_float(wf[1]),  x.z, a0);
@@ -763,7 +895,7 @@ static __device__ __forceinline__ void mmh_gemv_pass(const mmh_params & p, const
 #pragma unroll
         for (int d = 0; d < pf; ++d) {
             const typename wtype::raw cw = wr[d];
-            float4 cx[rows];
+            xtype cx[rows];
 #pragma unroll
             for (int i = 0; i < rows; ++i) {
                 cx[i] = xv[d % xpf][i];
@@ -784,7 +916,7 @@ static __device__ __forceinline__ void mmh_gemv_pass(const mmh_params & p, const
 #pragma unroll
     for (int d = 0; d < pf - 1; ++d) {
         if (kt + d < ke) {
-            float4 cx[rows];
+            xtype cx[rows];
 #pragma unroll
             for (int i = 0; i < rows; ++i) {
                 if (rows == 1 || i < nc) {
@@ -802,6 +934,22 @@ static __device__ __forceinline__ void mmh_gemv_pass(const mmh_params & p, const
             acc[i][c] += __shfl_xor_sync(0xFFFFFFFF, acc[i][c], 1, 32);
             acc[i][c] += __shfl_xor_sync(0xFFFFFFFF, acc[i][c], 2, 32);
         }
+        if constexpr (defer) {
+            if (rows == 1 || i < nc) {
+                if constexpr (fused) {
+                    // the staged slice sums of row i (after the staged rows)
+                    const float * xs = (const float *) ((const char *) s_xf + (size_t) srows*nks*4*sizeof(xtype)) + nks*i - koff;
+                    float sum = 0.0f;
+                    for (int t = kb + lane; t < ke; t += 32) {
+                        sum += xs[t];
+                    }
+                    sx[i] = mmh_sum32(sum);
+                }
+                const float b = MMH_MUL1_BIAS*sx[i];
+                acc[i][0] = fmaf(MMH_MUL1_KINV, acc[i][0], b);
+                acc[i][1] = fmaf(MMH_MUL1_KINV, acc[i][1], b);
+            }
+        }
         if (i < nc && lane % 4 == 0) {
             s_part[ksp][i][16*nt + lane/4]     = acc[i][0];
             s_part[ksp][i][16*nt + lane/4 + 8] = acc[i][1];
@@ -817,13 +965,14 @@ static __device__ __forceinline__ void mmh_gemv_pass(const mmh_params & p, const
 // it also resets its ticket, so that tickets that start at zero stay zero between ops.
 // fused: no prologue, the block writes H(rot_in * x) of its rows for the 128-value blocks of its k range to LDS (the
 // same values as the prologue, row scale 1), and its tickets must be zero when it starts. coal: see mmh_weight.
-template <ggml_type type, int rows, bool fused, bool coal>
+// h16: fp16 input, see mmh_gemv_pass (xsum: the range sums of the prologue, mul1).
+template <ggml_type type, int rows, bool fused, bool coal, bool h16 = false>
 static __global__ void __launch_bounds__(1024) mmh_gemv(const mmh_params p, const char * __restrict__ w,
-        const float4 * __restrict__ xh, const float * __restrict__ rscale, const int * __restrict__ items,
+        const void * __restrict__ xh, const float * __restrict__ xsum, const float * __restrict__ rscale, const int * __restrict__ items,
         const int * __restrict__ n_items, const int * __restrict__ rows_sorted, const int ksplit,
         float * __restrict__ part, int * __restrict__ tickets, const int max_chunks) {
     typedef mmh_weight<type, coal> wtype;
-    extern __shared__ float4 s_xf[]; // fused: rows x staged k slices x 4 float4
+    extern __shared__ float4 s_xf[]; // fused: rows x staged k slices x 4 float4 (h16: 4 uint2, then the slice sums)
 
     __shared__ int   s_rows[MMH_GEMV_LIST];
     __shared__ int   s_eid[MMH_GEMV_LIST];
@@ -913,6 +1062,13 @@ static __global__ void __launch_bounds__(1024) mmh_gemv(const mmh_params p, cons
     const int nks    = fused ? (min(kslices, kb_blk + ksplit*per) + 7)/8*8 - koff : 0;
 
     const wtype wl(mmh_weight_matrix(p, w, e) + (int64_t) g*MMH_NG*p.nb01, p.nb01, lane);
+    // h16 with the prologue: the range sums of this wave (range kz*ksplit + ksp of kblocks*ksplit)
+    int           n_ranges = 0;
+    const float * xsr      = nullptr;
+    if constexpr (h16 && !fused && wtype::codebook == 0) {
+        n_ranges = kblocks*ksplit;
+        xsr      = xsum + (kz*ksplit + ksp);
+    }
     const char * rout = mmh_rot_row(p, p.rot_out, p.rout_cache, p.rout_nb1, e) + (int64_t) g*MMH_NG*p.rout_nb0;
 
     for (int i0 = 0; i0 < nr; i0 += rows) {
@@ -921,11 +1077,11 @@ static __global__ void __launch_bounds__(1024) mmh_gemv(const mmh_params p, cons
         // a pass decodes each tile once for all its rows; a single row (an expert of one token) takes the one-row pass,
         // whose registers allow the deeper prefetch
         if (rows > 1 && nc == 1) {
-            mmh_gemv_pass<type, 1, fused, coal, rows>(p, wl, xh, s_xf, s_part, rowp + i0, nc, e, kb, ke, kslices, koff, nks,
-                lane, wave, nt, ksp);
+            mmh_gemv_pass<type, 1, fused, coal, rows, h16>(p, wl, xh, xsr, n_ranges, s_xf, s_part, rowp + i0, nc, e, kb, ke,
+                kslices, koff, nks, lane, wave, nt, ksp);
         } else {
-            mmh_gemv_pass<type, rows, fused, coal, rows>(p, wl, xh, s_xf, s_part, rowp + i0, nc, e, kb, ke, kslices, koff,
-                nks, lane, wave, nt, ksp);
+            mmh_gemv_pass<type, rows, fused, coal, rows, h16>(p, wl, xh, xsr, n_ranges, s_xf, s_part, rowp + i0, nc, e, kb, ke,
+                kslices, koff, nks, lane, wave, nt, ksp);
         }
         __syncthreads();
 
@@ -1297,18 +1453,31 @@ static int * mmh_fused_tickets(const int device, cudaStream_t stream, const int6
 }
 
 // the inline GEMV; coal only with one row per pass (expert ops), where it measured faster
-template <ggml_type type, int rows>
+template <ggml_type type, int rows, bool h16>
 static void mmh_launch_gemv(const bool fused, const bool coal, const dim3 grid, const int ksplit, const size_t lds,
-        cudaStream_t stream, const mmh_params & p, const char * w, const float4 * x4, const float * rscale, float * part,
-        int * tickets, const int max_chunks) {
+        cudaStream_t stream, const mmh_params & p, const char * w, const void * xh, const float * xsum, const float * rscale,
+        float * part, int * tickets, const int max_chunks) {
     if (coal && fused) {
-        mmh_gemv<type, rows, true, true><<<grid, 256*ksplit, lds, stream>>>(p, w, nullptr, nullptr, nullptr, nullptr, nullptr, ksplit, part, tickets, max_chunks);
+        mmh_gemv<type, rows, true, true, h16><<<grid, 256*ksplit, lds, stream>>>(p, w, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, ksplit, part, tickets, max_chunks);
     } else if (coal) {
-        mmh_gemv<type, rows, false, true><<<grid, 256*ksplit, 0, stream>>>(p, w, x4, rscale, nullptr, nullptr, nullptr, ksplit, part, tickets, max_chunks);
+        mmh_gemv<type, rows, false, true, h16><<<grid, 256*ksplit, 0, stream>>>(p, w, xh, xsum, rscale, nullptr, nullptr, nullptr, ksplit, part, tickets, max_chunks);
     } else if (fused) {
-        mmh_gemv<type, rows, true, false><<<grid, 256*ksplit, lds, stream>>>(p, w, nullptr, nullptr, nullptr, nullptr, nullptr, ksplit, part, tickets, max_chunks);
+        mmh_gemv<type, rows, true, false, h16><<<grid, 256*ksplit, lds, stream>>>(p, w, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, ksplit, part, tickets, max_chunks);
     } else {
-        mmh_gemv<type, rows, false, false><<<grid, 256*ksplit, 0, stream>>>(p, w, x4, rscale, nullptr, nullptr, nullptr, ksplit, part, tickets, max_chunks);
+        mmh_gemv<type, rows, false, false, h16><<<grid, 256*ksplit, 0, stream>>>(p, w, xh, xsum, rscale, nullptr, nullptr, nullptr, ksplit, part, tickets, max_chunks);
+    }
+}
+
+// the inline GEMV with F32 or (h16) fp16 input
+template <ggml_type type, bool h16>
+static void mmh_launch_gemv_rows(const int rows_t, const bool fused, const bool coal, const dim3 grid, const int ksplit,
+        const size_t lds, cudaStream_t stream, const mmh_params & p, const char * w, const void * xh, const float * xsum,
+        const float * rscale, float * part, int * tickets, const int max_chunks) {
+    switch (rows_t) {
+        case 1:  mmh_launch_gemv<type, 1, h16>(fused, coal, grid, ksplit, lds, stream, p, w, xh, xsum, rscale, part, tickets, max_chunks); break;
+        case 2:  mmh_launch_gemv<type, 2, h16>(fused, coal, grid, ksplit, lds, stream, p, w, xh, xsum, rscale, part, tickets, max_chunks); break;
+        case 4:  mmh_launch_gemv<type, 4, h16>(fused, coal, grid, ksplit, lds, stream, p, w, xh, xsum, rscale, part, tickets, max_chunks); break;
+        default: mmh_launch_gemv<type, 8, h16>(fused, coal, grid, ksplit, lds, stream, p, w, xh, xsum, rscale, part, tickets, max_chunks); break;
     }
 }
 
@@ -1365,6 +1534,11 @@ static void mmh_launch(ggml_backend_cuda_context & ctx, const mmh_params & p, co
         const size_t  lds    = (size_t) rows_t*nks*16*sizeof(float);
         const size_t  lds_static = (size_t) (2*MMH_GEMV_LIST + 33)*sizeof(int) + (size_t) 4*rows_t*MMH_NG*sizeof(float);
         bool fused = lds + lds_static <= MMH_FUSED_LDS && n_groups*used*kblocks <= MMH_FUSED_MAX_BLOCKS;
+        // the fp16 input: 2 bytes per value, and for mul1 the F32 sums of each 16 values (the fused choice is the same).
+        // Not for a dense op of one row, where it measured slower for the larger types
+        const bool    h16    = f16 && mmh_is_exl3(type) && (p.ids || per_exp > 1) && kslices*sizeof(float) <= MMH_FUSED_LDS;
+        const bool    sums   = h16 && mmh_exl3_codebook(type) == 0;
+        const size_t  lds16  = (size_t) rows_t*nks*(16*sizeof(half) + (sums ? sizeof(float) : 0));
         int * fused_tickets = nullptr;
         if (fused && kblocks > 1) {
             fused_tickets = mmh_fused_tickets(ctx.device, stream, n_tickets);
@@ -1374,26 +1548,38 @@ static void mmh_launch(ggml_backend_cuda_context & ctx, const mmh_params & p, co
         if (kblocks > 1) {
             part.alloc(p.n_rows*n_groups*kblocks*MMH_NG);
         }
+        ggml_cuda_pool_alloc<float> xsum(ctx.pool());
         if (!fused) {
-            xh.alloc(2*p.n_rows*p.k);
+            xh.alloc((h16 ? 1 : 2)*p.n_rows*p.k);
             rscale.alloc(p.n_rows);
+            if (sums) {
+                xsum.alloc(p.n_rows*split);
+            }
             if (kblocks > 1) {
                 tickets.alloc(n_tickets);
             }
-            mmh_prologue<true, false><<<p.n_rows, 256, 0, stream>>>(p, xh.get(), rscale.get(), tickets.ptr, n_tickets);
+            if (h16) {
+                mmh_prologue<true, true><<<p.n_rows, 256, sums ? kslices*sizeof(float) : 0, stream>>>(p, xh.get(), rscale.get(),
+                    tickets.ptr, n_tickets, xsum.ptr, split, (int) per);
+            } else {
+                mmh_prologue<true, false><<<p.n_rows, 256, 0, stream>>>(p, xh.get(), rscale.get(), tickets.ptr, n_tickets, nullptr, 0, 0);
+            }
             CUDA_CHECK(cudaGetLastError());
         }
         int * tk = fused ? fused_tickets : tickets.ptr;
-        const float4 * x4 = (const float4 *) xh.ptr;
 
         const bool coal = p.ids != nullptr;
         const dim3 grid(n_groups, n_items, kblocks);
-        switch (rows_t) {
-            case 1:  mmh_launch_gemv<type, 1>(fused, coal, grid, ksplit, lds, stream, p, w, x4, rscale.ptr, part.ptr, tk, max_chunks); break;
-            case 2:  mmh_launch_gemv<type, 2>(fused, coal, grid, ksplit, lds, stream, p, w, x4, rscale.ptr, part.ptr, tk, max_chunks); break;
-            case 4:  mmh_launch_gemv<type, 4>(fused, coal, grid, ksplit, lds, stream, p, w, x4, rscale.ptr, part.ptr, tk, max_chunks); break;
-            default: mmh_launch_gemv<type, 8>(fused, coal, grid, ksplit, lds, stream, p, w, x4, rscale.ptr, part.ptr, tk, max_chunks); break;
+        if constexpr (f16 && mmh_is_exl3(type)) {
+            if (h16) {
+                mmh_launch_gemv_rows<type, true>(rows_t, fused, coal, grid, ksplit, lds16, stream, p, w, xh.ptr, xsum.ptr, rscale.ptr,
+                    part.ptr, tk, max_chunks);
+                CUDA_CHECK(cudaGetLastError());
+                return;
+            }
         }
+        mmh_launch_gemv_rows<type, false>(rows_t, fused, coal, grid, ksplit, lds, stream, p, w, xh.ptr, nullptr, rscale.ptr, part.ptr,
+            tk, max_chunks);
         CUDA_CHECK(cudaGetLastError());
         return;
     }
@@ -1421,9 +1607,9 @@ static void mmh_launch(ggml_backend_cuda_context & ctx, const mmh_params & p, co
     }
 
     if (wmma) {
-        mmh_prologue<false, true><<<p.n_rows, 256, 0, stream>>>(p, xh.get(), rscale.get(), tickets.ptr, n_tickets);
+        mmh_prologue<false, true><<<p.n_rows, 256, 0, stream>>>(p, xh.get(), rscale.get(), tickets.ptr, n_tickets, nullptr, 0, 0);
     } else {
-        mmh_prologue<true, false><<<p.n_rows, 256, 0, stream>>>(p, xh.get(), rscale.get(), nullptr, 0);
+        mmh_prologue<true, false><<<p.n_rows, 256, 0, stream>>>(p, xh.get(), rscale.get(), nullptr, 0, nullptr, 0, 0);
     }
     CUDA_CHECK(cudaGetLastError());
 
@@ -1453,7 +1639,7 @@ static void mmh_launch(ggml_backend_cuda_context & ctx, const mmh_params & p, co
     } else {
         // the waves split k also for precision: a lane then sums at most a quarter of k
         const int ksplit = p.k/16 >= 64 ? 4 : p.k/16 >= 32 ? 2 : 1;
-        mmh_gemv<type, 8, false, false><<<grid, 256*ksplit, 0, stream>>>(p, w, (const float4 *) xh.get(), rscale.get(), items, n_items, rows_sorted, ksplit, nullptr, nullptr, 1);
+        mmh_gemv<type, 8, false, false><<<grid, 256*ksplit, 0, stream>>>(p, w, xh.get(), nullptr, rscale.get(), items, n_items, rows_sorted, ksplit, nullptr, nullptr, 1);
     }
     CUDA_CHECK(cudaGetLastError());
 }
