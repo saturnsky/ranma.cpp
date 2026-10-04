@@ -4438,8 +4438,18 @@ static int ggml_cuda_try_fuse_dsv4(ggml_backend_cuda_context * cuda_ctx, ggml_cg
     return 0;
 }
 
+// whether the allocations of two tensors overlap (allocated sizes, as ggml_cuda_check_fusion_memory_ranges)
+static bool ggml_cuda_fusion_ranges_overlap(const ggml_tensor * a, const ggml_tensor * b) {
+    const int64_t a0 = (int64_t) a->data;
+    const int64_t a1 = a0 + ggml_backend_buft_get_alloc_size(a->buffer->buft, a);
+    const int64_t b0 = (int64_t) b->data;
+    const int64_t b1 = b0 + ggml_backend_buft_get_alloc_size(b->buffer->buft, b);
+    return a0 < b1 && b0 < a1;
+}
+
 // Low-rank gated residual of Qwen3.8 hyper-connections (src/models/qwen4exp.cpp) for decode batches:
 //   MUL_MAT -> SCALE -> SILU -> MUL_MAT -> RESHAPE -> DSV4_HC_PRE         (two launches)
+//   MUL_MAT -> SCALE -> SIGMOID -> SCALE -> DSV4_HC_POST                   (one launch)
 // On by default; GGML_CUDA_HC_GATED_FUSION=0 leaves the nodes to the other paths.
 static bool ggml_cuda_hc_gated_fusion_enabled() {
     static const bool enabled = [] {
@@ -4478,6 +4488,26 @@ static int ggml_cuda_try_fuse_hc_gated(ggml_backend_cuda_context * cuda_ctx, ggm
         }
         ggml_cuda_op_hc_gated_pre(*cuda_ctx, mm, scale, mm_up, pre);
         return 5;
+    }
+
+    if (i + 4 < cgraph->n_nodes && cgraph->nodes[i + 4]->op == GGML_OP_DSV4_HC_POST) {
+        const ggml_tensor * scale0 = cgraph->nodes[i + 1];
+        const ggml_tensor * act    = cgraph->nodes[i + 2];
+        const ggml_tensor * scale1 = cgraph->nodes[i + 3];
+        ggml_tensor *       post   = cgraph->nodes[i + 4];
+        const int out = i + 4;
+        // the elided nodes are not written, so only the operands of the chain matter; dst may reuse the memory of
+        // xn after its last use, which the two-launch form handles
+        if (!ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_MUL_MAT, GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE,
+                    GGML_OP_DSV4_HC_POST }, { out }) ||
+                !ggml_cuda_hc_gated_post_supported(mm, scale0, act, scale1, post) ||
+                ggml_cuda_fusion_ranges_overlap(post, mm->src[0]) || ggml_cuda_fusion_ranges_overlap(post, post->src[0]) ||
+                ggml_cuda_fusion_ranges_overlap(post, post->src[1])) {
+            return 0;
+        }
+        const bool split = ggml_cuda_fusion_ranges_overlap(post, mm->src[1]);
+        ggml_cuda_op_hc_gated_post(*cuda_ctx, mm, scale0, scale1, post, split);
+        return 4;
     }
 
     return 0;
