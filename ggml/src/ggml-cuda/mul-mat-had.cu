@@ -23,11 +23,18 @@
 #include "expert-controller.cuh"
 
 #include <cfloat>
+#include <map>
+#include <mutex>
 
 #define MMH_NG          128 // output columns per block, one H128 output block
 #define MMH_GEMV_TOKENS   8 // GEMV without a routing pass up to this many tokens
 #define MMH_GEMV_LIST   512 // most rows one GEMV block collects without a routing pass
 #define MMH_MAX_EXPERTS 4096 // weight matrices the routing pass counts in LDS
+#define MMH_FUSED_LDS   49152 // LDS of a GEMV block that stages its own input (fused)
+#define MMH_FUSED_MAX_BLOCKS 512 // fused GEMV up to this many blocks with work (each block transforms its own input)
+#define MMH_GEMV_WAVES  1280 // GEMV waves the k split aims at
+#define MMH_GEMV_MIN_KSLICES 16 // fewest 16-value k slices per GEMV wave from the k split
+#define MMH_GEMV_MAX_SPLIT 64 // largest k split
 
 // src1 precision of an op that does not set one (GGML_PREC_F32 = F32 GEMV only, GGML_PREC_F16 = fp16 GEMM)
 #define MMH_PREC_DEFAULT GGML_PREC_F16
@@ -462,12 +469,25 @@ static constexpr int mmh_exl3_codebook(const ggml_type type) {
 // one lane's share of the 16x16 tile (kt, nt) of a 128-row group, as half2 over k, k + 1:
 // out[0] = (c0, r0), out[1] = (c0, r0 + 8), out[2] = (c0 + 8, r0), out[3] = (c0 + 8, r0 + 8), r0 = 2*(lane%4)
 // F32 weights give k in out and k + 1 in lo, as F32. fetch() only loads, so the loads can be issued ahead.
-template <ggml_type type>
+// coal (EXL3): the wave loads each tile once, one word per lane, and decode() takes the 3 words of a lane from their
+// lanes (ds_bpermute) instead of 3 loads per lane of the whole tile: fewer memory instructions, more LDS-unit work.
+// The words and so the results are the same.
+static __device__ __forceinline__ uint32_t mmh_lane_word(const uint32_t v, const int src) {
+#if defined(GGML_USE_HIP)
+    return (uint32_t) __builtin_amdgcn_ds_bpermute(4*src, (int) v);
+#else
+    return __shfl_sync(0xFFFFFFFF, v, src, 32);
+#endif // defined(GGML_USE_HIP)
+}
+
+template <ggml_type type, bool coal = false>
 struct mmh_weight {
-    static constexpr int  b2       = mmh_exl3_b2(type);
-    static constexpr int  codebook = mmh_exl3_codebook(type);
-    static constexpr bool is_exl3  = b2 > 0;
-    static constexpr int  n_raw   = is_exl3 ? 3 : type == GGML_TYPE_F16 ? 4 : 8;
+    static constexpr int  b2        = mmh_exl3_b2(type);
+    static constexpr int  codebook  = mmh_exl3_codebook(type);
+    static constexpr bool is_exl3   = b2 > 0;
+    static constexpr int  words     = is_exl3 ? 4*b2 : 0; // 32-bit words of a tile
+    static constexpr bool coalesced = is_exl3 && coal;
+    static constexpr int  n_raw     = coalesced ? (words > 32 ? 2 : 1) : is_exl3 ? 3 : type == GGML_TYPE_F16 ? 4 : 8;
 
     struct raw {
         uint32_t v[n_raw];
@@ -475,11 +495,15 @@ struct mmh_weight {
 
     const char * group; // wave-uniform base of the 128-row group
     int64_t  nb01;
-    uint32_t off[3];    // EXL3: byte offsets of the 3 words of this lane in a tile; F16/F32: offset of (c0, r0)
+    uint32_t off[3];    // EXL3: byte offsets of the 3 words of this lane in a tile (coal: word indices); F16/F32: offset of (c0, r0)
     int      o;         // EXL3: bit offset of the first window in the first word
+    int      lane;
 
-    __device__ __forceinline__ mmh_weight(const char * group, const int64_t nb01, const int lane) : group(group), nb01(nb01) {
-        if constexpr (is_exl3) {
+    __device__ __forceinline__ mmh_weight(const char * group, const int64_t nb01, const int lane) : group(group), nb01(nb01), lane(lane) {
+        if constexpr (coalesced) {
+            const mmh_exl3<b2> c(lane);
+            off[0] = c.i0; off[1] = c.i1; off[2] = c.i2; o = c.o;
+        } else if constexpr (is_exl3) {
             const mmh_exl3<b2> c(lane);
             off[0] = 4*c.i0; off[1] = 4*c.i1; off[2] = 4*c.i2; o = c.o;
         } else {
@@ -491,7 +515,13 @@ struct mmh_weight {
 
     __device__ __forceinline__ raw fetch(const int kt, const int nt) const {
         raw r;
-        if constexpr (is_exl3) {
+        if constexpr (coalesced) {
+            const uint32_t * t = (const uint32_t *) (group + (int64_t) (8*kt + nt)*mmh_exl3<b2>::tile_bytes);
+            r.v[0] = t[words >= 32 ? lane : lane % words];
+            if constexpr (words > 32) {
+                r.v[1] = t[32 + lane % (words - 32)];
+            }
+        } else if constexpr (is_exl3) {
             const char * t = group + (int64_t) (8*kt + nt)*mmh_exl3<b2>::tile_bytes;
 #pragma unroll
             for (int i = 0; i < 3; ++i) {
@@ -518,11 +548,29 @@ struct mmh_weight {
         return r;
     }
 
+    // coal: word i of the tile
+    __device__ __forceinline__ uint32_t word(const raw & r, const int i) const {
+        if constexpr (words > 32) {
+            const uint32_t a = mmh_lane_word(r.v[0], i & 31);
+            const uint32_t b = mmh_lane_word(r.v[1 % n_raw], (i - 32) & 31);
+            return i < 32 ? a : b;
+        } else {
+            return mmh_lane_word(r.v[0], i);
+        }
+    }
+
     __device__ __forceinline__ void decode(const raw & r, uint32_t out[4], uint32_t lo[4]) const {
         if constexpr (is_exl3) {
-            const uint32_t w0 = r.v[0];
-            const uint32_t w1 = r.v[1];
-            const uint32_t w2 = r.v[2];
+            uint32_t w0, w1, w2;
+            if constexpr (coalesced) {
+                w0 = word(r, off[0]);
+                w1 = word(r, off[1]);
+                w2 = word(r, off[2]);
+            } else {
+                w0 = r.v[0];
+                w1 = r.v[1 % n_raw];
+                w2 = r.v[2 % n_raw];
+            }
             const uint32_t v0 = (uint32_t) (((((uint64_t) w0) << 32) | w1) >> (32 - o));
             const uint32_t v1 = (uint32_t) (((((uint64_t) w1) << 32) | w2) >> (32 - o));
             const uint32_t v2 = w2 << o;
@@ -563,14 +611,18 @@ struct mmh_weight {
 // gridDim.z; wave = column tile nt + 8*k split. Its rows come from the routing pass (items) or are collected here: with
 // ids, block y is row y and runs only if y is the first row of its expert, then for every row of that expert. The
 // weight and input loads of the next pf k steps are in flight while a step is decoded. With a k split over blocks,
-// each block stores its partial sums and the last block of the group adds them in k order, then runs the epilogue.
-template <ggml_type type, int rows>
+// each block stores its partial sums and the last block of the group adds them in k order, then runs the epilogue;
+// it also resets its ticket, so that tickets that start at zero stay zero between ops.
+// fused: no prologue, the block writes H(rot_in * x) of its rows for the 128-value blocks of its k range to LDS (the
+// same values as the prologue, row scale 1), and its tickets must be zero when it starts. coal: see mmh_weight.
+template <ggml_type type, int rows, bool fused, bool coal>
 static __global__ void __launch_bounds__(1024) mmh_gemv(const mmh_params p, const char * __restrict__ w,
         const float4 * __restrict__ xh, const float * __restrict__ rscale, const int * __restrict__ items,
         const int * __restrict__ n_items, const int * __restrict__ rows_sorted, const int ksplit,
         float * __restrict__ part, int * __restrict__ tickets, const int max_chunks) {
-    typedef mmh_weight<type> wtype;
+    typedef mmh_weight<type, coal> wtype;
     constexpr int pf = rows <= 2 ? 4 : 2;
+    extern __shared__ float4 s_xf[]; // fused: rows x staged k slices x 4 float4
 
     __shared__ int   s_rows[MMH_GEMV_LIST];
     __shared__ int   s_eid[MMH_GEMV_LIST];
@@ -654,17 +706,62 @@ static __global__ void __launch_bounds__(1024) mmh_gemv(const mmh_params p, cons
     const int kb      = (kz*ksplit + ksp)*per;
     const int ke      = min(kslices, kb + per);
 
+    // fused: the k slices of the 128-value blocks that hold the k range of the block, from koff
+    const int kb_blk = min(kslices, kz*ksplit*per);
+    const int koff   = fused ? kb_blk/8*8 : 0;
+    const int nks    = fused ? (min(kslices, kb_blk + ksplit*per) + 7)/8*8 - koff : 0;
+
     const wtype wl(mmh_weight_matrix(p, w, e) + (int64_t) g*MMH_NG*p.nb01, p.nb01, lane);
     const char * rout = mmh_rot_row(p, p.rot_out, p.rout_cache, p.rout_nb1, e) + (int64_t) g*MMH_NG*p.rout_nb0;
 
     for (int i0 = 0; i0 < nr; i0 += rows) {
         const int nc = min(rows, nr - i0);
 
+        // the first weight loads go out before the input (the fused staging does not wait for them)
+        typename wtype::raw wr[pf];
+#pragma unroll
+        for (int d = 0; d < pf; ++d) {
+            if (kb + d < ke) {
+                wr[d] = wl.fetch(kb + d, nt);
+            }
+        }
+
         // input row bases are wave-uniform, the lane adds its 16-byte group of each 16 k
         const float4 * xr[rows];
+        if constexpr (fused) {
+            // as mmh_prologue<true, false>: one 128-value block of one row per wave and pass; the waves of the block
+            // read the previous rows only before the barrier after their k loop
+            const char * rin = mmh_rot_row(p, p.rot_in, p.rin_cache, p.rin_nb1, e);
+            const int nch = nks/8;
+            for (int t = wave; t < nc*nch; t += blockDim.x/32) {
+                const int i  = t/nch;
+                const int ch = t % nch;
+                const float * src = mmh_src_row(p, rowp[i0 + i]) + 16*koff + 128*ch;
+                const char  * rc  = rin + (16*koff + 128*ch)*(p.rin_f16 ? 2 : 4);
+                float v[4];
 #pragma unroll
-        for (int i = 0; i < rows; ++i) {
-            xr[i] = xh + (int64_t) mmh_uniform(rowp[i0 + (i < nc ? i : 0)])*(4*kslices) + lane % 4;
+                for (int j = 0; j < 4; ++j) {
+                    const int c = 32*j + lane;
+                    v[j] = src[c]*mmh_rot(rc, p.rin_f16, c);
+                }
+                mmh_fwht(v, lane, p.had, p.hscale);
+                float * xd = (float *) s_xf + (16*nks*i + 128*ch);
+#pragma unroll
+                for (int j = 0; j < 4; ++j) {
+                    const int c = 32*j + lane;
+                    xd[16*(c/16) + 4*((c % 8)/2) + 2*((c % 16)/8) + c % 2] = v[j];
+                }
+            }
+            __syncthreads();
+#pragma unroll
+            for (int i = 0; i < rows; ++i) {
+                xr[i] = s_xf + 4*nks*(i < nc ? i : 0) + lane % 4;
+            }
+        } else {
+#pragma unroll
+            for (int i = 0; i < rows; ++i) {
+                xr[i] = xh + (int64_t) mmh_uniform(rowp[i0 + (i < nc ? i : 0)])*(4*kslices) + lane % 4;
+            }
         }
 
         float acc[rows][2];
@@ -674,16 +771,14 @@ static __global__ void __launch_bounds__(1024) mmh_gemv(const mmh_params p, cons
             acc[i][1] = 0.0f;
         }
 
-        typename wtype::raw wr[pf];
         float4 xv[pf][rows];
 #pragma unroll
         for (int d = 0; d < pf; ++d) {
             if (kb + d < ke) {
-                wr[d] = wl.fetch(kb + d, nt);
 #pragma unroll
                 for (int i = 0; i < rows; ++i) {
                     if (i < nc) {
-                        xv[d][i] = xr[i][4*(kb + d)];
+                        xv[d][i] = xr[i][4*(kb + d - koff)];
                     }
                 }
             }
@@ -704,7 +799,7 @@ static __global__ void __launch_bounds__(1024) mmh_gemv(const mmh_params p, cons
 #pragma unroll
                         for (int i = 0; i < rows; ++i) {
                             if (i < nc) {
-                                xv[d][i] = xr[i][4*(kt + d + pf)];
+                                xv[d][i] = xr[i][4*(kt + d + pf - koff)];
                             }
                         }
                     }
@@ -770,7 +865,11 @@ static __global__ void __launch_bounds__(1024) mmh_gemv(const mmh_params p, cons
             __syncthreads();
             if (tid == 0) {
                 const int64_t t = ((int64_t) blockIdx.y*gridDim.x + g)*max_chunks + i0/rows;
-                s_last = atomicAdd(&tickets[t], 1) == kblocks - 1;
+                const bool last = atomicAdd(&tickets[t], 1) == kblocks - 1;
+                if (last) {
+                    tickets[t] = 0;
+                }
+                s_last = last;
             }
             __syncthreads();
             if (!s_last) {
@@ -799,7 +898,7 @@ static __global__ void __launch_bounds__(1024) mmh_gemv(const mmh_params p, cons
             }
             mmh_fwht(v, lane, p.had, p.hscale);
             float * out = mmh_dst_row(p, r) + (int64_t) g*MMH_NG;
-            const float rs = rscale[r];
+            const float rs = fused ? 1.0f : rscale[r];
 #pragma unroll
             for (int j = 0; j < 4; ++j) {
                 const int c = 32*j + lane;
@@ -1072,6 +1171,67 @@ static bool mmh_input_f16(const ggml_tensor * dst) {
     return prec >= GGML_PREC_F16;
 }
 
+// with WMMA, whether a dense op of `tokens` tokens runs the GEMV instead of the GEMM: the GEMV decodes every weight
+// once for all its rows, but its cost per weight grows with the rows, while the GEMM tile costs about the same up to
+// 16 rows; with few 128-row groups the GEMM also has few blocks (measured crossovers)
+static bool mmh_dense_gemv(const int64_t tokens, const int64_t groups, const int64_t weights) {
+    if (tokens <= 1) {
+        return true;
+    }
+    if (tokens <= 2) {
+        return groups <= 64;
+    }
+    if (tokens <= 3) {
+        return groups <= 48;
+    }
+    if (tokens <= 4) {
+        return groups <= 32;
+    }
+    return groups <= 16 || weights <= (1 << 21);
+}
+
+// k-split tickets of the fused GEMV, one buffer per device and stream: all zero between ops, as the last block of each
+// group resets its ticket. A new buffer is cleared on a stream of its own and waited for, so that it can also be made
+// while the op's stream is being captured into a CUDA graph (nullptr if n is too large).
+static int * mmh_fused_tickets(const int device, cudaStream_t stream, const int64_t n) {
+    constexpr int64_t cap = 16384;
+    if (n > cap) {
+        return nullptr;
+    }
+    static std::mutex mutex;
+    static std::map<std::pair<int, cudaStream_t>, int *> buffers;
+    std::lock_guard<std::mutex> lock(mutex);
+    const auto it = buffers.find({device, stream});
+    if (it != buffers.end()) {
+        return it->second;
+    }
+    int * t = nullptr;
+    cudaStream_t clear;
+    CUDA_CHECK(cudaMalloc((void **) &t, cap*sizeof(int)));
+    CUDA_CHECK(cudaStreamCreateWithFlags(&clear, cudaStreamNonBlocking));
+    CUDA_CHECK(cudaMemsetAsync(t, 0, cap*sizeof(int), clear));
+    CUDA_CHECK(cudaStreamSynchronize(clear));
+    CUDA_CHECK(cudaStreamDestroy(clear));
+    buffers[{device, stream}] = t;
+    return t;
+}
+
+// the inline GEMV; coal only with one row per pass (expert ops), where it measured faster
+template <ggml_type type, int rows>
+static void mmh_launch_gemv(const bool fused, const bool coal, const dim3 grid, const int ksplit, const size_t lds,
+        cudaStream_t stream, const mmh_params & p, const char * w, const float4 * x4, const float * rscale, float * part,
+        int * tickets, const int max_chunks) {
+    if (rows == 1 && coal && fused) {
+        mmh_gemv<type, 1, true, true><<<grid, 256*ksplit, lds, stream>>>(p, w, nullptr, nullptr, nullptr, nullptr, nullptr, ksplit, part, tickets, max_chunks);
+    } else if (rows == 1 && coal) {
+        mmh_gemv<type, 1, false, true><<<grid, 256*ksplit, 0, stream>>>(p, w, x4, rscale, nullptr, nullptr, nullptr, ksplit, part, tickets, max_chunks);
+    } else if (fused) {
+        mmh_gemv<type, rows, true, false><<<grid, 256*ksplit, lds, stream>>>(p, w, nullptr, nullptr, nullptr, nullptr, nullptr, ksplit, part, tickets, max_chunks);
+    } else {
+        mmh_gemv<type, rows, false, false><<<grid, 256*ksplit, 0, stream>>>(p, w, x4, rscale, nullptr, nullptr, nullptr, ksplit, part, tickets, max_chunks);
+    }
+}
+
 template <ggml_type type, bool f16>
 static void mmh_launch(ggml_backend_cuda_context & ctx, const mmh_params & p, const char * w, const int64_t n,
         const bool inline_rows) {
@@ -1082,8 +1242,8 @@ static void mmh_launch(ggml_backend_cuda_context & ctx, const mmh_params & p, co
     // the WMMA GEMM takes fp16 input: in the F32 mode the rows run the F32 GEMV
     const bool wmma = !inline_rows && f16 && type != GGML_TYPE_F32 && GGML_CUDA_CC_IS_RDNA4(cc);
 
-    ggml_cuda_pool_alloc<half>  xh(ctx.pool(), (wmma ? 1 : 2)*p.n_rows*p.k);
-    ggml_cuda_pool_alloc<float> rscale(ctx.pool(), p.n_rows);
+    ggml_cuda_pool_alloc<half>  xh(ctx.pool());
+    ggml_cuda_pool_alloc<float> rscale(ctx.pool());
 
     // rows per weight matrix, for the tile size
     const int64_t used    = p.ids ? std::min(p.n_rows, p.n_exp) : p.n_exp;
@@ -1092,43 +1252,72 @@ static void mmh_launch(ggml_backend_cuda_context & ctx, const mmh_params & p, co
     if (inline_rows) {
         const int64_t n_items = p.ids ? p.n_rows : p.n_exp;
         const int     rows    = std::min<int64_t>(MMH_GEMV_TOKENS, per_exp);
-        const float4 * x4 = (const float4 *) xh.get();
 
-        // waves split k inside a block until there are enough waves; with very few blocks, blocks split k too
+        // k split S = ksplit*kblocks: the power of 2 nearest (in log scale) to the split that gives about
+        // MMH_GEMV_WAVES waves, with at least MMH_GEMV_MIN_KSLICES k slices per wave; S >= 2 splits k over 2 waves of
+        // a block and S/2 blocks (small blocks fill the CUs better than blocks of 4 k splits)
         const int64_t kslices = p.k/16;
-        int ksplit  = 1;
-        int kblocks = 1;
-        while (ksplit < 4 && n_groups*used*8*ksplit < 4096 && kslices >= 8*ksplit*2) {
-            ksplit *= 2;
+        const double  want    = (double) MMH_GEMV_WAVES/(8.0*(double) (n_groups*used));
+        int split = 1;
+        while (split < MMH_GEMV_MAX_SPLIT && want >= 1.41421356*split && kslices >= MMH_GEMV_MIN_KSLICES*2*split) {
+            split *= 2;
         }
-        while (kblocks < 8 && n_groups*used*kblocks < 32 && kslices >= 4*ksplit*kblocks*2) {
-            kblocks *= 2;
+        // with ids and more than one token an expert can have several rows, which a block runs one after the other:
+        // two waves per k range keep that chain short
+        if (p.ids && p.ne2 > 1 && split < 2 && kslices >= 4*MMH_GEMV_MIN_KSLICES) {
+            split = 2;
         }
+        const int ksplit  = split >= 2 ? 2 : 1;
+        const int kblocks = split/ksplit;
 
         ggml_cuda_pool_alloc<float> part(ctx.pool());
         ggml_cuda_pool_alloc<int>   tickets(ctx.pool());
         const int max_chunks = (int) ((std::min<int64_t>(p.n_rows, MMH_GEMV_LIST) + rows - 1)/rows);
         const int n_tickets  = kblocks > 1 ? (int) (n_items*n_groups*max_chunks) : 0;
+        const int rows_t     = rows <= 1 ? 1 : rows <= 2 ? 2 : rows <= 4 ? 4 : 8;
+
+        // fused: the k slices one block stages (at most one 128-value block more at each end of its range), LDS of
+        // the staged rows beside the static LDS of the GEMV
+        const int64_t per    = (kslices + kblocks*ksplit - 1)/(kblocks*ksplit);
+        const int64_t nks    = std::min<int64_t>(kslices, (per*ksplit + 7)/8*8 + 8);
+        const size_t  lds    = (size_t) rows_t*nks*16*sizeof(float);
+        const size_t  lds_static = (size_t) (2*MMH_GEMV_LIST + 33)*sizeof(int) + (size_t) 4*rows_t*MMH_NG*sizeof(float);
+        bool fused = lds + lds_static <= MMH_FUSED_LDS && n_groups*used*kblocks <= MMH_FUSED_MAX_BLOCKS;
+        int * fused_tickets = nullptr;
+        if (fused && kblocks > 1) {
+            fused_tickets = mmh_fused_tickets(ctx.device, stream, n_tickets);
+            fused = fused_tickets != nullptr;
+        }
+
         if (kblocks > 1) {
             part.alloc(p.n_rows*n_groups*kblocks*MMH_NG);
-            tickets.alloc(n_tickets);
         }
-        mmh_prologue<true, false><<<p.n_rows, 256, 0, stream>>>(p, xh.get(), rscale.get(), tickets.ptr, n_tickets);
-        CUDA_CHECK(cudaGetLastError());
+        if (!fused) {
+            xh.alloc(2*p.n_rows*p.k);
+            rscale.alloc(p.n_rows);
+            if (kblocks > 1) {
+                tickets.alloc(n_tickets);
+            }
+            mmh_prologue<true, false><<<p.n_rows, 256, 0, stream>>>(p, xh.get(), rscale.get(), tickets.ptr, n_tickets);
+            CUDA_CHECK(cudaGetLastError());
+        }
+        int * tk = fused ? fused_tickets : tickets.ptr;
+        const float4 * x4 = (const float4 *) xh.ptr;
 
+        const bool coal = p.ids != nullptr;
         const dim3 grid(n_groups, n_items, kblocks);
-        if (rows <= 1) {
-            mmh_gemv<type, 1><<<grid, 256*ksplit, 0, stream>>>(p, w, x4, rscale.get(), nullptr, nullptr, nullptr, ksplit, part.ptr, tickets.ptr, max_chunks);
-        } else if (rows <= 2) {
-            mmh_gemv<type, 2><<<grid, 256*ksplit, 0, stream>>>(p, w, x4, rscale.get(), nullptr, nullptr, nullptr, ksplit, part.ptr, tickets.ptr, max_chunks);
-        } else if (rows <= 4) {
-            mmh_gemv<type, 4><<<grid, 256*ksplit, 0, stream>>>(p, w, x4, rscale.get(), nullptr, nullptr, nullptr, ksplit, part.ptr, tickets.ptr, max_chunks);
-        } else {
-            mmh_gemv<type, 8><<<grid, 256*ksplit, 0, stream>>>(p, w, x4, rscale.get(), nullptr, nullptr, nullptr, ksplit, part.ptr, tickets.ptr, max_chunks);
+        switch (rows_t) {
+            case 1:  mmh_launch_gemv<type, 1>(fused, coal, grid, ksplit, lds, stream, p, w, x4, rscale.ptr, part.ptr, tk, max_chunks); break;
+            case 2:  mmh_launch_gemv<type, 2>(fused, coal, grid, ksplit, lds, stream, p, w, x4, rscale.ptr, part.ptr, tk, max_chunks); break;
+            case 4:  mmh_launch_gemv<type, 4>(fused, coal, grid, ksplit, lds, stream, p, w, x4, rscale.ptr, part.ptr, tk, max_chunks); break;
+            default: mmh_launch_gemv<type, 8>(fused, coal, grid, ksplit, lds, stream, p, w, x4, rscale.ptr, part.ptr, tk, max_chunks); break;
         }
         CUDA_CHECK(cudaGetLastError());
         return;
     }
+
+    xh.alloc((wmma ? 1 : 2)*p.n_rows*p.k);
+    rscale.alloc(p.n_rows);
 
     const int mt = !wmma ? 8 : per_exp <= 16 ? 16 : per_exp <= 32 ? 32 : per_exp <= 64 ? 64 : 128;
     const int64_t max_items = used + p.n_rows/mt + 1;
@@ -1182,7 +1371,7 @@ static void mmh_launch(ggml_backend_cuda_context & ctx, const mmh_params & p, co
     } else {
         // the waves split k also for precision: a lane then sums at most a quarter of k
         const int ksplit = p.k/16 >= 64 ? 4 : p.k/16 >= 32 ? 2 : 1;
-        mmh_gemv<type, 8><<<grid, 256*ksplit, 0, stream>>>(p, w, (const float4 *) xh.get(), rscale.get(), items, n_items, rows_sorted, ksplit, nullptr, nullptr, 1);
+        mmh_gemv<type, 8, false, false><<<grid, 256*ksplit, 0, stream>>>(p, w, (const float4 *) xh.get(), rscale.get(), items, n_items, rows_sorted, ksplit, nullptr, nullptr, 1);
     }
     CUDA_CHECK(cudaGetLastError());
 }
@@ -1313,11 +1502,12 @@ void ggml_cuda_mul_mat_had(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int64_t n = w->ne[1];
 
     // without a routing pass: few tokens (ids) or few rows per weight matrix; with WMMA a dense matrix of more than
-    // one row goes to the GEMM, which stages the rows once per block
+    // one row goes to the GEMM, which stages the rows once per block, unless the GEMV is faster (mmh_dense_gemv)
     const int cc = ggml_cuda_info().devices[ctx.device].cc;
     const bool wmma = w->type != GGML_TYPE_F32 && GGML_CUDA_CC_IS_RDNA4(cc);
     const int64_t tokens = ids ? dst->ne[2] : (p.n_rows + p.n_exp - 1)/p.n_exp;
-    const bool inline_rows = p.n_rows <= MMH_GEMV_LIST && tokens <= (ids || !wmma ? MMH_GEMV_TOKENS : 1);
+    const bool inline_rows = p.n_rows <= MMH_GEMV_LIST && tokens <= MMH_GEMV_TOKENS &&
+        (ids || !wmma || mmh_dense_gemv(tokens, n/MMH_NG, p.k*n));
 
     // F32 weights run only the GEMV, which has no F16 mode
     const bool f16 = w->type != GGML_TYPE_F32 && mmh_input_f16(dst);
