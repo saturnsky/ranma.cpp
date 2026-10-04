@@ -195,6 +195,16 @@ applies, how to switch it, and its limits.
 - **Raw and compressed K of a layer in one tensor**, so the attention reads a view instead of a concatenated
   copy on every token. Same page.
 
+### EXL3 weights and Qwen3.8 decode (HIP)
+
+- **EXL3 weights** - GGUF files hold the weights of ExLlamaV3 EXL3 checkpoints unchanged (mul1, mcg and 3inst
+  codebooks), converted by `convert_hf_to_gguf.py`, and run as `MUL_MAT_HAD` on the CPU and on HIP (GEMV for
+  decode, WMMA GEMM on RDNA4 for prompts), with host-direct expert banks and the expert cache. Checked with
+  `llama`, `qwen3moe`, `lfm2moe`, `qwen4exp` and `deepseek4` models; RDNA3 compiles but is untested.
+  [docs/ranma/exl3.md](docs/ranma/exl3.md)
+- **Fused Qwen3.8 hyper-connections** - the gated residual mix and the combine of each hyper-connection site run
+  as fused decode kernels. `GGML_CUDA_HC_GATED_FUSION=0` turns them off. Same page.
+
 ## Building
 
 RANMA.cpp builds exactly like upstream. For the primary target, follow the HIP section of
@@ -255,3 +265,6 @@ RANMA.cpp is distributed under the [MIT License](LICENSE), the same license as l
 All of the heavy lifting is the work of [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp)
 and its contributors. This fork exists only to carry a narrow set of workload-specific
 changes on top of it.
+
+The EXL3 format support follows [ExLlamaV3](https://github.com/turboderp-org/exllamav3) (MIT License,
+turboderp); see [NOTICE](NOTICE).
