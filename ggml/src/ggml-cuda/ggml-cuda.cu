@@ -4438,6 +4438,51 @@ static int ggml_cuda_try_fuse_dsv4(ggml_backend_cuda_context * cuda_ctx, ggml_cg
     return 0;
 }
 
+// Low-rank gated residual of Qwen3.8 hyper-connections (src/models/qwen4exp.cpp) for decode batches:
+//   MUL_MAT -> SCALE -> SILU -> MUL_MAT -> RESHAPE -> DSV4_HC_PRE         (two launches)
+// On by default; GGML_CUDA_HC_GATED_FUSION=0 leaves the nodes to the other paths.
+static bool ggml_cuda_hc_gated_fusion_enabled() {
+    static const bool enabled = [] {
+        const char * env = getenv("GGML_CUDA_HC_GATED_FUSION");
+        return env == nullptr || std::atoi(env) != 0;
+    }();
+    return enabled;
+}
+
+static int ggml_cuda_try_fuse_hc_gated(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+    const ggml_tensor * mm = cgraph->nodes[i];
+    if (mm->op != GGML_OP_MUL_MAT || !ggml_cuda_hc_gated_fusion_enabled() ||
+            ggml_get_op_params_i32(mm, 1) == GGML_HINT_SRC0_IS_HADAMARD ||
+            mm->src[0]->buffer == nullptr || ggml_backend_buffer_is_host(mm->src[0]->buffer)) {
+        return 0;
+    }
+
+    if (i + 5 < cgraph->n_nodes && cgraph->nodes[i + 5]->op == GGML_OP_DSV4_HC_PRE) {
+        const ggml_tensor * scale = cgraph->nodes[i + 1];
+        const ggml_tensor * act   = cgraph->nodes[i + 2];
+        const ggml_tensor * mm_up = cgraph->nodes[i + 3];
+        const ggml_tensor * gate  = cgraph->nodes[i + 4];
+        ggml_tensor *       pre   = cgraph->nodes[i + 5];
+        const int out = i + 5;
+        // only where the unfused matmuls take the vector kernel: matrix kernels are faster for wider batches
+        const int cc        = ggml_cuda_info().devices[cuda_ctx->device].cc;
+        const int warp_size = ggml_cuda_info().devices[cuda_ctx->device].warp_size;
+        if (!ggml_cuda_should_use_mmvf(mm->src[0]->type, cc, warp_size, mm->src[0]->ne, mm->src[0]->nb, mm->src[1]->ne[1]) ||
+                mm_up->op != GGML_OP_MUL_MAT || ggml_get_op_params_i32(mm_up, 1) == GGML_HINT_SRC0_IS_HADAMARD ||
+                mm_up->src[0]->buffer == nullptr || ggml_backend_buffer_is_host(mm_up->src[0]->buffer) ||
+                !ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_MUL_MAT, GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_MUL_MAT,
+                    GGML_OP_RESHAPE, GGML_OP_DSV4_HC_PRE }, { out }) ||
+                !ggml_cuda_hc_gated_pre_supported(mm, scale, act, mm_up, gate, pre) ||
+                !ggml_cuda_check_fusion_memory_ranges(cgraph, i, 6, &out, 1)) {
+            return 0;
+        }
+        ggml_cuda_op_hc_gated_pre(*cuda_ctx, mm, scale, mm_up, pre);
+        return 5;
+    }
+
+    return 0;
+}
+
 // try and fuse nodes and return the number of nodes to skip
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
@@ -4448,6 +4493,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     {
         const int nodes_to_skip = ggml_cuda_try_fuse_dsv4(cuda_ctx, cgraph, i);
+        if (nodes_to_skip > 0) {
+            return nodes_to_skip;
+        }
+    }
+
+    {
+        const int nodes_to_skip = ggml_cuda_try_fuse_hc_gated(cuda_ctx, cgraph, i);
         if (nodes_to_skip > 0) {
             return nodes_to_skip;
         }

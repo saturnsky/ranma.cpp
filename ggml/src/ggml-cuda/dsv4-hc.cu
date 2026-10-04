@@ -872,3 +872,407 @@ void ggml_cuda_op_dsv4_row_copy(ggml_backend_cuda_context & ctx,
     ggml_cuda_kernel_launch(dsv4_row_copy_f32, launch_params,
             args, sidx->data, didx->data, sidx->type == GGML_TYPE_I64, didx->type == GGML_TYPE_I64, ncols);
 }
+
+// Low-rank gated residual of Qwen3.8 hyper-connections (src/models/qwen4exp.cpp build_hc_mix) for decode
+// batches, matched in ggml-cuda.cu:
+//   pre:  MUL_MAT(down, xn) -> SCALE -> SILU -> MUL_MAT(up, .) -> RESHAPE -> DSV4_HC_PRE (gated)
+// The chain is two launches: the down projection with its activation, then the up projection with
+// the gated stream mean. Each thread issues all 16-byte loads of its part of a
+// weight row before the first use, so a whole row is in flight per block. The dot products accumulate
+// in FP32; the elementwise arithmetic is that of scale_f32, the silu op and dsv4_hc_pre_f32.
+
+#define HC_GATED_THREADS 256
+#define HC_GATED_NCH     5   // 16-byte chunks of a row per thread and segment (k = 10240 down rows are one segment)
+
+// 8 consecutive weights of a row as one load unit
+template <typename T> struct hc_gated_chunk;
+
+template <> struct hc_gated_chunk<half> {
+    int4 v = make_int4(0, 0, 0, 0);
+
+    static __device__ __forceinline__ hc_gated_chunk load(const half * row, const int c) {
+        hc_gated_chunk r;
+        r.v = ((const int4 *) row)[c];
+        return r;
+    }
+    __device__ __forceinline__ void to_float(float * f) const {
+        const half2 * h = (const half2 *) &v;
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const float2 t = __half22float2(h[i]);
+            f[2*i + 0] = t.x;
+            f[2*i + 1] = t.y;
+        }
+    }
+};
+
+// acc += <f, x[0..7]> in order
+static __device__ __forceinline__ float hc_gated_dot8(const float * f, const float4 xa, const float4 xb, float acc) {
+    acc = fmaf(f[0], xa.x, acc);
+    acc = fmaf(f[1], xa.y, acc);
+    acc = fmaf(f[2], xa.z, acc);
+    acc = fmaf(f[3], xa.w, acc);
+    acc = fmaf(f[4], xb.x, acc);
+    acc = fmaf(f[5], xb.y, acc);
+    acc = fmaf(f[6], xb.z, acc);
+    acc = fmaf(f[7], xb.w, acc);
+    return acc;
+}
+
+// Sums n values over the width lanes of a group and spreads the n sums over the lanes: the n values halve at every
+// xor step while n > 1, the remaining steps sum one value. Lane l ends with sum n_index(l) in v[0].
+template <int width, int n>
+static __device__ __forceinline__ float hc_gated_reduce_scatter(float * v, const int lane) {
+    int m = n;
+#pragma unroll
+    for (int o = width/2; o > 0; o >>= 1) {
+        if (m > 1) {
+            m /= 2;
+            const bool upper = lane & o;
+#pragma unroll
+            for (int j = 0; j < m; ++j) {
+                const float send = upper ? v[j] : v[j + m];
+                const float keep = upper ? v[j + m] : v[j];
+                v[j] = keep + __shfl_xor_sync(0xffffffff, send, o, width);
+            }
+        } else {
+            v[0] += __shfl_xor_sync(0xffffffff, v[0], o, width);
+        }
+    }
+    return v[0];
+}
+
+template <int width, int n>
+static __device__ __forceinline__ int hc_gated_scatter_index(const int lane) {
+    int idx = 0;
+    int m = n;
+#pragma unroll
+    for (int o = width/2; o > 0 && m > 1; o >>= 1) {
+        m /= 2;
+        if (lane & o) {
+            idx += m;
+        }
+    }
+    return idx;
+}
+
+// the lanes that hold a sum once (the lowest lane of each group of equal sums)
+template <int width, int n>
+static __device__ __forceinline__ bool hc_gated_scatter_owner(const int lane) {
+    return (lane & (width/n - 1)) == 0;
+}
+
+static constexpr int hc_gated_pow2(const int n) {
+    return n <= 1 ? 1 : n <= 2 ? 2 : n <= 4 ? 4 : 8;
+}
+
+// t[it, j] = silu(scale*<w[j, :], x[:, it]> + bias) for J rows j per block
+template <typename T, int ncols, int J>
+static __global__ void __launch_bounds__(HC_GATED_THREADS) hc_gated_down_silu(
+        const T * __restrict__ w, const int64_t stride_w,
+        const float * __restrict__ x, const int64_t stride_x,
+        float * __restrict__ t,
+        const int k, const int m, const float scale, const float bias) {
+    constexpr int np = hc_gated_pow2(ncols);
+    static_assert(J*np <= 32, "too many sums per block");
+
+    const int tid = threadIdx.x;
+    const int j0  = blockIdx.x*J;
+    const int k8  = k/8;
+
+    float acc[J*np];
+#pragma unroll
+    for (int i = 0; i < J*np; ++i) {
+        acc[i] = 0.0f;
+    }
+
+    for (int c0 = 0; c0 < k8; c0 += HC_GATED_NCH*HC_GATED_THREADS) {
+        hc_gated_chunk<T> wc[J][HC_GATED_NCH];
+#pragma unroll
+        for (int jj = 0; jj < J; ++jj) {
+            const T * row = w + (int64_t) min(j0 + jj, m - 1)*stride_w;
+#pragma unroll
+            for (int ic = 0; ic < HC_GATED_NCH; ++ic) {
+                const int c = c0 + ic*HC_GATED_THREADS + tid;
+                if (c < k8) {
+                    wc[jj][ic] = hc_gated_chunk<T>::load(row, c);
+                }
+            }
+        }
+        if (c0 == 0) {
+            ggml_cuda_pdl_sync(); // the weights do not depend on the previous kernel
+        }
+#pragma unroll
+        for (int ic = 0; ic < HC_GATED_NCH; ++ic) {
+            const int c = c0 + ic*HC_GATED_THREADS + tid;
+            if (c >= k8) {
+                break;
+            }
+            float f[J][8];
+#pragma unroll
+            for (int jj = 0; jj < J; ++jj) {
+                wc[jj][ic].to_float(f[jj]);
+            }
+#pragma unroll
+            for (int it = 0; it < ncols; ++it) {
+                const float4 * xc = (const float4 *) (x + it*stride_x) + 2*c;
+                const float4 xa = xc[0];
+                const float4 xb = xc[1];
+#pragma unroll
+                for (int jj = 0; jj < J; ++jj) {
+                    acc[jj*np + it] = hc_gated_dot8(f[jj], xa, xb, acc[jj*np + it]);
+                }
+            }
+        }
+    }
+
+    __shared__ float red[J*np][HC_GATED_THREADS/32];
+    const int lane = tid % 32;
+    const int warp = tid / 32;
+    const float s = hc_gated_reduce_scatter<32, J*np>(acc, lane);
+    if (hc_gated_scatter_owner<32, J*np>(lane)) {
+        red[hc_gated_scatter_index<32, J*np>(lane)][warp] = s;
+    }
+    __syncthreads();
+    ggml_cuda_pdl_lc();
+
+    if (tid < J*np) {
+        const int jj = tid / np;
+        const int it = tid % np;
+        if (it < ncols && j0 + jj < m) {
+            float sum = 0.0f;
+#pragma unroll
+            for (int i = 0; i < HC_GATED_THREADS/32; ++i) {
+                sum += red[tid][i];
+            }
+            const float v = scale*sum + bias;
+            t[it*m + j0 + jj] = v / (1.0f + expf(-v));
+        }
+    }
+}
+
+// dst[col, it] = scale_pre*sum_h x[col, h, it]*sigmoid(<u[h*n_embd + col, :], t[it, :]>); a group of 32 lanes
+// handles ncpg columns with 8 lanes per stream h
+template <typename T, int ncols, int ncpg>
+static __global__ void __launch_bounds__(HC_GATED_THREADS) hc_gated_up_mix(
+        const T * __restrict__ u, const int64_t stride_u,
+        const float * __restrict__ t,
+        const float * __restrict__ x, const int64_t sx0, const int64_t sx1, const int64_t sx2,
+        float * __restrict__ dst, const int64_t sd0, const int64_t sd1,
+        const int k, const int n_embd, const float scale) {
+    extern __shared__ float hc_gated_t[]; // [ncols][k]
+    constexpr int np = hc_gated_pow2(ncols);
+
+    const int tid  = threadIdx.x;
+    const int lane = tid % 32;
+    const int h    = lane / 8;
+    const int l8   = lane % 8;
+    const int col0 = (blockIdx.x*(HC_GATED_THREADS/32) + tid/32)*ncpg;
+    const int k8   = k/8;
+
+    const T * rows[ncpg];
+#pragma unroll
+    for (int cc = 0; cc < ncpg; ++cc) {
+        rows[cc] = u + (int64_t) (h*n_embd + min(col0 + cc, n_embd - 1))*stride_u;
+    }
+
+    float acc[ncpg][np];
+#pragma unroll
+    for (int cc = 0; cc < ncpg; ++cc) {
+#pragma unroll
+        for (int it = 0; it < np; ++it) {
+            acc[cc][it] = 0.0f;
+        }
+    }
+
+    for (int c0 = 0; c0 < k8; c0 += 8*HC_GATED_NCH) {
+        hc_gated_chunk<T> uc[ncpg][HC_GATED_NCH];
+#pragma unroll
+        for (int cc = 0; cc < ncpg; ++cc) {
+#pragma unroll
+            for (int ic = 0; ic < HC_GATED_NCH; ++ic) {
+                const int c = c0 + 8*ic + l8;
+                if (c < k8) {
+                    uc[cc][ic] = hc_gated_chunk<T>::load(rows[cc], c);
+                }
+            }
+        }
+        if (c0 == 0) {
+            ggml_cuda_pdl_sync();
+            for (int i = tid; i < ncols*k; i += HC_GATED_THREADS) {
+                hc_gated_t[i] = t[i];
+            }
+            __syncthreads();
+        }
+#pragma unroll
+        for (int ic = 0; ic < HC_GATED_NCH; ++ic) {
+            const int c = c0 + 8*ic + l8;
+            if (c >= k8) {
+                break;
+            }
+            float f[ncpg][8];
+#pragma unroll
+            for (int cc = 0; cc < ncpg; ++cc) {
+                uc[cc][ic].to_float(f[cc]);
+            }
+#pragma unroll
+            for (int it = 0; it < ncols; ++it) {
+                const float4 * tc = (const float4 *) (hc_gated_t + it*k) + 2*c;
+                const float4 ta = tc[0];
+                const float4 tb = tc[1];
+#pragma unroll
+                for (int cc = 0; cc < ncpg; ++cc) {
+                    acc[cc][it] = hc_gated_dot8(f[cc], ta, tb, acc[cc][it]);
+                }
+            }
+        }
+    }
+    ggml_cuda_pdl_lc();
+
+    const int  it    = hc_gated_scatter_index<8, np>(l8);
+    const bool owner = hc_gated_scatter_owner<8, np>(l8) && it < ncols;
+#pragma unroll
+    for (int cc = 0; cc < ncpg; ++cc) {
+        const int col = col0 + cc;
+        const float g = hc_gated_reduce_scatter<8, np>(acc[cc], l8);
+        float xv = 0.0f;
+        float wv = 0.0f;
+        if (owner && col < n_embd) {
+            xv = x[col*sx0 + h*sx1 + it*sx2];
+            wv = 1.0f / (1.0f + expf(-g));
+        }
+        float sum = 0.0f;
+#pragma unroll
+        for (int ih = 0; ih < DSV4_HC; ++ih) {
+            sum += __shfl_sync(0xffffffff, xv, 8*ih + l8, 32) * __shfl_sync(0xffffffff, wv, 8*ih + l8, 32);
+        }
+        if (owner && h == 0 && col < n_embd) {
+            dst[col*sd0 + it*sd1] = scale * sum;
+        }
+    }
+}
+
+static bool hc_gated_weight_ok(const ggml_tensor * w) {
+    if (w->type != GGML_TYPE_F16) {
+        return false;
+    }
+    return w->ne[2] == 1 && w->ne[3] == 1 && w->nb[0] == ggml_type_size(w->type) && w->ne[0] % 8 == 0 &&
+        w->nb[1] % 16 == 0 && (uintptr_t) w->data % 16 == 0;
+}
+
+// a column-major activation [k, ncols] read with 16-byte loads
+static bool hc_gated_cols_ok(const ggml_tensor * x, const int64_t k) {
+    return x->type == GGML_TYPE_F32 && x->ne[0] == k && x->ne[1] >= 1 && x->ne[1] <= GGML_CUDA_HC_GATED_MAX_TOKENS &&
+        x->ne[2] == 1 && x->ne[3] == 1 && x->nb[0] == sizeof(float) && x->nb[1] % 16 == 0 && (uintptr_t) x->data % 16 == 0;
+}
+
+static bool hc_gated_scale_ok(const ggml_tensor * s, const ggml_tensor * src) {
+    return s->op == GGML_OP_SCALE && s->src[0] == src && s->type == GGML_TYPE_F32 && ggml_are_same_shape(s, src) &&
+        ggml_is_contiguous(s) && ggml_is_contiguous(src);
+}
+
+bool ggml_cuda_hc_gated_pre_supported(const ggml_tensor * mm_down, const ggml_tensor * scale, const ggml_tensor * act,
+        const ggml_tensor * mm_up, const ggml_tensor * gate, const ggml_tensor * pre) {
+    const ggml_tensor * w  = mm_down->src[0];
+    const ggml_tensor * xn = mm_down->src[1];
+    const ggml_tensor * u  = mm_up->src[0];
+    const ggml_tensor * x  = pre->src[0];
+
+    if (!hc_gated_weight_ok(w) || !hc_gated_weight_ok(u)) {
+        return false;
+    }
+    const int64_t k     = w->ne[0];
+    const int64_t m     = w->ne[1];
+    const int64_t ncols = xn->ne[1];
+    if (!hc_gated_cols_ok(xn, k) || mm_down->type != GGML_TYPE_F32 || mm_down->ne[0] != m || mm_down->ne[1] != ncols ||
+            !ggml_is_contiguous(mm_down)) {
+        return false;
+    }
+    if (!hc_gated_scale_ok(scale, mm_down) || act->op != GGML_OP_UNARY || ggml_get_unary_op(act) != GGML_UNARY_OP_SILU ||
+            act->src[0] != scale || !ggml_are_same_shape(act, scale) || !ggml_is_contiguous(act) || act->type != GGML_TYPE_F32) {
+        return false;
+    }
+    // the activation stays in shared memory: [ncols][m]
+    if (mm_up->src[1] != act || u->ne[0] != m || m % 8 != 0 || ncols*m*(int64_t) sizeof(float) > 32*1024) {
+        return false;
+    }
+    if (pre->op != GGML_OP_DSV4_HC_PRE || ggml_get_op_params_i32(pre, 1) == 0 || pre->src[1] != gate ||
+            gate->op != GGML_OP_RESHAPE || gate->src[0] != mm_up) {
+        return false;
+    }
+    const int64_t n_embd = x->ne[0];
+    if (x->type != GGML_TYPE_F32 || x->ne[1] != DSV4_HC || x->ne[2] != ncols || x->ne[3] != 1 ||
+            u->ne[1] != n_embd*DSV4_HC || mm_up->ne[0] != n_embd*DSV4_HC || mm_up->ne[1] != ncols ||
+            !ggml_is_contiguous(mm_up) || !ggml_is_contiguous(gate) || gate->ne[0] != n_embd || gate->ne[1] != DSV4_HC ||
+            gate->ne[2] != ncols || pre->type != GGML_TYPE_F32 || pre->ne[0] != n_embd || pre->ne[1] != ncols) {
+        return false;
+    }
+    return true;
+}
+
+template <typename T, int ncols>
+static void hc_gated_pre_launch(ggml_backend_cuda_context & ctx, const ggml_tensor * mm_down, const ggml_tensor * scale,
+        const ggml_tensor * mm_up, ggml_tensor * pre) {
+    const ggml_tensor * w  = mm_down->src[0];
+    const ggml_tensor * xn = mm_down->src[1];
+    const ggml_tensor * u  = mm_up->src[0];
+    const ggml_tensor * x  = pre->src[0];
+
+    const int k      = (int) w->ne[0];
+    const int m      = (int) w->ne[1];
+    const int n_embd = (int) x->ne[0];
+
+    float scale_v;
+    float bias_v;
+    memcpy(&scale_v, (const float *) scale->op_params + 0, sizeof(float));
+    memcpy(&bias_v,  (const float *) scale->op_params + 1, sizeof(float));
+    const float scale_pre = ggml_get_op_params_f32(pre, 0);
+
+    ggml_cuda_pool_alloc<float> t(ctx.pool(), (size_t) ncols*m);
+
+    // more tokens: two rows per block of the down projection (fewer reads of the activation) and two columns per
+    // lane group of the up projection (fewer reads of t)
+    constexpr int J    = ncols <= 2 ? 1 : 2;
+    constexpr int ncpg = ncols <= 2 ? 1 : 2;
+    const dim3 block(HC_GATED_THREADS, 1, 1);
+    {
+        const dim3 grid((m + J - 1)/J, 1, 1);
+        ggml_cuda_kernel_launch(hc_gated_down_silu<T, ncols, J>, ggml_cuda_kernel_launch_params(grid, block, 0, ctx.stream()),
+            (const T *) w->data, (int64_t) (w->nb[1]/sizeof(T)), (const float *) xn->data, (int64_t) (xn->nb[1]/sizeof(float)),
+            t.get(), k, m, scale_v, bias_v);
+    }
+    {
+        constexpr int cols_per_block = ncpg*(HC_GATED_THREADS/32);
+        const dim3 grid((n_embd + cols_per_block - 1)/cols_per_block, 1, 1);
+        const size_t shmem = (size_t) ncols*m*sizeof(float);
+        ggml_cuda_kernel_launch(hc_gated_up_mix<T, ncols, ncpg>, ggml_cuda_kernel_launch_params(grid, block, shmem, ctx.stream()),
+            (const T *) u->data, (int64_t) (u->nb[1]/sizeof(T)), (const float *) t.get(),
+            (const float *) x->data, (int64_t) (x->nb[0]/sizeof(float)), (int64_t) (x->nb[1]/sizeof(float)), (int64_t) (x->nb[2]/sizeof(float)),
+            (float *) pre->data, (int64_t) (pre->nb[0]/sizeof(float)), (int64_t) (pre->nb[1]/sizeof(float)),
+            m, n_embd, scale_pre);
+    }
+}
+
+template <typename T>
+static void hc_gated_pre_switch_ncols(ggml_backend_cuda_context & ctx, const ggml_tensor * mm_down, const ggml_tensor * scale,
+        const ggml_tensor * mm_up, ggml_tensor * pre) {
+    switch (mm_down->src[1]->ne[1]) {
+        case 1: hc_gated_pre_launch<T, 1>(ctx, mm_down, scale, mm_up, pre); break;
+        case 2: hc_gated_pre_launch<T, 2>(ctx, mm_down, scale, mm_up, pre); break;
+        case 3: hc_gated_pre_launch<T, 3>(ctx, mm_down, scale, mm_up, pre); break;
+        case 4: hc_gated_pre_launch<T, 4>(ctx, mm_down, scale, mm_up, pre); break;
+        case 5: hc_gated_pre_launch<T, 5>(ctx, mm_down, scale, mm_up, pre); break;
+        case 6: hc_gated_pre_launch<T, 6>(ctx, mm_down, scale, mm_up, pre); break;
+        case 7: hc_gated_pre_launch<T, 7>(ctx, mm_down, scale, mm_up, pre); break;
+        case 8: hc_gated_pre_launch<T, 8>(ctx, mm_down, scale, mm_up, pre); break;
+        default: GGML_ABORT("fatal error");
+    }
+}
+
+void ggml_cuda_op_hc_gated_pre(ggml_backend_cuda_context & ctx, const ggml_tensor * mm_down, const ggml_tensor * scale,
+        const ggml_tensor * mm_up, ggml_tensor * pre) {
+    switch (mm_down->src[0]->type) {
+        case GGML_TYPE_F16: hc_gated_pre_switch_ncols<half>(ctx, mm_down, scale, mm_up, pre); break;
+        default: GGML_ABORT("unsupported type: %s", ggml_type_name(mm_down->src[0]->type));
+    }
+}
