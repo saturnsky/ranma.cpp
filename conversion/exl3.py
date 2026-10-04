@@ -26,6 +26,7 @@ from __future__ import annotations
 import copy
 import json
 import logging
+import re
 import struct
 from dataclasses import dataclass, field
 from math import prod
@@ -886,7 +887,8 @@ class _Exl3Model:
 
     def modify_tensors(self, data_torch, name, bid) -> Iterable[tuple[str, Any]]:
         try:
-            for new_name, t in super().modify_tensors(data_torch, name, bid):  # ty: ignore[unresolved-attribute]
+            handled = self._exl3_adapter_modify(data_torch, name, bid)
+            for new_name, t in (handled if handled is not None else super().modify_tensors(data_torch, name, bid)):  # ty: ignore[unresolved-attribute]
                 if isinstance(t, Exl3Tensor):
                     self._exl3.emit(self, new_name, t)
                 else:
@@ -903,6 +905,7 @@ class _Exl3Model:
 
     def prepare_tensors(self):
         super().prepare_tensors()  # ty: ignore[unresolved-attribute]
+        self._exl3_adapter_check()
         self._exl3.emit_ngram(self)
         self._exl3.finish()
 
@@ -912,10 +915,78 @@ class _Exl3Model:
         self._exl3.add_metadata(self, self._exl3_rope_neox)
 
 
+# ---- per-class adapters ---------------------------------------------------------------------------------------------
+# A model class that writes some tensors outside modify_tensors (from sources that exist only in its original
+# checkpoint format) or whose EXL3 checkpoint names differ from the original needs a small adapter. The table maps the
+# class name (the first match along the MRO) to the methods that adapt() adds to the EXL3 class:
+#   _exl3_adapter_modify(data_torch, name, bid) -> list of (name, tensor) or None (not handled)
+#   _exl3_adapter_check()                       -> raise when the adapter holds unfinished state
+#   plus any methods the class calls itself (DeepseekV4Model: _write_mxfp4_expert_tensor).
+
+def _adapter_none_modify(self, data_torch, name, bid):
+    return None
+
+
+def _adapter_none_check(self):
+    return None
+
+
+def _ds4_write_experts(self, bid: int, proj: str, tensor_key: gguf.MODEL_TENSOR) -> list[str]:
+    """DeepseekV4Model routed experts: the class repacks MXFP4 sources, the EXL3 checkpoint has one group per expert
+    (`layers.N.ffn.experts.E.w{1,2,3}`); stack the E groups as one [E, N, K] EXL3 tensor of the bank."""
+    n_experts = self.hparams["n_routed_experts"]
+    names = [f"layers.{bid}.ffn.experts.{e}.{proj}.weight" for e in range(n_experts)]
+    missing = [n for n in names if n not in self.model_tensors]
+    if missing:
+        raise Exl3Error(f"EXL3 routed experts of layer {bid}: {len(missing)} of {n_experts} missing, e.g. {missing[0]!r}")
+    stacked = torch.stack([self.model_tensors[n]() for n in names], dim=0)
+    if not isinstance(stacked, Exl3Tensor):
+        raise Exl3Error(f"layers.{bid}.ffn.experts.*.{proj}: not EXL3 groups")
+    self._exl3.emit(self, self.format_tensor_name(tensor_key, bid), stacked)
+    return names
+
+
+DS4_O_GROUPS = 8
+
+
+def _ds4_modify(self, data_torch, name, bid):
+    """`layers.N.attn.wo_a.slice.0..7` (grouped wo_a, one [1024, 4096] linear per output group, each with its own
+    rot_in / rot_out): stacked as attn_output_a [8, 1024, 4096] = ne [4096, 1024, 8] with rot_in [8, 4096], rot_out [8, 1024]."""
+    m = re.match(r"layers\.(\d+)\.attn\.wo_a\.slice\.(\d+)\.weight$", name)
+    if m is None:
+        return None
+    if not isinstance(data_torch, Exl3Tensor):
+        raise Exl3Error(f"{name}: a grouped wo_a slice that is not an EXL3 group")
+    slices = self.__dict__.setdefault("_ds4_wo_a", {}).setdefault(bid, {})
+    slices[int(m[2])] = data_torch
+    if len(slices) < DS4_O_GROUPS:
+        return []
+    del self._ds4_wo_a[bid]
+    if sorted(slices) != list(range(DS4_O_GROUPS)):
+        raise Exl3Error(f"layer {bid}: wo_a slices {sorted(slices)}, expected 0..{DS4_O_GROUPS - 1}")
+    return [(self.format_tensor_name(gguf.MODEL_TENSOR.ATTN_OUT_A, bid), torch.stack([slices[i] for i in range(DS4_O_GROUPS)], dim=0))]
+
+
+def _ds4_check(self):
+    left = {b: sorted(v) for b, v in self.__dict__.get("_ds4_wo_a", {}).items()}
+    if left:
+        raise Exl3Error(f"incomplete grouped wo_a (layer: slices present): {left}")
+
+
+EXL3_CLASS_ADAPTERS: dict[str, dict[str, Any]] = {
+    "DeepseekV4Model": dict(_write_mxfp4_expert_tensor=_ds4_write_experts, _exl3_adapter_modify=_ds4_modify, _exl3_adapter_check=_ds4_check),
+}
+
+
 def adapt(model_class: type, ngram: str = "table") -> type:
     """The model class with EXL3 weights; RoPE Q/K permutation off (NEOX key instead). The MTP layers follow the class
     (default, --no-mtp, --mtp); when they cannot be stored as EXL3, construction raises Exl3MtpUnsupported."""
-    attrs: dict[str, Any] = dict(model_arch=model_class.model_arch, _exl3_ngram=ngram, _exl3_mtp_names=set())
+    attrs: dict[str, Any] = dict(model_arch=model_class.model_arch, _exl3_ngram=ngram, _exl3_mtp_names=set(),
+                                 _exl3_adapter_modify=_adapter_none_modify, _exl3_adapter_check=_adapter_none_check)
+    for klass in model_class.__mro__:
+        if klass.__name__ in EXL3_CLASS_ADAPTERS:
+            attrs.update(EXL3_CLASS_ADAPTERS[klass.__name__])
+            break
     if getattr(model_class, "undo_permute", False):
         attrs["undo_permute"] = False
         attrs["_exl3_rope_neox"] = True
