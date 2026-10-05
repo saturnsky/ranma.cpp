@@ -6317,6 +6317,179 @@ struct test_mul_mat_id_shared_unit : public test_case {
     }
 };
 
+// GGML_OP_MUL_MAT_HAD
+// The output holds the op and, behind it on dim 3, the same product built from ordinary ops:
+// mul(rot_in) -> Hadamard matmul (hint) -> mul_mat(_id) of the F32 weight -> Hadamard matmul -> mul(rot_out).
+// err() compares the tested op with the composite and with the op of the reference backend.
+struct test_mul_mat_had : public test_case {
+    const ggml_type type_a;
+    const ggml_type type_rot;
+    const int64_t k;
+    const int64_t n;
+    const int64_t m;       // rows of b (no ids) or tokens (ids)
+    const int n_exp;       // experts of a (1 = 2D)
+    const int n_used;      // 0 = no ids
+    const bool bcast;      // ids: one b row per token; no ids: 3 batches of b for a 2D a
+    const int had;
+    const int64_t n_v;     // rows of a in memory; for n_v > n the op reads a view at row 128
+    const int64_t pad;     // b is zero-padded from k - pad, the output is cut to n - pad rows
+
+    std::string vars() override {
+        return VARS_TO_STR11(type_a, type_rot, k, n, m, n_exp, n_used, bcast, had, n_v, pad);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return ggml_op_name(GGML_OP_MUL_MAT_HAD);
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    double max_nmse_err() override {
+        return 1e-9;
+    }
+
+    double err(const float * a, const float * b, size_t n_all) override {
+        const size_t half = n_all/2;
+        return std::max(nmse(a, b + half, half), nmse(a, b, half));
+    }
+
+    test_mul_mat_had(ggml_type type_a = GGML_TYPE_F32, ggml_type type_rot = GGML_TYPE_F16,
+            int64_t k = 256, int64_t n = 256, int64_t m = 3, int n_exp = 1, int n_used = 0,
+            bool bcast = false, int had = 128, int64_t n_v = 0, int64_t pad = 0)
+        : type_a(type_a), type_rot(type_rot), k(k), n(n), m(m), n_exp(n_exp), n_used(n_used),
+            bcast(bcast), had(had), n_v(n_v), pad(pad) {
+            GGML_ASSERT(n_v == 0 || n_v >= n + 128);
+            GGML_ASSERT(n_used > 0 || !bcast || n_exp == 1);
+        }
+
+    ggml_tensor * hadamard(ggml_context * ctx, ggml_tensor * hm, ggml_tensor * cur) {
+        ggml_tensor * res = ggml_mul_mat(ctx, hm, ggml_reshape_2d(ctx, cur, had, ggml_nelements(cur)/had));
+        ggml_mul_mat_set_hint(res, GGML_HINT_SRC0_IS_HADAMARD);
+        return ggml_reshape_4d(ctx, res, cur->ne[0], cur->ne[1], cur->ne[2], cur->ne[3]);
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t rows = n_v ? n_v : n;
+        const size_t  offs = n_v ? 128 : 0;
+
+        ggml_tensor * a_mem = ggml_new_tensor_3d(ctx, type_a, k, rows, n_exp);
+        ggml_set_name(a_mem, "a");
+        ggml_tensor * a = n_v ? ggml_view_3d(ctx, a_mem, k, n, n_exp, a_mem->nb[1], a_mem->nb[2], offs*a_mem->nb[1]) : a_mem;
+
+        // F32 weight for the composite; EXL3 has no row API, initialize_tensors() decodes it
+        ggml_tensor * af;
+        if (ggml_is_exl3(type_a)) {
+            ggml_tensor * af_mem = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, rows, n_exp);
+            ggml_set_name(af_mem, "a_f32");
+            af = n_v ? ggml_view_3d(ctx, af_mem, k, n, n_exp, af_mem->nb[1], af_mem->nb[2], offs*af_mem->nb[1]) : af_mem;
+        } else {
+            af = ggml_cast(ctx, a, GGML_TYPE_F32);
+        }
+
+        ggml_tensor * rot_in = ggml_new_tensor_2d(ctx, type_rot, k, n_exp);
+        ggml_set_name(rot_in, "rot_in");
+        ggml_tensor * rot_out_mem = ggml_new_tensor_2d(ctx, type_rot, rows, n_exp);
+        ggml_set_name(rot_out_mem, "rot_out");
+        ggml_tensor * rot_out = n_v ? ggml_view_2d(ctx, rot_out_mem, n, n_exp, rot_out_mem->nb[1], offs*rot_out_mem->nb[0]) : rot_out_mem;
+
+        ggml_tensor * hm = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, had, had);
+        ggml_set_name(hm, "hadamard");
+
+        ggml_tensor * ids = nullptr;
+        ggml_tensor * b;
+        if (n_used > 0) {
+            ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, m);
+            ggml_set_name(ids, "ids");
+            b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k - pad, bcast ? 1 : n_used, m);
+        } else {
+            b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k - pad, m, bcast ? 3 : n_exp);
+        }
+        ggml_set_name(b, "b");
+        if (pad) {
+            b = ggml_pad(ctx, b, pad, 0, 0, 0);
+        }
+
+        ggml_tensor * out = ggml_mul_mat_had(ctx, a, b, rot_in, rot_out, ids, had);
+        ggml_set_name(out, "out_had");
+
+        ggml_tensor * rin  = ggml_cast(ctx, rot_in, GGML_TYPE_F32);
+        ggml_tensor * rout = ggml_cast(ctx, rot_out, GGML_TYPE_F32);
+        ggml_tensor * ref;
+        if (ids) {
+            ggml_tensor * ids_1d  = ggml_reshape_1d(ctx, ids, n_used*m);
+            ggml_tensor * rin_sel = ggml_reshape_3d(ctx, ggml_get_rows(ctx, rin, ids_1d), k, n_used, m);
+            ggml_tensor * x = ggml_mul(ctx, bcast ? ggml_repeat(ctx, b, rin_sel) : b, rin_sel);
+            ref = ggml_mul_mat_id(ctx, af, hadamard(ctx, hm, x), ids);
+            ref = ggml_mul(ctx, hadamard(ctx, hm, ref), ggml_reshape_3d(ctx, ggml_get_rows(ctx, rout, ids_1d), n, n_used, m));
+        } else {
+            ggml_tensor * x = ggml_mul(ctx, b, ggml_reshape_3d(ctx, rin, k, 1, n_exp));
+            ref = ggml_mul_mat(ctx, af, hadamard(ctx, hm, x));
+            ref = ggml_mul(ctx, hadamard(ctx, hm, ref), ggml_reshape_3d(ctx, rout, n, 1, n_exp));
+        }
+        ggml_set_name(ref, "out_ref");
+
+        if (pad) {
+            out = ggml_cont(ctx, ggml_view_3d(ctx, out, n - pad, out->ne[1], out->ne[2], out->nb[1], out->nb[2], 0));
+            ref = ggml_cont(ctx, ggml_view_3d(ctx, ref, n - pad, ref->ne[1], ref->ne[2], ref->nb[1], ref->nb[2], 0));
+        }
+
+        out = ggml_concat(ctx, out, ref, 3);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        ggml_tensor * a  = ggml_get_tensor(ctx, "a");
+        ggml_tensor * af = ggml_get_tensor(ctx, "a_f32");
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->op != GGML_OP_NONE || t == a || t == af || t->type == GGML_TYPE_I32) {
+                continue;
+            }
+            if (strcmp(t->name, "hadamard") == 0) {
+                std::vector<float> data(had*had);
+                for (int r = 0; r < had; r++) {
+                    for (int i = 0; i < had; i++) {
+                        int pop = 0;
+                        for (int v = r & i; v; v >>= 1) {
+                            pop += v & 1;
+                        }
+                        data[r*had + i] = (pop % 2 ? -1.0f : 1.0f) / sqrtf((float) had);
+                    }
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(float));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+        if (n_used > 0) {
+            init_mul_mat_id_ids(ctx, n_exp);
+        }
+        if (!ggml_is_exl3(type_a)) {
+            init_tensor_uniform(a);
+            return;
+        }
+        // random trellis bytes, and their raw values for the composite
+        std::default_random_engine rng(std::random_device{}());
+        std::vector<uint8_t> bytes(ggml_nbytes(a));
+        for (auto & v : bytes) {
+            v = (uint8_t) rng();
+        }
+        ggml_backend_tensor_set(a, bytes.data(), 0, bytes.size());
+        std::vector<ggml_fp16_t> raw(128*k);
+        std::vector<float> rawf(128*k);
+        for (int64_t e = 0; e < a->ne[2]; e++) {
+            for (int64_t g = 0; g < a->ne[1]/128; g++) {
+                ggml_exl3_decode_group(type_a, bytes.data() + e*a->nb[2] + g*128*a->nb[1], k, raw.data());
+                for (size_t i = 0; i < raw.size(); i++) {
+                    rawf[i] = ggml_fp16_to_fp32(raw[i]);
+                }
+                ggml_backend_tensor_set(af, rawf.data(), e*af->nb[2] + g*128*af->nb[1], rawf.size()*sizeof(float));
+            }
+        }
+    }
+};
+
 // GGML_OP_OUT_PROD
 struct test_out_prod : public test_case {
     const ggml_type type_a;
@@ -11223,6 +11396,29 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F16, 4096, 1, 4096));
     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F16, 8192, 1, 8192));
     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F16, 1024, 7, 1024));  // many rows
+
+    // MUL_MAT_HAD: EXL3 types, F16/F32 weights and other Hadamard sizes, ids with duplicates and broadcast b,
+    // batched and broadcast b without ids, 128-row views, zero-padded K/N
+    for (ggml_type type_a : { GGML_TYPE_EXL3_M1, GGML_TYPE_EXL3_M2, GGML_TYPE_EXL3_M3, GGML_TYPE_EXL3_M4, GGML_TYPE_EXL3_M5, GGML_TYPE_EXL3_M6,
+                              GGML_TYPE_EXL3_M7, GGML_TYPE_EXL3_M8, GGML_TYPE_EXL3_M1H, GGML_TYPE_EXL3_M2H, GGML_TYPE_EXL3_M3H }) {
+        test_cases.emplace_back(new test_mul_mat_had(type_a, GGML_TYPE_F16, 256, 256, 3));
+    }
+    for (ggml_type type_a : { GGML_TYPE_F32, GGML_TYPE_F16 }) {
+        for (int had : { 64, 128, 256 }) {
+            test_cases.emplace_back(new test_mul_mat_had(type_a, GGML_TYPE_F32, 512, 256, 4, 1, 0, false, had));
+        }
+    }
+    for (ggml_type type_a : { GGML_TYPE_EXL3_M3, GGML_TYPE_F16 }) {
+        test_cases.emplace_back(new test_mul_mat_had(type_a, GGML_TYPE_F16, 256, 384, 5, 4, 2));                     // ids
+        test_cases.emplace_back(new test_mul_mat_had(type_a, GGML_TYPE_F16, 256, 384, 5, 4, 6));                     // duplicate ids
+        test_cases.emplace_back(new test_mul_mat_had(type_a, GGML_TYPE_F32, 256, 384, 5, 4, 3, true));               // ids, broadcast b
+        test_cases.emplace_back(new test_mul_mat_had(type_a, GGML_TYPE_F16, 384, 256, 2, 1, 0, true));               // broadcast b
+        test_cases.emplace_back(new test_mul_mat_had(type_a, GGML_TYPE_F16, 384, 256, 2, 3));                        // batched
+        test_cases.emplace_back(new test_mul_mat_had(type_a, GGML_TYPE_F16, 256, 256, 3, 1, 0, false, 128, 512));    // 128-row view
+        test_cases.emplace_back(new test_mul_mat_had(type_a, GGML_TYPE_F16, 256, 256, 3, 3, 2, false, 128, 640));    // view of experts
+        test_cases.emplace_back(new test_mul_mat_had(type_a, GGML_TYPE_F16, 384, 256, 3, 1, 0, false, 128, 0, 72)); // padded K/N
+        test_cases.emplace_back(new test_mul_mat_had(type_a, GGML_TYPE_F16, 384, 256, 4, 2, 3, false, 128, 0, 56)); // padded, ids
+    }
 
     // FP4 activation precision (default = native W4A4, src1 GGML_PREC_Q8 = W4A8)
     test_cases.emplace_back(new test_mul_mat_w4a8(GGML_TYPE_NVFP4, GGML_TYPE_F32, 32,  1, 256));
