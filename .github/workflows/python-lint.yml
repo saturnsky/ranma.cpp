@@ -1,19 +1,7 @@
 name: flake8 Lint
 
 on:
-  push:
-    branches:
-      - master
-    paths: [
-      '.github/workflows/python-lint.yml',
-      '**/*.py'
-    ]
-  pull_request:
-    types: [opened, synchronize, reopened]
-    paths: [
-      '.github/workflows/python-lint.yml',
-      '**/*.py'
-    ]
+  workflow_dispatch:
 
 cache-mode: none
 permissions:
