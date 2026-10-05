@@ -164,7 +164,7 @@ applies, how to switch it, and its limits.
   between the experts, so the experts in VRAM compute inside the wait for the experts read over the link.
   Same page.
 - **Shared expert unit in the routed launch** - on RDNA4 a dense shared expert whose type differs from the
-  routed type (Q6_K with IQ2/IQ3 routed experts), and the shared down
+  routed type (Q6_K with IQ2/IQ3 routed experts, Q8_0 with Q4_K, Q5_K, Q5_1 or Q8_0), and the shared down
   matrix, run as one more channel of the routed launches, on top of upstream's same-type shared expert
   fusion; its own launches disappear. Same page.
 
