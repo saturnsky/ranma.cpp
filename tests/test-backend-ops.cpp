@@ -10821,8 +10821,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_mul_mat_id_shared(type, n));
         }
     }
-    // the routed/shared pairs of the RDNA4 shared unit, one token (unit) and two (no unit)
+    // the routed/shared pairs of the RDNA4 shared unit and a same-type pair, one token (unit) and two (no unit)
     for (auto [type, type_shared] : std::initializer_list<std::pair<ggml_type, ggml_type>>{
+            { GGML_TYPE_Q4_K, GGML_TYPE_Q8_0 }, { GGML_TYPE_Q5_1, GGML_TYPE_Q8_0 }, { GGML_TYPE_Q8_0, GGML_TYPE_Q8_0 },
             { GGML_TYPE_IQ2_XS, GGML_TYPE_Q6_K }, { GGML_TYPE_IQ3_XXS, GGML_TYPE_Q6_K } }) {
         for (bool down : { false, true }) {
             for (int64_t n : { 1, 2 }) {
