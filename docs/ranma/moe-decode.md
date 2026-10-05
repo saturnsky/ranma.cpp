@@ -138,3 +138,110 @@ difference shows.
 The output must be bit-identical with the switch on and off - the same summands
 in the same order, only dispatched differently - so a greedy continuation with
 `GGML_CUDA_MMVQ_ID_EXPERTS_FIRST=0` and `=1` should reproduce token for token.
+
+
+## Shared expert unit in the routed launch
+
+### What it is
+
+Upstream fuses the dense shared expert of a layer into the one-token routed
+gate/up launch when the shared matrices have the routed type: the launch gets
+one more channel, and that channel runs the routed code on the shared matrices
+(`ggml_cuda_match_shared_expert()`, upstream pull request #29184). This change
+extends the same channel to the cases upstream does not cover:
+
+- a shared expert whose type differs from the routed type, which is how the
+  usual mixed quantizations store it (routed IQ2/IQ3 with a Q6_K shared expert);
+- the shared down matrix, which rides in the routed down launch of the layer.
+
+Such a channel is computed by a **shared unit** of the one-token kernel instead
+of the routed code. The launches the shared expert would need of its own - the
+fused gate/up matmul, the down matmul and their q8_1 quantizations - disappear.
+
+### When it applies
+
+Every one-token decode step of a model whose shared expert pairs with its
+routed experts as in the table below. With the expert cache the routed launch
+alternates its experts (previous section), and the shared channel is the last
+expert of that alternation, so its rows run inside the wait for the experts read
+over the link; that is where it pays most. Without the cache it still removes
+the launches of the shared expert.
+
+### How it works
+
+**The unit.** Which shared type a routed type can carry is a property of the
+routed type alone (`ggml_cuda_mmvq_shared_unit_type()`); every pair is another
+compiled kernel instance, which is why the list is short.
+
+| Routed type | Shared type | Layout of the unit |
+| --- | --- | --- |
+| IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S | Q6_K | replayed |
+
+The layout follows from the RDNA4 parameter table. The routed kernel runs one
+warp and one row per block and the standalone shared kernel runs eight warps and
+four rows, so the unit **replays**: a row of the result does not depend on how
+the rows are spread over blocks, so one lane walks all eight warp strides, keeps
+one partial sum per warp, adds them in warp order and finishes with the same lane
+reduction - the same summands in the same order, hence the same rows. The kernel
+refuses to compile a unit for a launch of another layout.
+
+The gate/up unit reads the q8_1 input the routed launch already made (it is the
+same tensor and the same bytes); the down unit quantizes the shared GLU result
+exactly as a launch of its own would. A gate unit only rides in the fused variant
+of the routed kernel, which is the one that has the shared memory for it.
+
+**The match.** The gate/up pair is upstream's pattern
+(`ggml_cuda_match_shared_expert()`): the routed `MUL_MAT_ID` gate and up and
+their GLU, and a shared `MUL_MAT` gate and up and their GLU behind them, which
+the graph-optimize pass moves right behind the routed nodes. The extension only
+widens the type check to the pairs of the table (one token, shared matrices of
+the routed shape in this device's memory, SwiGLU or clamped SwiGLU without
+swapped operands) and also accepts a shared input that is the routed input seen
+through another chain of views.
+
+The down pair is a pattern of its own (`ggml_cuda_match_shared_expert_down()`):
+a one-token routed `MUL_MAT_ID` whose input is a GLU result, and a shared
+`MUL_MAT` of the routed shape and a pair type whose input is the shared GLU
+result, computed before the routed launch. The graph-optimize pass moves the
+shared down matmul right behind the routed down launch and keeps the routed
+input and ids allocated until the shared result is placed, so that the launch
+can write it while it still reads them; at evaluation the usual fusion checks
+(`ggml_can_fuse_subgraph_ext()`, `ggml_cuda_check_fusion_memory_ranges()`)
+decide.
+
+**The launch.** The fusion arguments carry the shared matrices
+(`shared_up`, `shared_gate`, null for the down matrix), the shared result and,
+for the down matrix, the shared input. The launch adds one channel to its grid
+as upstream does; a channel of another type or without a gate is flagged as a
+shared unit, gets its row stride and its q8_1 input, and runs in the kernel
+instance of the routed type that has the unit compiled in. The matmuls the unit
+takes over are reported to the q8_1 sharing plan of the graph, so that their
+group keeps moving; the same is done for upstream's same-type channel.
+
+### Options
+
+| Name | Kind | Default | Effect |
+| --- | --- | --- | --- |
+| `GGML_CUDA_MMVQ_ID_FOLD_SHARED` | env | `1` | `0` disables the shared unit: a shared expert of another type, and every shared down matrix, keep their own launches. Upstream's same-type channel is not affected (`GGML_CUDA_DISABLE_FUSION=1` turns off all fusions). Reference path for equivalence checks. |
+
+### Limits
+
+- HIP with the RDNA4 parameter table only, and only for the one-token kernel of
+  a routed type that has a shared type in the table above, with one row per
+  block. The small-k and halved-iteration variants of a routed kernel carry no
+  unit.
+- A model that pairs its types differently (for example routed IQ3_XXS with a
+  Q8_0 shared expert) keeps the shared launches; so does a launch with more than
+  one token, where only upstream's same-type channel applies.
+- Only SwiGLU and clamped SwiGLU shared activations, without swapped operands.
+
+### How to verify it
+
+- Compare logits or a greedy continuation against a run with
+  `GGML_CUDA_MMVQ_ID_FOLD_SHARED=0`. The unit computes the same sums in the same
+  order as a standalone launch, so the result is expected to be unchanged.
+- `test-backend-ops -o MUL_MAT_ID_SHARED_UNIT` compares the gate/up and the down
+  pairs of the table against the CPU backend, at one token (unit) and two (no
+  unit).
+- With `--log-verbosity 5` (debug) the graph-optimize pass logs how many routed gate/up
+  and down launches got a shared expert matched.

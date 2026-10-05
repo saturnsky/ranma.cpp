@@ -1602,6 +1602,9 @@ struct ggml_cuda_mm_fusion_args_host {
     const ggml_tensor * shared_up = nullptr;
     const ggml_tensor * shared_gate = nullptr;
     ggml_tensor * shared_dst = nullptr;
+    // input of the shared expert when it is not the routed input (the shared down matrix reads the
+    // shared GLU result); null for the gate/up pair, which reads the routed input
+    const ggml_tensor * shared_src1 = nullptr;
 };
 struct ggml_cuda_mm_fusion_args_device {
     const void * x_bias = nullptr;
@@ -1635,6 +1638,12 @@ struct ggml_cuda_mm_fusion_args_device {
     const void * shared_gate = nullptr;
     float * shared_dst = nullptr;
     uint32_t shared_stride_col_dst = 0;
+    // the shared expert channel is computed by a shared unit of the one-token kernel (mmvq.cu)
+    // instead of the routed code: its type differs from the routed type, or it has no gate (the
+    // down matrix). shared_y is its q8_1 input, shared_stride_row_x its row stride in blocks.
+    bool shared_unit = false;
+    const void * shared_y = nullptr;
+    uint32_t shared_stride_row_x = 0;
 };
 
 // ranma expert cache: where one routed expert matrix is read from. The arena packs resident slices
