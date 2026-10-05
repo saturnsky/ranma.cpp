@@ -11,25 +11,6 @@ on:
         description: 'Run slow tests'
         required: true
         type: boolean
-  push:
-    branches:
-      - master
-    paths: [
-      '.github/workflows/server-sanitize.yml',
-      '**/CMakeLists.txt',
-      '**/Makefile',
-      '**/*.h',
-      '**/*.hpp',
-      '**/*.c',
-      '**/*.cpp',
-      'tools/server/**.*'
-    ]
-
-  pull_request:
-    types: [opened, synchronize, reopened]
-    paths: [
-      '.github/workflows/server-sanitize.yml'
-    ]
 
 cache-mode: none
 permissions:

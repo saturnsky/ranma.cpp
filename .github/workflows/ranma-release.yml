@@ -1,0 +1,589 @@
+# RANMA.cpp release binaries (Windows x64, HIP / ROCm 10).
+#
+# Builds the executables of a release tag (ranma_YYYYMMDD...) on a GitHub-hosted Windows runner and
+# attaches the zip files to a DRAFT GitHub Release. A maintainer downloads the zip, runs a local smoke
+# test on the target GPU and publishes the release by hand. This workflow never publishes a release
+# and never modifies a published one.
+#
+# This file is RANMA-only and is kept apart from the upstream workflows (release.yml etc.).
+# All steps are inline on purpose: a workflow_dispatch run takes this file from the default branch
+# but checks out the requested tag, and older tags do not contain any RANMA helper action/script.
+
+name: RANMA release (Windows HIP)
+
+on:
+  push:
+    tags:
+      - 'ranma_*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing release tag to build, e.g. ranma_20261005'
+        required: true
+        type: string
+
+permissions: {}
+
+concurrency:
+  group: ranma-release-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  ROCM_VERSION: '10.0.0'
+  ROCM_WHL_INDEX: 'https://stable.repo.amd.com/rocm/whl-next/'
+  # LLVM OpenMP runtime shipped as libomp.dll; same pinned installer and hashes as upstream
+  # ggml/src/CMakeLists.txt (GGML_OPENMP_FETCH). GGML_OPENMP_FETCH itself cannot be used because it
+  # requires the clang major version to equal the LLVM version (ROCm 10 clang is 23.x).
+  OPENMP_LLVM_VERSION: '20.1.8'
+  OPENMP_INSTALLER_SHA256: '3197846a2b19063687dd56e93e34cd941e3548d907f23a6131571321bdf9fe7b'
+  OPENMP_LICENSE_SHA256: 'fdad1758a9e1f9d5a81e18879b3406772115edc92c24bfa36b70c654f325e8e4'
+  # cmake targets that are built and shipped (one .exe each)
+  RANMA_TARGETS: 'llama-server llama-bench llama-cli llama-completion llama-gguf-split test-backend-ops'
+
+jobs:
+  resolve:
+    name: Resolve tag
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+      sha: ${{ steps.meta.outputs.sha }}
+      base: ${{ steps.meta.outputs.base }}
+      build_number: ${{ steps.meta.outputs.build_number }}
+    steps:
+      - name: Validate tag name
+        id: tag
+        env:
+          EVENT: ${{ github.event_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" = "workflow_dispatch" ]; then tag="$INPUT_TAG"; else tag="$REF_NAME"; fi
+          if ! printf '%s' "$tag" | grep -Eq '^ranma_[0-9]{8}(_[A-Za-z0-9]+)*$'; then
+            echo "::error::'$tag' is not a release tag name (ranma_YYYYMMDD[_suffix])"
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Clone
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: refs/tags/${{ steps.tag.outputs.tag }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Commit, upstream base and build number
+        id: meta
+        env:
+          TAG: ${{ steps.tag.outputs.tag }}
+        run: |
+          set -euo pipefail
+          sha=$(git rev-parse "refs/tags/$TAG^{commit}")
+          [ "$(git rev-parse HEAD)" = "$sha" ] || { echo "::error::HEAD is not $TAG"; exit 1; }
+          # master is the upstream base of the latest release; for any release the merge base with
+          # master is that release's own upstream base (the series is never merged into master).
+          base=$(git merge-base "$sha" refs/remotes/origin/master)
+          build_number=$(git rev-list --count "$sha")
+          {
+            echo "tag=$TAG"
+            echo "sha=$sha"
+            echo "base=$base"
+            echo "build_number=$build_number"
+          } >> "$GITHUB_OUTPUT"
+          echo "tag $TAG -> $sha, upstream base $base, build number $build_number"
+
+  build:
+    name: Build ${{ matrix.variant }}
+    needs: resolve
+    runs-on: windows-2022
+    timeout-minutes: 300
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # rocm_devices: the pip extras with the rocBLAS/hipBLASLt kernels of each target
+          # (rocm-sdk-device-<gfx>); rocm[libraries] alone has the DLLs but no kernels.
+          - variant: gfx1201
+            gpu_targets: 'gfx1201'
+            rocm_devices: 'device-gfx1201'
+          # RDNA3 trial package; enable after the gfx1201 package has been verified.
+          # - variant: gfx110x
+          #   gpu_targets: 'gfx1100;gfx1101;gfx1102'
+          #   rocm_devices: 'device-gfx1100,device-gfx1101,device-gfx1102'
+    env:
+      TAG: ${{ needs.resolve.outputs.tag }}
+      TAG_SHA: ${{ needs.resolve.outputs.sha }}
+      UPSTREAM_BASE: ${{ needs.resolve.outputs.base }}
+      BUILD_NUMBER: ${{ needs.resolve.outputs.build_number }}
+      VARIANT: ${{ matrix.variant }}
+      GPU_TARGETS: ${{ matrix.gpu_targets }}
+      ROCM_DEVICES: ${{ matrix.rocm_devices }}
+      ROCM_VENV: 'C:\TheRock\build\.venv'
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Clone
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: refs/tags/${{ needs.resolve.outputs.tag }}
+          fetch-depth: 0 # the build number (and the UI version derived from it) needs full history
+          persist-credentials: false
+
+      - name: Check commit
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $head = (git rev-parse HEAD).Trim()
+          if ($head -ne $env:TAG_SHA) { throw "HEAD $head is not $env:TAG ($env:TAG_SHA)" }
+          $pkg = "$env:TAG-win-x64-rocm$env:ROCM_VERSION-$env:VARIANT"
+          "PKG_NAME=$pkg" >> $env:GITHUB_ENV
+          Write-Host "package $pkg"
+
+      - name: Install Ninja
+        run: |
+          choco install ninja -y --no-progress
+          if ($LASTEXITCODE -ne 0) { throw "choco install ninja failed" }
+
+      - name: ccache
+        uses: ggml-org/ccache-action@f09c25b45002a07be2955cbe52e8cee55643f89d # v1.2.24
+        with:
+          key: ranma-release-windows-rocm${{ env.ROCM_VERSION }}-${{ matrix.variant }}
+          max-size: '2G'
+          evict-old-files: 'job'
+          # caches written by a tag run are scoped to that tag and cannot be restored by the next
+          # release; only runs on the default branch save (they are readable from every ref).
+          save: ${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
+
+      - name: Install ROCm (pip wheels)
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -Path C:\TheRock\build -ItemType Directory -Force | Out-Null
+          python --version
+          python -m venv $env:ROCM_VENV
+          if ($LASTEXITCODE -ne 0) { throw "venv failed" }
+          & "$env:ROCM_VENV\Scripts\Activate.ps1"
+          python -m pip install --upgrade pip
+          if ($LASTEXITCODE -ne 0) { throw "pip upgrade failed" }
+          python -m pip install --index-url $env:ROCM_WHL_INDEX "rocm[libraries,devel,$env:ROCM_DEVICES]==$env:ROCM_VERSION"
+          if ($LASTEXITCODE -ne 0) { throw "ROCm wheel install failed" }
+          rocm-sdk init
+          if ($LASTEXITCODE -ne 0) { throw "rocm-sdk init failed with exit code $LASTEXITCODE" }
+
+          $rocmPath = (rocm-sdk path --root).Trim()
+          $cmakePath = (rocm-sdk path --cmake).Trim()
+          $binPath = (rocm-sdk path --bin).Trim()
+          if (-not $rocmPath -or -not $binPath) { throw "rocm-sdk path returned empty" }
+          Write-Host "ROCm root: $rocmPath"
+          Write-Host "ROCm cmake: $cmakePath"
+          Write-Host "ROCm bin: $binPath"
+
+          "HIP_PATH=$rocmPath" >> $env:GITHUB_ENV
+          "ROCM_BIN=$binPath" >> $env:GITHUB_ENV
+          "CMAKE_PREFIX_PATH=$cmakePath" >> $env:GITHUB_ENV
+          "HIP_DEVICE_LIB_PATH=$rocmPath\lib\llvm\amdgcn\bitcode" >> $env:GITHUB_ENV
+          "HIP_PLATFORM=amd" >> $env:GITHUB_ENV
+          "LLVM_PATH=$rocmPath\lib\llvm" >> $env:GITHUB_ENV
+          $binPath >> $env:GITHUB_PATH
+          "$env:ROCM_VENV\Scripts" >> $env:GITHUB_PATH
+
+          python -m pip freeze | Out-File -Encoding utf8 (Join-Path $env:RUNNER_TEMP 'rocm-pip-freeze.txt')
+          & "$rocmPath\lib\llvm\bin\clang.exe" --version
+
+      - name: Fetch LLVM OpenMP runtime
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $v = $env:OPENMP_LLVM_VERSION
+          $root = Join-Path $env:RUNNER_TEMP "llvm-openmp-$v"
+          $extract = Join-Path $root 'extract'
+          New-Item -ItemType Directory -Force $extract, "$root\lib", "$root\bin", "$root\include" | Out-Null
+          $installer = Join-Path $root "LLVM-$v-win64.exe"
+          Invoke-WebRequest -Uri "https://github.com/llvm/llvm-project/releases/download/llvmorg-$v/LLVM-$v-win64.exe" -OutFile $installer
+          $hash = (Get-FileHash $installer -Algorithm SHA256).Hash.ToLower()
+          if ($hash -ne $env:OPENMP_INSTALLER_SHA256) { throw "LLVM installer hash mismatch: $hash" }
+          7z e -y "-o$extract" $installer -r libomp.lib libomp.dll omp.h | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw "7z extraction failed" }
+          Copy-Item "$extract\libomp.lib" "$root\lib\"
+          Copy-Item "$extract\libomp.dll" "$root\bin\"
+          Copy-Item "$extract\omp.h" "$root\include\"
+          Remove-Item -Recurse -Force $extract, $installer
+          $license = Join-Path $root 'LICENSE.TXT'
+          Invoke-WebRequest -Uri "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-$v/openmp/LICENSE.TXT" -OutFile $license
+          $hash = (Get-FileHash $license -Algorithm SHA256).Hash.ToLower()
+          if ($hash -ne $env:OPENMP_LICENSE_SHA256) { throw "OpenMP license hash mismatch: $hash" }
+          "OPENMP_ROOT=$($root -replace '\\', '/')" >> $env:GITHUB_ENV
+
+      - name: Locate MSVC
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = (& $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath).Trim()
+          $vcvars = Join-Path $vs 'VC\Auxiliary\Build\vcvars64.bat'
+          if (-not (Test-Path $vcvars)) { throw "vcvars64.bat not found under $vs" }
+          "VCVARS64=$vcvars" >> $env:GITHUB_ENV
+
+      - name: Configure and build
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # import the MSVC environment (Windows SDK, rc.exe, CRT libraries) like a VS developer prompt
+          cmd /c "call `"$env:VCVARS64`" >nul && set" | ForEach-Object {
+            if ($_ -match '^([^=]+)=(.*)$') { [Environment]::SetEnvironmentVariable($matches[1], $matches[2]) }
+          }
+          # the LLVM libomp.lib must win over the MSVC libomp.lib (libomp140.x86_64.dll, not redistributable)
+          $env:LIB = "$($env:OPENMP_ROOT -replace '/', '\')\lib;$env:LIB"
+          $llvm = "$env:HIP_PATH\lib\llvm\bin"
+          $ompFlags = "-fopenmp=libomp -I$env:OPENMP_ROOT/include"
+          $cmakeArgs = @(
+            '-S', '.', '-B', 'build', '-G', 'Ninja',
+            '-DCMAKE_BUILD_TYPE=Release',
+            "-DCMAKE_C_COMPILER=$llvm\clang.exe",
+            "-DCMAKE_CXX_COMPILER=$llvm\clang++.exe",
+            "-DCMAKE_HIP_COMPILER=$llvm\clang.exe",
+            "-DCMAKE_PREFIX_PATH=$env:HIP_PATH",
+            "-DHIP_PATH=$env:HIP_PATH",
+            '-DGGML_HIP=ON',
+            "-DGPU_TARGETS=$env:GPU_TARGETS",
+            '-DGGML_NATIVE=OFF',
+            '-DGGML_BACKEND_DL=OFF',
+            '-DGGML_RPC=OFF',
+            '-DGGML_CCACHE=ON',
+            '-DGGML_OPENMP=ON',
+            "-DOpenMP_C_FLAGS=$ompFlags",
+            "-DOpenMP_CXX_FLAGS=$ompFlags",
+            '-DOpenMP_C_LIB_NAMES=libomp',
+            '-DOpenMP_CXX_LIB_NAMES=libomp',
+            "-DOpenMP_libomp_LIBRARY=$env:OPENMP_ROOT/lib/libomp.lib",
+            '-DLLAMA_OPENSSL=OFF',
+            '-DLLAMA_BUILD_TESTS=ON',
+            '-DLLAMA_BUILD_EXAMPLES=OFF',
+            '-DLLAMA_BUILD_TOOLS=ON',
+            '-DLLAMA_BUILD_SERVER=ON'
+          )
+          cmake --version
+          cmake @cmakeArgs
+          if ($LASTEXITCODE -ne 0) { throw "cmake configure failed" }
+          $targets = $env:RANMA_TARGETS -split ' ' | Where-Object { $_ }
+          cmake --build build --config Release -j 4 --target @targets
+          if ($LASTEXITCODE -ne 0) { throw "build failed" }
+          ($cmakeArgs | Where-Object { $_ -like '-D*' }) -join "`n" | Out-File -Encoding utf8 (Join-Path $env:RUNNER_TEMP 'cmake-args.txt')
+
+      - name: Package
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $pkg = $env:PKG_NAME
+          $stageRoot = Join-Path $env:RUNNER_TEMP 'stage'
+          $stage = Join-Path $stageRoot $pkg
+          $binOut = Join-Path $stage 'bin'
+          $outDir = Join-Path $env:RUNNER_TEMP 'out'
+          New-Item -ItemType Directory -Force $binOut, $outDir, "$stage\LICENSES" | Out-Null
+          $buildBin = Resolve-Path 'build\bin'
+          $targets = @($env:GPU_TARGETS -split ';' | Where-Object { $_ })
+
+          # 1. executables and the DLLs of this build
+          $exes = @()
+          foreach ($t in ($env:RANMA_TARGETS -split ' ' | Where-Object { $_ })) {
+            $p = Join-Path $buildBin "$t.exe"
+            if (-not (Test-Path $p)) { throw "missing $t.exe" }
+            Copy-Item $p $binOut
+            $exes += "$t.exe"
+          }
+          Get-ChildItem $buildBin -Filter *.dll | Copy-Item -Destination $binOut
+          Copy-Item "$env:OPENMP_ROOT/bin/libomp.dll" $binOut
+
+          # 2. HIP runtime DLLs (the exe directory is searched before System32, where the driver
+          #    installs its own amdhip64_7.dll)
+          $siteRoot = Join-Path $env:ROCM_VENV 'Lib\site-packages'
+          $searchRoots = @($env:ROCM_BIN, $siteRoot)
+          $rocmDlls = @('amdhip64_7.dll', 'amd_comgr.dll', 'hipblas.dll', 'libhipblaslt.dll',
+                        'rocblas.dll', 'rocsolver.dll', 'origami.dll', 'rocm_kpack.dll')
+          $runtimeSources = [ordered]@{}
+          foreach ($name in $rocmDlls) {
+            $hits = @(foreach ($r in $searchRoots) { Get-ChildItem -Path $r -Recurse -File -Filter $name -ErrorAction SilentlyContinue })
+            if ($hits.Count -eq 0) { throw "runtime DLL $name not found under $($searchRoots -join ', ')" }
+            $hashes = @($hits | ForEach-Object { (Get-FileHash $_.FullName -Algorithm SHA256).Hash } | Sort-Object -Unique)
+            if ($hashes.Count -gt 1) { throw "different copies of ${name}: $($hits.FullName -join ', ')" }
+            Copy-Item $hits[0].FullName $binOut
+            $runtimeSources[$name] = $hits[0].FullName
+          }
+
+          # 3. rocBLAS / hipBLASLt Tensile libraries next to the DLLs, only for the GPU targets.
+          #    A file is dropped only when every gfx token in its relative path is a full arch id that
+          #    is not a target; files without a gfx token, or with a generic token (gfx11, gfx12 ...),
+          #    are kept and counted as 'common'.
+          $archRe = '^gfx(9[0-9][0-9a-f]|1[0-2][0-9][0-9])$'
+          $libReport = [ordered]@{}
+          foreach ($lib in @('rocblas', 'hipblaslt')) {
+            $cands = @(foreach ($r in $searchRoots) {
+              Get-ChildItem -Path $r -Recurse -Directory -Filter library -ErrorAction SilentlyContinue |
+                Where-Object { $_.Parent.Name -eq $lib }
+            })
+            $src = $null
+            foreach ($c in $cands) {
+              $names = (Get-ChildItem $c.FullName -Recurse -File | ForEach-Object { $_.FullName.ToLower() }) -join "`n"
+              if (@($targets | Where-Object { $names -notmatch $_ }).Count -eq 0) { $src = $c.FullName; break }
+            }
+            if (-not $src) { throw "no $lib\library with files for $($targets -join ', '); candidates: $($cands.FullName -join ', ')" }
+            $dst = Join-Path $binOut "$lib\library"
+            $kept = 0; $common = 0; $dropped = 0
+            $perTarget = @{}; foreach ($t in $targets) { $perTarget[$t] = 0 }
+            $droppedTokens = @{}; $commonTokens = @{}
+            foreach ($f in Get-ChildItem $src -Recurse -File) {
+              $rel = $f.FullName.Substring($src.Length).TrimStart('\')
+              $tokens = @([regex]::Matches($rel.ToLower(), 'gfx[0-9a-z]+') | ForEach-Object { $_.Value } | Sort-Object -Unique)
+              $full = @($tokens | Where-Object { $_ -match $archRe })
+              $hit = @($tokens | Where-Object { $targets -contains $_ })
+              if ($hit.Count -gt 0) { $keep = $true; $kept++; foreach ($h in $hit) { $perTarget[$h]++ } }
+              elseif ($tokens.Count -eq 0 -or $full.Count -lt $tokens.Count) { $keep = $true; $common++; foreach ($x in $tokens) { $commonTokens[$x] = 1 } }
+              else { $keep = $false; $dropped++; foreach ($x in $tokens) { $droppedTokens[$x] = 1 } }
+              if ($keep) {
+                $to = Join-Path $dst $rel
+                New-Item -ItemType Directory -Force (Split-Path $to) | Out-Null
+                Copy-Item $f.FullName $to
+              }
+            }
+            foreach ($t in $targets) { if ($perTarget[$t] -eq 0) { throw "$lib\library has no file for $t" } }
+            Write-Host "$lib\library from $src : kept $kept target files, $common common, dropped $dropped"
+            Write-Host "  dropped arch tokens: $(($droppedTokens.Keys | Sort-Object) -join ' ')"
+            Write-Host "  tokens in common files: $(($commonTokens.Keys | Sort-Object) -join ' ')"
+            $libReport["$lib/library"] = [ordered]@{
+              source = $src; target_files = $perTarget; common_files = $common; dropped_files = $dropped
+              dropped_arch_tokens = @($droppedTokens.Keys | Sort-Object)
+            }
+          }
+
+          # 4. every import of every shipped PE file must be shipped or be a Windows / MSVC runtime DLL
+          $readobj = Join-Path $env:HIP_PATH 'lib\llvm\bin\llvm-readobj.exe'
+          if (-not (Test-Path $readobj)) { throw "llvm-readobj not found at $readobj" }
+          $sysRe = '^(kernel32|advapi32|user32|gdi32|shell32|shlwapi|ole32|oleaut32|ws2_32|setupapi|version|ntdll|bcrypt|crypt32|dbghelp|psapi|winmm|iphlpapi|secur32|userenv|rpcrt4|msvcp140(_\d+|_atomic_wait|_codecvt_ids)?|vcruntime140(_1)?|concrt140|ucrtbase|api-ms-win-[a-z0-9-]+)\.dll$'
+          $shipped = @(Get-ChildItem $binOut -Filter *.dll | ForEach-Object { $_.Name.ToLower() })
+          $importMap = [ordered]@{}
+          $bad = @()
+          foreach ($pe in @(Get-ChildItem $binOut -File | Where-Object { $_.Extension -in '.exe', '.dll' })) {
+            $out = & $readobj --coff-imports $pe.FullName
+            if ($LASTEXITCODE -ne 0) { throw "llvm-readobj failed on $($pe.Name)" }
+            $imports = @($out | ForEach-Object { if ($_ -match '^\s*Name:\s*(\S+\.dll)\s*$') { $matches[1].ToLower() } } | Sort-Object -Unique)
+            $importMap[$pe.Name] = $imports
+            foreach ($i in $imports) {
+              if ($i -like 'libomp140*') { $bad += "$($pe.Name) -> $i (MSVC OpenMP runtime, not redistributable)" }
+              elseif (-not ($shipped -contains $i) -and $i -notmatch $sysRe) { $bad += "$($pe.Name) -> $i" }
+            }
+          }
+          if ($bad.Count -gt 0) { throw "unresolved imports:`n$($bad -join "`n")" }
+          if (-not ($importMap['ggml-cpu.dll'] -contains 'libomp.dll')) { throw "ggml-cpu.dll does not import libomp.dll (OpenMP not enabled?)" }
+          if (-not ($importMap['ggml-hip.dll'] -contains 'amdhip64_7.dll')) { throw "ggml-hip.dll does not import amdhip64_7.dll" }
+
+          # 5. licenses
+          Copy-Item LICENSE "$stage\LICENSES\ranma.cpp-LICENSE.txt"
+          Copy-Item "$env:OPENMP_ROOT/LICENSE.TXT" "$stage\LICENSES\llvm-openmp-LICENSE.txt"
+          foreach ($di in @(Get-ChildItem $siteRoot -Directory -Filter '*.dist-info' | Where-Object { $_.Name -match '^(_)?rocm' })) {
+            $lic = @(Get-ChildItem $di.FullName -Recurse -File | Where-Object { $_.Name -match '^(LICEN[CS]E|COPYING|NOTICE)' })
+            if ($lic.Count -gt 0) {
+              $d = Join-Path "$stage\LICENSES\rocm" $di.Name
+              New-Item -ItemType Directory -Force $d | Out-Null
+              $lic | Copy-Item -Destination $d
+            }
+          }
+
+          # 6. README (no example commands: none of them has been run on this package)
+          $uiStamp = ''
+          if (Test-Path 'build\tools\ui\.ui-stamp') { $uiStamp = [string]((Get-Content 'build\tools\ui\.ui-stamp' -Raw).Trim()) }
+          $readme = @"
+          RANMA.cpp $env:TAG - Windows x64, HIP (ROCm $env:ROCM_VERSION), GPU targets: $env:GPU_TARGETS
+
+          Source:        https://github.com/$env:GITHUB_REPOSITORY/tree/$env:TAG
+          Commit:        $env:TAG_SHA
+          Upstream base: $env:UPSTREAM_BASE (llama.cpp)
+          Built by:      $env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID
+
+          Requirements
+          - Windows 10/11 x64 and an AMD Radeon GPU of the targets above with a current AMD Software:
+            Adrenalin Edition driver. Other GPUs have no kernels in this package.
+          - Microsoft Visual C++ 2015-2022 Redistributable (x64) (MSVCP140.dll, VCRUNTIME140.dll).
+
+          Contents
+          - bin\: $($exes -join ', ') and their DLLs.
+          - The HIP runtime (amdhip64_7.dll, amd_comgr.dll, rocm_kpack.dll, hipblas.dll, rocblas.dll,
+            rocsolver.dll, libhipblaslt.dll, origami.dll) from ROCm $env:ROCM_VERSION is next to the
+            executables. Windows searches the executable's folder before System32, where the driver
+            installs its own amdhip64_7.dll, so keep the executables and these DLLs in the same folder.
+          - bin\rocblas\library and bin\hipblaslt\library hold the rocBLAS/hipBLASLt kernels for the
+            targets above and are found next to the DLLs; ROCBLAS_TENSILE_LIBPATH and
+            HIPBLASLT_TENSILE_LIBPATH are not needed. If you set them anyway, use paths with
+            backslashes only: hipBLASLt on Windows mis-reads a path that contains '/'.
+          - libomp.dll is the LLVM OpenMP runtime $env:OPENMP_LLVM_VERSION.
+          - manifest.json lists the build settings and the SHA-256 of every file.
+
+          GPU selection
+          - When the system also has an AMD integrated GPU, the HIP runtime may list it as device 0.
+            HIP_VISIBLE_DEVICES selects which devices the runtime uses (a comma-separated list of
+            device indices); set it to the index of the target Radeon GPU.
+
+          Build notes
+          - Built on a GitHub-hosted runner with GGML_NATIVE=OFF (AVX2/FMA/F16C, no AVX-512) for
+            portability. The benchmark records in docs/ranma/benchmarks were measured with the
+            maintainer's own builds, not with this package.
+          - Verification: the maintainer runs a local smoke test on gfx1201 (test-backend-ops and a
+            short generation) before publishing; see docs/ranma/releases.md.
+
+          Licenses: LICENSES\ (RANMA.cpp/llama.cpp: MIT; LLVM OpenMP; ROCm components).
+          "@
+          $readme = $readme -replace "`r?`n", "`r`n"
+          Set-Content -Path "$stage\README.txt" -Value $readme -Encoding utf8
+
+          # 7. manifest
+          $files = [ordered]@{}
+          foreach ($f in Get-ChildItem $stage -Recurse -File | Sort-Object FullName) {
+            $rel = $f.FullName.Substring($stage.Length).TrimStart('\') -replace '\\', '/'
+            $files[$rel] = (Get-FileHash $f.FullName -Algorithm SHA256).Hash.ToLower()
+          }
+          $clang = (& "$env:HIP_PATH\lib\llvm\bin\clang.exe" --version | Select-Object -First 1)
+          $theRock = Get-Item (Join-Path $env:HIP_PATH 'share\therock\therock_manifest.json') -ErrorAction SilentlyContinue
+          $theRockInfo = $null
+          if ($theRock) {
+            $m = Get-Content $theRock.FullName -Raw | ConvertFrom-Json
+            $theRockInfo = [ordered]@{ the_rock_commit = $m.the_rock_commit; rocm_package_version = $m.rocm_package_version; rocm_version = $m.rocm_version }
+          }
+          $manifest = [ordered]@{
+            name = $pkg
+            tag = $env:TAG
+            commit = $env:TAG_SHA
+            upstream_base = $env:UPSTREAM_BASE
+            build_number = $env:BUILD_NUMBER
+            ui_assets = $uiStamp
+            gpu_targets = $env:GPU_TARGETS
+            rocm = [ordered]@{
+              version = $env:ROCM_VERSION
+              wheel_index = $env:ROCM_WHL_INDEX
+              therock = $theRockInfo
+              pip_freeze = @(Get-Content (Join-Path $env:RUNNER_TEMP 'rocm-pip-freeze.txt') | Where-Object { $_ -match 'rocm' } | ForEach-Object { [string]$_ })
+              runtime_sources = $runtimeSources
+              libraries = $libReport
+            }
+            openmp = [ordered]@{ runtime = 'libomp.dll'; llvm_version = $env:OPENMP_LLVM_VERSION; installer_sha256 = $env:OPENMP_INSTALLER_SHA256 }
+            compiler = $clang
+            cmake_args = @(Get-Content (Join-Path $env:RUNNER_TEMP 'cmake-args.txt') | ForEach-Object { [string]$_ })
+            runner = [ordered]@{ os = $env:ImageOS; image_version = $env:ImageVersion }
+            workflow_run = "$env:GITHUB_SERVER_URL/$env:GITHUB_REPOSITORY/actions/runs/$env:GITHUB_RUN_ID"
+            verification = 'CI build only; published after a maintainer smoke test on the target GPU'
+            imports = $importMap
+            files = $files
+          }
+          $manifest | ConvertTo-Json -Depth 8 | Set-Content -Path "$stage\manifest.json" -Encoding utf8
+
+          # 8. zip (GitHub release assets must be smaller than 2 GiB)
+          $zip = Join-Path $outDir "$pkg.zip"
+          Push-Location $stageRoot
+          7z a -tzip -mx=7 $zip $pkg | Out-Null
+          $rc = $LASTEXITCODE
+          Pop-Location
+          if ($rc -ne 0) { throw "7z failed" }
+          $size = (Get-Item $zip).Length
+          if ($size -ge 2GB) { throw "zip is $size bytes, at or above the 2 GiB release asset limit" }
+          $zipHash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
+          # LF, so that `sha256sum -c` also works on Linux and macOS
+          [IO.File]::WriteAllText("$zip.sha256", "$zipHash *$pkg.zip`n", [Text.Encoding]::ASCII)
+          $raw = (Get-ChildItem $stage -Recurse -File | Measure-Object Length -Sum).Sum
+          $summary = "### $pkg`n`n- files: $($files.Count), unpacked $([math]::Round($raw / 1MB, 1)) MiB`n- zip: $([math]::Round($size / 1MB, 1)) MiB, sha256 $zipHash`n"
+          $summary >> $env:GITHUB_STEP_SUMMARY
+          Write-Host $summary
+
+      - name: Upload package
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ranma-pkg-${{ matrix.variant }}
+          path: ${{ runner.temp }}/out/
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+
+  rpc-check:
+    # GGML_RPC is not part of the shipped build. This compiles ggml-rpc (its op-count static_assert in
+    # ggml-rpc.h) and rpc-server from the same tag. It is a separate job so that a failure is reported
+    # without blocking the draft release of an already published tag; check it before publishing.
+    name: RPC compile check
+    needs: resolve
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - name: Clone
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: refs/tags/${{ needs.resolve.outputs.tag }}
+          persist-credentials: false
+
+      - name: Configure and build
+        run: |
+          set -euo pipefail
+          cmake -S . -B build-rpc -DCMAKE_BUILD_TYPE=Release -DGGML_RPC=ON -DGGML_NATIVE=OFF \
+            -DGGML_OPENMP=OFF -DLLAMA_OPENSSL=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF
+          cmake --build build-rpc --config Release -j "$(nproc)" --target ggml-rpc rpc-server
+
+  publish:
+    name: Draft release
+    needs: [resolve, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ needs.resolve.outputs.tag }}
+      TAG_SHA: ${{ needs.resolve.outputs.sha }}
+      UPSTREAM_BASE: ${{ needs.resolve.outputs.base }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Download packages
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: ranma-pkg-*
+          merge-multiple: true
+          path: dist
+
+      - name: Create or update the draft release
+        run: |
+          set -euo pipefail
+          ls -l dist
+          shopt -s nullglob
+          assets=(dist/*.zip dist/*.zip.sha256)
+          [ "${#assets[@]}" -gt 0 ] || { echo "::error::no packages"; exit 1; }
+
+          # Policy: no release for the tag -> create a draft; exactly one draft -> replace the assets
+          # of the same name (other assets and the notes stay); a published release, or several
+          # releases for the tag -> fail without changing anything.
+          existing=$(gh api --paginate "repos/$GITHUB_REPOSITORY/releases?per_page=100" \
+            --jq '.[] | select(.tag_name == env.TAG) | "\(.id) \(.draft)"')
+          count=$(printf '%s' "$existing" | grep -c . || true)
+
+          if [ "$count" -eq 0 ]; then
+            {
+              echo "RANMA.cpp \`$TAG\` - Windows x64 HIP (ROCm $ROCM_VERSION) binaries."
+              echo
+              echo "- commit: \`$TAG_SHA\`"
+              echo "- upstream base (llama.cpp): \`$UPSTREAM_BASE\`"
+              echo "- built by: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+              echo
+              echo "Each zip contains README.txt (requirements) and manifest.json (build settings, SHA-256 of every file)."
+              echo
+              echo "SHA-256:"
+              echo '```'
+              cat dist/*.zip.sha256
+              echo '```'
+            } > notes.md
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --draft --verify-tag \
+              --title "$TAG" --notes-file notes.md "${assets[@]}"
+            echo "created draft release $TAG"
+          elif [ "$count" -eq 1 ] && [ "${existing#* }" = "true" ]; then
+            gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber "${assets[@]}"
+            echo "::warning::replaced assets of the existing draft release $TAG; check its notes and other assets"
+          elif [ "$count" -eq 1 ]; then
+            echo "::error::release $TAG is already published; it is not modified"
+            exit 1
+          else
+            echo "::error::$count releases exist for $TAG"
+            exit 1
+          fi
