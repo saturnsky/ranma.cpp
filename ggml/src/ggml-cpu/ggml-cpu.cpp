@@ -429,7 +429,12 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
         return true;
     }
 
-    // EXL3 weights have no row API (to_float, vec_dot)
+    // EXL3 weights have no row API (to_float, vec_dot), only MUL_MAT_HAD reads them
+    if (op->op == GGML_OP_MUL_MAT_HAD) {
+        const ggml_tensor * w = op->src[0];
+        return (w->type == GGML_TYPE_F32 || w->type == GGML_TYPE_F16 || ggml_is_exl3(w->type)) && src1->type == GGML_TYPE_F32 &&
+            (w->buffer == nullptr || !ggml_backend_cpu_is_extra_buffer_type(w->buffer->buft));
+    }
     if (ggml_is_exl3(op->type)) {
         return false;
     }
