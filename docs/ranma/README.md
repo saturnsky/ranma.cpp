@@ -1,7 +1,8 @@
 # Changes over upstream
 
 Each user-visible change gets a line here and a page under `docs/ranma/` that describes what it is, when it
-applies, how to switch it, and its limits. The main features are summarized in the [README](../../README.md#main-features).
+applies, how to switch it, and its limits. The main features are summarized in the [README](../../README.md#main-features);
+measured effects are collected in [benchmarks](benchmarks/README.md).
 
 ### RDNA4 kernels (HIP)
 
@@ -34,12 +35,15 @@ applies, how to switch it, and its limits. The main features are summarized in t
   server is idle and while the model is freed, so that Windows does not evict the VRAM of the process between
   turns. Off by default. [gpu-heartbeat.md](gpu-heartbeat.md)
 - **Per-position draft thresholds** - `--spec-draft-p-min` takes one probability per draft position, and
-  `--spec-draft-p-continue` keeps a token in the draft but stops drafting after it. Defaults unchanged.
+  `--spec-draft-p-continue` keeps a token in the draft but stops drafting after it. Defaults unchanged; with
+  `draft-mtp`, giving either turns the smart draft length off.
   [spec-draft-thresholds.md](spec-draft-thresholds.md)
-- **Smart draft length for draft-mtp (llama-server)** - `--spec-smart` chooses the draft length at every step from
+- **Smart draft length for draft-mtp (llama-server)** - `draft-mtp` chooses the draft length at every step from
   the measured verification time per width and a calibrated acceptance of the draft probabilities, up to
-  `--spec-draft-n-max`; `--spec-smart-store PATH` keeps the estimates across restarts of the same model, build and
-  cache settings. Off by default. [spec-smart.md](spec-smart.md)
+  `--spec-draft-n-max` (7 when not given); `--spec-smart-store PATH` keeps the estimates across restarts of the same
+  model, build and cache settings. On by default with `draft-mtp`; `--no-spec-smart`, or giving
+  `--spec-draft-p-min` or `--spec-draft-p-continue`, returns to the single-argument rule.
+  [spec-smart.md](spec-smart.md)
 - **Reuse of a just-restored context checkpoint (llama-server)** - when the first prompt batch after a checkpoint
   restore starts at that checkpoint, the server keeps the restored entry instead of serializing the unchanged
   state again. `LLAMA_SERVER_CKPT_REUSE=0` restores the upstream behaviour.
@@ -87,8 +91,13 @@ applies, how to switch it, and its limits. The main features are summarized in t
   Same page.
 - **One HIP graph per batch shape** - the backend keys the graphs it captured by the batch shape as well as by
   the first node, so a speculative verification whose width changes between rounds launches the graph it already
-  captured for that width. On by default in HIP builds; `GGML_CUDA_GRAPH_PER_SHAPE=0` restores the keying by the
-  first node. Same page.
+  captured for that width. On by default in HIP builds, at most 32 graphs per context;
+  `GGML_CUDA_GRAPH_PER_SHAPE=0` restores the keying by the first node. Same page.
+- **One llama graph per batch shape** - a context keeps the built graph of up to 24 batch shapes together with
+  its scheduler split and allocation, so a verification width seen before is made current again instead of
+  being built, split and allocated anew. On by default; `LLAMA_GRAPH_REUSE_SHAPES=0` turns it off. With both
+  defaults, decode with MTP (`--spec-draft-n-max 7`) in English roleplay is +11.1 % (Qwen3.8-Flash-Next) and
+  +8.6 % (DeepSeek V4 Flash) with identical replies. Same page.
 
 ### MoE decode kernels (HIP)
 
