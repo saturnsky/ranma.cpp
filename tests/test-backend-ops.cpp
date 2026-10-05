@@ -5568,6 +5568,57 @@ struct test_mul_mat_id_shared : public test_case {
     }
 };
 
+// MUL_MAT_ID with a dense shared expert whose type may differ from the routed type, at one token carried by
+// the routed launch where the backend has a shared unit for the pair. down = false: gate/up + GLU, the shared
+// expert reading the routed input; down = true: the down matrices, the shared one reading its own input.
+struct test_mul_mat_id_shared_unit : public test_case {
+    const ggml_type type;
+    const ggml_type type_shared;
+    const bool down;
+    const int64_t n;
+    ggml_tensor * routed = nullptr;
+    ggml_tensor * shared = nullptr;
+
+    test_mul_mat_id_shared_unit(ggml_type type, ggml_type type_shared, bool down, int64_t n)
+        : type(type), type_shared(type_shared), down(down), n(n) {}
+
+    std::string vars() override { return VARS_TO_STR4(type, type_shared, down, n); }
+    std::string op_desc(ggml_tensor *) override { return "MUL_MAT_ID_SHARED_UNIT"; }
+    bool run_whole_graph() override { return true; }
+    double max_nmse_err() override { return 5e-4; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return { routed, shared }; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t n_embd = 512, n_ff = 256, n_expert = 8, n_used = 4;
+        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, n);
+        ggml_set_name(ids, "ids");
+        if (down) {
+            // the routed input is a GLU result, as in a model; the shared one a graph input, computed before
+            ggml_tensor * x        = ggml_swiglu_split(ctx, ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_ff, n_used, n),
+                                                       ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_ff, n_used, n));
+            ggml_tensor * x_shared = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_ff, n);
+            ggml_tensor * w        = ggml_new_tensor_3d(ctx, type, n_ff, n_embd, n_expert);
+            ggml_tensor * w_shared = ggml_new_tensor_2d(ctx, type_shared, n_ff, n_embd);
+            routed = ggml_mul_mat_id(ctx, w, x, ids);
+            shared = ggml_mul_mat(ctx, w_shared, x_shared);
+            return ggml_add(ctx, routed, ggml_reshape_3d(ctx, shared, n_embd, 1, n));
+        }
+        ggml_tensor * input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n);
+        ggml_tensor * input_ids = ggml_reshape_3d(ctx, input, n_embd, 1, n);
+        ggml_tensor * up   = ggml_new_tensor_3d(ctx, type, n_embd, n_ff, n_expert);
+        ggml_tensor * gate = ggml_new_tensor_3d(ctx, type, n_embd, n_ff, n_expert);
+        ggml_tensor * shared_up   = ggml_new_tensor_2d(ctx, type_shared, n_embd, n_ff);
+        ggml_tensor * shared_gate = ggml_new_tensor_2d(ctx, type_shared, n_embd, n_ff);
+        routed = ggml_swiglu_split(ctx, ggml_mul_mat_id(ctx, gate, input_ids, ids), ggml_mul_mat_id(ctx, up, input_ids, ids));
+        shared = ggml_swiglu_split(ctx, ggml_mul_mat(ctx, shared_gate, input), ggml_mul_mat(ctx, shared_up, input));
+        return ggml_add(ctx, routed, ggml_reshape_3d(ctx, shared, n_ff, 1, n));
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        init_mul_mat_id_tensors(ctx, 8);
+    }
+};
+
 // GGML_OP_OUT_PROD
 struct test_out_prod : public test_case {
     const ggml_type type_a;
@@ -10768,6 +10819,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (ggml_type type : { GGML_TYPE_Q4_K, GGML_TYPE_Q8_0 }) {
         for (int64_t n : { 1, 2, 3, 4, 8, 9 }) {
             test_cases.emplace_back(new test_mul_mat_id_shared(type, n));
+        }
+    }
+    // the routed/shared pairs of the RDNA4 shared unit, one token (unit) and two (no unit)
+    for (auto [type, type_shared] : std::initializer_list<std::pair<ggml_type, ggml_type>>{
+            { GGML_TYPE_IQ2_XS, GGML_TYPE_Q6_K }, { GGML_TYPE_IQ3_XXS, GGML_TYPE_Q6_K } }) {
+        for (bool down : { false, true }) {
+            for (int64_t n : { 1, 2 }) {
+                test_cases.emplace_back(new test_mul_mat_id_shared_unit(type, type_shared, down, n));
+            }
         }
     }
 

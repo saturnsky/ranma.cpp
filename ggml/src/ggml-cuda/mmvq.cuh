@@ -25,3 +25,16 @@ void ggml_cuda_op_mul_mat_vec_q(
 // all nodes run on the same stream. Must be paired with ggml_cuda_mmvq_share_q8_end().
 void ggml_cuda_mmvq_share_q8_plan(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, bool allow);
 void ggml_cuda_mmvq_share_q8_end(ggml_backend_cuda_context & ctx);
+
+// Tell the plan that this MUL_MAT never reaches the backend, so that the group it belongs to keeps
+// moving: the cursor passes its entry and the buffer of a finished group is handed back.
+void ggml_cuda_mmvq_share_q8_skip(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1);
+
+// GGML_CUDA_MMVQ_ID_FOLD_SHARED (on by default, 0 disables the shared unit)
+bool ggml_cuda_mmvq_shared_unit_enabled();
+
+// The quantization type of a dense shared expert that the one-token MUL_MAT_ID kernel of
+// `routed_type` computes as a shared unit in an extra channel of its grid (a type other than the
+// routed type, or the down matrix, see ggml_cuda_mm_fusion_args_host::shared_up), or GGML_TYPE_COUNT
+// when it carries none on this arch.
+ggml_type ggml_cuda_mmvq_shared_unit_type(ggml_type routed_type, int cc);
