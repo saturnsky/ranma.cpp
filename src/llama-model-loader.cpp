@@ -717,6 +717,37 @@ llama_model_loader::llama_model_loader(
         llm_kv = LLM_KV(llm_arch_from_string(arch_name));
     }
 
+    // The type IDs from GGML_TYPE_EXL3_M1 (256) on are the EXL3 band of this fork, and another program may use the same IDs
+    // for other data. Such tensors are accepted only from a model with the metadata that the EXL3 converter writes:
+    // quantize.exl3.version (the format version of the source) and quantize.exl3.codebook (mul1, mcg or 3inst).
+    // gguf-split writes the metadata only to the first split, so the keys of the first file decide for every split.
+    {
+        std::string missing;
+        const int64_t version_idx  = gguf_find_key(metadata, "quantize.exl3.version");
+        const int64_t codebook_idx = gguf_find_key(metadata, "quantize.exl3.codebook");
+        if (version_idx == -1 || gguf_get_kv_type(metadata, version_idx) != GGUF_TYPE_STRING) {
+            missing = "quantize.exl3.version";
+        }
+        if (codebook_idx == -1 || gguf_get_kv_type(metadata, codebook_idx) != GGUF_TYPE_STRING) {
+            missing += std::string(missing.empty() ? "" : ", ") + "quantize.exl3.codebook";
+        } else {
+            const std::string codebook = gguf_get_val_str(metadata, codebook_idx);
+            if (codebook != "mul1" && codebook != "mcg" && codebook != "3inst") {
+                missing += std::string(missing.empty() ? "" : ", ") + "quantize.exl3.codebook (has '" + codebook + "', not mul1, mcg or 3inst)";
+            }
+        }
+        if (!missing.empty()) {
+            for (const auto & it : weights_map) {
+                const ggml_tensor * cur = it.second.tensor;
+                if (cur->type >= GGML_TYPE_EXL3_M1) {
+                    throw std::runtime_error(format("tensor '%s' has ggml type %d (%s) of the EXL3 range, but the model has no "
+                        "valid EXL3 metadata (missing: %s): it may use the type ID for other data",
+                        ggml_get_name(cur), (int) cur->type, ggml_type_name(cur->type), missing.c_str()));
+                }
+            }
+        }
+    }
+
     n_kv      = gguf_get_n_kv(metadata);
     n_tensors = weights_map.size();
 
