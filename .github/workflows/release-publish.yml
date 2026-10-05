@@ -1,13 +1,7 @@
 name: Publish Release
 
 on:
-  workflow_run:
-    workflows:
-      - Release
-    types:
-      - completed
-    branches:
-      - master
+  workflow_dispatch:
 
 run-name: "Publish ${{ github.event.workflow_run.display_title }}"
 

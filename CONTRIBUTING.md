@@ -1,209 +1,131 @@
-# Contributors
+# Contributing to RANMA.cpp
 
-The project differentiates between 3 levels of contributors:
+RANMA.cpp is a hobby fork of [llama.cpp](https://github.com/ggml-org/llama.cpp)
+maintained by a single developer. The contribution policy is deliberately narrow.
 
-- Contributors: people who have contributed before (no special privileges)
-- Collaborators (Triage): people with significant contributions, who may be responsible for some parts of the code, and are expected to maintain and review contributions for the code they own
-- Maintainers: responsible for reviewing and merging PRs, after approval from the code owners
+## Issues
 
-# AI Usage Policy
+Issues are welcome. The most useful reports are:
 
-> [!IMPORTANT]
->
-> AI-generated code is allowed. You are 100% responsible for every line, however it was produced.
->
-> Undisclosed AI usage may result in your account being permanently banned from contributing to the project.
->
-> Detailed information regarding permissible and restricted uses of AI can be found in the [AGENTS.md](AGENTS.md) file.
+- Bugs or crashes on the target environment (Windows 11, AMD Radeon gfx1201, HIP backend).
+- Reproducible performance regressions on that environment, ideally with `llama-bench`
+  numbers before and after.
+- Incorrect behavior that is specific to this fork and does not reproduce on upstream
+  llama.cpp at the same base commit.
 
-If AI is used to generate any portion of the code, contributors must adhere to the following requirements:
+Feature requests are read but not promised. Problems that also reproduce on upstream
+should be reported to upstream instead.
 
-1. Explicitly disclose the manner in which AI was employed.
-2. Check for an existing PR addressing the same change; if one exists, comment there to work with its author instead of opening a duplicate.
-3. Perform a comprehensive manual review prior to submitting the pull request. A proper code review usually takes something like one hour per 200-400 LOC and you should be spending **at least that much time on code review alone**.
-4. Be prepared to explain every line of code you submit when asked about it by a maintainer.
-5. It is strictly prohibited to use AI to write your posts for you (bug reports, feature requests, pull request descriptions, Github discussions, responding to humans, ...).
+When reporting, please include the fork commit (`git rev-parse HEAD`), the upstream base
+commit it was rebased onto, and the environment as listed under
+[Your test environment](#your-test-environment) below (at least the SDK and driver versions).
 
-For more info, please refer to the [AGENTS.md](AGENTS.md) file.
+## Pull requests
 
-# Pull requests (for contributors & collaborators)
+Pull requests are welcome. RANMA.cpp is maintained by one person with limited time, and
+the way this fork is rebuilt for every release (see [releases](docs/ranma/releases.md))
+means that some things cannot be promised. The terms below say what can and cannot be.
+Please read them before you start; opening a pull request means you accept them.
 
-### Before you start
+### No promise of review or merge
 
-- Search for existing discussions and PRs first - duplicates will likely be closed without questions.
-- Features must begin with an issue, not a PR - let interest accumulate before writing code; niche features may only land as an example/tool, or on a private fork.
-- Bug-fix PRs must include a reproducible issue and a regression test that fails before your change and passes after. Fixes without a test may be closed without review.
-- New CLI or public API additions carry a **higher bar** than internal changes - justify why an existing mechanism doesn't suffice.
-- Meeting all of the above still doesn't guarantee a merge - see [Pull requests (for maintainers)](#pull-requests-for-maintainers).
-- If you are a new contributor
-    - Limit your open PRs to 1
-    - Do not submit trivial fixes (e.g. typos, formatting changes)
+- There is no response time. A pull request may wait a long time, and it may be closed
+  without review or without a detailed reason.
+- For anything larger than a small fix, open an issue first and describe the change.
+  This avoids work on something that cannot be taken.
+- If the change is a general improvement to llama.cpp, please submit it to
+  [upstream](https://github.com/ggml-org/llama.cpp) as well (or instead). Changes that
+  land upstream reach this fork on the next rebase.
 
-### Preparing your PR
+### Target branch
 
-- llama.cpp uses the ggml tensor library for model evaluation. If you are unfamiliar with ggml, consider taking a look at the [examples in the ggml repository](https://github.com/ggml-org/ggml/tree/master/examples/). [simple](https://github.com/ggml-org/ggml/tree/master/examples/simple) shows the bare minimum for using ggml. [gpt-2](https://github.com/ggml-org/ggml/tree/master/examples/gpt-2) has minimal implementations for language model inference using GPT-2. [mnist](https://github.com/ggml-org/ggml/tree/master/examples/mnist) demonstrates how to train and evaluate a simple image classifier
-- Test your changes:
-  - Execute [the full CI locally on your machine](ci/README.md) before publishing
-  - Verify that the perplexity and the performance are not affected negatively by your changes (use `llama-perplexity` and `llama-bench`)
-  - If you modified the `ggml` source, run the `test-backend-ops` tool to check whether different backend implementations of the `ggml` operators produce consistent results (this requires access to at least two different `ggml` backends)
-  - If you modified a `ggml` operator or added a new one, add the corresponding test cases to `test-backend-ops`
-- Create separate PRs for each feature or fix:
-  - Avoid combining unrelated changes in a single PR
-  - When adding support for a new model or feature, focus on **CPU support only** in the initial PR unless you have a good reason not to. Add support for other backends like CUDA in follow-up PRs
-  - In particular, adding new data types (extension of the `ggml_type` enum) carries with it a disproportionate maintenance burden. As such, to add a new quantization type you will need to meet the following *additional* criteria *at minimum*:
-    - convert a small model to GGUF using the new type and upload it to HuggingFace
-    - provide [perplexity](https://github.com/ggml-org/llama.cpp/tree/master/tools/perplexity) comparisons to FP16/BF16 (whichever is the native precision) as well as to types of similar size
-    - provide KL divergence data calculated vs. the FP16/BF16 (whichever is the native precision) version for both the new type as well as types of similar size
-    - provide [performance data](https://github.com/ggml-org/llama.cpp/tree/master/tools/llama-bench) for the new type in comparison to types of similar size on pure CPU
-- Consider allowing write access to your branch for faster reviews, as reviewers can push commits directly
+Open pull requests against `ranma_upstream`, the latest release rebased onto a recent
+upstream commit. Release snapshots are tags and are never changed.
 
-### After submitting your PR
+### History is not preserved
 
-- Expect requests for modifications to ensure the code meets llama.cpp's standards for quality and long-term maintainability
-- Maintainers will rely on your insights and approval when making a final decision to approve and merge a PR
-- If your PR becomes stale, rebase it on top of latest `master` to get maintainers attention
-- Consider adding yourself to [CODEOWNERS](CODEOWNERS) to indicate your availability for fixing related issues and reviewing related PRs
+Accepted improvements are meant to stay, and the maintainer will try to carry them forward.
+This fork, however, is rebuilt for every release: commits are squashed, split, reordered and
+rewritten, and the release is published as a new tag. By opening a pull request you agree
+that, if your change is accepted:
 
-# Pull requests (for maintainers)
+- it may be squashed with other commits, split, reordered or rewritten, so your commits
+  and their hashes may not survive as separate commits;
+- it may be changed later, or removed in any later release, for example when it is found to
+  cause a regression or to conflict with other work;
+- credit is kept on a best-effort basis, through a `Co-authored-by:` line or the release
+  notes, without a guarantee of either.
 
-- Squash-merge PRs
-- Use the following format for the squashed commit title: `<module> : <commit title> (#<issue_number>)`. For example: `utils : fix typo in utils.py (#1234)`
-- Optionally pick a `<module>` from here: https://github.com/ggml-org/llama.cpp/wiki/Modules
-- Let other maintainers merge their own PRs
-- When merging a PR, make sure you have a good understanding of the changes
-- If a PR does not warrant a new release, add `[no release]` in the squashed commit to spare CI resources
-- Be mindful of maintenance: most of the work going into a feature happens after the PR is merged. If the PR author is not committed to contribute long-term, someone else needs to take responsibility (you)
-- Add the ["merge ready"](https://github.com/ggml-org/llama.cpp/pulls?q=is%3Apr+is%3Aopen+draft%3Ano+sort%3Aupdated-desc+label%3A%22merge+ready%22+) label to a PR to indicate when a PR can be fast-merged without waiting for 2 independent reviews. [(more info)](https://github.com/ggml-org/llama.cpp/pull/26178)
-- Wait for CI results before merging
+### Verification is your job
 
-Maintainers reserve the right to decline review or close pull requests for any reason, without any questions, particularly under any of the following conditions:
-- The proposed change is already mentioned in the roadmap or an existing issue, and it has been assigned to someone.
-- The pull request duplicates an existing one.
-- The contributor fails to adhere to this contributing guide or the AI policy.
-- The change doesn't fit the existing architecture, or is too complex to justify its benefit.
+The maintainer cannot reproduce most environments, so a pull request has to carry its own
+evidence. Every pull request must include:
 
-# Coding guidelines
+- **Correctness**
+  - `test-backend-ops` results for every operation the change touches, on your hardware.
+  - Whether the generated output changes. Compare the generated text, and if possible the
+    token probabilities, before and after with a fixed seed and a short prompt. If the
+    output changes, explain why (for example a different reduction order).
+- **Performance**, if the change claims a speedup or may affect speed:
+  - `llama-bench` (or `llama-server` request timings) before and after, built from the same
+    base commit, with the number of repetitions and the run order.
+  - The full command lines and the raw output. Summaries alone are not enough.
+- **Memory**: whether VRAM or host memory use changes, and by how much.
+- **Models**: the model file names, quantization types and context sizes you used.
 
-- Avoid adding third-party dependencies, extra files, extra headers, etc.
-- Always consider cross-compatibility with other operating systems and architectures
-- Avoid fancy-looking modern STL constructs, use basic `for` loops, avoid templates, keep it simple
-- Vertical alignment makes things more readable and easier to batch edit
-- Clean-up any trailing whitespaces, use 4 spaces for indentation, brackets on the same line, `void * ptr`, `int & a`
-- Use sized integer types such as `int32_t` in the public API, e.g. `size_t` may also be appropriate for allocation sizes or byte offsets
-- Declare structs with `struct foo {}` instead of `typedef struct foo {} foo`
-    - In C++ code omit optional `struct` and `enum` keyword whenever they are not necessary
-    ```cpp
-    // OK
-    llama_context * ctx;
-    const llama_rope_type rope_type;
+### Your test environment
 
-    // not OK
-    struct llama_context * ctx;
-    const enum llama_rope_type rope_type;
-    ```
+Describe the environment of every result. All of the following are required:
 
-    _(NOTE: this guideline is yet to be applied to the `llama.cpp` codebase. New code should follow this guideline.)_
+- OS and build number (for example Windows 11 26200, or the distribution and kernel version)
+- CPU model
+- RAM: capacity, speed and channel configuration
+- GPU model and VRAM size; overclocking, undervolting or power limits if any
+- PCIe: the generation and lane count the GPU actually negotiated (not the slot rating),
+  and whether Resizable BAR is on
+- GPU driver version
+- SDK and compiler versions (for example ROCm/HIP SDK, CUDA toolkit), and the CMake options
+- Storage type, if the change touches the expert cache SSD tier
+- The fork commit and the upstream commit it is based on
 
-- Try to follow the existing patterns in the code (indentation, spaces, etc.). In case of doubt use `clang-format` (from clang-tools v15+) to format the added code
-- For anything not covered in the current guidelines, refer to the [C++ Core Guidelines](https://isocpp.github.io/CppCoreGuidelines/CppCoreGuidelines)
-- Tensors store data in row-major order. We refer to dimension 0 as columns, 1 as rows, 2 as matrices
-- Matrix multiplication is unconventional: [`C = ggml_mul_mat(ctx, A, B)`](https://github.com/ggml-org/llama.cpp/blob/880e352277fc017df4d5794f0c21c44e1eae2b84/ggml.h#L1058-L1064) means $C^T = A B^T \Leftrightarrow C = B A^T.$
+### Other architectures
 
-![matmul](media/matmul.png)
+Pull requests that add or improve support for other GPUs, backends or operating systems are
+welcome. The maintainer will try to keep such support working when it does not get in the
+way of the target environment, but cannot promise it:
 
-# Naming guidelines
+- the change must not alter the behavior or speed of the target environment (Windows 11,
+  Radeon gfx1201, HIP). Keep it behind a compile-time or runtime check of the architecture
+  where possible;
+- the maintainer tests only the target environment, and releases are made without testing
+  any other one. CI is trimmed and does not cover other platforms either;
+- support added this way may therefore break, or be removed, in a later release without
+  notice. Fixes for such breakage are welcome in turn.
 
-- Use `snake_case` for function, variable and type names
-- Naming usually optimizes for longest common prefix (see https://github.com/ggml-org/ggml/pull/302#discussion_r1243240963)
+### AI-assisted contributions
 
-    ```cpp
-    // not OK
-    int small_number;
-    int big_number;
+Disclose whether you used AI tools to write the change. Whatever the tooling, you must
+understand the change and have run the verification above yourself; results you did not
+run are not accepted as evidence.
 
-    // OK
-    int number_small;
-    int number_big;
-    ```
+### License
 
-- Enum values are always in upper case and prefixed with the enum name
+Contributions are accepted under the license of this repository (MIT).
 
-    ```cpp
-    enum llama_vocab_type {
-        LLAMA_VOCAB_TYPE_NONE = 0,
-        LLAMA_VOCAB_TYPE_SPM  = 1,
-        LLAMA_VOCAB_TYPE_BPE  = 2,
-        LLAMA_VOCAB_TYPE_WPM  = 3,
-        LLAMA_VOCAB_TYPE_UGM  = 4,
-        LLAMA_VOCAB_TYPE_RWKV = 5,
-    };
-    ```
+## Sponsorship
 
-- The general naming pattern is `<class>_<method>`, with `<method>` being `<action>_<noun>`
+The fork can be sponsored through [GitHub Sponsors](https://github.com/sponsors/saturnsky).
+Sponsorship does not buy review, features, or support.
 
-    ```cpp
-    llama_model_init();           // class: "llama_model",         method: "init"
-    llama_sampler_chain_remove(); // class: "llama_sampler_chain", method: "remove"
-    llama_sampler_get_seed();     // class: "llama_sampler",       method: "get_seed"
-    llama_set_embeddings();       // class: "llama_context",       method: "set_embeddings"
-    llama_n_threads();            // class: "llama_context",       method: "n_threads"
-    llama_adapter_lora_free();    // class: "llama_adapter_lora",  method: "free"
-    ```
+## Coding conventions
 
-    - The `get` `<action>` can be omitted
-    - The `<noun>` can be omitted if not necessary
-    - The `_context` suffix of the `<class>` is optional. Use it to disambiguate symbols when needed
-    - Use `init`/`free` for constructor/destructor `<action>`
+Code in this fork follows the upstream llama.cpp
+[coding and naming guidelines](https://github.com/ggml-org/llama.cpp/blob/master/CONTRIBUTING.md)
+so that selected changes can be submitted upstream without rework.
 
-- Use the `_t` suffix when a type is supposed to be opaque to the user - it's not relevant to them if it is a struct or anything else
+## AI usage
 
-    ```cpp
-    typedef struct llama_context * llama_context_t;
-
-    enum llama_pooling_type llama_pooling_type(const llama_context_t ctx);
-    ```
-
-    _(NOTE: this guideline is yet to be applied to the `llama.cpp` codebase. New code should follow this guideline)_
-
-- C/C++ filenames are all lowercase with dashes. Headers use the `.h` extension. Source files use the `.c` or `.cpp` extension
-- Python filenames are all lowercase with underscores
-
-- _(TODO: abbreviations usage)_
-
-# Preprocessor directives
-
-- _(TODO: add guidelines with examples and apply them to the codebase)_
-
-    ```cpp
-    #ifdef FOO
-    #endif // FOO
-    ```
-
-# Code maintenance
-
-- Existing code should have designated collaborators and/or maintainers specified in the [CODEOWNERS](CODEOWNERS) file responsible for:
-  - Reviewing and merging related PRs
-  - Fixing related bugs
-  - Providing developer guidance/support
-
-- When adding or modifying a large piece of code:
-  - If you are a collaborator, make sure to add yourself to [CODEOWNERS](CODEOWNERS) to indicate your availability for reviewing related PRs
-  - If you are a contributor, find an existing collaborator who is willing to review and maintain your code long-term
-  - Provide the necessary CI workflow (and hardware) to test your changes (see [ci/README.md](https://github.com/ggml-org/llama.cpp/tree/master/ci))
-
-- New code should follow the guidelines (coding, naming, etc.) outlined in this document. Exceptions are allowed in isolated, backend-specific parts of the code that do not interface directly with the `ggml` interfaces.
-  _(NOTE: for legacy reasons, existing code is not required to follow this guideline)_
-
-- For changes in server, please make sure to refer to the [server development documentation](./tools/server/README-dev.md)
-
-# Documentation
-
-- Documentation is a community effort
-- When you need to look into the source code to figure out how to use an API consider adding a short summary to the header file for future reference
-- When you notice incorrect or outdated documentation, please update it
-
-# Resources
-
-The Github issues, PRs and discussions contain a lot of information that can be useful to get familiar with the codebase. For convenience, some of the more important information is referenced from Github projects:
-
-https://github.com/ggml-org/llama.cpp/projects
+The maintainer uses AI-assisted tooling during development. Every line carried by this
+fork is reviewed and tested by the maintainer on the target environment, and the
+maintainer takes full responsibility for it. Changes submitted from this fork to upstream
+follow upstream's AI usage policy and disclosure requirements.

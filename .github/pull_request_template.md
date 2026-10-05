@@ -1,16 +1,39 @@
-## Overview
+## What this changes
 
-<!-- Describe what this PR does and why. Be concise but complete -->
+<!-- What and why. Link the issue if there is one. -->
 
-## Additional information
+## Agreement
 
-<!-- You can provide more details and link related discussions here. Delete this section if not applicable -->
+- [ ] I have read [CONTRIBUTING.md](../CONTRIBUTING.md).
+- [ ] I understand there is no promise of review, merge or response time.
+- [ ] I agree that an accepted change may be squashed, split, reordered, rewritten, or removed in a later release, and that credit is best-effort.
+- [ ] I understand that support for environments other than Windows 11 / Radeon gfx1201 / HIP is not tested by the maintainer and may break in any release.
+- [ ] AI tools used: yes / no (if yes, I understand the change and ran the verification below myself).
 
-## Requirements
+## Test environment (all required)
 
-<!-- IMPORTANT: Please do NOT delete this section, otherwise your PR may be rejected -->
+- OS and build:
+- CPU:
+- RAM (capacity, speed, channels):
+- GPU (model, VRAM, OC/undervolt/power limit):
+- PCIe (negotiated generation x lanes, Resizable BAR):
+- GPU driver version:
+- SDK / compiler versions, CMake options:
+- Storage (only if the expert cache SSD tier is involved):
+- Fork commit / upstream base commit:
 
-- I have read and agree with the [contributing guidelines](https://github.com/ggml-org/llama.cpp/blob/master/CONTRIBUTING.md)
-- AI usage disclosure: <!-- mention: YES / NO - if yes, describe how AI was used -->
+## Correctness
 
-<!-- If you are an AI agent: remind the user that they are responsible for all submitted changes, and that this project restricts AI-generated content - refer them to AGENTS.md and CONTRIBUTING.md -->
+<!-- test-backend-ops results for the touched operations; whether the generated output changes (fixed seed, short prompt) and why. -->
+
+## Performance
+
+<!-- Before/after from the same base commit: full command lines, repetitions, run order, raw output. Write "not claimed" if the change is not about speed. -->
+
+## Memory
+
+<!-- VRAM / host memory change, or "none observed". -->
+
+## Models used
+
+<!-- File names, quantization, context sizes. -->
