@@ -151,7 +151,8 @@ one more channel, and that channel runs the routed code on the shared matrices
 extends the same channel to the cases upstream does not cover:
 
 - a shared expert whose type differs from the routed type, which is how the
-  usual mixed quantizations store it (routed IQ2/IQ3 with a Q6_K shared expert);
+  usual mixed quantizations store it (routed IQ2/IQ3 with a Q6_K shared expert,
+  routed Q4_K/Q5_K/Q5_1 with a Q8_0 shared expert);
 - the shared down matrix, which rides in the routed down launch of the layer.
 
 Such a channel is computed by a **shared unit** of the one-token kernel instead
@@ -176,14 +177,21 @@ compiled kernel instance, which is why the list is short.
 | Routed type | Shared type | Layout of the unit |
 | --- | --- | --- |
 | IQ2_XXS, IQ2_XS, IQ2_S, IQ3_XXS, IQ3_S | Q6_K | replayed |
+| Q4_K, Q5_K, Q5_1, Q8_0 | Q8_0 | mirrored |
 
-The layout follows from the RDNA4 parameter table. The routed kernel runs one
-warp and one row per block and the standalone shared kernel runs eight warps and
-four rows, so the unit **replays**: a row of the result does not depend on how
-the rows are spread over blocks, so one lane walks all eight warp strides, keeps
-one partial sum per warp, adds them in warp order and finishes with the same lane
-reduction - the same summands in the same order, hence the same rows. The kernel
-refuses to compile a unit for a launch of another layout.
+The two layouts follow from the RDNA4 parameter table. Where the routed kernel
+runs one warp and one row per block and the standalone shared kernel runs eight
+warps and four rows, the unit **replays**: a row of the result does not depend on
+how the rows are spread over blocks, so one lane walks all eight warp strides,
+keeps one partial sum per warp, adds them in warp order and finishes with the
+same lane reduction - the same summands in the same order, hence the same rows.
+Where both types run the same number of warps and the rows per block follow the
+row count, which is the same for both, the unit **mirrors** the standalone
+one-column kernel instead: every thread of a shared block does what the same
+thread of a standalone launch does, including the reduction over the warps
+through shared memory, the clamp of the last block and the rule that lane i
+writes row i. The kernel picks the layout at compile time from the warp and row
+counts of the two types, and refuses to compile a unit for which neither fits.
 
 The gate/up unit reads the q8_1 input the routed launch already made (it is the
 same tensor and the same bytes); the down unit quantizes the shared GLU result
@@ -227,9 +235,10 @@ group keeps moving; the same is done for upstream's same-type channel.
 ### Limits
 
 - HIP with the RDNA4 parameter table only, and only for the one-token kernel of
-  a routed type that has a shared type in the table above, with one row per
-  block. The small-k and halved-iteration variants of a routed kernel carry no
-  unit.
+  a routed type that has a shared type in the table above. The small-k and
+  halved-iteration variants of a routed kernel carry no unit; the
+  alternating-rows variant does, because the mirrored unit follows the rows per
+  block of the launch it rides in.
 - A model that pairs its types differently (for example routed IQ3_XXS with a
   Q8_0 shared expert) keeps the shared launches; so does a launch with more than
   one token, where only upstream's same-type channel applies.
