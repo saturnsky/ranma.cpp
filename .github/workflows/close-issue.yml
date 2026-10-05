@@ -1,7 +1,6 @@
 name: Close inactive issues
 on:
-  schedule:
-    - cron: "42 0 * * *"
+  workflow_dispatch:
 
 cache-mode: none
 permissions:
