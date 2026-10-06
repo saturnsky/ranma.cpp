@@ -892,7 +892,7 @@ ggml_tensor * llama_model_glm5_next::graph::build_kda_layer(
     ggml_tensor * gated = ggml_mul(ctx0, normed, ggml_sigmoid(ctx0, g2));
 
     gated = ggml_cont_2d(ctx0, gated, d_inner, n_tokens);
-    cur   = ggml_mul_mat(ctx0, layer.wo, gated);
+    cur   = build_lora_mm(layer.wo, gated);
     cb(cur, "kda_out", il);
 
     return cur;
@@ -1137,7 +1137,7 @@ ggml_tensor * llama_model_glm5_next::graph::build_dsa_layer(
     }
     cb(out, "kqv_out", il);
 
-    out = ggml_mul_mat(ctx0, layer.wo, out);
+    out = build_lora_mm(layer.wo, out);
     cb(out, "attn_out", il);
 
     return out;
