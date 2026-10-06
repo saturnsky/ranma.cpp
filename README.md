@@ -26,15 +26,61 @@ Some of the optimizations that pay off here trade away multi-request throughput 
 generality, so they are not appropriate for upstream. Others are general improvements
 and may be submitted upstream. This fork is where both kinds live together in a tested state.
 
-It is not a general replacement for llama.cpp. If you serve many users, use upstream.
+It can also serve one person's own development work in a single session, such as a coding assistant
+on the same machine.
+
+It is not a general replacement for llama.cpp. The expert cache does not change its placement while a
+request is processed: it installs a new plan only when every slot is idle, so when several sessions send
+requests in turn it rarely gets the chance. If you serve many users, use upstream.
+
+## Main features
+
+- **Expert cache** - for a MoE model whose routed experts do not fit in VRAM, the server profiles which
+  experts the router selects and keeps the most valuable set in a VRAM budget (`--expert-l1-mib`); the
+  other experts are read from host memory over PCIe, and with `--expert-l2-mib` from the GGUF file when
+  they do not fit in RAM either. Needs host-direct and `--load-mode none`.
+  [docs/ranma/expert-cache.md](docs/ranma/expert-cache.md),
+  [docs/ranma/expert-cache-l2.md](docs/ranma/expert-cache-l2.md)
+  - Give the slot count with `-np` (`-np 1` for one user). Without it the server runs four slots: the
+    state kept per slot grows with them (for Qwen3.8-Flash-Next at a 256K context the recurrent state
+    and the compute buffers grow by several GiB), which can overflow VRAM, and a finite host tier is
+    refused with `finite L2 needs positive batch/parallel bounds`.
+- **Smart MTP draft length (`--spec-smart`)** - with `--spec-type draft-mtp`, llama-server chooses the
+  draft length at every step from the measured verification time per width and a calibrated acceptance
+  of the draft probabilities, without per-model thresholds. On by default with `draft-mtp`;
+  `--spec-smart-store PATH` keeps the estimates across restarts.
+  [docs/ranma/spec-smart.md](docs/ranma/spec-smart.md)
+- **EXL3 weights** - ExLlamaV3 EXL3 quantizations run from GGUF files, on the CPU and on HIP (GEMV for
+  decode, WMMA GEMM on RDNA4 for prompts), with host-direct expert banks and the expert cache. They need
+  GGUF files in this fork's format: an ordinary GGUF or an EXL3 safetensors checkpoint is not read
+  directly. Take the converted files from Hugging Face
+  ([Qwen3.8-Flash-Next](https://huggingface.co/SaturnHeaven/Qwen3.8-Flash-Next-RANMA-EXL3-GGUF),
+  [DeepSeek-V4-Flash-0731](https://huggingface.co/SaturnHeaven/DeepSeek-V4-Flash-0731-RANMA-EXL3-GGUF)).
+  For another EXL3 model, convert its EXL3 checkpoint with `convert_hf_to_gguf.py`. Several
+  architectures have been converted and run ([checked models](docs/ranma/exl3.md#checked-models)), but
+  not every model is guaranteed to work yet. These files use tensor types of this fork and do not open
+  in upstream llama.cpp, LM Studio, Ollama or other llama.cpp-based tools.
+  [docs/ranma/exl3.md](docs/ranma/exl3.md)
+
+Every other change, one line each with its page: [docs/ranma/README.md](docs/ranma/README.md).
+
+## Benchmarks
+
+The benchmark of a release is the last commit of its series
+([docs/ranma/releases.md](docs/ranma/releases.md#release-cycle)).
 
 ## Roadmap
 
-The first phase is porting. The features come from a private experimental fork that the
-maintainer has been running for personal use; each one is cleaned up, reshaped to fit
-upstream's code layout, and measured again before it lands here. Once that backlog is
-ported, the fork keeps going in the same direction: changes for an individual user
-running llama.cpp on Windows with a Radeon GPU, measured on that setup.
+Planned, not done yet. Nothing here is promised or scheduled.
+
+- **DeepSeek V4 Flash**: try further performance work. It may not pay off.
+- **DeepSeek V4.1 Flash**: take the upstream pull request for this model while it is not merged yet,
+  then add EXL3 support on top. If upstream merges a different implementation, this fork follows
+  upstream, and GGUF files made for the earlier one, EXL3 GGUF files in particular, may stop loading and
+  need to be converted again.
+- **Experimental RDNA3 and NVIDIA (CUDA) builds**: open the paths that do not depend on RDNA4
+  instructions and check only that they compile. Whether they work is not guaranteed; reports and pull
+  requests are welcome.
 
 ## Target environment
 
@@ -45,9 +91,32 @@ running llama.cpp on Windows with a Radeon GPU, measured on that setup.
 | Backend | HIP / ROCm (`GGML_HIP=ON`) |
 | Use case | `llama-server` driving a roleplay client, single or few slots |
 
-All changes are developed and tested only on this environment. Some rely on Windows APIs
-or on gfx1201-specific behavior; on other platforms they may have no effect or may
-misbehave. Other platforms and backends are not tested and not supported by this fork.
+The maintainer develops and tests every change only on this environment. Some changes rely on Windows
+APIs or on gfx1201-specific behavior; on other platforms they may have no effect or may misbehave. Other
+GPUs, backends and operating systems may work, but nothing is guaranteed there: releases are made
+without testing them. Reports and pull requests are welcome
+([CONTRIBUTING.md](CONTRIBUTING.md#other-architectures)).
+
+### Features by GPU
+
+| feature | RDNA4 (gfx1201) | RDNA3 (gfx1100/1101/1102) |
+|---|:---:|:---:|
+| Host-direct MoE weights | ✔ | ◇ ranma_20261005 |
+| Expert cache, VRAM tier | ✔ | ◇ ranma_20261005 |
+| Expert cache, finite host tier with file backing | ✔ | ◇ ranma_20261005 |
+| Smart MTP draft length | ✔ | ? |
+| Qwen sparse attention, selected cells only | ✔ | ? |
+| DeepSeek V4 selected-cell attention | ✔ | ? |
+| DeepSeek V4 graph ops (hyper-connection coefficients, KV compressor) | ✔ | ? |
+| EXL3 decode (GEMV) | ✔ | ○ |
+| EXL3 prompt processing (WMMA GEMM) | ✔ | ✕ (prompts run on the GEMV ○) |
+| Qwen3.8 hyper-connection fusion | ✔ | ○ |
+
+✔ tested by the maintainer at the current release. ◇ reported by a user who tested it on their own machine at
+the release named; not tested by the maintainer. ○ the HIP device code compiles for gfx1100 (the EXL3 kernels
+also for gfx1101 and gfx1102); not run. ✕ not implemented for that GPU yet; it takes a slower general path.
+? not confirmed. Optimizations that only make sense with RDNA4 instructions or RDNA4 tuning, such as the
+RDNA4 matmul selection and the shared expert unit, are not listed.
 
 ## Principles
 
@@ -67,144 +136,6 @@ misbehave. Other platforms and backends are not tested and not supported by this
    VRAM, generality, or complexity.
 4. **Upstream what belongs upstream.** Changes that are general improvements may be
    submitted to llama.cpp rather than kept only here.
-
-## Changes over upstream
-
-Each user-visible change gets a line here and a page under `docs/ranma/` that describes what it is, when it
-applies, how to switch it, and its limits.
-
-### RDNA4 kernels (HIP)
-
-- **Small-batch matmul dispatch** - four weight rows per MMVQ block for 3..8 activation columns and a
-  per-type MMVQ/MMQ crossover, so the cost of a decode call no longer rises and then falls with the number of rows
-  in it. This is the range of a speculative verification step and of a server that batches a few slots.
-  [docs/ranma/rdna4-small-batch.md](docs/ranma/rdna4-small-batch.md)
-- **Four rows per block at one column** - single-token decode of a wide matrix reads the activation once per
-  four weight rows; chosen per call from the matrix size. Same page.
-- **12-column tile attention for GQA-12 groups** - token generation on a model whose head group is a multiple
-  of twelve reads each K/V head once instead of three times. `GGML_HIP_FATTN_GQA12=0` restores the upstream
-  dispatch. Same page.
-- **WMMA attention for 512-wide heads** - prompt processing of a 512/512 head at GQA 8 with an F16 KV cache
-  takes the wide-tile MMA kernel. `GGML_HIP_PREFILL_WMMA=0` restores the upstream dispatch.
-  [docs/ranma/rdna4-prefill.md](docs/ranma/rdna4-prefill.md)
-- **Padded F16 BLAS for wide dense Q2_K/Q6_K/IQ2 matmuls** - wide prompt matmuls of those types convert both
-  operands to F16 with a padded row pitch and run hipBLASLt instead of MMQ. Needs `ROCBLAS_USE_HIPBLASLT=1`;
-  `GGML_HIP_PREFILL_BLAS=0` turns it off. Same page.
-- **Fixed-order kernels for skinny F32 matmuls** - F32 products of up to 512 weight rows with more than eight
-  activation columns (router, SSM and hyper-connection projections of a prompt batch) run on dedicated kernels
-  instead of hipBLAS, whose per-process solution choice changed their speed and summation order from one process
-  to the next. `GGML_CUDA_SKINNY_F32=0` restores hipBLAS. Same page.
-- **Wider MoE column tiles** - the MMQ tile width of a `MUL_MAT_ID` is sized against three times the mean
-  column count per expert, so popular experts re-read their weights less often. Bit-identical;
-  `GGML_CUDA_MMQ_ID_NCOLS_OPT_SCALE=1` restores the upstream width. Same page.
-
-### Server and common tools
-
-- **GPU heartbeat (llama-server)** - `--gpu-heartbeat-seconds 5` records one GPU event per interval while the
-  server is idle and while the model is freed, so that Windows does not evict the VRAM of the process between
-  turns. Off by default. [docs/ranma/gpu-heartbeat.md](docs/ranma/gpu-heartbeat.md)
-- **Per-position draft thresholds** - `--spec-draft-p-min` takes one probability per draft position, and
-  `--spec-draft-p-continue` keeps a token in the draft but stops drafting after it. Defaults unchanged.
-  [docs/ranma/spec-draft-thresholds.md](docs/ranma/spec-draft-thresholds.md)
-- **Smart draft length for draft-mtp (llama-server)** - `--spec-smart` chooses the draft length at every step from
-  the measured verification time per width and a calibrated acceptance of the draft probabilities, up to
-  `--spec-draft-n-max`; `--spec-smart-store PATH` keeps the estimates across restarts of the same model, build and
-  cache settings. Off by default. [docs/ranma/spec-smart.md](docs/ranma/spec-smart.md)
-- **Reuse of a just-restored context checkpoint (llama-server)** - when the first prompt batch after a checkpoint
-  restore starts at that checkpoint, the server keeps the restored entry instead of serializing the unchanged
-  state again. `LLAMA_SERVER_CKPT_REUSE=0` restores the upstream behaviour.
-  [docs/ranma/server-checkpoints.md](docs/ranma/server-checkpoints.md)
-- **Per-layer embedding prefetch** - `--ple-prefetch {off,prefill,always}` (default `always`) hands the rows of
-  a lazily mapped per-layer embedding table to the operating system before the gather, and the gather of that
-  tensor runs on the threadpool. [docs/ranma/ple-prefetch.md](docs/ranma/ple-prefetch.md)
-- **Only the shards with lazy tensors are mapped** - with mmap loading off, the loader no longer maps model
-  files that nothing reads through the mapping. Same page.
-
-### Host-resident MoE experts
-
-- **Host-direct MoE weights (HIP)** - `MUL_MAT_ID` kernels read host-resident expert weights in place over PCIe
-  instead of copying them per op or computing them on the CPU. Off by default; the recommended profile for a
-  model whose experts live in system RAM is `GGML_CUDA_HOST_DIRECT=1 GGML_CUDA_HOST_DIRECT_MAX_BATCH=512`
-  (the second value at least the ubatch size). [docs/ranma/host-direct-moe.md](docs/ranma/host-direct-moe.md)
-- **Expert cache** - `--expert-l1-mib N --expert-profile-dir DIR` gives the routed experts a VRAM budget: the
-  server profiles which experts the router selects, plans the most valuable set for the budget and installs it
-  at a request boundary. The budget decides the expert placement, so it replaces `--n-cpu-moe`. Needs host-direct
-  and `--load-mode none`. [docs/ranma/expert-cache.md](docs/ranma/expert-cache.md)
-- **The cache serves prompt processing, and installs are deltas** - MMQ reads the cache arena through the same
-  slot tables as MMVQ, and an install moves only what changed between two plans.
-  [docs/ranma/expert-cache-prefill.md](docs/ranma/expert-cache-prefill.md)
-- **Exclusive mode (Windows)** - `--expert-cache-mode exclusive` gives every routed expert exactly one home, a
-  VRAM slot or a host slot, so the budget is not a second copy of experts that also sit in RAM.
-  [docs/ranma/expert-cache-exclusive.md](docs/ranma/expert-cache-exclusive.md)
-- **Profile banks and the prefill swap** - prompt processing and generation are profiled into separate banks;
-  `--expert-prefill-swap` additionally installs the prompt plan while a prompt is processed.
-  [docs/ranma/expert-cache-banks.md](docs/ranma/expert-cache-banks.md)
-- **Finite host tier with file backing (Windows)** - `--expert-l2-mib N` bounds the host memory of the cache;
-  what fits in neither VRAM nor that budget stays in the GGUF file and is read on demand into a ring of host
-  slots that the kernels address directly. [docs/ranma/expert-cache-l2.md](docs/ranma/expert-cache-l2.md)
-- **`llama-perplexity` takes the expert cache options**, with the cache frozen, so a model whose routed experts
-  do not fit in VRAM can be scored without `--n-cpu-moe`.
-
-### Graph runtime
-
-- **Compute buffers regrow with headroom** - a compute buffer that has to grow after its first allocation is
-  allocated one eighth larger, so a long prompt does not reallocate a slightly larger buffer at every step.
-  [docs/ranma/graph-runtime.md](docs/ranma/graph-runtime.md)
-- **Graph inputs are uploaded through a pinned staging ring** - asynchronously on the stream of the backend
-  instead of one blocking copy per input. `LLAMA_INPUT_UPLOAD_ASYNC=0` restores the blocking path. Same page.
-- **LoRA scale folding** - a LoRA scale of exactly 1 produces no graph node, and other scales are folded into
-  a pre-scaled copy of the dense B matrices at attach time. `llama-bench` gains `--lora` and `--lora-scaled`.
-  Same page.
-- **One HIP graph per batch shape** - the backend keys the graphs it captured by the batch shape as well as by
-  the first node, so a speculative verification whose width changes between rounds launches the graph it already
-  captured for that width. On by default in HIP builds; `GGML_CUDA_GRAPH_PER_SHAPE=0` restores the keying by the
-  first node. Same page.
-
-### MoE decode kernels (HIP)
-
-- **One q8_1 quantization per shared input** - `MUL_MAT` nodes of one graph that read the same activation
-  share its quantization. [docs/ranma/moe-decode.md](docs/ranma/moe-decode.md)
-- **Expert-first launch grid** - with the expert cache, the routed `MUL_MAT_ID` launch alternates its blocks
-  between the experts, so the experts in VRAM compute inside the wait for the experts read over the link.
-  Same page.
-- **Shared expert unit in the routed launch** - on RDNA4 a dense shared expert whose type differs from the
-  routed type (Q6_K with IQ2/IQ3 routed experts, Q8_0 with Q4_K, Q5_K, Q5_1 or Q8_0), and the shared down
-  matrix, run as one more channel of the routed launches, on top of upstream's same-type shared expert
-  fusion; its own launches disappear. Same page.
-
-### Qwen sparse attention
-
-- **Stable top-k tie selection for reproducible runs** - `GGML_CUDA_TOP_K_STABLE_TIES=1` makes the radix top-k
-  select the smallest columns among exactly tied values, so selections and outputs can be compared between runs.
-  Off by default. [docs/ranma/qwen-sparse-attention.md](docs/ranma/qwen-sparse-attention.md)
-- **Attention reads only the selected cells** - on HIP the tile flash attention gathers the selected K/V rows
-  through the compacted index list of its query tile instead of scanning the KV cache. It applies to tiles of up
-  to four query rows, from a cache length that depends on the selection budget. `GGML_CUDA_FATTN_SPARSE=0` keeps
-  the dense kernel. Same page.
-- **Parallel mask compaction** for long index lists, with `GGML_CUDA_FATTN_COMPACT_VERIFY=1` as the equivalence
-  gate. Same page.
-
-### DeepSeek V4
-
-- **Selected-cell attention for 512-wide heads**, including attention calls with sinks.
-  [docs/ranma/deepseek-v4.md](docs/ranma/deepseek-v4.md)
-- **Hyper-connection coefficients in one op** with a backend capability probe and the upstream ops as the
-  fallback. Same page.
-- **Fused KV compressor** - gather, per-feature softmax and weighted sum in one op. Same page.
-- **No dummy HCA compression** on the decode steps in which no block completes. Same page.
-- **Raw and compressed K of a layer in one tensor**, so the attention reads a view instead of a concatenated
-  copy on every token. Same page.
-
-### EXL3 weights and Qwen3.8 decode (HIP)
-
-- **EXL3 weights** - GGUF files hold the weights of ExLlamaV3 EXL3 checkpoints unchanged (mul1, mcg and 3inst
-  codebooks), converted by `convert_hf_to_gguf.py`, and run as `MUL_MAT_HAD` on the CPU and on HIP (GEMV for
-  decode, WMMA GEMM on RDNA4 for prompts), with host-direct expert banks and the expert cache. Checked with
-  `llama`, `qwen3moe`, `lfm2moe`, `qwen4exp`, `deepseek4` and `glm5-next` models; RDNA3 compiles but is
-  untested.
-  [docs/ranma/exl3.md](docs/ranma/exl3.md)
-- **Fused Qwen3.8 hyper-connections** - the gated residual mix and the combine of each hyper-connection site run
-  as fused decode kernels. `GGML_CUDA_HC_GATED_FUSION=0` turns them off. Same page.
 
 ## Building
 
