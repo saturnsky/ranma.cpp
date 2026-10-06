@@ -973,8 +973,28 @@ def _ds4_check(self):
         raise Exl3Error(f"incomplete grouped wo_a (layer: slices present): {left}")
 
 
+def _glm5_next_modify(self, data_torch, name, bid):
+    """GLM5-Next KDA: the EXL3 checkpoint joins q_proj, k_proj and v_proj as `qkv_proj` (rows q | k | v) and their
+    convolutions as `conv1d`; split them back to the source tensors (each n_head * head_dim rows, whole 128-row groups)."""
+    for fused, parts in (("qkv_proj", ("q_proj", "k_proj", "v_proj")), ("conv1d", ("q_conv1d", "k_conv1d", "v_conv1d"))):
+        if name.endswith(f".self_attn.{fused}.weight"):
+            break
+    else:
+        return None
+    lin = self.hparams["linear_attn_config"]
+    d_inner = lin["num_heads"] * lin["head_dim"]
+    if data_torch.shape[0] != 3 * d_inner:
+        raise Exl3Error(f"{name}: {data_torch.shape[0]} rows, expected 3 * {d_inner} (q, k, v)")
+    base = name[:-len(f"{fused}.weight")]
+    out = []
+    for part, t in zip(parts, data_torch.split(d_inner, dim=0)):
+        out.extend(super(_Exl3Model, self).modify_tensors(t, f"{base}{part}.weight", bid))  # ty: ignore[unresolved-attribute]
+    return out
+
+
 EXL3_CLASS_ADAPTERS: dict[str, dict[str, Any]] = {
     "DeepseekV4Model": dict(_write_mxfp4_expert_tensor=_ds4_write_experts, _exl3_adapter_modify=_ds4_modify, _exl3_adapter_check=_ds4_check),
+    "Glm5NextModel": dict(_exl3_adapter_modify=_glm5_next_modify),
 }
 
 
