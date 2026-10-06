@@ -270,6 +270,7 @@ class Keys:
         SCALING_YARN_ATTN_FACTOR  = "{arch}.rope.scaling.yarn_attn_factor"
         SCALING_YARN_BETA_FAST    = "{arch}.rope.scaling.yarn_beta_fast"
         SCALING_YARN_BETA_SLOW    = "{arch}.rope.scaling.yarn_beta_slow"
+        STYLE                     = "{arch}.rope.style"  # "neox": unpermuted HF Q/K rows with NEOX rope (EXL3 sources)
 
     class Activation:
         SITU_BETA        = "{arch}.activation.situ_beta"
@@ -5141,6 +5142,7 @@ MODEL_TENSORS: dict[MODEL_ARCH, list[MODEL_TENSOR]] = {
     MODEL_ARCH.LFM2MOE: [
         MODEL_TENSOR.TOKEN_EMBD,
         MODEL_TENSOR.TOKEN_EMBD_NORM,
+        MODEL_TENSOR.OUTPUT, # untied output, e.g. the separately quantized lm_head of EXL3 checkpoints
         MODEL_TENSOR.SHORTCONV_CONV,
         MODEL_TENSOR.SHORTCONV_INPROJ,
         MODEL_TENSOR.SHORTCONV_OUTPROJ,
@@ -5988,6 +5990,7 @@ class LlamaFileType(IntEnum):
     MOSTLY_NVFP4         = 39  # except 1d tensors
     MOSTLY_Q1_0          = 40  # except 1d tensors
     MOSTLY_Q2_0          = 41  # except 1d tensors
+    MOSTLY_EXL3          = 256 # EXL3 trellis weights of any bitrate and codebook, other tensors as in the source
 
     GUESSED              = 1024  # not specified in the model file
 

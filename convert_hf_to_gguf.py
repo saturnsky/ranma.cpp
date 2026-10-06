@@ -170,6 +170,11 @@ def parse_args() -> argparse.Namespace:
         ),
     )
 
+    parser.add_argument(
+        "--exl3-ngram", choices=["refuse", "omit"], default="refuse",
+        help="EXL3 source with n-gram row codec tables (Qwen3.8): refuse (default) or convert without the table and its PLE keys",
+    )
+
     args = parser.parse_args()
     if not args.print_supported_models and args.model is None:
         parser.error("the following arguments are required: model")
@@ -282,20 +287,38 @@ def main() -> None:
             if args.mtp:
                 model_class.mtp_only = True
 
-        model_instance = model_class(dir_model, output_type, fname_out,
-                                     is_big_endian=args.bigendian, use_temp_file=args.use_temp_file,
-                                     eager=args.no_lazy,
-                                     metadata_override=args.metadata, model_name=args.model_name,
-                                     split_max_tensors=args.split_max_tensors,
-                                     split_max_size=split_str_to_n_bytes(args.split_max_size), dry_run=args.dry_run,
-                                     small_first_shard=args.no_tensor_first_split,
-                                     remote_hf_model_id=hf_repo_id, disable_mistral_community_chat_template=disable_mistral_community_chat_template,
-                                     sentence_transformers_dense_modules=args.sentence_transformers_dense_modules,
-                                     target_model_dir=Path(args.target_model_dir) if args.target_model_dir else None,
-                                     fuse_gate_up_exps=args.fuse_gate_up_exps,
-                                     fp8_as_q8=args.fp8_as_q8,
-                                     fuse_qkv=args.fuse_qkv,
-                                     )
+        if not is_mistral_format:
+            from conversion import exl3
+            if exl3.is_exl3(hparams):
+                exl3.check_args(args)
+                model_class = exl3.adapt(model_class, ngram=args.exl3_ngram)
+                logger.info(f"EXL3 source: {model_class.__name__}")
+
+        def make_model():
+            return model_class(dir_model, output_type, fname_out,
+                               is_big_endian=args.bigendian, use_temp_file=args.use_temp_file,
+                               eager=args.no_lazy,
+                               metadata_override=args.metadata, model_name=args.model_name,
+                               split_max_tensors=args.split_max_tensors,
+                               split_max_size=split_str_to_n_bytes(args.split_max_size), dry_run=args.dry_run,
+                               small_first_shard=args.no_tensor_first_split,
+                               remote_hf_model_id=hf_repo_id, disable_mistral_community_chat_template=disable_mistral_community_chat_template,
+                               sentence_transformers_dense_modules=args.sentence_transformers_dense_modules,
+                               target_model_dir=Path(args.target_model_dir) if args.target_model_dir else None,
+                               fuse_gate_up_exps=args.fuse_gate_up_exps,
+                               fp8_as_q8=args.fp8_as_q8,
+                               fuse_qkv=args.fuse_qkv,
+                               )
+
+        try:
+            model_instance = make_model()
+        except Exception as e:
+            from conversion import exl3
+            if not isinstance(e, exl3.Exl3MtpUnsupported):
+                raise
+            # the MTP layers cannot be stored as EXL3: convert as with --no-mtp
+            model_class.no_mtp = True
+            model_instance = make_model()
 
         if args.vocab_only:
             logger.info("Exporting model vocab...")
