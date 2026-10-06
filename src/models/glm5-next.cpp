@@ -195,7 +195,7 @@ std::unique_ptr<llm_graph_context> llama_model_glm5_next::build_arch_graph(const
 // Causal conv1d over one of Q/K/V
 static ggml_tensor * glm5_conv1d(ggml_cgraph * gf, ggml_context * ctx0,
                                  ggml_tensor * conv_states_all, ggml_tensor * conv_state_all,
-                                 int64_t qkv, ggml_tensor * x, ggml_tensor * proj_w, ggml_tensor * conv_w,
+                                 int64_t qkv, ggml_tensor * x_proj, ggml_tensor * conv_w,
                                  int64_t d_conv, int64_t head_dim, int64_t n_head,
                                  int64_t n_seq_tokens, int64_t n_seqs, int64_t n_tokens, int64_t kv_head,
                                  int64_t mem_size, int64_t K_rs) {
@@ -208,7 +208,6 @@ static ggml_tensor * glm5_conv1d(ggml_cgraph * gf, ggml_context * ctx0,
         n_embd_r_total * ggml_element_size(conv_state_all),
         qkv * conv_state_size * ggml_element_size(conv_state_all));
 
-    ggml_tensor * x_proj = ggml_mul_mat(ctx0, proj_w, x);
     ggml_tensor * x_3d   = ggml_reshape_3d(ctx0, x_proj, d_inner, n_seq_tokens, n_seqs);
     ggml_tensor * conv_x = ggml_concat(ctx0, conv_state_x, ggml_transpose(ctx0, x_3d), 0);
 
@@ -811,7 +810,7 @@ llama_model_glm5_next::graph::graph(const llama_model & model, const llm_graph_p
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
 
-    cur = ggml_mul_mat(ctx0, model.output, cur);
+    cur = build_mm(model.output, cur);
     cb(cur, "result_output", -1);
     res->t_logits = cur;
 
@@ -834,9 +833,9 @@ ggml_tensor * llama_model_glm5_next::graph::build_kda_layer(
     const int64_t mem_size = mctx_cur->get_size();
     const int64_t K_rs     = (int64_t) cparams.n_rs_seq + 1;
 
-    ggml_tensor * Qcur = glm5_conv1d(gf, ctx0, conv_states_all, conv_state_all, 0, cur, layer.wq, layer.ssm_q_conv, d_conv, head_dim, n_head_kda, n_seq_tokens, n_seqs, n_tokens, kv_head, mem_size, K_rs);
-    ggml_tensor * Kcur = glm5_conv1d(gf, ctx0, conv_states_all, conv_state_all, 1, cur, layer.wk, layer.ssm_k_conv, d_conv, head_dim, n_head_kda, n_seq_tokens, n_seqs, n_tokens, kv_head, mem_size, K_rs);
-    ggml_tensor * Vcur = glm5_conv1d(gf, ctx0, conv_states_all, conv_state_all, 2, cur, layer.wv, layer.ssm_v_conv, d_conv, head_dim, n_head_kda, n_seq_tokens, n_seqs, n_tokens, kv_head, mem_size, K_rs);
+    ggml_tensor * Qcur = glm5_conv1d(gf, ctx0, conv_states_all, conv_state_all, 0, build_mm(layer.wq, cur), layer.ssm_q_conv, d_conv, head_dim, n_head_kda, n_seq_tokens, n_seqs, n_tokens, kv_head, mem_size, K_rs);
+    ggml_tensor * Kcur = glm5_conv1d(gf, ctx0, conv_states_all, conv_state_all, 1, build_mm(layer.wk, cur), layer.ssm_k_conv, d_conv, head_dim, n_head_kda, n_seq_tokens, n_seqs, n_tokens, kv_head, mem_size, K_rs);
+    ggml_tensor * Vcur = glm5_conv1d(gf, ctx0, conv_states_all, conv_state_all, 2, build_mm(layer.wv, cur), layer.ssm_v_conv, d_conv, head_dim, n_head_kda, n_seq_tokens, n_seqs, n_tokens, kv_head, mem_size, K_rs);
     cb(Qcur, "kda_q_conv", il);
     cb(Kcur, "kda_k_conv", il);
     cb(Vcur, "kda_v_conv", il);
@@ -912,7 +911,7 @@ ggml_tensor * llama_model_glm5_next::graph::build_kpool_select(
     const int64_t n_pool         = inp_kpool->pool_cells->ne[0];
     const int64_t n_new          = inp_kpool->n_new;
 
-    ggml_tensor * iq = ggml_mul_mat(ctx0, layer.indexer_attn_q_b, qr);
+    ggml_tensor * iq = build_mm(layer.indexer_attn_q_b, qr);
     iq = ggml_reshape_3d(ctx0, iq, n_embd_indexer, n_indexer_head, n_tokens);
     cb(iq, "indexer_q", il);
 
@@ -1062,14 +1061,14 @@ ggml_tensor * llama_model_glm5_next::graph::build_dsa_layer(
 
     GGML_ASSERT(hparams.n_rot() == 0 && "GLM5-Next MLA is nope-only");
 
-    ggml_tensor * qr = ggml_mul_mat(ctx0, layer.wq_a, cur);
+    ggml_tensor * qr = build_mm(layer.wq_a, cur);
     qr = build_norm(qr, layer.attn_q_a_norm, nullptr, LLM_NORM_RMS, il);
     cb(qr, "q_resid", il);
 
-    ggml_tensor * q = ggml_mul_mat(ctx0, layer.wq_b, qr);
+    ggml_tensor * q = build_mm(layer.wq_b, qr);
     q = ggml_reshape_3d(ctx0, q, n_embd_head_qk_nope, n_head, n_tokens);
 
-    ggml_tensor * kv_cmpr = ggml_mul_mat(ctx0, layer.wkv_a_mqa, cur);
+    ggml_tensor * kv_cmpr = build_mm(layer.wkv_a_mqa, cur);
     kv_cmpr = build_norm(kv_cmpr, layer.attn_kv_a_norm, nullptr, LLM_NORM_RMS, il);
     kv_cmpr = ggml_reshape_3d(ctx0, kv_cmpr, kv_lora_rank, 1, n_tokens);
     cb(kv_cmpr, "kv_cmpr", il);
