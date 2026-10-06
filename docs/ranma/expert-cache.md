@@ -173,6 +173,12 @@ requests rebuild a profile from cold.
   process runs uncached with a warning.
 - **Slot 0 is profiled.** With `--parallel N > 1` the other slots use the cache but do not feed the
   profile.
+- **Give the slot count with `-np`** (`-np 1` for one user). Without it llama-server runs four slots:
+  the state kept per slot grows with them (for Qwen3.8-Flash-Next at a 256K context the recurrent state
+  and the compute buffers grow by several GiB), which can overflow VRAM, and a finite host tier is
+  refused (`finite L2 needs positive batch/parallel bounds`, `expert-cache-l2.md`). Plans are installed
+  only when every slot is idle (`expert-cache-banks.md`), so several sessions that send requests in turn
+  leave the cache few chances to change its placement.
 - **A manual `-ot` on `_exps` tensors is left alone** and is the user's responsibility; if the
   experts end up in VRAM anyway there is nothing to cache and the option is ignored with a log line.
 - **The arena is read on the in-place kernels only.** MMVQ (generation) and MMQ (prompt processing
