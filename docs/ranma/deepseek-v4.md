@@ -6,7 +6,7 @@ selects a few of the compressed cells for every query. This page describes what
 this fork changes in that path: how the attention reads the selected cells, how
 the graph is built around the hyper-connections and the KV compressor, and how
 the two caches of a layer are laid out. The attention section is a HIP kernel
-path and applies to RDNA4 (gfx1201) only; the other sections are backend
+path, measured on RDNA4 (gfx1201) only; the other sections are backend
 independent and have CPU and CUDA/HIP implementations.
 
 ## Gathering the selected cells for head size 512

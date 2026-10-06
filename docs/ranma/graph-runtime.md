@@ -237,6 +237,15 @@ it when the tool moves on to the next model.
   for a single-token decode the `B` matmul and the add appear as one kernel.
 
 
+## LoRA on the GLM5-Next attention output
+
+`glm5-next` multiplied its KDA and MLA attention output projections (`attn_output`) with `ggml_mul_mat`, so
+an adapter that targets `attn_output`, such as the GLM-5.3 heretic adapter, was loaded but not applied to
+them. They now go through `build_lora_mm` like the other projections, and the adapter changes the output.
+Without an adapter `build_lora_mm` adds no node here (the precision policy applies only to tensors listed in
+the GGUF precision metadata, the BF16 accumulation only to NVFP4 weights), so the graph is unchanged.
+
+
 ## One HIP graph per batch shape
 
 ### What it is
