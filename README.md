@@ -66,8 +66,71 @@ Every other change, one line each with its page: [docs/ranma/README.md](docs/ran
 
 ## Benchmarks
 
-The benchmark of a release is the last commit of its series
-([docs/ranma/releases.md](docs/ranma/releases.md#release-cycle)).
+The release ranma_20261007 is based on upstream `8e1642198`. It adds GLM-5.3 Flash in EXL3 with its MTP draft and
+has no benchmark record of its own. The records keep the release each number was measured at: Qwen3.8-Flash-Next in
+EXL3 against UD-Q4_K_XL is from ranma_20261005 (upstream `42d958167`), the MTP draft length from ranma_20261001, the
+ratios against upstream from ranma_20260928 and the full `llama-bench` set from ranma_20260922. Everything was
+measured on the Radeon AI PRO R9700;
+[docs/ranma/benchmarks](docs/ranma/benchmarks/README.md) has every number with its release, and
+[the method](docs/ranma/benchmarks/method.md).
+
+EXL3 against UD-Q4_K_XL, measured for ranma_20261005: Qwen3.8-Flash-Next EXL3 3.05 bpw and 4.05 bpw on two systems,
+the R9700 with 128 GB (exclusive expert cache of 20480 MiB, unlimited host tier) and the RX 9070 XT emulation with
+64 GB (3072 MiB, host tier of 40960 MiB). `llama-bench` TG128 at depth 0, warm with the prefill swap, and server
+decode in the five scenarios with MTP and `--spec-smart`, warm, against UD-Q4_K_XL on the same system
+([record](docs/ranma/benchmarks/2026-10-05-exl3.md), with the 64 GB rows, the prompt rates, cold and memory).
+
+| model | system | TG128 @0 t/s | TG128 @0 against UD-Q4_K_XL | server decode with MTP against UD-Q4_K_XL |
+|---|---|---:|---:|---:|
+| EXL3 3.05 bpw | R9700, 128 GB | 53.5 | +8.6 % | +17.2 to +23.1 % |
+| EXL3 4.05 bpw | R9700, 128 GB | 49.6 | +0.7 % | +3.9 to +10.0 % |
+| UD-Q4_K_XL | R9700, 128 GB | 49.3 | | |
+| EXL3 3.05 bpw | RX 9070 XT emulation, 64 GB | 43.2 | +20.5 % | +50.6 to +85.9 % |
+| EXL3 4.05 bpw | RX 9070 XT emulation, 64 GB | 37.0 | +3.3 % | +15.4 to +28.1 % |
+| UD-Q4_K_XL | RX 9070 XT emulation, 64 GB | 35.8 | | |
+
+Decode against upstream, measured at ranma_20260928 against its upstream base: the server scenarios that the project
+runs (roleplay in four languages and coding, one slot, greedy decoding), release warm against upstream. Upstream keeps
+the routed experts of the first 35 layers in host memory (`-ncmoe 35`; `-ncmoe 36` with the DeepSeek MTP head on the
+GPU); the release runs the exclusive expert cache with a VRAM budget of 20480 MiB (18432 MiB with the DeepSeek MTP
+head outside the cache) and an unlimited host tier
+([record](docs/ranma/benchmarks/2026-09-28-release.md), with the t/s, the cold and 64 GB rows and the prompt times).
+
+| model | English roleplay | coding | Korean roleplay | Japanese roleplay | Chinese roleplay |
+|---|---:|---:|---:|---:|---:|
+| DeepSeek V4 Flash UD-IQ3_XXS, MTP n1 | x2.79 | x2.52 | x2.89 | x2.95 | x2.92 |
+| DeepSeek V4 Flash UD-IQ3_XXS, no MTP | x2.97 | x2.70 | x3.07 | x3.11 | x3.09 |
+| Qwen3.8-Flash-Next UD-Q4_K_XL | x2.78 | x2.57 | x2.78 | x2.79 | x2.79 |
+
+MTP draft length, measured for ranma_20261001: decode with no MTP, with the single-argument values tuned on this
+machine for these two models (Qwen3.8-Flash-Next `--spec-draft-n-max 2 --spec-draft-p-min 0`, DeepSeek V4 Flash
+`--spec-draft-n-max 1 --spec-draft-p-min 0`), and with `--spec-smart`, the default of `draft-mtp` now, from a cold
+start and from a warm store. Six scenarios per model (coding, roleplay in four languages, a mixed scenario), the MTP
+head on the GPU in the joint expert cache ([record](docs/ranma/benchmarks/2026-10-01-mtp-smart.md)).
+
+| model | English roleplay t/s: no MTP / single / smart cold / smart warm | single against no MTP | smart cold against single | smart warm against single |
+|---|---:|---:|---:|---:|
+| Qwen3.8-Flash-Next UD-Q4_K_XL | 46.10 / 57.13 / 56.99 / 57.54 | +19.7 to +29.5 % | -4.3 to +0.6 % | -1.9 to +2.6 % |
+| DeepSeek V4 Flash UD-IQ3_XXS | 31.17 / 35.00 / 34.07 / 34.55 | +9.8 to +14.6 % | -3.8 to +1.0 % | -3.2 to +1.5 % |
+
+Smart needs no per-model values and stays within a few percent of the tuned values; on DeepSeek V4 Flash it is 1.3 to
+3.8 % slower in every roleplay scenario. `--no-spec-smart` or the thresholds give the single-argument rule back.
+
+`llama-bench` PP512 / TG128 in t/s at depth 0, 8192 and 65536, measured at ranma_20260922 against its upstream base on
+two systems: the R9700 (32 GiB) with 128 GiB of host memory, and an RX 9070 XT (16 GiB) with 64 GiB, emulated on the
+R9700 by the placement and the host-tier budget. Upstream runs `-ncmoe 35`; ranma_20260922 runs the exclusive expert
+cache (20480 MiB on the R9700, 3072 MiB for Qwen and 4096 MiB for DeepSeek on the emulated RX 9070 XT) with prefill
+swap where that is faster. The last column is the peak VRAM / host commit of the process in GiB
+([record](docs/ranma/benchmarks/2026-09-22-full-set.md), with the 32 GB rows and Gemma 4 31B).
+
+| model | system | @0 | @8192 | @65536 | VRAM / host |
+|---|---|---:|---:|---:|---:|
+| Qwen3.8-Flash-Next UD-Q4_K_XL | upstream, R9700, 128 GB | 335 / 15.9 | 316 / 15.2 | 307 / 13.2 | 29.9 / 80.7 |
+| | ranma_20260922, R9700, 128 GB | 1014 / 49.7 | 949 / 47.9 | 692 / 44.8 | 29.1 / 78.2 |
+| | ranma_20260922, RX 9070 XT emulation, 64 GB | 625 / 36.7 | 596 / 38.2 | 480 / 35.2 | 12.0 / 48.8 |
+| DeepSeek V4 Flash UD-IQ3_XXS | upstream, R9700, 128 GB | 248 / 9.8 | 209 / 9.7 | (measured to 8192) | 27.8 / 98.7 |
+| | ranma_20260922, R9700, 128 GB | 310 / 31.8 | 255 / 30.9 | 108 / 28.1 | 27.9 / 90.3 |
+| | ranma_20260922, RX 9070 XT emulation, 64 GB | 129 / 18.8 | 128 / 20.3 | 78 / 18.9 | 11.8 / 49.0 |
 
 ## Roadmap
 
