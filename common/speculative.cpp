@@ -1470,6 +1470,23 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     // --spec-smart: chooses the draft length per step (owned by common_speculative, nullptr when off)
     common_spec_smart * smart = nullptr;
 
+    // Single-head MTP (no chained heads, no shared memory): the catch-up decode of a verification batch
+    // is not run in process(). Its rows are kept here, and draft() runs the rows of the accepted
+    // positions in the same batch as the first draft step (consecutive positions, outputs only on the
+    // draft row), which saves one launch and the decode of the rejected rows. A stash that is still
+    // pending at the next process() is run there instead.
+    struct catchup_stash {
+        bool                     valid  = false;
+        int32_t                  n_rows = 0;  // rows kept
+        int32_t                  n_keep = 0;  // rows to run: up to the last accepted position
+        std::vector<llama_token> tok;
+        std::vector<llama_pos>   pos;
+        std::vector<float>       h;           // [n_rows][n_embd]: the embedding paired with each token
+    };
+    std::vector<catchup_stash> stash;
+    bool fuse_catchup = false;
+    static constexpr int32_t fuse_max_rows = 16; // larger batches (prompt ubatches) are decoded at once
+
     common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq, params.draft.n_max)
         , params(params.draft)
@@ -1539,6 +1556,25 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
         this->n_max = this->params.n_max;
 
+        // RANMA_MTP_FUSE_CATCHUP: 0 = off, 1 = on for any single-head MTP, unset = on for the glm
+        // architectures only (their draft memory holds no recurrent state to checkpoint before a draft)
+        {
+            const char * env = getenv("RANMA_MTP_FUSE_CATCHUP");
+            bool allowed = false;
+            if (env != nullptr) {
+                allowed = strcmp(env, "0") != 0;
+            } else {
+                char arch[64] = {};
+                allowed = llama_model_meta_val_str(llama_get_model(ctx_dft), "general.architecture", arch, sizeof(arch)) > 0 &&
+                          strncmp(arch, "glm", 3) == 0;
+            }
+            fuse_catchup = allowed && !is_mem_shared && !chain_heads;
+            if (fuse_catchup) {
+                SPC_TRC("%s", "- the catch-up decode joins the first draft step\n");
+            }
+        }
+        stash.assign(n_seq, {});
+
         pending_h.assign(n_seq, std::vector<float>(n_embd, 0.0f));
 
         i_last.assign(n_seq, -1);
@@ -1575,13 +1611,72 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         auto * ctx_dft = this->params.ctx_dft;
         const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_dft), seq_id);
 
-        if (pos_max < N - 1 && !is_mem_shared) {
+        const bool pending = stash[seq_id].valid && stash[seq_id].pos[stash[seq_id].n_rows - 1] >= N - 1;
+        if (pos_max < N - 1 && !is_mem_shared && !pending) {
             SPC_WRN("ctx_dft pos_max=%d < N-1=%d - "
                     "process() hook may not have run on every prefill ubatch "
                     "(need_embd / output flag on every prompt position?). "
                     "Drafts may degrade.\n",
                     (int) pos_max, N - 1);
         }
+    }
+
+    // the stash of seq_id continues the draft memory of that sequence
+    bool stash_usable(llama_seq_id seq_id) const {
+        const auto & st = stash[seq_id];
+        if (!st.valid || st.n_keep <= 0) {
+            return false;
+        }
+        const llama_pos pos_max = llama_memory_seq_pos_max(llama_get_memory(params.ctx_dft), seq_id);
+        return pos_max == st.pos[0] - 1 || (pos_max < 0 && st.pos[0] == 0);
+    }
+
+    // adds the rows of the stash to batch, without outputs
+    void stash_add_rows(llama_seq_id seq_id) {
+        const auto & st = stash[seq_id];
+        for (int32_t r = 0; r < st.n_keep; ++r) {
+            const int32_t idx = batch.add(st.tok[r], st.pos[r], seq_id, false);
+            batch.set_embd(idx, { st.h.data() + (size_t) r * n_embd, 1, (size_t) n_embd });
+        }
+    }
+
+    // Runs the pending stashes (all but those marked in `skip`) in one decode. A stash whose positions do
+    // not continue the draft memory (the request ended, the target rolled back) is dropped.
+    bool stash_flush(const std::vector<bool> * skip = nullptr) {
+        auto * ctx_dft = params.ctx_dft;
+        const int32_t n_ub = (int32_t) llama_n_ubatch(ctx_dft);
+
+        bool ok = true;
+        batch.clear();
+
+        auto run = [&]() {
+            if (batch.size() > 0) {
+                const int32_t rc = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
+                if (rc != 0) {
+                    SPC_ERR("llama_process(ctx_dft) catch-up failed rc=%d\n", (int) rc);
+                    ok = false;
+                }
+                batch.clear();
+            }
+        };
+
+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+            if (!stash[seq_id].valid || (skip && (*skip)[seq_id])) {
+                continue;
+            }
+            const bool use = stash_usable(seq_id);
+            stash[seq_id].valid = false;
+            if (!use) {
+                continue;
+            }
+            if (batch.size() + stash[seq_id].n_keep > n_ub) {
+                run();
+            }
+            stash_add_rows(seq_id);
+        }
+        run();
+
+        return ok;
     }
 
     bool process(const common_batch & batch_in) override {
@@ -1616,8 +1711,52 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
 
+        // the catch-up of a short batch waits for the next draft() (see catchup_stash)
+        bool deferred = false;
+        if (fuse_catchup) {
+            if (!stash_flush()) {
+                return false;
+            }
+
+            deferred = true;
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq && deferred; ++seq_id) {
+                if (i_batch_beg[seq_id] < 0) {
+                    continue;
+                }
+                deferred = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1 <= fuse_max_rows;
+                for (int k = i_batch_beg[seq_id] + 1; k <= i_batch_end[seq_id] && deferred; ++k) {
+                    deferred = batch_in.tokens[k].seq_id == seq_id &&
+                               batch_in.tokens[k].pos[0] == batch_in.tokens[k - 1].pos[0] + 1;
+                }
+            }
+
+            if (deferred) {
+                const float * h_tgt = llama_get_embeddings_nextn(ctx_tgt);
+
+                for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                    if (i_batch_beg[seq_id] < 0) {
+                        continue;
+                    }
+                    auto & st = stash[seq_id];
+                    st.n_rows = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
+                    st.n_keep = st.n_rows; // accept() lowers it to the accepted positions
+                    st.tok.resize(st.n_rows);
+                    st.pos.resize(st.n_rows);
+                    st.h.resize((size_t) st.n_rows * n_embd);
+                    for (int32_t r = 0; r < st.n_rows; ++r) {
+                        const int k = i_batch_beg[seq_id] + r;
+                        st.tok[r] = batch_in.tokens[k].id;
+                        st.pos[r] = batch_in.tokens[k].pos[0];
+                        const float * h_row = r == 0 ? pending_h[seq_id].data() : h_tgt + (size_t) (k - 1) * n_embd;
+                        std::memcpy(st.h.data() + (size_t) r * n_embd, h_row, row_bytes);
+                    }
+                    st.valid = true;
+                }
+            }
+        }
+
         // if kv is shared with target (e.g Gemma4), then we can skip this catch-up decode
-        if (!is_mem_shared) {
+        if (!is_mem_shared && !deferred) {
             batch.clear();
 
             // pair each token with the tgt embedding shifted right by one position, and
@@ -1696,6 +1835,35 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     void draft(common_speculative_draft_params_vec & dparams) override {
         auto & ctx_dft = params.ctx_dft;
 
+        // the sequences whose pending catch-up rows go into the batch of the first draft step; the
+        // other pending stashes are decoded now
+        std::vector<bool> merge(n_seq, false);
+        if (fuse_catchup) {
+            const int32_t n_ub = (int32_t) llama_n_ubatch(ctx_dft);
+            int32_t n_rows = 0;
+            bool    flush  = false;
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                const auto & dp = dparams[seq_id];
+                const auto & st = stash[seq_id];
+                if (!dp.drafting) {
+                    continue;
+                }
+                n_rows += 1;
+                if (!st.valid) {
+                    continue;
+                }
+                if (stash_usable(seq_id) && st.pos[st.n_keep - 1] + 1 == dp.pos0 && n_rows + st.n_keep <= n_ub) {
+                    merge[seq_id] = true;
+                    n_rows += st.n_keep;
+                } else {
+                    flush = true;
+                }
+            }
+            if (flush && !stash_flush(&merge)) {
+                SPC_ERR("%s", "the catch-up decode failed\n");
+            }
+        }
+
         batch.clear();
 
         // keep track of which sequences are still drafting
@@ -1734,6 +1902,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             // a reset reseeds the chain, which breaks probabilistic drafting
             if (!dp.result_q) {
                 common_sampler_reset(smpls[seq_id].get());
+            }
+
+            if (merge[seq_id]) {
+                stash_add_rows(seq_id);
+                stash[seq_id].valid = false;
             }
 
             const int32_t idx = batch.add(dp.id_last, dp.pos0, seq_id, true);
@@ -1923,6 +2096,82 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         const int32_t i_h = std::min<int32_t>(n_accepted, n_rows - 1);
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
         std::memcpy(pending_h[seq_id].data(), verify_h[seq_id].data() + (size_t) i_h * n_embd, row_bytes);
+
+        // the rows of the rejected positions are not decoded
+        auto & st = stash[seq_id];
+        if (st.valid) {
+            st.n_keep = std::min<int32_t>(i_h + 1, st.n_rows);
+        }
+    }
+
+    // A prompt checkpoint stores the draft memory, which lacks the rows still held back in the stash (see
+    // catchup_stash). The stash and the carried-over hidden row are saved with the checkpoint, or the restored
+    // draft memory ends before the next positions and the draft decode fails.
+    // layout: n_rows (int32, 0 = no stash), n_keep (int32), pending_h, then tok, pos and h of the rows
+    bool get_state(llama_seq_id seq_id, std::vector<uint8_t> & data) const override {
+        if (!fuse_catchup || seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+            return false;
+        }
+
+        const auto & st = stash[seq_id];
+        const int32_t n_rows = st.valid ? st.n_rows : 0;
+        const int32_t n_keep = st.valid ? st.n_keep : 0;
+
+        data.resize(2 * sizeof(int32_t) + (size_t) n_embd * sizeof(float) +
+                    (size_t) n_rows * (sizeof(llama_token) + sizeof(llama_pos) + (size_t) n_embd * sizeof(float)));
+
+        uint8_t * ptr = data.data();
+        auto put = [&](const void * src, size_t n) { std::memcpy(ptr, src, n); ptr += n; };
+
+        put(&n_rows, sizeof(n_rows));
+        put(&n_keep, sizeof(n_keep));
+        put(pending_h[seq_id].data(), (size_t) n_embd * sizeof(float));
+        if (n_rows > 0) {
+            put(st.tok.data(), (size_t) n_rows * sizeof(llama_token));
+            put(st.pos.data(), (size_t) n_rows * sizeof(llama_pos));
+            put(st.h.data(),   (size_t) n_rows * n_embd * sizeof(float));
+        }
+
+        return true;
+    }
+
+    void set_state(llama_seq_id seq_id, const std::vector<uint8_t> & data) override {
+        if (!fuse_catchup || seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+            return;
+        }
+
+        auto & st = stash[seq_id];
+        st.valid = false; // the stash of the state being left no longer continues the restored memory
+
+        const size_t head = 2 * sizeof(int32_t) + (size_t) n_embd * sizeof(float);
+        if (data.size() < head) {
+            return;
+        }
+
+        const uint8_t * ptr = data.data();
+        auto get = [&](void * dst, size_t n) { std::memcpy(dst, ptr, n); ptr += n; };
+
+        int32_t n_rows = 0;
+        int32_t n_keep = 0;
+        get(&n_rows, sizeof(n_rows));
+        get(&n_keep, sizeof(n_keep));
+
+        if (n_rows < 0 || data.size() != head + (size_t) n_rows * (sizeof(llama_token) + sizeof(llama_pos) + (size_t) n_embd * sizeof(float))) {
+            return;
+        }
+
+        get(pending_h[seq_id].data(), (size_t) n_embd * sizeof(float));
+        if (n_rows > 0) {
+            st.tok.resize(n_rows);
+            st.pos.resize(n_rows);
+            st.h.resize((size_t) n_rows * n_embd);
+            get(st.tok.data(), (size_t) n_rows * sizeof(llama_token));
+            get(st.pos.data(), (size_t) n_rows * sizeof(llama_pos));
+            get(st.h.data(),   (size_t) n_rows * n_embd * sizeof(float));
+            st.n_rows = n_rows;
+            st.n_keep = n_keep;
+            st.valid  = true;
+        }
     }
 };
 
