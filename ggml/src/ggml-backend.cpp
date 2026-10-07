@@ -1886,6 +1886,17 @@ static bool ggml_backend_sched_input_upload_async_enabled(void) {
     return enabled;
 }
 
+// GGML_SCHED_STAGE_ALL_INPUTS: 1 (default) also stages the small inputs of a split that are not marked as graph inputs
+// (views of the user inputs, results of a CPU split), 0 keeps their synchronous copy
+static bool ggml_backend_sched_stage_all_inputs_enabled(void) {
+    static const bool enabled = []() {
+        const char * env = getenv("GGML_SCHED_STAGE_ALL_INPUTS");
+        return env ? atoi(env) != 0 : true;
+    }();
+
+    return enabled;
+}
+
 // (re)allocate the staging ring of one backend, pinned host memory so that the uploads are really asynchronous
 static void ggml_backend_sched_staging_alloc(ggml_backend_sched_t sched, int backend_id, size_t slot_size) {
     auto & st = sched->staging[backend_id];
@@ -2066,6 +2077,15 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
             ggml_backend_synchronize(split_backend);
         }
         ggml_backend_tensor_copy(input, input_cpy);
+        return;
+    }
+
+    // a small input that is final in host memory: the data of a CPU split is complete when its compute call returns
+    // (the CPU backend computes synchronously) and the staging copy snapshots it, so the upload can be queued on the stream
+    if (ggml_backend_sched_stage_all_inputs_enabled() && input_backend != NULL &&
+            ggml_backend_dev_type(ggml_backend_get_device(input_backend)) == GGML_BACKEND_DEVICE_TYPE_CPU &&
+            !ggml_backend_sched_is_host_weight(input) && ggml_is_contiguous(input) && ggml_nbytes(input) <= 1024*1024 &&
+            ggml_backend_sched_input_upload_staged(sched, split_backend_id, input, input_cpy)) {
         return;
     }
 
