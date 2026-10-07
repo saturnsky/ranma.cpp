@@ -2072,6 +2072,15 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
         return;
     }
 
+    // a small input that is final in host memory: the data of a CPU split is complete when its compute call returns
+    // (the CPU backend computes synchronously) and the staging copy snapshots it, so the upload can be queued on the stream
+    if (input_backend != NULL &&
+            ggml_backend_dev_type(ggml_backend_get_device(input_backend)) == GGML_BACKEND_DEVICE_TYPE_CPU &&
+            !ggml_backend_sched_is_host_weight(input) && ggml_is_contiguous(input) && ggml_nbytes(input) <= 1024*1024 &&
+            ggml_backend_sched_input_upload_staged(sched, split_backend_id, input, input_cpy)) {
+        return;
+    }
+
     // wait for the split backend to finish using the input before overwriting it
     if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
         ggml_backend_event_wait(split_backend, sched->events[split_backend_id][sched->cur_copy]);
