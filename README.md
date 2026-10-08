@@ -108,6 +108,7 @@ without testing them. Reports and pull requests are welcome
 | Qwen sparse attention, selected cells only | ✔ | ? |
 | DeepSeek V4 selected-cell attention | ✔ | ? |
 | DeepSeek V4 graph ops (hyper-connection coefficients, KV compressor) | ✔ | ? |
+| GLM-5.3 Flash decode kernels (hyper-connection mixes, KDA conv and state, MLA decode attention) | ✔ | ? |
 | EXL3 decode (GEMV) | ✔ | ○ |
 | EXL3 prompt processing (WMMA GEMM) | ✔ | ✕ (prompts run on the GEMV ○) |
 | Qwen3.8 hyper-connection fusion | ✔ | ○ |

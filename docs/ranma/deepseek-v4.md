@@ -182,6 +182,41 @@ turns the fusion off there.
   probe rejected the op, that it is disabled.
 - `LLAMA_DSV4_HC_COEF_FUSED=0` gives the unfused graph for a comparison run.
 
+## Hyper-connection mixes in one kernel
+
+### What it is
+
+For a decode token or a speculative verification batch, the `mixes` of a hyper-connection site are an
+`RMS_NORM` of the streams, a skinny `MUL_MAT` against `hc_fn` and, with the coefficient op above, a
+`DSV4_HC_COEF` node: three launches of a few microseconds at every site of every layer. On HIP they run as
+one kernel with one block per mix row and token. Each block accumulates `sum(x^2)` and `x.w` in the same pass
+over `x`; the last block of a token (one atomic ticket per token) scales the dots by the norm and, when the
+coefficient node follows, computes pre, post and comb with the summation order of the separate kernel. Per site
+on gfx1201 (16384 inputs, 64 sites, one token): 22.1 us unfused, 9.8 us with norm and matmul fused, 7.1 us with
+the coefficients as well. The same sites exist in `glm5-next`, which emits the coefficient node too
+([glm5-next.md](glm5-next.md#hyper-connection-coefficients-in-one-node)).
+
+### Switches
+
+| Switch | Default | Effect |
+|---|---|---|
+| `GGML_CUDA_HC_MIXES_FUSION` | `1` | `2` fuses only the norm and the matmul, `0` keeps the three ops. |
+| `GGML_CUDA_HC_MIXES_MAX_ROWS` | `4` | Largest batch that takes the fused kernel, at most 4; `1` limits it to a single token. |
+
+### Limits
+
+- F32 streams and weights, contiguous rows, a width that is a multiple of 128 and 16-byte aligned data; other
+  graphs keep the separate ops, as do batches of more than four tokens (prompt processing).
+- Not bit-identical to the separate ops: the norm and the dot products share one pass. A KL-divergence check of
+  GLM-5.3 Flash with this kernel and the coefficient node stayed within the difference between two micro-batch
+  sizes of the separate ops. DeepSeek V4 Flash gave the same 128 greedy tokens with and without the kernel.
+
+### How to verify
+
+- `test-backend-ops -o DSV4_HC_MIXES` builds a chain of sites with 1, 2, 4 and 5 tokens, so the fusion is
+  exercised (5 tokens falls back) and, in perf mode, measured.
+- `GGML_CUDA_HC_MIXES_FUSION=0` gives the separate ops for a comparison run.
+
 ## Fused KV compressor
 
 ### What it is
