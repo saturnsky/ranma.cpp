@@ -209,6 +209,14 @@ static ggml_tensor * glm5_conv1d(ggml_cgraph * gf, ggml_context * ctx0,
     ggml_tensor * x_3d   = ggml_reshape_3d(ctx0, x_proj, d_inner, n_seq_tokens, n_seqs);
     ggml_tensor * conv_x = ggml_concat(ctx0, conv_state_x, ggml_transpose(ctx0, x_3d), 0);
 
+    ggml_tensor * conv_weight = ggml_reshape_2d(ctx0, conv_w, d_conv, d_inner);
+    ggml_tensor * Xcur = ggml_ssm_conv(ctx0, conv_x, conv_weight);
+    // silu directly on the conv output so that ssm_conv + silu stay adjacent for the backend fusion
+    Xcur = ggml_silu(ctx0, Xcur);
+
+    // expand the conv/silu chain first, then the state writes, so a backend can fuse concat + ssm_conv + silu + cpy
+    ggml_build_forward_expand(gf, Xcur);
+
     // group s holds the conv window s tokens back.
     // [TAG_RECURRENT_ROLLBACK_SPLITS]: the last K_rs tokens must share one ubatch.
     for (int64_t s = 0; s < K_rs; ++s) {
@@ -222,11 +230,6 @@ static ggml_tensor * glm5_conv1d(ggml_cgraph * gf, ggml_context * ctx0,
                     n_embd_r_total * ggml_element_size(conv_states_all),
                     ((s * mem_size + kv_head) * n_embd_r_total + qkv * conv_state_size) * ggml_element_size(conv_states_all))));
     }
-
-    ggml_tensor * conv_weight = ggml_reshape_2d(ctx0, conv_w, d_conv, d_inner);
-    ggml_tensor * Xcur = ggml_ssm_conv(ctx0, conv_x, conv_weight);
-    Xcur = ggml_reshape_2d(ctx0, Xcur, d_inner, n_tokens);
-    Xcur = ggml_silu(ctx0, Xcur);
 
     return ggml_reshape_4d(ctx0, Xcur, head_dim, n_head, n_seq_tokens, n_seqs);
 }
@@ -869,16 +872,27 @@ ggml_tensor * llama_model_glm5_next::graph::build_kda_layer(
     cb(beta, "kda_beta", il);
 
     ggml_tensor * ssm_states_all = mctx_cur->get_s_l(il);
-    ggml_tensor * state = build_rs(inp_rs, ssm_states_all, hparams.n_embd_s(), n_seqs);
-    state = ggml_reshape_4d(ctx0, state, head_dim, head_dim, n_head_kda, n_seqs);
 
     // Match FLA l2 norm
     constexpr float l2_eps = 1e-6f;
     Qcur = build_gdn_l2_norm(ctx0, Qcur, l2_eps);
     Kcur = build_gdn_l2_norm(ctx0, Kcur, l2_eps);
 
+    // everything the scan reads goes into the graph first, so that the state gather is the node right before it
+    ggml_build_forward_expand(gf, Qcur);
+    ggml_build_forward_expand(gf, Kcur);
+    ggml_build_forward_expand(gf, g1);
+    ggml_build_forward_expand(gf, beta);
+
+    // gather the recurrent state last, right before the scan, so a backend can read it in place
+    ggml_tensor * state = build_rs(inp_rs, ssm_states_all, hparams.n_embd_s(), n_seqs);
+    state = ggml_reshape_4d(ctx0, state, head_dim, head_dim, n_head_kda, n_seqs);
+
     ggml_tensor * output = build_recurrent_attn(inp_rs, ssm_states_all, Qcur, Kcur, Vcur, g1, beta, state, il);
-    output = ggml_cont(ctx0, output);
+    // the attention scores are a contiguous prefix of the op result: copy only when a path returns something else
+    if (!ggml_is_contiguous(output)) {
+        output = ggml_cont(ctx0, output);
+    }
     cb(output, "kda_scan_out", il);
 
     // output gate, then RMSNorm(o) * Sigmoid(g2)
@@ -892,7 +906,7 @@ ggml_tensor * llama_model_glm5_next::graph::build_kda_layer(
     cb(normed, "kda_normed", il);
     ggml_tensor * gated = ggml_mul(ctx0, normed, ggml_sigmoid(ctx0, g2));
 
-    gated = ggml_cont_2d(ctx0, gated, d_inner, n_tokens);
+    gated = ggml_reshape_2d(ctx0, gated, d_inner, n_tokens);
     cur   = build_lora_mm(layer.wo, gated);
     cb(cur, "kda_out", il);
 
