@@ -2898,6 +2898,83 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens
     CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cuda_ctx->stream()));
 }
 
+// Small host inputs of a split that were staged in pinned memory (ggml-backend.cpp) are written to their tensors by one kernel that
+// reads the pinned range directly (zero-copy), instead of one hipMemcpyAsync each: those copies run one after the other on the stream.
+#define GGML_CUDA_STAGED_BATCH_MAX    128
+#define GGML_CUDA_STAGED_CHUNK_BYTES  16384
+#define GGML_CUDA_STAGED_MAX_CHUNKS   4   // inputs up to 64 KiB, the scheduler does not batch larger ones
+
+struct ggml_cuda_staged_batch {
+    int           n;
+    char *        dst[GGML_CUDA_STAGED_BATCH_MAX];
+    const char *  src[GGML_CUDA_STAGED_BATCH_MAX];
+    unsigned int  size[GGML_CUDA_STAGED_BATCH_MAX];
+};
+
+static __global__ void ggml_cuda_staged_gather(const ggml_cuda_staged_batch b) {
+    const int i = blockIdx.x;
+    const unsigned int begin = blockIdx.y*GGML_CUDA_STAGED_CHUNK_BYTES;
+    if (i >= b.n || begin >= b.size[i]) {
+        return;
+    }
+    const unsigned int end = min(b.size[i], begin + GGML_CUDA_STAGED_CHUNK_BYTES);
+    const char * src = b.src[i];
+    char *       dst = b.dst[i];
+    if ((((size_t) src | (size_t) dst | begin | end) & 3) == 0) {
+        for (unsigned int k = begin/4 + threadIdx.x; k < end/4; k += blockDim.x) {
+            ((unsigned int *) dst)[k] = ((const volatile unsigned int *) src)[k];
+        }
+    } else {
+        for (unsigned int k = begin + threadIdx.x; k < end; k += blockDim.x) {
+            dst[k] = ((const volatile char *) src)[k];
+        }
+    }
+}
+
+static bool ggml_backend_cuda_set_tensors_batch_async(ggml_backend_t backend, int n, ggml_tensor ** tensors, const void ** data, const size_t * sizes) {
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+
+    if (n < 1 || n > GGML_CUDA_STAGED_BATCH_MAX) {
+        return false;
+    }
+
+    // the kernel reads the host range through its device address
+    void * dev0 = nullptr;
+    if (cudaHostGetDevicePointer(&dev0, (void *) data[0], 0) != cudaSuccess) {
+        (void) cudaGetLastError();
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            GGML_LOG_WARN("%s: the staging ring is not mapped, uploading the small inputs one by one\n", __func__);
+        }
+        return false;
+    }
+
+    ggml_cuda_staged_batch b;
+    b.n = n;
+    for (int i = 0; i < n; ++i) {
+        ggml_tensor * t = tensors[i];
+        ggml_backend_buffer_t buf = t->view_src ? t->view_src->buffer : t->buffer;
+        if (buf == nullptr || buf->buft != ggml_backend_cuda_buffer_type(cuda_ctx->device) ||
+                sizes[i] > (size_t) GGML_CUDA_STAGED_MAX_CHUNKS*GGML_CUDA_STAGED_CHUNK_BYTES) {
+            return false;
+        }
+        b.dst[i]  = (char *) t->data;
+        b.src[i]  = (const char *) dev0 + ((const char *) data[i] - (const char *) data[0]);
+        b.size[i] = (unsigned int) sizes[i];
+    }
+
+    ggml_cuda_set_device(cuda_ctx->device);
+    ggml_cuda_staged_gather<<<dim3(n, GGML_CUDA_STAGED_MAX_CHUNKS), 256, 0, cuda_ctx->stream()>>>(b);
+    CUDA_CHECK(cudaGetLastError());
+    static bool logged = false;
+    if (!logged) {
+        logged = true;
+        GGML_LOG_INFO("%s: %d small inputs uploaded by one kernel\n", __func__, n);
+    }
+    return true;
+}
+
 static void ggml_backend_cuda_get_tensor_async(ggml_backend_t backend, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
     ggml_backend_buffer_t buf = tensor->view_src ? tensor->view_src->buffer : tensor->buffer;
@@ -5372,6 +5449,7 @@ static const ggml_backend_i ggml_backend_cuda_interface = {
     /* .event_record            = */ ggml_backend_cuda_event_record,
     /* .event_wait              = */ ggml_backend_cuda_event_wait,
     /* .graph_optimize          = */ ggml_backend_cuda_graph_optimize,
+    /* .set_tensors_batch_async = */ ggml_backend_cuda_set_tensors_batch_async,
 };
 
 static ggml_guid_t ggml_backend_cuda_guid() {
