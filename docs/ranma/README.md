@@ -25,6 +25,9 @@ applies, how to switch it, and its limits. The main features are summarized in t
   to the next. Same page.
 - **Wider MoE column tiles** - the MMQ tile width of a `MUL_MAT_ID` is sized against three times the mean
   column count per expert, so popular experts re-read their weights less often. Bit-identical. Same page.
+- **Short f16 mat-vec rows** - one-column f16 mat-vecs with rows of 256 or 512 elements (the per-head
+  projections of absorbed MLA attention) read whole rows with 16-byte loads. Bit-identical.
+  [rdna4-small-batch.md](rdna4-small-batch.md#short-f16-mat-vec-rows)
 
 ### Server and common tools
 
@@ -81,6 +84,10 @@ applies, how to switch it, and its limits. The main features are summarized in t
   [graph-runtime.md](graph-runtime.md)
 - **Graph inputs are uploaded through a pinned staging ring** - asynchronously on the stream of the backend
   instead of one blocking copy per input. Same page.
+- **Every small input of a split goes through the staging ring** - also the views of user inputs and the results
+  of a CPU split, which took a stream synchronize and a blocking copy each. [graph-runtime.md](graph-runtime.md#inputs-that-are-not-marked-as-graph-inputs)
+- **One upload for the small inputs of a split** - the staged inputs of at most 64 KiB are written by one kernel
+  instead of one copy each. Bit-identical. Same page.
 - **LoRA scale folding** - a LoRA scale of exactly 1 produces no graph node, and other scales are folded into
   a pre-scaled copy of the dense B matrices at attach time. `llama-bench` gains `--lora` and `--lora-scaled`.
   Same page.
@@ -118,6 +125,8 @@ applies, how to switch it, and its limits. The main features are summarized in t
   [deepseek-v4.md](deepseek-v4.md)
 - **Hyper-connection coefficients in one op** with a backend capability probe and the upstream ops as the
   fallback. Same page.
+- **Hyper-connection mixes in one kernel** - the norm, the mixing matmul and the coefficients of a site run as
+  one HIP kernel for up to four tokens (decode and speculative verification), also in `glm5-next`. Same page.
 - **Fused KV compressor** - gather, per-feature softmax and weighted sum in one op. Same page.
 - **No dummy HCA compression** on the decode steps in which no block completes. Same page.
 - **Raw and compressed K of a layer in one tensor**, so the attention reads a view instead of a concatenated
@@ -131,8 +140,18 @@ applies, how to switch it, and its limits. The main features are summarized in t
 - **MTP (NextN) draft** - upstream pull request
   [ggml-org/llama.cpp#29928](https://github.com/ggml-org/llama.cpp/pull/29928) (GLM5-Next MTP) is merged upstream
   (`b9acf138a`), so the series carries no commits of its own for it. `--spec-type draft-mtp` runs the MTP layer of the model file
-  without `-md`, and the expert cache accepts it with a finite host tier.
+  without `-md`, and the expert cache accepts it with a finite host tier and profiles its NextN layer.
   [exl3.md](exl3.md#checked-models), [expert-cache-joint.md](expert-cache-joint.md)
+- **Hyper-connection coefficients in one node** - `glm5-next` emits the `DSV4_HC_COEF` node of DeepSeek V4
+  instead of a dozen small ops per site.
+  [glm5-next.md](glm5-next.md)
+- **KDA conv step and recurrent state** - the conv step with its state copies runs as one HIP kernel and the scan
+  reads its state row in place. Bit-identical. Same page.
+- **MLA decode attention on WMMA (RDNA4)** - one to eight query rows of the MLA layers attend over the latent
+  cache with WMMA, from the compacted cell list or the dense rows. Same page.
+- **MTP catch-up in the first draft batch** - the rows up to the last accepted position are decoded together with
+  the first draft row, not as their own call. On for the `glm` architectures; `RANMA_MTP_FUSE_CATCHUP=0` turns it
+  off. Same page.
 
 ### EXL3 weights and Qwen3.8 decode (HIP)
 
