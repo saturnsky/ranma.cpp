@@ -1,13 +1,14 @@
 # RDNA4 small-batch kernels (HIP)
 
-Two related pieces of the single-token and few-token path on HIP: the dispatch of the quantized
-dense matrix multiplication, and a tile flash-attention block shape for head groups of twelve.
+Pieces of the single-token and few-token path on HIP: the dispatch of the quantized dense matrix
+multiplication, a tile flash-attention block shape for head groups of twelve, and the f16 mat-vec for short rows.
 
 ## Environment switches
 
 | Name | Default | Effect of the non-default value |
 | --- | --- | --- |
 | `GGML_HIP_FATTN_GQA12` | `1` (on) | `0` removes the 12-column tile attention dispatch below, so the selection falls back to the upstream one. Kept as the reference path for equivalence checks; read once per process. |
+| `GGML_CUDA_DISABLE_MMVF_SHORT_ROWS` | unset (on) | `1` sends short f16 mat-vec rows to the generic kernel again (see the last section). |
 
 The matmul dispatch has no switch and no CLI option.
 
@@ -177,3 +178,24 @@ Prompt processing, other head sizes and other GQA ratios keep the upstream dispa
   512 and 8192; they exercise exactly this block shape.
 - An A/B against `GGML_HIP_FATTN_GQA12=0` on a model with a GQA ratio of twelve shows the effect on
   the `FLASH_ATTN_EXT` operation time and on decode throughput at depth.
+
+# Short f16 mat-vec rows
+
+## What it is
+
+One-column f16 mat-vecs whose rows have 256 or 512 elements, the per-head projections of absorbed MLA attention
+in GLM-5.3 Flash, gave every row a block of 128 or 256 threads that loaded one `half2` each and reached about half of
+the memory bandwidth. A warp now reads whole rows with 16-byte loads, two rows at a time, and replays the summation
+tree of the generic kernel (`half2` products, xor reductions of the virtual threads, then the virtual warps in the
+generic order), so the result is bit-identical.
+
+## Limits
+
+Other row lengths, strides that are not 16-byte aligned, channel ratios and sample dimensions keep the generic
+kernel. `GGML_CUDA_DISABLE_MMVF_SHORT_ROWS=1` selects the generic kernel for every shape.
+
+## How to verify
+
+`test-backend-ops -o MUL_MAT` includes the short-row shapes and the fallback cases. `TBO_MLA_DECODE=1
+test-backend-ops perf` runs only the decode ops of absorbed MLA attention (the per-head mat-vecs and the attention
+over the latent cache at several depths).
