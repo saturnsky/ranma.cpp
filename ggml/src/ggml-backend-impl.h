@@ -154,6 +154,10 @@ extern "C" {
 
         // (optional) sort/optimize the nodes in the graph
         void                      (*graph_optimize)    (ggml_backend_t backend, struct ggml_cgraph * cgraph, struct ggml_backend_graph_optimize_params * params);
+
+        // (optional) upload n small host buffers with one operation; data[i] holds sizes[i] bytes for tensors[i] (offset 0) and all of them
+        // lie in one pinned host range. Returns false if the batch cannot be done, the caller then calls set_tensor_async for each tensor
+        bool (*set_tensors_batch_async)(ggml_backend_t backend, int n, struct ggml_tensor ** tensors, const void ** data, const size_t * sizes);
     };
 
     struct ggml_backend {
