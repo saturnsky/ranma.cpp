@@ -106,30 +106,19 @@ static __device__ __forceinline__ float dsv4_hc_affine_sigmoid(float x, float sc
     return 1.0f / (1.0f + expf(-v));
 }
 
-static __global__ void dsv4_hc_coef_f32(
+// the arithmetic of one token of the coefficient op, shared by the standalone kernel and the fused hc mixes kernel
+static __device__ __forceinline__ void dsv4_hc_coef_token(
         const float * mixes,
         const float * scale,
         const float * base,
         float * dst,
-        int64_t n_tokens,
         int64_t sm0,
-        int64_t sm1,
         int64_t ss0,
         int64_t sb0,
         int64_t sd0,
-        int64_t sd1,
         float eps,
         int32_t n_iter) {
     constexpr int comb_offset = 2*DSV4_HC;
-
-    ggml_cuda_pdl_lc();
-    const int64_t it = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
-
-    if (it >= n_tokens) {
-        return;
-    }
-
-    ggml_cuda_pdl_sync();
 
     const float scale_pre  = scale[0*ss0];
     const float scale_post = scale[1*ss0];
@@ -137,15 +126,15 @@ static __global__ void dsv4_hc_coef_f32(
 
     // pre: ggml_sigmoid then ggml_scale_bias(1.0f, eps)
     for (int ih = 0; ih < DSV4_HC; ++ih) {
-        const float s = dsv4_hc_affine_sigmoid(mixes[ih*sm0 + it*sm1], scale_pre, base[ih*sb0]);
-        dst[ih*sd0 + it*sd1] = fmaf(1.0f, s, eps);
+        const float s = dsv4_hc_affine_sigmoid(mixes[ih*sm0], scale_pre, base[ih*sb0]);
+        dst[ih*sd0] = fmaf(1.0f, s, eps);
     }
 
     // post: ggml_sigmoid then ggml_scale(2.0f)
     for (int ih = 0; ih < DSV4_HC; ++ih) {
         const int idx = DSV4_HC + ih;
-        const float s = dsv4_hc_affine_sigmoid(mixes[idx*sm0 + it*sm1], scale_post, base[idx*sb0]);
-        dst[idx*sd0 + it*sd1] = fmaf(2.0f, s, 0.0f);
+        const float s = dsv4_hc_affine_sigmoid(mixes[idx*sm0], scale_post, base[idx*sb0]);
+        dst[idx*sd0] = fmaf(2.0f, s, 0.0f);
     }
 
     // comb: identical arithmetic to dsv4_hc_comb_f32
@@ -155,7 +144,7 @@ static __global__ void dsv4_hc_coef_f32(
         float max = -INFINITY;
         for (int idst = 0; idst < DSV4_HC; ++idst) {
             const int idx = idst + DSV4_HC*isrc;
-            const float v = mixes[(comb_offset + idx)*sm0 + it*sm1] * scale_comb + base[(comb_offset + idx)*sb0];
+            const float v = mixes[(comb_offset + idx)*sm0] * scale_comb + base[(comb_offset + idx)*sb0];
             comb[idx] = v;
             max = fmaxf(max, v);
         }
@@ -182,8 +171,33 @@ static __global__ void dsv4_hc_coef_f32(
     }
 
     for (int idx = 0; idx < DSV4_HC*DSV4_HC; ++idx) {
-        dst[(comb_offset + idx)*sd0 + it*sd1] = comb[idx];
+        dst[(comb_offset + idx)*sd0] = comb[idx];
     }
+}
+
+static __global__ void dsv4_hc_coef_f32(
+        const float * mixes,
+        const float * scale,
+        const float * base,
+        float * dst,
+        int64_t n_tokens,
+        int64_t sm0,
+        int64_t sm1,
+        int64_t ss0,
+        int64_t sb0,
+        int64_t sd0,
+        int64_t sd1,
+        float eps,
+        int32_t n_iter) {
+    ggml_cuda_pdl_lc();
+    const int64_t it = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (it >= n_tokens) {
+        return;
+    }
+
+    ggml_cuda_pdl_sync();
+    dsv4_hc_coef_token(mixes + it*sm1, scale, base, dst + it*sd1, sm0, ss0, sb0, sd0, eps, n_iter);
 }
 
 template <bool gated>
@@ -1483,4 +1497,227 @@ void ggml_cuda_op_hc_gated_post(ggml_backend_cuda_context & ctx, const ggml_tens
         case GGML_TYPE_F32: hc_gated_post_launch<float>(ctx, mm_inject, scale0, scale1, post, split); break;
         default: GGML_ABORT("unsupported type: %s", ggml_type_name(mm_inject->src[0]->type));
     }
+}
+
+// the coefficients of one token computed by one warp (lane = idst + 4*isrc for the comb matrix): same arithmetic and summation
+// order as dsv4_hc_coef_token, the dependent sinkhorn sums are gathered with shuffles instead of a serial loop
+static __device__ __forceinline__ void dsv4_hc_coef_token_warp(
+        const float * mixes,
+        const float * scale,
+        const float * base,
+        float * dst,
+        int64_t sm0,
+        int64_t ss0,
+        int64_t sb0,
+        int64_t sd0,
+        float eps,
+        int32_t n_iter) {
+    constexpr int comb_offset = 2*DSV4_HC;
+    constexpr unsigned int full = 0xffffffffu;
+
+    const int lane = threadIdx.x % WARP_SIZE;
+
+    if (lane < 2*DSV4_HC) {
+        const float sc = scale[(lane < DSV4_HC ? 0 : 1)*ss0];
+        const float s = dsv4_hc_affine_sigmoid(mixes[lane*sm0], sc, base[lane*sb0]);
+        dst[lane*sd0] = lane < DSV4_HC ? fmaf(1.0f, s, eps) : fmaf(2.0f, s, 0.0f);
+    }
+
+    const int  idst = lane & (DSV4_HC - 1);
+    const int  row0 = lane & ~(DSV4_HC - 1);
+    const bool act  = lane < DSV4_HC*DSV4_HC;
+
+    float v = 0.0f;
+    if (act) {
+        v = mixes[(comb_offset + lane)*sm0] * scale[2*ss0] + base[(comb_offset + lane)*sb0];
+    }
+
+    float max = -INFINITY;
+    for (int k = 0; k < DSV4_HC; ++k) {
+        max = fmaxf(max, __shfl_sync(full, v, row0 + k, WARP_SIZE));
+    }
+
+    const float e = expf(v - max);
+    float sum = 0.0f;
+    for (int k = 0; k < DSV4_HC; ++k) {
+        sum += __shfl_sync(full, e, row0 + k, WARP_SIZE);
+    }
+
+    const float inv_sum = 1.0f / sum;
+    float c = e * inv_sum + eps;
+
+    // columns: the sum over isrc of comb[idst + hc*isrc]
+    sum = eps;
+    for (int k = 0; k < DSV4_HC; ++k) {
+        sum += __shfl_sync(full, c, idst + DSV4_HC*k, WARP_SIZE);
+    }
+    c *= 1.0f / sum;
+
+    for (int32_t i = 1; i < n_iter; ++i) {
+        sum = eps;
+        for (int k = 0; k < DSV4_HC; ++k) {
+            sum += __shfl_sync(full, c, row0 + k, WARP_SIZE);
+        }
+        c *= 1.0f / sum;
+
+        sum = eps;
+        for (int k = 0; k < DSV4_HC; ++k) {
+            sum += __shfl_sync(full, c, idst + DSV4_HC*k, WARP_SIZE);
+        }
+        c *= 1.0f / sum;
+    }
+
+    if (act) {
+        dst[(comb_offset + lane)*sd0] = c;
+    }
+}
+
+// RMS_NORM -> MUL_MAT (f32 hc_fn, one token) (-> DSV4_HC_COEF) in one launch.
+// One block per mix row: it reads the input once, forms sum(x*x) and sum(x*w), and writes mixes[row] = dot * rsqrt(mean + eps).
+// With the coefficient op the last block to finish (atomic ticket) runs it for the single token.
+// one ticket per token (blockIdx.y)
+constexpr int DSV4_HC_MIXES_MAX_TOKENS = 4;
+static __device__ unsigned int dsv4_hc_mixes_ticket[DSV4_HC_MIXES_MAX_TOKENS] = {};
+
+template <bool with_coef>
+static __global__ void dsv4_hc_mixes_f32(
+        const float * x,
+        const float * w,
+        float * mixes,
+        const float * scale,
+        const float * base,
+        float * coef,
+        int64_t ne00,
+        int64_t sw1,
+        int64_t ss0,
+        int64_t sb0,
+        int64_t sd0,
+        int64_t sd1,
+        float eps_norm,
+        float eps,
+        int32_t n_iter) {
+    constexpr int n_warps_max = 1024 / WARP_SIZE;
+    __shared__ float s_sq[n_warps_max];
+    __shared__ float s_dot[n_warps_max];
+    __shared__ bool  s_last;
+
+    ggml_cuda_pdl_lc();
+
+    const int tok = blockIdx.y;
+    mixes += (int64_t) tok * gridDim.x;
+    const float4 * w4 = (const float4 *) (w + (int64_t) blockIdx.x * sw1);
+    const float4 * x4 = (const float4 *) (x + (int64_t) tok * ne00);
+    const int n4 = (int) (ne00 / 4);
+
+    // the weights do not depend on the previous kernel
+    ggml_cuda_pdl_sync();
+
+    float sq = 0.0f;
+    float dot = 0.0f;
+    #pragma unroll 4
+    for (int i = threadIdx.x; i < n4; i += blockDim.x) {
+        const float4 xv = x4[i];
+        const float4 wv = w4[i];
+        sq  = fmaf(xv.x, xv.x, sq);  sq  = fmaf(xv.y, xv.y, sq);  sq  = fmaf(xv.z, xv.z, sq);  sq  = fmaf(xv.w, xv.w, sq);
+        dot = fmaf(xv.x, wv.x, dot); dot = fmaf(xv.y, wv.y, dot); dot = fmaf(xv.z, wv.z, dot); dot = fmaf(xv.w, wv.w, dot);
+    }
+
+    sq  = warp_reduce_sum(sq);
+    dot = warp_reduce_sum(dot);
+
+    const int n_warps = blockDim.x / WARP_SIZE;
+    if (threadIdx.x % WARP_SIZE == 0) {
+        s_sq[threadIdx.x / WARP_SIZE]  = sq;
+        s_dot[threadIdx.x / WARP_SIZE] = dot;
+    }
+    __syncthreads();
+
+    if (threadIdx.x == 0) {
+        sq = 0.0f;
+        dot = 0.0f;
+        for (int i = 0; i < n_warps; ++i) {
+            sq  += s_sq[i];
+            dot += s_dot[i];
+        }
+
+        mixes[blockIdx.x] = dot * rsqrtf(sq / (float) ne00 + eps_norm);
+
+        if constexpr (with_coef) {
+            __threadfence();
+            s_last = atomicAdd(&dsv4_hc_mixes_ticket[tok], 1u) == gridDim.x - 1;
+            if (s_last) {
+                dsv4_hc_mixes_ticket[tok] = 0;
+            }
+            __threadfence();
+        }
+    }
+
+    if constexpr (with_coef) {
+        __syncthreads();
+        if (s_last && threadIdx.x < WARP_SIZE) {
+            dsv4_hc_coef_token_warp(mixes, scale, base, coef + (int64_t) tok * sd1, 1, ss0, sb0, sd0, eps, n_iter);
+        }
+    }
+}
+
+// GGML_CUDA_HC_MIXES_MAX_ROWS: most tokens of one fused hc mixes launch (default 4, 1 = single token only)
+static int dsv4_hc_mixes_max_rows() {
+    static const int rows = [] {
+        const char * env = getenv("GGML_CUDA_HC_MIXES_MAX_ROWS");
+        const int v = env == nullptr ? DSV4_HC_MIXES_MAX_TOKENS : atoi(env);
+        return v < 1 ? 1 : v > DSV4_HC_MIXES_MAX_TOKENS ? DSV4_HC_MIXES_MAX_TOKENS : v;
+    }();
+    return rows;
+}
+
+bool ggml_cuda_dsv4_hc_mixes_supported(const ggml_tensor * rms_norm, const ggml_tensor * mm, const ggml_tensor * coef) {
+    constexpr int64_t hc_mix_dim = (2 + DSV4_HC)*DSV4_HC;
+
+    const ggml_tensor * x = rms_norm->src[0];
+    const ggml_tensor * w = mm->src[0];
+
+    if (mm->src[1] != rms_norm || rms_norm->type != GGML_TYPE_F32 || x->type != GGML_TYPE_F32 || w->type != GGML_TYPE_F32 ||
+            mm->type != GGML_TYPE_F32 || !ggml_is_contiguous(x) || !ggml_is_contiguous(mm) || !ggml_is_contiguous_rows(w) ||
+            x->ne[1] > dsv4_hc_mixes_max_rows() || ggml_nelements(x) != x->ne[0]*x->ne[1] || mm->ne[1] != x->ne[1] || w->ne[0] != x->ne[0] || w->ne[1] != hc_mix_dim || w->ne[2] != 1 || w->ne[3] != 1 ||
+            mm->ne[0] != hc_mix_dim || ggml_nelements(mm) != hc_mix_dim*x->ne[1] || x->ne[0] % (4*WARP_SIZE) != 0 || w->nb[1] % 16 != 0 ||
+            (uintptr_t) x->data % 16 != 0 || (uintptr_t) w->data % 16 != 0) {
+        return false;
+    }
+
+    if (coef != nullptr) {
+        return coef->op == GGML_OP_DSV4_HC_COEF && coef->src[0] == mm && ggml_nelements(coef) == hc_mix_dim*x->ne[1] && ggml_is_contiguous(coef) &&
+            coef->type == GGML_TYPE_F32 && coef->src[1]->type == GGML_TYPE_F32 && coef->src[2]->type == GGML_TYPE_F32;
+    }
+
+    return true;
+}
+
+void ggml_cuda_op_dsv4_hc_mixes(ggml_backend_cuda_context & ctx, const ggml_tensor * rms_norm, ggml_tensor * mm, ggml_tensor * coef) {
+    constexpr int64_t hc_mix_dim = (2 + DSV4_HC)*DSV4_HC;
+
+    const ggml_tensor * x = rms_norm->src[0];
+    const ggml_tensor * w = mm->src[0];
+
+    const float eps_norm = ggml_get_op_params_f32(rms_norm, 0);
+
+    const dim3 block_dims(1024, 1, 1);
+    const dim3 grid_dims(hc_mix_dim, x->ne[1], 1);
+    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid_dims, block_dims, 0, ctx.stream());
+
+    if (coef == nullptr) {
+        ggml_cuda_kernel_launch(dsv4_hc_mixes_f32<false>, launch_params,
+                (const float *) x->data, (const float *) w->data, (float *) mm->data, (const float *) nullptr, (const float *) nullptr,
+                (float *) nullptr, x->ne[0], (int64_t) (w->nb[1] / sizeof(float)), (int64_t) 0, (int64_t) 0, (int64_t) 0, (int64_t) 0,
+                eps_norm, 0.0f, 0);
+        return;
+    }
+
+    const ggml_tensor * scale = coef->src[1];
+    const ggml_tensor * base  = coef->src[2];
+
+    ggml_cuda_kernel_launch(dsv4_hc_mixes_f32<true>, launch_params,
+            (const float *) x->data, (const float *) w->data, (float *) mm->data, (const float *) scale->data, (const float *) base->data,
+            (float *) coef->data, x->ne[0], (int64_t) (w->nb[1] / sizeof(float)),
+            (int64_t) (scale->nb[0] / sizeof(float)), (int64_t) (base->nb[0] / sizeof(float)), (int64_t) (coef->nb[0] / sizeof(float)), (int64_t) (coef->nb[1] / sizeof(float)),
+            eps_norm, ggml_get_op_params_f32(coef, 0), ggml_get_op_params_i32(coef, 1));
 }

@@ -1653,7 +1653,7 @@ struct test_case {
         static const size_t graph_nodes = 8192;
 
         ggml_init_params params = {
-            /* .mem_size = */ ggml_tensor_overhead()*128 + ggml_graph_overhead_custom(graph_nodes, false),
+            /* .mem_size = */ ggml_tensor_overhead()*512 + ggml_graph_overhead_custom(graph_nodes, false),
             /* .mem_base = */ NULL,
             /* .no_alloc = */ true,
         };
@@ -4694,6 +4694,65 @@ struct test_dsv4_hc_coef : public test_dsv4_hc {
         ggml_set_name(out, "out");
         return out;
     }
+};
+
+// RMS_NORM -> MUL_MAT (-> DSV4_HC_COEF): the hyper-connection mixes of a decode token (fused into one launch on CUDA/HIP)
+struct test_dsv4_hc_mixes : public test_dsv4_hc {
+    const int64_t n_dim;
+    const int64_t n_tokens;
+    const bool    coef;
+    const float   eps_norm;
+    const int     n_sites; // independent chains (own input and weights) per repetition; 64 keeps the weights out of the caches in perf mode
+
+    std::vector<ggml_tensor *> rep;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "DSV4_HC_MIXES";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR5(n_dim, n_tokens, coef, eps_norm, n_sites);
+    }
+
+    test_dsv4_hc_mixes(int64_t n_dim = 16384, int64_t n_tokens = 1, bool coef = true, float eps_norm = 1e-6f, int n_sites = 1)
+        : n_dim(n_dim), n_tokens(n_tokens), coef(coef), eps_norm(eps_norm), n_sites(n_sites) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * scale = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 3);
+        ggml_set_name(scale, "scale");
+
+        ggml_tensor * base = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, (2 + hc)*hc);
+        ggml_set_name(base, "base");
+
+        rep.clear();
+        out = nullptr;
+        for (int i = 0; i < n_sites; ++i) {
+            ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_dim, n_tokens);
+            ggml_set_name(x, "x");
+
+            ggml_tensor * fn = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_dim, (2 + hc)*hc);
+            ggml_set_name(fn, "fn");
+
+            ggml_tensor * norm = ggml_rms_norm(ctx, x, eps_norm);
+            ggml_tensor * cur = ggml_mul_mat(ctx, fn, norm);
+            ggml_set_name(cur, "mixes_mm");
+            rep.push_back(norm);
+            rep.push_back(cur);
+
+            if (coef) {
+                cur = ggml_dsv4_hc_coef(ctx, cur, scale, base, 1e-6f, 20);
+                rep.push_back(cur);
+            }
+            out = cur;
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    std::vector<ggml_tensor *> perf_nodes(ggml_tensor * out) override { GGML_UNUSED(out); return rep; }
+    int perf_ops_per_rep() override { return n_sites; }
+    int perf_max_reps() override { return 8; }
 };
 
 struct test_dsv4_hc_pre : public test_dsv4_hc {
@@ -10761,6 +10820,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_hc_coef(1, 1));
     test_cases.emplace_back(new test_dsv4_hc_coef(17, 4));
     test_cases.emplace_back(new test_dsv4_hc_coef(257, 8));
+    test_cases.emplace_back(new test_dsv4_hc_mixes(16384, 1, true));
+    test_cases.emplace_back(new test_dsv4_hc_mixes(16384, 1, false));
+    test_cases.emplace_back(new test_dsv4_hc_mixes(4096, 1, true));
+    test_cases.emplace_back(new test_dsv4_hc_mixes(16384, 3, true));
+    test_cases.emplace_back(new test_dsv4_hc_mixes(1000, 1, true));
+    for (int64_t n_tokens : { 2, 4, 5 }) {
+        test_cases.emplace_back(new test_dsv4_hc_mixes(16384, n_tokens, true));
+        test_cases.emplace_back(new test_dsv4_hc_mixes(16384, n_tokens, false));
+    }
     // DeepSeek V4 KV compressor: CSA/HCA head dim 512, indexer head dim 128
     test_cases.emplace_back(new test_dsv4_compress(512,   4,   1, true,  false));
     test_cases.emplace_back(new test_dsv4_compress(512,   4,   1, true,  true));
@@ -13339,6 +13407,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+    // hyper-connection mixes of one decode token (GLM 3.05, DeepSeek V4); 64 sites keep the weights out of the caches
+    test_cases.emplace_back(new test_dsv4_hc_mixes(16384, 1, true, 1e-6f, 64));
+    test_cases.emplace_back(new test_dsv4_hc_mixes(16384, 1, false, 1e-6f, 64));
+    for (int64_t n_tokens : { 2, 3, 4 }) {
+        test_cases.emplace_back(new test_dsv4_hc_mixes(16384, n_tokens, true, 1e-6f, 64));
+    }
+
 
     // TBO_MLA_DECODE=1: the decode ops of absorbed MLA attention (64 heads of 512, per-head f16 mat-vecs and the attention over the latent cache, V a view of K) at several cache depths
     if (getenv("TBO_MLA_DECODE") != nullptr && atoi(getenv("TBO_MLA_DECODE")) != 0) {
