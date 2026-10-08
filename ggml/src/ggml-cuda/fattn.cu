@@ -1098,8 +1098,302 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
     return f16_extra.end - (uintptr_t) dst->data;
 }
 
+// ---- MLA decode attention (RDNA4, WMMA) ----------------------------------------------------------------------------
+// One query row over a latent cache with K == V (DeepSeek/GLM style MLA after absorbing the key projection): 64 heads of 512
+// values share one K/V head. The tile kernel serializes 16 gather/compute stages per KV tile and needs about 100-250 us per
+// layer for the 2048 selected cells of a sparse decode; here a block stages 16 cells at a time in LDS, runs the scores
+// S^T[cell][head] = K Q^T and the update O[head][dv] += P V on the WMMA units and keeps the next chunk's loads in flight.
+// A block owns 32 heads and a run of NCH chunks of 16 list entries, the partial results are merged by a second kernel.
+#if defined(GGML_USE_HIP)
+
+static constexpr int fattn_mla_dim      = 512;
+static constexpr int fattn_mla_heads    = 64;
+static constexpr int fattn_mla_chunk    = 16;
+static constexpr int fattn_mla_pitch    = 520; // halves per LDS row (16 B of padding against bank conflicts)
+static constexpr int fattn_mla_max_part = 128; // upper bound of partial results per head (scratch size)
+static constexpr int fattn_mla_max_rows = 8;   // query rows (MTP verification), each one a block row of its own
+
+template <int NCH>
+static __global__ void __launch_bounds__(256) fattn_mla_decode_kernel(
+        const float * __restrict__ Q, const int64_t q_head_stride, const int64_t q_row_stride, const half * __restrict__ K, const int64_t k_stride,
+        const int32_t * __restrict__ indices_all, const int32_t * __restrict__ pcount_all, const int n_cells, const int64_t list_stride,
+        const half * __restrict__ mask_all, const int64_t mask_row_stride, float * __restrict__ Opart_all, float2 * __restrict__ ML_all,
+        const int n_part, const float scale) {
+#if defined(AMD_WMMA_AVAILABLE) && defined(RDNA4)
+    using halfx8_t  = __attribute__((ext_vector_type(8))) _Float16;
+    using floatx8_t = __attribute__((ext_vector_type(8))) float;
+
+    __shared__ _Float16 Qs[32*fattn_mla_pitch];
+    __shared__ _Float16 Ks[fattn_mla_chunk*fattn_mla_pitch];
+    __shared__ float biasS[fattn_mla_chunk];
+
+    const int tid = threadIdx.x, lane = tid & 31, w = tid >> 5, ht = w & 1, dqq = w >> 1;
+    const int g = blockIdx.x, hh = blockIdx.y, row = blockIdx.z;
+    const int32_t * indices = indices_all ? indices_all + row*list_stride : nullptr;
+    const half * mask = mask_all + row*mask_row_stride;
+    float * Opart = Opart_all + (int64_t) row*n_part*fattn_mla_heads*fattn_mla_dim;
+    float2 * ML = ML_all + (int64_t) row*n_part*fattn_mla_heads;
+    const int cnt = indices ? min(pcount_all[row], n_cells) : n_cells;
+
+    for (int e = tid; e < 32*fattn_mla_dim/4; e += 256) {
+        const int h = e/(fattn_mla_dim/4), c4 = e % (fattn_mla_dim/4);
+        const float4 f = *(const float4 *) (Q + row*q_row_stride + (int64_t) (hh*32 + h)*q_head_stride + c4*4);
+        _Float16 * d = Qs + h*fattn_mla_pitch + c4*4;
+        d[0] = (_Float16) (f.x*scale); d[1] = (_Float16) (f.y*scale); d[2] = (_Float16) (f.z*scale); d[3] = (_Float16) (f.w*scale);
+    }
+
+    floatx8_t O[8];
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        O[i] = floatx8_t{0, 0, 0, 0, 0, 0, 0, 0};
+    }
+    float m_run = -INFINITY, l_run = 0.0f;
+
+    const int r_ld = tid/16, s_ld = tid % 16; // row of the chunk and first 16 B segment of this thread (segments s_ld + 16 j)
+    uint4 pre[4];
+    float pre_bias = 0.0f;
+    const auto issue = [&](const int c) {
+        const int pos = (g*NCH + c)*fattn_mla_chunk + r_ld;
+        int cid = -1;
+        if (pos < cnt) {
+            cid = indices ? indices[pos] : pos;
+        }
+        float bias = 0.0f;
+        if (cid >= 0) {
+            if (mask) {
+                bias = __half2float(mask[cid]);
+            }
+            const uint4 * src = (const uint4 *) (K + (int64_t) cid*k_stride);
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                pre[j] = src[s_ld + 16*j];
+            }
+        }
+        const bool valid = cid >= 0 && bias > -INFINITY;
+        pre_bias = valid ? bias : -INFINITY;
+        if (!valid) {
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                pre[j] = make_uint4(0, 0, 0, 0);
+            }
+        }
+    };
+    issue(0);
+
+    for (int c = 0; c < NCH; ++c) {
+        {
+            uint4 * dst = (uint4 *) (Ks + r_ld*fattn_mla_pitch);
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                dst[s_ld + 16*j] = pre[j];
+            }
+            if (s_ld == 0) {
+                biasS[r_ld] = pre_bias;
+            }
+        }
+        __syncthreads();
+        if (c + 1 < NCH) {
+            issue(c + 1);
+        }
+
+        floatx8_t s0 = floatx8_t{0, 0, 0, 0, 0, 0, 0, 0}, s1 = s0;
+        const _Float16 * Ka = Ks + (lane & 15)*fattn_mla_pitch + 8*(lane >> 4);
+        const _Float16 * Qb = Qs + (ht*16 + (lane & 15))*fattn_mla_pitch + 8*(lane >> 4);
+#pragma unroll
+        for (int ks = 0; ks < 32; ks += 2) {
+            const halfx8_t a0 = *(const halfx8_t *) (Ka + ks*16), b0 = *(const halfx8_t *) (Qb + ks*16);
+            const halfx8_t a1 = *(const halfx8_t *) (Ka + (ks + 1)*16), b1 = *(const halfx8_t *) (Qb + (ks + 1)*16);
+            s0 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a0, b0, s0);
+            s1 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a1, b1, s1);
+        }
+        float s[8];
+        float mc = -INFINITY;
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            s[i] = s0[i] + s1[i] + biasS[8*(lane >> 4) + i];
+            mc = fmaxf(mc, s[i]);
+        }
+        mc = fmaxf(mc, __shfl_xor(mc, 16, 32));
+        const float m_new = fmaxf(m_run, mc);
+        float corr, ls = 0.0f;
+        halfx8_t P;
+        if (m_new == -INFINITY) { // nothing visible yet
+            corr = 1.0f;
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                P[i] = (_Float16) 0.0f;
+            }
+        } else {
+            corr = m_run == -INFINITY ? 0.0f : expf(m_run - m_new);
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                const float p = expf(s[i] - m_new);
+                ls += p;
+                P[i] = (_Float16) p;
+            }
+            ls += __shfl_xor(ls, 16, 32);
+        }
+        l_run = l_run*corr + ls;
+        m_run = m_new;
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            const float f = __shfl(corr, 8*(lane >> 4) + i, 32);
+#pragma unroll
+            for (int nt = 0; nt < 8; ++nt) {
+                O[nt][i] *= f;
+            }
+        }
+#pragma unroll
+        for (int nt = 0; nt < 8; ++nt) {
+            halfx8_t bv;
+            const _Float16 * vp = Ks + (8*(lane >> 4))*fattn_mla_pitch + dqq*128 + nt*16 + (lane & 15);
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                bv[i] = vp[i*fattn_mla_pitch];
+            }
+            O[nt] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(P, bv, O[nt]);
+        }
+        __syncthreads();
+    }
+
+    const int head0 = hh*32 + ht*16;
+    float * op = Opart + ((int64_t) g*fattn_mla_heads + head0)*fattn_mla_dim;
+#pragma unroll
+    for (int nt = 0; nt < 8; ++nt) {
+#pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            op[(int64_t) (8*(lane >> 4) + i)*fattn_mla_dim + dqq*128 + nt*16 + (lane & 15)] = O[nt][i];
+        }
+    }
+    if (dqq == 0 && lane < 16) {
+        ML[(int64_t) g*fattn_mla_heads + head0 + lane] = make_float2(m_run, l_run);
+    }
+#else
+    GGML_UNUSED_VARS(Q, q_head_stride, q_row_stride, K, k_stride, indices_all, pcount_all, n_cells, list_stride, mask_all, mask_row_stride, Opart_all, ML_all, n_part, scale);
+    NO_DEVICE_CODE;
+#endif // defined(AMD_WMMA_AVAILABLE) && defined(RDNA4)
+}
+
+static __global__ void __launch_bounds__(512) fattn_mla_combine_kernel(
+        const float * __restrict__ Opart_all, const float2 * __restrict__ ML_all, const int n_part, float * __restrict__ dst_all) {
+    const int h = blockIdx.x, t = threadIdx.x, row = blockIdx.y;
+    const float * Opart = Opart_all + (int64_t) row*n_part*fattn_mla_heads*fattn_mla_dim;
+    const float2 * ML = ML_all + (int64_t) row*n_part*fattn_mla_heads;
+    float * dst = dst_all + (int64_t) row*fattn_mla_heads*fattn_mla_dim;
+    float M = -INFINITY;
+    for (int g = 0; g < n_part; ++g) {
+        M = fmaxf(M, ML[(int64_t) g*fattn_mla_heads + h].x);
+    }
+    float L = 0.0f, acc = 0.0f;
+    for (int g = 0; g < n_part; ++g) {
+        const float2 ml = ML[(int64_t) g*fattn_mla_heads + h];
+        const float f = ml.x == -INFINITY ? 0.0f : expf(ml.x - M);
+        L += f*ml.y;
+        acc += f*Opart[((int64_t) g*fattn_mla_heads + h)*fattn_mla_dim + t];
+    }
+    dst[h*fattn_mla_dim + t] = L > 0.0f ? acc/L : 0.0f;
+}
+
+// true when the MLA decode kernel computed `dst`; false leaves the op to the regular kernels
+static bool ggml_cuda_flash_attn_ext_mla_decode(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    static const bool enabled = [] {
+        const char * value = getenv("GGML_CUDA_DISABLE_FATTN_MLA_DECODE");
+        return value == nullptr || atoi(value) == 0;
+    }();
+    if (!enabled) {
+        return false;
+    }
+
+    const ggml_tensor * Q     = dst->src[0];
+    const ggml_tensor * K     = dst->src[1];
+    const ggml_tensor * V     = dst->src[2];
+    const ggml_tensor * mask  = dst->src[3];
+    const ggml_tensor * sinks = dst->src[4];
+
+    const int cc = ggml_cuda_info().devices[ctx.device].cc;
+    if (!GGML_CUDA_CC_IS_RDNA4(cc) || !amd_wmma_available(cc) || ggml_cuda_info().devices[ctx.device].warp_size != 32) {
+        return false;
+    }
+    if (Q->ne[0] != fattn_mla_dim || K->ne[0] != fattn_mla_dim || V->ne[0] != fattn_mla_dim || Q->ne[1] < 1 || Q->ne[1] > fattn_mla_max_rows || Q->ne[2] != fattn_mla_heads ||
+            Q->ne[3] != 1 || K->ne[2] != 1 || K->ne[3] != 1 || V->ne[2] != 1 || V->ne[3] != 1 || mask == nullptr || sinks != nullptr) {
+        return false;
+    }
+    if (Q->type != GGML_TYPE_F32 || K->type != GGML_TYPE_F16 || V->type != GGML_TYPE_F16 || mask->type != GGML_TYPE_F16 || dst->type != GGML_TYPE_F32) {
+        return false;
+    }
+    // V is the K cache itself (the latent is both key and value)
+    if (V->data != K->data || V->nb[1] != K->nb[1] || V->ne[1] != K->ne[1] || K->nb[0] != sizeof(half)) {
+        return false;
+    }
+    if (mask->ne[0] != K->ne[1] || mask->ne[1] < Q->ne[1] || mask->ne[2] != 1 || mask->ne[3] != 1 || mask->nb[0] != sizeof(half) || mask->nb[1] % sizeof(half) != 0) {
+        return false;
+    }
+    float max_bias = 0.0f, logit_softcap = 0.0f, scale = 1.0f;
+    memcpy(&scale,         (const float *) dst->op_params + 0, sizeof(float));
+    memcpy(&max_bias,      (const float *) dst->op_params + 1, sizeof(float));
+    memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
+    if (max_bias != 0.0f || logit_softcap != 0.0f) {
+        return false;
+    }
+    if (Q->nb[0] != sizeof(float) || Q->nb[2] % 16 != 0 || Q->nb[1] % 16 != 0 || ((uintptr_t) Q->data) % 16 != 0 || K->nb[1] % 16 != 0 || ((uintptr_t) K->data) % 16 != 0 ||
+            !ggml_is_contiguous(dst)) {
+        return false;
+    }
+
+    const int64_t n_kv     = K->ne[1];
+    const int32_t n_kv_max = ggml_get_op_params_i32(dst, 4);
+    const bool    use_list = n_kv_max > 0 && n_kv >= 2*(int64_t) n_kv_max;
+    const int64_t n_cells  = use_list ? n_kv_max : n_kv;
+    // the dense form visits every cache row; far beyond a few thousand rows only the list form is worth it
+    if (n_cells <= 0 || (!use_list && n_kv > 8192)) {
+        return false;
+    }
+
+    const int nch    = n_cells <= 1024 ? 4 : 8;
+    const int n_part = (int) ((n_cells + fattn_mla_chunk*nch - 1)/(fattn_mla_chunk*nch));
+    if (n_part > fattn_mla_max_part) {
+        return false;
+    }
+
+    const int n_rows = (int) Q->ne[1];
+    cudaStream_t stream = ctx.stream();
+    // one index list per query row, the live counts of all rows behind the lists
+    ggml_cuda_pool_alloc<int32_t> list(ctx.pool(), use_list ? (size_t) n_rows*((size_t) n_kv_max + 1) : 0);
+    ggml_cuda_pool_alloc<float>   part(ctx.pool(), (size_t) n_rows*n_part*fattn_mla_heads*fattn_mla_dim);
+    ggml_cuda_pool_alloc<float2>  ml(ctx.pool(), (size_t) n_rows*n_part*fattn_mla_heads);
+    if (use_list) {
+        ggml_cuda_flash_attn_ext_compact_mask(ctx, mask, list.ptr, list.ptr + (size_t) n_rows*n_kv_max, n_rows, 1, n_kv_max);
+    }
+
+    const dim3 grid(n_part, 2, n_rows);
+    const float * q = (const float *) Q->data;
+    const int64_t q_head_stride = Q->nb[2]/sizeof(float);
+    const int64_t q_row_stride  = Q->nb[1]/sizeof(float);
+    const int64_t k_stride      = K->nb[1]/sizeof(half);
+    const int32_t * indices = use_list ? list.ptr : nullptr;
+    const int32_t * pcount  = use_list ? list.ptr + (size_t) n_rows*n_kv_max : nullptr;
+    const int64_t mask_row_stride = mask->nb[1]/sizeof(half);
+    if (nch == 4) {
+        fattn_mla_decode_kernel<4><<<grid, 256, 0, stream>>>(q, q_head_stride, q_row_stride, (const half *) K->data, k_stride, indices, pcount,
+            (int) n_cells, (int64_t) n_kv_max, (const half *) mask->data, mask_row_stride, part.ptr, ml.ptr, n_part, scale);
+    } else {
+        fattn_mla_decode_kernel<8><<<grid, 256, 0, stream>>>(q, q_head_stride, q_row_stride, (const half *) K->data, k_stride, indices, pcount,
+            (int) n_cells, (int64_t) n_kv_max, (const half *) mask->data, mask_row_stride, part.ptr, ml.ptr, n_part, scale);
+    }
+    CUDA_CHECK(cudaGetLastError());
+    fattn_mla_combine_kernel<<<dim3(fattn_mla_heads, n_rows), fattn_mla_dim, 0, stream>>>(part.ptr, ml.ptr, n_part, (float *) dst->data);
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+#endif // defined(GGML_USE_HIP)
+
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_set_device(ctx.device);
+#if defined(GGML_USE_HIP)
+    if (ggml_cuda_flash_attn_ext_mla_decode(ctx, dst)) {
+        return;
+    }
+#endif // defined(GGML_USE_HIP)
     switch (ggml_cuda_get_best_fattn_kernel(ggml_cuda_get_device(), dst)) {
         case BEST_FATTN_KERNEL_NONE:
             GGML_ABORT("fatal error");
