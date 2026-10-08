@@ -923,6 +923,12 @@ static bool ggml_is_view_op(enum ggml_op op) {
 #define GGML_SCHED_MAX_COPIES 4
 #endif
 
+// staged uploads of one split that are collected for a single batched upload, and the largest input that joins the batch
+#ifndef GGML_SCHED_STAGED_BATCH_MAX
+#define GGML_SCHED_STAGED_BATCH_MAX 128
+#endif
+#define GGML_SCHED_STAGED_BATCH_BYTES (64*1024)
+
 // number of slots of the pinned staging ring used for asynchronous graph-input uploads
 #ifndef GGML_SCHED_INPUT_STAGING_SLOTS
 #define GGML_SCHED_INPUT_STAGING_SLOTS 4
@@ -1015,6 +1021,11 @@ struct ggml_backend_sched {
         bool   failed;      // allocation failed once, do not try again
         ggml_backend_event_t events[GGML_SCHED_INPUT_STAGING_SLOTS];
         bool                 ev_pending[GGML_SCHED_INPUT_STAGING_SLOTS];
+        // small staged uploads of the current split that wait for one batched upload (set_tensors_batch_async)
+        int                  n_batch;
+        struct ggml_tensor * batch_dst[GGML_SCHED_STAGED_BATCH_MAX];
+        const void *         batch_data[GGML_SCHED_STAGED_BATCH_MAX];
+        size_t               batch_size[GGML_SCHED_STAGED_BATCH_MAX];
     } staging[GGML_SCHED_MAX_BACKENDS];
 
     // used for debugging graph reallocations [GGML_SCHED_DEBUG_REALLOC]
@@ -1897,6 +1908,37 @@ static bool ggml_backend_sched_stage_all_inputs_enabled(void) {
     return enabled;
 }
 
+// GGML_SCHED_STAGED_GATHER: 1 (default) uploads the small staged inputs of a split with one batched operation of the backend
+// (set_tensors_batch_async) instead of one copy each, 0 keeps one set_tensor_async per input
+static bool ggml_backend_sched_staged_gather_enabled(void) {
+    static const bool enabled = []() {
+        const char * env = getenv("GGML_SCHED_STAGED_GATHER");
+        return env ? atoi(env) != 0 : true;
+    }();
+
+    return enabled;
+}
+
+// queue the collected small uploads of a backend: one batched operation, or one copy each if the backend cannot batch them
+static void ggml_backend_sched_staging_flush(ggml_backend_sched_t sched, int backend_id) {
+    auto & st = sched->staging[backend_id];
+
+    if (st.n_batch == 0) {
+        return;
+    }
+
+    ggml_backend_t backend = sched->backends[backend_id];
+
+    if (st.n_batch < 2 || backend->iface.set_tensors_batch_async == NULL ||
+            !backend->iface.set_tensors_batch_async(backend, st.n_batch, st.batch_dst, st.batch_data, st.batch_size)) {
+        for (int i = 0; i < st.n_batch; i++) {
+            backend->iface.set_tensor_async(backend, st.batch_dst[i], st.batch_data[i], 0, st.batch_size[i]);
+        }
+    }
+
+    st.n_batch = 0;
+}
+
 // (re)allocate the staging ring of one backend, pinned host memory so that the uploads are really asynchronous
 static void ggml_backend_sched_staging_alloc(ggml_backend_sched_t sched, int backend_id, size_t slot_size) {
     auto & st = sched->staging[backend_id];
@@ -1984,6 +2026,7 @@ static void ggml_backend_sched_staging_begin(ggml_backend_sched_t sched) {
         }
         st.off     = 0;
         st.pending = false;
+        st.n_batch = 0;
     }
 }
 
@@ -2033,7 +2076,18 @@ static bool ggml_backend_sched_input_upload_staged(
 
     // the upload runs on the stream of the split backend: it is ordered after the previous graph
     // (which may still be reading the destination) and before the graph that is queued next
-    backend->iface.set_tensor_async(backend, dst, stage, 0, nbytes);
+    if (ggml_backend_sched_staged_gather_enabled() && backend->iface.set_tensors_batch_async != NULL && nbytes <= GGML_SCHED_STAGED_BATCH_BYTES) {
+        // queued with the other small inputs of the split by ggml_backend_sched_staging_end_split
+        if (st.n_batch == GGML_SCHED_STAGED_BATCH_MAX) {
+            ggml_backend_sched_staging_flush(sched, backend_id);
+        }
+        st.batch_dst [st.n_batch] = dst;
+        st.batch_data[st.n_batch] = stage;
+        st.batch_size[st.n_batch] = nbytes;
+        st.n_batch++;
+    } else {
+        backend->iface.set_tensor_async(backend, dst, stage, 0, nbytes);
+    }
 
     st.pending = true;
 
@@ -2043,6 +2097,8 @@ static bool ggml_backend_sched_input_upload_staged(
 // mark the point of the backend stream up to which the staged copies of the current slot have been executed
 static void ggml_backend_sched_staging_end_split(ggml_backend_sched_t sched, int backend_id) {
     auto & st = sched->staging[backend_id];
+
+    ggml_backend_sched_staging_flush(sched, backend_id);
 
     if (!st.pending) {
         return;
