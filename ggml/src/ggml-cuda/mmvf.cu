@@ -416,6 +416,133 @@ static void mul_mat_vec_f_switch_fusion(
 
 }
 
+// One-column f16 mat-vec with half2 products for rows of 256 or 512 elements (MLA absorbed projections: one matrix per head,
+// a 256 B or 512 B row per output). The generic kernel gives every row a block of 128/256 threads that load one half2 each,
+// which reaches about half of the memory bandwidth for such short rows. Here a warp reads whole rows with 16 B loads, R rows
+// at a time. Every lane holds the elements of four virtual threads of the generic kernel and the reductions replay the
+// generic kernel's tree (xor 16..1 inside a virtual warp, then the virtual warps in the generic order), so the result is
+// bit-identical to mul_mat_vec_f<half, half, 1, 128|256>.
+template <int K, int R>
+static __global__ void __launch_bounds__(256) mul_mat_vec_f16_short_rows(
+        const half * x, const float * y, float * dst, const int nrows, const int64_t stride_row,
+        const int64_t stride_channel_x, const int64_t stride_channel_y, const int64_t stride_channel_dst) {
+#ifdef FP16_AVAILABLE
+    constexpr int NL = K/256;
+    const int lane = threadIdx.x & 31;
+    const int row0 = (blockIdx.x*8 + (threadIdx.x >> 5))*R;
+    const int channel = blockIdx.y;
+
+    half2 yh[NL][4];
+    const float2 * y2 = (const float2 *) (y + channel*stride_channel_y);
+#pragma unroll
+    for (int l = 0; l < NL; ++l) {
+#pragma unroll
+        for (int p = 0; p < 4; ++p) {
+            const float2 f = y2[l*128 + 4*lane + p];
+            yh[l][p] = make_half2(f.x, f.y);
+        }
+    }
+
+    uint4 xv[R][NL];
+    const half * xc = x + channel*stride_channel_x;
+#pragma unroll
+    for (int i = 0; i < R; ++i) {
+#pragma unroll
+        for (int l = 0; l < NL; ++l) {
+            xv[i][l] = row0 + i < nrows ? *(const uint4 *) (xc + (int64_t) (row0 + i)*stride_row + l*256 + lane*8) : make_uint4(0, 0, 0, 0);
+        }
+    }
+
+#pragma unroll
+    for (int i = 0; i < R; ++i) {
+        float w[NL];
+#pragma unroll
+        for (int l = 0; l < NL; ++l) {
+            float s[4];
+            const half2 * xh = (const half2 *) &xv[i][l];
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                half2 sh = make_half2(0.0f, 0.0f);
+                sh += xh[j]*yh[l][j];
+                s[j] = __low2float(sh) + __high2float(sh);
+            }
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                s[j] += __shfl_xor_sync(0xffffffff, s[j], 4, 32);
+                s[j] += __shfl_xor_sync(0xffffffff, s[j], 2, 32);
+                s[j] += __shfl_xor_sync(0xffffffff, s[j], 1, 32);
+            }
+            w[l] = (s[0] + s[2]) + (s[1] + s[3]);
+        }
+        // w[l] is valid in lanes 8W..8W+7 and belongs to the generic kernel's warp 4*l + W
+        float ww[NL][4];
+#pragma unroll
+        for (int l = 0; l < NL; ++l) {
+#pragma unroll
+            for (int W = 0; W < 4; ++W) {
+                ww[l][W] = __shfl_sync(0xffffffff, w[l], 8*W, 32);
+            }
+        }
+        float res;
+        if constexpr (NL == 1) {
+            res = (ww[0][0] + ww[0][2]) + (ww[0][1] + ww[0][3]);
+        } else {
+            res = ((ww[0][0] + ww[1][0]) + (ww[0][2] + ww[1][2])) + ((ww[0][1] + ww[1][1]) + (ww[0][3] + ww[1][3]));
+        }
+        if (lane == 0 && row0 + i < nrows) {
+            dst[channel*stride_channel_dst + row0 + i] = res;
+        }
+    }
+#else
+    GGML_UNUSED_VARS(x, y, dst, nrows, stride_row, stride_channel_x, stride_channel_y, stride_channel_dst);
+    NO_DEVICE_CODE;
+#endif // FP16_AVAILABLE
+}
+
+template <int K>
+static void mul_mat_vec_f16_short_rows_cuda(
+        const half * x, const float * y, float * dst, const int64_t nrows, const int64_t stride_row, const int64_t nchannels,
+        const int64_t stride_channel_x, const int64_t stride_channel_y, const int64_t stride_channel_dst, cudaStream_t stream) {
+    constexpr int R = 2;
+    const dim3 block_nums((nrows + 8*R - 1)/(8*R), nchannels, 1);
+    const dim3 block_dims(256, 1, 1);
+    mul_mat_vec_f16_short_rows<K, R><<<block_nums, block_dims, 0, stream>>>(
+        x, y, dst, (int) nrows, stride_row, stride_channel_x, stride_channel_y, stride_channel_dst);
+}
+
+// true when the short-row kernel handled the op
+static bool mul_mat_vec_f16_short_rows_try(
+        const half * x, const float * y, const int32_t * ids, const bool has_fusion, float * dst,
+        const int64_t ncols, const int64_t nrows, const int64_t stride_row,
+        const int64_t nchannels_x, const int64_t nchannels_y, const int64_t nchannels_dst,
+        const int64_t stride_channel_x, const int64_t stride_channel_y, const int64_t stride_channel_dst,
+        const int64_t nsamples_x, const int64_t nsamples_dst, const int64_t nsamples_or_ntokens, cudaStream_t stream) {
+    static const bool enabled = [] {
+        const char * value = getenv("GGML_CUDA_DISABLE_MMVF_SHORT_ROWS");
+        return value == nullptr || atoi(value) == 0;
+    }();
+    if (!enabled || ids != nullptr || has_fusion || (ncols != 256 && ncols != 512)) {
+        return false;
+    }
+    if (ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size != 32 || nrows <= 0 || nchannels_dst > 65535) {
+        return false;
+    }
+    if (nchannels_x != nchannels_dst || nchannels_y != nchannels_dst || nsamples_x != 1 || nsamples_dst != 1 || nsamples_or_ntokens != 1) {
+        return false;
+    }
+    // 16 B loads of the weights, 8 B loads of the vector
+    if (((uintptr_t) x) % 16 != 0 || ((uintptr_t) y) % 8 != 0 || (stride_row*sizeof(half)) % 16 != 0 ||
+            (stride_channel_x*sizeof(half)) % 16 != 0 || (stride_channel_y*sizeof(float)) % 8 != 0) {
+        return false;
+    }
+    if (ncols == 256) {
+        mul_mat_vec_f16_short_rows_cuda<256>(x, y, dst, nrows, stride_row, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst, stream);
+    } else {
+        mul_mat_vec_f16_short_rows_cuda<512>(x, y, dst, nrows, stride_row, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst, stream);
+    }
+    return true;
+}
+
 template <typename T, typename type_acc, int ncols_dst, bool is_multi_token_id = false>
 void launch_mul_mat_vec_f_cuda(
         const T * x, const float * y, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
@@ -452,6 +579,14 @@ void launch_mul_mat_vec_f_cuda(
     }
 
     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr;
+
+    if constexpr (std::is_same_v<T, half> && std::is_same_v<type_acc, half> && ncols_dst == 1 && !is_multi_token_id) {
+        if (mul_mat_vec_f16_short_rows_try((const half *) x, y, ids, has_fusion, dst, ncols, nrows, stride_row,
+                nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+                nsamples_x, nsamples_dst, nsamples_or_ntokens, stream)) {
+            return;
+        }
+    }
 
     const int nbytes_shared = warp_size*sizeof(float) + (has_fusion ? warp_size*sizeof(float) : 0);
     const dim3 block_nums(nrows, nchannels_dst, nsamples_or_ntokens);
