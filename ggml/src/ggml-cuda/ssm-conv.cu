@@ -204,3 +204,88 @@ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, g
                           out->nb[2], nc, nr, n_t, n_s, stream);
     }
 }
+
+// one thread per channel: reads the d_conv-1 state columns and the n_t new inputs, writes silu(conv) and the new states
+template <int d_conv>
+static __global__ void ssm_conv_state_fused_f32(
+        const float * __restrict__ state, const int state_nb1,
+        const float * __restrict__ xin, const int xin_nb0, const int xin_nb1,
+        const float * __restrict__ weight, const int weight_nb1,
+        float * __restrict__ y, const int y_nb1,
+        const int n_t, const int n_win, const int4 win_col,
+        float * dst0, float * dst1, float * dst2, float * dst3,
+        const int nr) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= nr) {
+        return;
+    }
+
+    float ext[d_conv - 1 + GGML_CUDA_SSM_CONV_FUSED_MAX_TOKENS];
+#pragma unroll
+    for (int j = 0; j < d_conv - 1; ++j) {
+        ext[j] = state[c * state_nb1 + j];
+    }
+    for (int t = 0; t < n_t; ++t) {
+        ext[d_conv - 1 + t] = xin[c * xin_nb1 + t * xin_nb0];
+    }
+
+    float w[d_conv];
+#pragma unroll
+    for (int j = 0; j < d_conv; ++j) {
+        w[j] = weight[c * weight_nb1 + j];
+    }
+
+    for (int t = 0; t < n_t; ++t) {
+        float sumf = 0.0f;
+#pragma unroll
+        for (int j = 0; j < d_conv; ++j) {
+            sumf += ext[t + j] * w[j];
+        }
+        sumf += 0.0f;
+        y[t * y_nb1 + c] = ggml_cuda_op_silu_single(sumf);
+    }
+
+    float * const dsts[4] = { dst0, dst1, dst2, dst3 };
+    const int     cols[4] = { win_col.x, win_col.y, win_col.z, win_col.w };
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+        if (k < n_win) {
+#pragma unroll
+            for (int j = 0; j < d_conv - 1; ++j) {
+                dsts[k][c * (d_conv - 1) + j] = ext[cols[k] + j];
+            }
+        }
+    }
+}
+
+void ggml_cuda_op_ssm_conv_state_fused(ggml_backend_cuda_context & ctx, const ggml_tensor * concat,
+                                       const ggml_tensor * ssm_conv, const ggml_tensor * silu,
+                                       const ggml_cuda_ssm_conv_state_fused & fused) {
+    const ggml_tensor * state  = concat->src[0];
+    const ggml_tensor * xin    = concat->src[1];
+    const ggml_tensor * weight = ssm_conv->src[1];
+
+    const int64_t nr = ssm_conv->src[0]->ne[1];
+    const int64_t n_t = silu->ne[1];
+
+    GGML_ASSERT(weight->ne[0] == 4);
+    GGML_ASSERT(n_t >= 1 && n_t <= GGML_CUDA_SSM_CONV_FUSED_MAX_TOKENS);
+    GGML_ASSERT(fused.n_win >= 1 && fused.n_win <= GGML_CUDA_SSM_CONV_FUSED_MAX_WINDOWS);
+
+    int cols[4] = { 0, 0, 0, 0 };
+    float * dsts[4] = { nullptr, nullptr, nullptr, nullptr };
+    for (int k = 0; k < fused.n_win; ++k) {
+        cols[k] = fused.win_col[k];
+        dsts[k] = fused.win_dst[k];
+    }
+
+    const int threads = 128;
+    const int blocks  = (int) ((nr + threads - 1) / threads);
+    ssm_conv_state_fused_f32<4><<<blocks, threads, 0, ctx.stream()>>>(
+        (const float *) state->data, (int) (state->nb[1] / sizeof(float)),
+        (const float *) xin->data, (int) (xin->nb[0] / sizeof(float)), (int) (xin->nb[1] / sizeof(float)),
+        (const float *) weight->data, (int) (weight->nb[1] / sizeof(float)),
+        (float *) silu->data, (int) (silu->nb[1] / sizeof(float)),
+        (int) n_t, fused.n_win, make_int4(cols[0], cols[1], cols[2], cols[3]),
+        dsts[0], dsts[1], dsts[2], dsts[3], (int) nr);
+}
