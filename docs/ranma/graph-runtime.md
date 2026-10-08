@@ -113,6 +113,21 @@ of the backend's device:
   and only there does the host wait. With four slots, three graph computes may be
   in flight before a wait is possible.
 
+### Inputs that are not marked as graph inputs
+
+A split also copies inputs that the caller did not flag: views of the user inputs and results of a CPU split.
+Their data is final in host memory when the split starts, so they take the ring as well instead of a stream
+synchronize and a blocking copy (about 60 us each; GLM-5.3 Flash had 35 of them per decode token).
+
+### One upload for the small inputs of a split
+
+The staged inputs of a split were uploaded with one `set_tensor_async` each, which the stream executes one after
+the other (about 37 us each on HIP, 46 per decode call of GLM-5.3 Flash) in front of the first kernel of the graph.
+The scheduler now collects the staged inputs of at most 64 KiB (up to 128 per batch) and hands them to the optional
+backend function `set_tensors_batch_async`. The CUDA/HIP backend writes them with one kernel that reads the pinned
+staging ring directly. Without a mapped staging ring, without the function, or for a single input, each input is
+copied as before. Bit-identical.
+
 ### Options
 
 | Name | Kind | Default | Effect |
