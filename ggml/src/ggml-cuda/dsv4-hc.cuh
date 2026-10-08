@@ -26,3 +26,8 @@ void ggml_cuda_op_hc_gated_pre(ggml_backend_cuda_context & ctx, const ggml_tenso
 // split: two launches, for a dst that overlaps the activation of the MUL_MAT
 void ggml_cuda_op_hc_gated_post(ggml_backend_cuda_context & ctx, const ggml_tensor * mm_inject, const ggml_tensor * scale0,
         const ggml_tensor * scale1, ggml_tensor * post, bool split);
+
+// RMS_NORM -> MUL_MAT (f32 hc_fn, one token) (-> DSV4_HC_COEF) in one launch (hyper-connection mixes of a decode token), matched in ggml-cuda.cu
+// coef may be nullptr: then only the norm and the matrix product are fused
+bool ggml_cuda_dsv4_hc_mixes_supported(const ggml_tensor * rms_norm, const ggml_tensor * mm, const ggml_tensor * coef);
+void ggml_cuda_op_dsv4_hc_mixes(ggml_backend_cuda_context & ctx, const ggml_tensor * rms_norm, ggml_tensor * mm, ggml_tensor * coef);
