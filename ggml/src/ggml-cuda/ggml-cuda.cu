@@ -4604,6 +4604,39 @@ static int ggml_cuda_try_fuse_hc_gated(ggml_backend_cuda_context * cuda_ctx, ggm
     return 0;
 }
 
+// RMS_NORM -> MUL_MAT (-> DSV4_HC_COEF) of the hyper-connection mixes of one decode token (src/models/glm5-next.cpp, deepseek4.cpp)
+// Fuses the norm, the matrix product and the coefficients when the coefficient node follows, else the first two.
+static int ggml_cuda_try_fuse_hc_mixes(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+    ggml_tensor * rms_norm = cgraph->nodes[i];
+    if (rms_norm->op != GGML_OP_RMS_NORM || i + 1 >= cgraph->n_nodes || cgraph->nodes[i + 1]->op != GGML_OP_MUL_MAT) {
+        return 0;
+    }
+
+    ggml_tensor * mm = cgraph->nodes[i + 1];
+
+    if (i + 2 < cgraph->n_nodes && cgraph->nodes[i + 2]->op == GGML_OP_DSV4_HC_COEF) {
+        ggml_tensor * coef = cgraph->nodes[i + 2];
+        const int out = i + 2;
+        if (ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL_MAT, GGML_OP_DSV4_HC_COEF }, { out }) &&
+                ggml_cuda_dsv4_hc_mixes_supported(rms_norm, mm, coef) &&
+                ggml_cuda_check_fusion_memory_ranges(cgraph, i, 3, &out, 1) &&
+                !ggml_cuda_fusion_ranges_overlap(coef, mm)) {
+            ggml_cuda_op_dsv4_hc_mixes(*cuda_ctx, rms_norm, mm, coef);
+            return 2;
+        }
+    }
+
+    const int out = i + 1;
+    if (ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL_MAT }, { out }) &&
+            ggml_cuda_dsv4_hc_mixes_supported(rms_norm, mm, nullptr) &&
+            ggml_cuda_check_fusion_memory_ranges(cgraph, i, 2, &out, 1)) {
+        ggml_cuda_op_dsv4_hc_mixes(*cuda_ctx, rms_norm, mm, nullptr);
+        return 1;
+    }
+
+    return 0;
+}
+
 // try and fuse nodes and return the number of nodes to skip
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
@@ -4621,6 +4654,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     {
         const int nodes_to_skip = ggml_cuda_try_fuse_hc_gated(cuda_ctx, cgraph, i);
+        if (nodes_to_skip > 0) {
+            return nodes_to_skip;
+        }
+    }
+
+    {
+        const int nodes_to_skip = ggml_cuda_try_fuse_hc_mixes(cuda_ctx, cgraph, i);
         if (nodes_to_skip > 0) {
             return nodes_to_skip;
         }
