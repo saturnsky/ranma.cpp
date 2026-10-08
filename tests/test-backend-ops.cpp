@@ -10991,6 +10991,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 #endif
 
+    // one-column f16 mat-vecs with short rows (MLA absorbed projections: one 256 or 512 element row per output, one matrix per head)
+    for (int64_t k : {256, 512}) {
+        for (int64_t m : {1, 17, 256, 512}) {
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, m, 1, k, {64, 1}, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, m, 1, k, {3, 1}, {1, 1}));
+        }
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 33, 1, k, {8, 1}, {4, 1}));                       // channel ratio
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 33, 1, k, {1, 3}, {1, 1}));                       // samples
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 40, 1, k, {8, 1}, {1, 1}, {0, 1, 2, 3}, 0, 1, false, 48));   // strided batches
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 40, 1, k, {8, 1}, {1, 1}, {0, 1, 2, 3}, 0, 1, false, 41, 4)); // batch stride not a multiple of 16 B
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 64, 1, k, {8, 1}, {1, 1}, {0, 1, 2, 3}, k + 64));        // strided rows
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 64, 1, k, {8, 1}, {1, 1}, {0, 1, 2, 3}, k + 2));         // row stride not a multiple of 16 B
+    }
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32,  64, 2,  128, { 8,  1}, {1, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32,  83, 2,  128, { 8,  1}, {4, 1}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32,  64, 2,   64, { 8,  1}, {4, 1}));
@@ -12201,6 +12214,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    // TBO_MLA_DECODE=1: the decode ops of absorbed MLA attention (64 heads of 512, per-head f16 mat-vecs and the attention over the latent cache, V a view of K) at several cache depths
+    if (getenv("TBO_MLA_DECODE") != nullptr && atoi(getenv("TBO_MLA_DECODE")) != 0) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 256, 1, 512, {64, 1}, {1, 1}));
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 512, 1, 256, {64, 1}, {1, 1}));
+        for (int64_t kv : {768, 4096, 8192, 32768}) {
+            test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true, std::min<int64_t>(2051, kv)));
+        }
+        return test_cases;
+    }
 
     // TBO_MOE_CROSSOVER=1: only the MUL_MAT_ID crossover cases (the expert tensors of DeepSeek V4 Flash UD-IQ3_XXS and
     // Qwen3.8-Flash-Next UD-Q4_K_XL, 1..16 tokens); the pool sizes are the logged distinct experts per layer by rows
