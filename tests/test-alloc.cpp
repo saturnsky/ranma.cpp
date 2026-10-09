@@ -1109,6 +1109,35 @@ static void run(const char * name, void (*f)()) {
     printf("PASSED\n");
 }
 
+// ggml_backend_shared_buft_new: buffers are views of one allocation, a larger request gets a new one
+static void test_shared_buft() {
+    ggml_backend_buffer_type_t base   = ggml_backend_cpu_buffer_type();
+    ggml_backend_buffer_type_t shared = ggml_backend_shared_buft_new(base);
+    GGML_ASSERT(ggml_backend_buft_is_shared(shared) && !ggml_backend_buft_is_shared(base));
+
+    ggml_backend_buffer_t a = ggml_backend_buft_alloc_buffer(shared, 1024);
+    ggml_backend_buffer_t b = ggml_backend_buft_alloc_buffer(shared, 512);
+    GGML_ASSERT(a && b);
+    GGML_ASSERT(ggml_backend_buffer_get_base(a) == ggml_backend_buffer_get_base(b));
+    GGML_ASSERT(ggml_backend_buffer_get_type(a) == base && ggml_backend_buffer_get_size(b) == 512);
+    memset(ggml_backend_buffer_get_base(b), 0x5a, 512);
+    GGML_ASSERT(((const unsigned char *) ggml_backend_buffer_get_base(a))[100] == 0x5a);
+
+    ggml_backend_buffer_t c = ggml_backend_buft_alloc_buffer(shared, 4096);
+    GGML_ASSERT(c && ggml_backend_buffer_get_base(c) != ggml_backend_buffer_get_base(a));
+    ggml_backend_buffer_t d = ggml_backend_buft_alloc_buffer(shared, 100);
+    GGML_ASSERT(ggml_backend_buffer_get_base(d) == ggml_backend_buffer_get_base(c));
+
+    // the type may be released before its buffers
+    ggml_backend_shared_buft_retain(shared);
+    ggml_backend_shared_buft_release(shared);
+    ggml_backend_shared_buft_release(shared);
+    ggml_backend_buffer_free(a);
+    ggml_backend_buffer_free(b);
+    ggml_backend_buffer_free(c);
+    ggml_backend_buffer_free(d);
+}
+
 int main() {
     run("test_max_size_too_many_tensors", test_max_size_too_many_tensors);
     run("test_max_size_tensor_too_large", test_max_size_tensor_too_large);
@@ -1142,5 +1171,6 @@ int main() {
     run("test_buft_get_alloc_size_n_custom_override", test_buft_get_alloc_size_n_custom_override);
     run("test_buft_get_alloc_size_n_custom_override_ctx_size", test_buft_get_alloc_size_n_custom_override_ctx_size);
     run("test_buft_get_alloc_size_n_does_not_allocate", test_buft_get_alloc_size_n_does_not_allocate);
+    run("test_shared_buft", test_shared_buft);
     return 0;
 }
