@@ -388,6 +388,15 @@ extern "C" {
     // ggml_backend_sched_alloc_graph; false if the graph is not stored or its allocation is no longer valid
     GGML_API bool                 ggml_backend_sched_resume_graph(ggml_backend_sched_t sched, const struct ggml_cgraph * graph);
 
+    // after ggml_backend_sched_alloc_graph or ggml_backend_sched_resume_graph: base and size of the compute buffer of
+    // `backend` and the end of the highest tensor the current graph has in it; the bytes past it are not used by
+    // that graph. False when the buffer is not allocated, has more than one chunk, or no graph is allocated.
+    // compact: the next ggml_backend_sched_alloc_graph plans the buffers for that graph alone (from offset 0) instead of
+    // placing it at the offsets of the last reserved graph when it fits them, so a small graph uses only the start of
+    // the buffers. The buffers do not shrink. Off by default; not with pipeline parallelism.
+    GGML_API void                 ggml_backend_sched_set_alloc_compact(ggml_backend_sched_t sched, bool compact);
+    GGML_API bool                 ggml_backend_sched_get_buffer_extent(ggml_backend_sched_t sched, ggml_backend_t backend, void ** base, size_t * size, size_t * extent);
+
     // Set a callback to be called for each resulting node during graph compute
     GGML_API void                 ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backend_sched_eval_callback callback, void * user_data);
 
