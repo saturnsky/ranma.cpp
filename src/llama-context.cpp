@@ -817,6 +817,12 @@ void llama_context::sched_reserve() {
     synchronize();
     share_compute_wait();
 
+    // ranma expert cache: the compute buffers are about to be freed and planned again; an unknown extent takes back
+    // whatever the cache keeps in them (RANMA_EXPERT_UB_POOL)
+    if (expert_iface && expert_backend && expert_iface->compute_spare) {
+        expert_iface->compute_spare(expert_backend, nullptr, 0, SIZE_MAX, -1);
+    }
+
     const int64_t t_start_us = ggml_time_us();
 
     const uint32_t n_seqs = cparams.n_seq_max;
@@ -1763,7 +1769,13 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             return nullptr;
         }
 
-        if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
+        // ranma expert cache: a graph of few rows is planned on its own, so it leaves the rest of the compute buffer
+        // unused (RANMA_EXPERT_UB_POOL)
+        const int32_t compact_rows = expert_iface && expert_iface->compact_rows ? expert_iface->compact_rows() : 0;
+        ggml_backend_sched_set_alloc_compact(sched.get(), compact_rows > 0 && (int32_t) ubatch.n_tokens <= compact_rows);
+        const bool allocated = ggml_backend_sched_alloc_graph(sched.get(), gf);
+        ggml_backend_sched_set_alloc_compact(sched.get(), false);
+        if (!allocated) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
@@ -1810,7 +1822,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         expert_iface->profile_select(expert_backend, row_begin, row_end, expert_profiled_bank);
     }
 
-    const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1, (int32_t) ubatch.n_tokens);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
@@ -2982,7 +2994,8 @@ void llama_context::sched_graph_realloc(ggml_backend_sched_t sched, ggml_cgraph 
 
 ggml_status llama_context::graph_compute(
             ggml_cgraph * gf,
-                   bool   batched) {
+                   bool   batched,
+                int32_t   n_tokens) {
     int n_threads        = batched ? cparams.n_threads_batch : cparams.n_threads;
     ggml_threadpool_t tp = batched ? threadpool_batch        : threadpool;
 
@@ -3002,6 +3015,19 @@ ggml_status llama_context::graph_compute(
     copy_experts.reset();
 
     share_compute_wait();
+
+    // ranma expert cache: the part of the compute buffer this graph does not reach (RANMA_EXPERT_UB_POOL)
+    if (expert_iface && expert_backend && expert_iface->compute_spare) {
+        void * base   = nullptr;
+        size_t size   = 0;
+        size_t extent = 0;
+        if (ggml_backend_sched_get_buffer_extent(sched.get(), expert_backend, &base, &size, &extent)) {
+            expert_iface->compute_spare(expert_backend, base, size, extent, n_tokens);
+        } else {
+            // unknown extent: the whole buffer may be used
+            expert_iface->compute_spare(expert_backend, nullptr, 0, SIZE_MAX, -1);
+        }
+    }
 
     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
     if (status != GGML_STATUS_SUCCESS) {
