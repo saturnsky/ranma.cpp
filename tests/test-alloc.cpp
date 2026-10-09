@@ -1109,6 +1109,41 @@ static void run(const char * name, void (*f)()) {
     printf("PASSED\n");
 }
 
+// ggml_gallocr_get_alloc_extent: the end of the highest tensor of the last allocated graph
+static void test_alloc_extent() {
+    dummy_backend backend      = dummy_backend_init(64);
+    auto [ctx, graph, ctx_ptr] = make_context();
+
+    ggml_tensor * x[6];
+    x[0] = make_input_with_size(ctx, 24);
+    x[1] = make_input_with_size(ctx, 8);
+    x[2] = ggml_pad(ctx, x[0], 2, 0, 0, 0);
+    x[3] = ggml_scale(ctx, x[2], 2.0f);
+    x[4] = ggml_view_1d(ctx, x[3], 2, 8);
+    x[5] = ggml_add(ctx, x[1], x[4]);
+    assign_names(ctx);
+
+    ggml_gallocr_ptr galloc = allocate_graph(graph, x[5], &backend.buffer_type);
+    check_all_allocated(graph);
+
+    void * base   = nullptr;
+    size_t size   = 0;
+    size_t extent = 0;
+    GGML_ASSERT(ggml_gallocr_get_alloc_extent(galloc.get(), 0, &base, &size, &extent));
+    size_t expected = 0;
+    for (int i = 0; i < ggml_graph_n_nodes(graph); ++i) {
+        const ggml_tensor * t = ggml_graph_node(graph, i);
+        if (t->view_src == nullptr && t->data != nullptr) {
+            expected = std::max(expected, (size_t) ((const char *) t->data - (const char *) base) + ggml_nbytes(t));
+        }
+    }
+    for (int i = 0; i < 2; ++i) {
+        expected = std::max(expected, (size_t) ((const char *) x[i]->data - (const char *) base) + ggml_nbytes(x[i]));
+    }
+    GGML_ASSERT(extent == expected);
+    GGML_ASSERT(extent <= size);
+}
+
 // ggml_backend_shared_buft_new: buffers are views of one allocation, a larger request gets a new one
 static void test_shared_buft() {
     ggml_backend_buffer_type_t base   = ggml_backend_cpu_buffer_type();
@@ -1171,6 +1206,7 @@ int main() {
     run("test_buft_get_alloc_size_n_custom_override", test_buft_get_alloc_size_n_custom_override);
     run("test_buft_get_alloc_size_n_custom_override_ctx_size", test_buft_get_alloc_size_n_custom_override_ctx_size);
     run("test_buft_get_alloc_size_n_does_not_allocate", test_buft_get_alloc_size_n_does_not_allocate);
+    run("test_alloc_extent", test_alloc_extent);
     run("test_shared_buft", test_shared_buft);
     return 0;
 }

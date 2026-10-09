@@ -1052,6 +1052,11 @@ struct ggml_backend_sched {
     struct ggml_context * ctx_views;
     char * views_buffer;
     size_t views_buffer_size;
+
+    // [ggml_backend_sched_get_buffer_extent] per backend, the end of the highest tensor of the current graph in the
+    // compute buffer of the backend; SIZE_MAX = unknown
+    size_t alloc_extent[GGML_SCHED_MAX_BACKENDS];
+    bool   alloc_compact; // [ggml_backend_sched_set_alloc_compact]
 };
 
 // the working set of one graph slot, see ggml_backend_sched::n_graph_slots
@@ -1077,6 +1082,7 @@ struct ggml_backend_sched_graph_state {
     struct ggml_context * ctx_views;
     char * views_buffer;
     size_t views_buffer_size;
+    size_t alloc_extent[GGML_SCHED_MAX_BACKENDS];
 };
 
 #define hash_id(tensor) ggml_hash_find_or_insert(&sched->hash_set, tensor)
@@ -1941,13 +1947,14 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
         }
     }
 
-    // allocate graph
-    if (backend_ids_changed || !ggml_gallocr_alloc_graph(sched->galloc, &sched->graph)) {
+    // allocate graph; a compact allocation plans the buffers for this graph alone
+    const bool compact = sched->alloc_compact && sched->n_copies == 1;
+    if (backend_ids_changed || compact || !ggml_gallocr_alloc_graph(sched->galloc, &sched->graph)) {
 #ifndef NDEBUG
         GGML_LOG_DEBUG("%s: failed to allocate graph, reserving (backend_ids_changed = %d)\n", __func__, backend_ids_changed);
 #endif
 
-        if (sched->debug_realloc > 0) {
+        if (sched->debug_realloc > 0 && !compact) {
             // we are interested only in situations where the graph was reallocated even though its size remained the same [GGML_SCHED_DEBUG_REALLOC]
             // example: https://github.com/ggml-org/llama.cpp/pull/17143
             const bool unexpected = !backend_ids_changed && sched->debug_prev_graph_size == sched->debug_graph_size;
@@ -2504,6 +2511,7 @@ static void ggml_backend_sched_gstate_save(ggml_backend_sched_t sched, struct gg
     st->ctx_views             = sched->ctx_views;
     st->views_buffer          = sched->views_buffer;
     st->views_buffer_size     = sched->views_buffer_size;
+    memcpy(st->alloc_extent, sched->alloc_extent, sizeof(st->alloc_extent));
 }
 
 static void ggml_backend_sched_gstate_load(ggml_backend_sched_t sched, const struct ggml_backend_sched_graph_state * st) {
@@ -2523,6 +2531,7 @@ static void ggml_backend_sched_gstate_load(ggml_backend_sched_t sched, const str
     sched->ctx_views             = st->ctx_views;
     sched->views_buffer          = st->views_buffer;
     sched->views_buffer_size     = st->views_buffer_size;
+    memcpy(sched->alloc_extent, st->alloc_extent, sizeof(sched->alloc_extent));
 }
 
 // a new, empty working set; the context buffers are sized when the slot is split
@@ -2726,6 +2735,25 @@ bool ggml_backend_sched_resume_graph(ggml_backend_sched_t sched, const struct gg
     return true;
 }
 
+void ggml_backend_sched_set_alloc_compact(ggml_backend_sched_t sched, bool compact) {
+    GGML_ASSERT(sched);
+    sched->alloc_compact = compact;
+}
+
+bool ggml_backend_sched_get_buffer_extent(ggml_backend_sched_t sched, ggml_backend_t backend, void ** base, size_t * size, size_t * extent) {
+    GGML_ASSERT(sched);
+    const int b = ggml_backend_sched_backend_id(sched, backend);
+    if (b < 0 || !sched->is_alloc || sched->alloc_extent[b] == SIZE_MAX) {
+        return false;
+    }
+    size_t cur = 0;
+    if (!ggml_gallocr_get_alloc_extent(sched->galloc, b, base, size, &cur)) {
+        return false;
+    }
+    *extent = sched->alloc_extent[b];
+    return true;
+}
+
 void ggml_backend_sched_reset(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     if (sched->n_graph_slots > 0) {
@@ -2813,10 +2841,21 @@ bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgra
                 break;
             }
         }
+    }
+
+    for (int b = 0; b < sched->n_backends; b++) {
+        void * base = NULL;
+        size_t size = 0;
+        size_t extent = 0;
+        sched->alloc_extent[b] = ggml_gallocr_get_alloc_extent(sched->galloc, b, &base, &size, &extent) ? extent : SIZE_MAX;
+    }
+
+    if (sched->n_graph_slots > 0) {
         auto & st = sched->gstates[sched->gstate_cur];
         st.valid      = true;
         st.generation = sched->alloc_generation;
         st.last_use   = ++sched->gstate_clock;
+        memcpy(st.alloc_extent, sched->alloc_extent, sizeof(st.alloc_extent));
     }
 
     sched->is_alloc = true;

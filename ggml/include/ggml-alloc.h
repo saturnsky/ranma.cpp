@@ -73,6 +73,11 @@ GGML_API bool ggml_gallocr_alloc_graph(ggml_gallocr_t galloc, struct ggml_cgraph
 
 GGML_API size_t ggml_gallocr_get_buffer_size(ggml_gallocr_t galloc, int buffer_id);
 
+// The part of the buffer that the last ggml_gallocr_alloc_graph used: base and size of the buffer and the end of its
+// highest tensor (the planned size of each tensor). Bytes past the extent are not touched by that graph. False when
+// the buffer is not allocated or has more than one chunk.
+GGML_API bool ggml_gallocr_get_alloc_extent(ggml_gallocr_t galloc, int buffer_id, void ** base, size_t * size, size_t * extent);
+
 // Utils
 // Create a buffer and allocate all the tensors in a ggml_context
 
