@@ -4,6 +4,8 @@ RANMA.cpp is a series of changes on top of upstream llama.cpp. The series is reb
 every release instead of growing by merges, so that every change keeps a clear place and
 can be submitted upstream or dropped on its own.
 
+What each release adds, changes and fixes is in [changelog.md](changelog.md).
+
 ## Refs
 
 | ref | kind | what it points to | changes |
