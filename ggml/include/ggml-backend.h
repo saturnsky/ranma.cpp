@@ -462,6 +462,16 @@ extern "C" {
     GGML_API enum ggml_status ggml_backend_tensor_alloc(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor, void * addr);
     GGML_API enum ggml_status ggml_backend_view_init(struct ggml_tensor * tensor);
 
+    // Shared buffer type: every buffer allocated from it is a view of one allocation of `base` (the largest one
+    // asked for so far), so schedulers that take turns can share one compute buffer. A buffer larger than the
+    // current allocation gets a new allocation, which later buffers share; an allocation is freed with its last
+    // view. The views keep the buffer type, interface and context of `base`, so a backend sees its own buffers.
+    // The users must not compute at the same time.
+    GGML_API ggml_backend_buffer_type_t ggml_backend_shared_buft_new(ggml_backend_buffer_type_t base);
+    GGML_API void                       ggml_backend_shared_buft_retain(ggml_backend_buffer_type_t buft);
+    GGML_API void                       ggml_backend_shared_buft_release(ggml_backend_buffer_type_t buft);
+    GGML_API bool                       ggml_backend_buft_is_shared(ggml_backend_buffer_type_t buft);
+
     // CPU buffer types are always available
     GGML_API ggml_backend_buffer_t      ggml_backend_cpu_buffer_from_ptr(void * ptr, size_t size);
     GGML_API ggml_backend_buffer_type_t ggml_backend_cpu_buffer_type(void);
