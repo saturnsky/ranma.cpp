@@ -20,6 +20,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <algorithm>
+#include <mutex>
 #include <unordered_map>
 #include <vector>
 
@@ -3353,4 +3354,150 @@ static ggml_backend_buffer_type_t ggml_backend_cpu_buffer_from_ptr_type(void) {
 ggml_backend_buffer_t ggml_backend_cpu_buffer_from_ptr(void * ptr, size_t size) {
     GGML_ASSERT((uintptr_t)ptr % TENSOR_ALIGNMENT == 0 && "buffer pointer must be aligned");
     return ggml_backend_buffer_init(ggml_backend_cpu_buffer_from_ptr_type(), ggml_backend_cpu_buffer_from_ptr_i, ptr, size);
+}
+
+// shared buffer type [ggml_backend_shared_buft_new]
+
+struct ggml_backend_shared_block;
+
+struct ggml_backend_shared_state {
+    ggml_backend_buffer_type_t        base;
+    struct ggml_backend_buffer_type   buft;     // what the scheduler is given
+    ggml_backend_shared_block       * current;  // the block new buffers are views of
+    int                               owners;   // retain/release count of the buffer type
+    int                               blocks;   // blocks that still exist
+};
+
+struct ggml_backend_shared_block {
+    ggml_backend_shared_state * state;
+    ggml_backend_buffer_t       real;
+    int                         views;
+};
+
+static std::mutex & ggml_backend_shared_mutex() {
+    static std::mutex m;
+    return m;
+}
+
+static std::unordered_map<ggml_backend_buffer_type_t, ggml_backend_shared_state *> & ggml_backend_shared_states() {
+    static std::unordered_map<ggml_backend_buffer_type_t, ggml_backend_shared_state *> m;
+    return m;
+}
+
+static std::unordered_map<ggml_backend_buffer_t, ggml_backend_shared_block *> & ggml_backend_shared_views() {
+    static std::unordered_map<ggml_backend_buffer_t, ggml_backend_shared_block *> m;
+    return m;
+}
+
+// under the mutex: frees a block without views, and the state once it has no owner and no block
+static void ggml_backend_shared_block_drop_locked(ggml_backend_shared_block * block) {
+    ggml_backend_shared_state * st = block->state;
+    if (st->current == block) {
+        st->current = NULL;
+    }
+    ggml_backend_buffer_free(block->real);
+    delete block;
+    if (--st->blocks == 0 && st->owners == 0) {
+        delete st;
+    }
+}
+
+static void ggml_backend_shared_view_free(ggml_backend_buffer_t buffer) {
+    std::lock_guard<std::mutex> lock(ggml_backend_shared_mutex());
+    auto & views = ggml_backend_shared_views();
+    auto it = views.find(buffer);
+    GGML_ASSERT(it != views.end());
+    ggml_backend_shared_block * block = it->second;
+    views.erase(it);
+    if (--block->views == 0) {
+        ggml_backend_shared_block_drop_locked(block);
+    }
+}
+
+static ggml_backend_buffer_t ggml_backend_shared_alloc_buffer(ggml_backend_buffer_type_t buft, size_t size) {
+    std::lock_guard<std::mutex> lock(ggml_backend_shared_mutex());
+    auto & states = ggml_backend_shared_states();
+    auto it = states.find(buft);
+    GGML_ASSERT(it != states.end());
+    ggml_backend_shared_state * st = it->second;
+
+    ggml_backend_shared_block * block = st->current;
+    if (block == NULL || ggml_backend_buffer_get_size(block->real) < size) {
+        ggml_backend_buffer_t real = ggml_backend_buft_alloc_buffer(st->base, size);
+        if (real == NULL) {
+            return NULL;
+        }
+        if (block != NULL) {
+            GGML_LOG_INFO("%s: %s: a %.2f MiB buffer does not fit the shared %.2f MiB block; it gets a block of its own\n",
+                __func__, ggml_backend_buft_name(st->base), size/1024.0/1024.0,
+                ggml_backend_buffer_get_size(block->real)/1024.0/1024.0);
+        }
+        block = new ggml_backend_shared_block { st, real, 0 };
+        st->blocks++;
+        st->current = block;
+        GGML_LOG_INFO("%s: %s: a new shared block of %.2f MiB\n", __func__, ggml_backend_buft_name(st->base),
+            size/1024.0/1024.0);
+    } else {
+        GGML_LOG_INFO("%s: %s: a %.2f MiB buffer is a view of the shared %.2f MiB block (%d views before it)\n", __func__,
+            ggml_backend_buft_name(st->base), size/1024.0/1024.0, ggml_backend_buffer_get_size(block->real)/1024.0/1024.0,
+            block->views);
+    }
+
+    // a view: the interface and context of the block's buffer, so the backend sees its own buffer type and
+    // its own buffer context; only freeing it is different
+    struct ggml_backend_buffer_i iface = block->real->iface;
+    iface.free_buffer = ggml_backend_shared_view_free;
+    ggml_backend_buffer_t view = ggml_backend_buffer_init(block->real->buft, iface, block->real->context, size);
+    if (view == NULL) {
+        if (block->views == 0) {
+            ggml_backend_shared_block_drop_locked(block);
+        }
+        return NULL;
+    }
+    ggml_backend_shared_views()[view] = block;
+    block->views++;
+    return view;
+}
+
+ggml_backend_buffer_type_t ggml_backend_shared_buft_new(ggml_backend_buffer_type_t base) {
+    GGML_ASSERT(base);
+    std::lock_guard<std::mutex> lock(ggml_backend_shared_mutex());
+    ggml_backend_shared_state * st = new ggml_backend_shared_state {};
+    st->base   = base;
+    st->buft   = *base;
+    st->buft.iface.alloc_buffer = ggml_backend_shared_alloc_buffer;
+    st->owners = 1;
+    ggml_backend_shared_states()[&st->buft] = st;
+    return &st->buft;
+}
+
+void ggml_backend_shared_buft_retain(ggml_backend_buffer_type_t buft) {
+    std::lock_guard<std::mutex> lock(ggml_backend_shared_mutex());
+    auto & states = ggml_backend_shared_states();
+    auto it = states.find(buft);
+    GGML_ASSERT(it != states.end());
+    it->second->owners++;
+}
+
+void ggml_backend_shared_buft_release(ggml_backend_buffer_type_t buft) {
+    if (buft == NULL) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(ggml_backend_shared_mutex());
+    auto & states = ggml_backend_shared_states();
+    auto it = states.find(buft);
+    GGML_ASSERT(it != states.end());
+    ggml_backend_shared_state * st = it->second;
+    if (--st->owners > 0) {
+        return;
+    }
+    states.erase(it);
+    if (st->blocks == 0) {
+        delete st;
+    }
+}
+
+bool ggml_backend_buft_is_shared(ggml_backend_buffer_type_t buft) {
+    std::lock_guard<std::mutex> lock(ggml_backend_shared_mutex());
+    return ggml_backend_shared_states().count(buft) != 0;
 }
