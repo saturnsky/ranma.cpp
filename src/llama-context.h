@@ -288,7 +288,8 @@ public:
     llm_graph_result * get_gf_res_reserve() const;
 
     // returns the result of ggml_backend_sched_graph_compute_async execution
-    ggml_status graph_compute(ggml_cgraph * gf, bool batched);
+    // n_tokens: the rows of the batch the graph computes, -1 for a graph that is not one (a K-shift)
+    ggml_status graph_compute(ggml_cgraph * gf, bool batched, int32_t n_tokens = -1);
 
     // reserve a graph with a dummy ubatch of the specified size
     ggml_cgraph * graph_reserve(
