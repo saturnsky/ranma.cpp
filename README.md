@@ -176,7 +176,7 @@ curated features land.
 | `ranma_upstream` | The latest release rebased onto a newer upstream commit with its overlaps with upstream resolved: the baseline of further work, the starting point of the next release and the target of pull requests. Not benchmarked again. |
 | `features/*` | Changes prepared for upstream pull requests. |
 
-How a release is made and how far each ref is verified: [docs/ranma/releases.md](docs/ranma/releases.md).
+How a release is made and how far each ref is verified: [docs/ranma/releases.md](docs/ranma/releases.md). What each release changed: [docs/ranma/changelog.md](docs/ranma/changelog.md).
 
 Upstream is tracked as the git remote `upstream`. When the series is rebased, upstream
 changes to this README and other fork-owned files are reviewed by hand and applied or
