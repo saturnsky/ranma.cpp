@@ -65,8 +65,10 @@ def is_exl3(hparams: dict[str, Any]) -> bool:
     return isinstance(qc, dict) and qc.get("quant_method") == "exl3"
 
 
-def check_args(args: Any) -> None:
+def check_args(args: Any, model_class: type | None = None) -> None:
     """Options that change tensor values or join tensors cannot apply to EXL3 weights."""
+    # the DSpark draft of DeepSeek V4.1 is stored in the EXL3 checkpoint (mtp.*) and converted from it
+    dspark_ok = model_class is not None and any(k.__name__ == "DeepseekV41DSparkModel" for k in model_class.__mro__)
     refused = [opt for opt, on in (
         ("--outtype", args.outtype != "auto"),
         ("--fuse-gate-up-exps", args.fuse_gate_up_exps),  # gate and up have their own rot_in
@@ -74,7 +76,7 @@ def check_args(args: Any) -> None:
         ("--bigendian", args.bigendian),
         ("--remote", args.remote),
         ("--mmproj", args.mmproj),                        # quantized vision towers are not converted yet
-        ("--dspark", args.dspark),
+        ("--dspark", args.dspark and not dspark_ok),
     ) if on]
     if refused:
         raise Exl3Error(f"EXL3 source: {', '.join(refused)} cannot be used with EXL3 weights")
