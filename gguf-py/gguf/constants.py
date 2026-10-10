@@ -236,6 +236,9 @@ class Keys:
             TYPES      = "{arch}.attention.indexer.types"
             KPOOL             = "{arch}.attention.indexer.kpool"              # GLM5-Next
             KPOOL_SELECT_TAIL = "{arch}.attention.indexer.kpool_select_tail"  # GLM5-Next
+            CANDIDATE_SOURCE_LAYER = "{arch}.attention.indexer.candidate_source_layer"  # DeepSeek-V4.1
+            CANDIDATE_TOPK_BLOCKS  = "{arch}.attention.indexer.candidate_topk_blocks"   # DeepSeek-V4.1
+            CANDIDATE_BLOCK_SIZE   = "{arch}.attention.indexer.candidate_block_size"    # DeepSeek-V4.1
 
     class HyperConnection:
         COUNT                = "{arch}.hyper_connection.count"

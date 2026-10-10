@@ -320,6 +320,12 @@ struct llama_hparams {
     // MSA
     uint32_t indexer_block_size  = 0;
     uint32_t indexer_local_blocks = 0;
+    // DeepSeek-V4.1 two level top-k: the index source at this layer keeps the best
+    // candidate_topk_blocks blocks of candidate_block_size positions, and the index sources after
+    // it only rank positions inside them. Negative disables it.
+    int32_t  candidate_source_layer = -1;
+    uint32_t candidate_topk_blocks  = 0;
+    uint32_t candidate_block_size   = 0;
 
     // Indexer is "full" (1) or "shared" (0)
     // Shared indexers reuse top-k from previous full layer
