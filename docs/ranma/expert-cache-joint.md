@@ -87,7 +87,7 @@ target's arena or is read from host memory on every draft call.
 ## Log lines
 
 - `expert cache: model <key> (<path>) is declared to join: ...` at configure.
-- `expert cache: model <i> <key>: joint layers a..b, weight w` and one `size class` line per class.
+- `expert cache: model <i> <key>: joint layers a..b, E experts, weight w` and one `size class` line per class (layers, experts, KiB per expert).
 - `expert cache: model <key> (<path>) joins the cache as model <i>` and `model <i> <key> bound`.
 - `expert cache: plan budget=... models=<key>*<w>,...` and `installed ... models=...` (inclusive).
 - `expert cache: model <i> <key> at model load|after a model joined|after install: L1 n experts / MiB, host n experts / MiB`.
@@ -98,8 +98,14 @@ target's arena or is read from host memory on every draft call.
 
 ## Limits and fallbacks
 
-- **One expert count.** All models of a joint cache must route the same number of experts per layer;
-  a model that does not is not cached.
+- **Expert counts.** The models of a joint cache may route different numbers of experts (DeepSeek
+  V4.1 Flash routes 384 per layer, its DSpark drafter 128). The joint `[layer][expert]` tables keep
+  one stride, the largest count, and each joint layer keeps its own count: an expert past it does not
+  exist, so no plan selects it, it has no VRAM slot, host slot or file read, and the class capacities
+  and the cold split count the experts each layer has. Each model's profile store keeps its own
+  count and layout, so its records are the same whether it runs alone or joined. With one count
+  (every earlier joint) the tables, plans and profile bytes are those of before. Each model must
+  route one count over all its layers.
 - **Prefill swap: the draft's VRAM share stays the draft's.** The class capacities are frozen at load,
   and the draft's MXFP4 slots cannot hold a target expert, so during prompt processing the draft's
   share of L1 holds draft experts nobody reads. Giving that share to target prefill experts needs
