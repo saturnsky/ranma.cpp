@@ -1,6 +1,12 @@
 #pragma once
 
+#include "llama.h"
+
 #include <cstddef>
+#include <cstdint>
+#include <vector>
+
+struct ggml_tensor;
 
 // Best-effort hint that a set of virtual ranges is about to be read.
 //
@@ -18,3 +24,10 @@ struct llama_prefetch_range {
 };
 
 void llama_prefetch_ranges(const llama_prefetch_range * ranges, size_t n_ranges);
+
+// Batched prefetch of the rows of a lazily mapped table that a GET_ROWS of this ubatch is about to read
+// (per-layer embeddings, DeepSeek V4.1 engram tables). The rows are sorted, deduplicated and merged into
+// ranges; the thresholds are the measured ones of docs/ranma/ple-prefetch.md. A hint: it does nothing for
+// mode off, for a gather below the threshold, or for a table that is not in host memory.
+void llama_prefetch_table_rows(const struct ggml_tensor * table, const std::vector<int32_t> & rows,
+                               enum llama_ple_prefetch mode);

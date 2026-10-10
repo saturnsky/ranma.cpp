@@ -1,5 +1,9 @@
 #include "llama-prefetch.h"
 
+#include "ggml-backend.h"
+#include "ggml.h"
+
+#include <algorithm>
 #include <cstdint>
 #include <vector>
 
@@ -87,3 +91,54 @@ void llama_prefetch_ranges(const llama_prefetch_range * ranges, size_t n_ranges)
 }
 
 #endif
+
+// Batched prefetch of the rows of one ubatch gather from a lazily mapped table (see llama-prefetch.h).
+//
+// A per-layer embedding or engram table is a multi-GiB table that the loader maps lazily, so every gathered row
+// is a demand page fault. A 512-token prompt ubatch gathers thousands of ~110 byte rows: that is
+// thousands of serialized 4 KiB reads when the pages are not in the page cache. One call with the
+// merged ranges lets the OS read them together. It is a hint; the gather reads the same bytes.
+//
+// Thresholds are the measured ones, see docs/ranma/ple-prefetch.md.
+static const size_t PLE_PREFETCH_MIN_ROWS_PREFILL = 256;
+static const size_t PLE_PREFETCH_MIN_ROWS_DECODE  = 16;
+
+void llama_prefetch_table_rows(const ggml_tensor * table, const std::vector<int32_t> & rows,
+                               enum llama_ple_prefetch mode) {
+    if (mode == LLAMA_PLE_PREFETCH_OFF || table == nullptr || table->data == nullptr) {
+        return;
+    }
+
+    const size_t min_rows = mode == LLAMA_PLE_PREFETCH_ALWAYS
+        ? PLE_PREFETCH_MIN_ROWS_DECODE
+        : PLE_PREFETCH_MIN_ROWS_PREFILL;
+    if (rows.size() < min_rows) {
+        return;
+    }
+
+    // A table that is not in host memory is not page-faulted by the CPU; prefetching a device
+    // pointer would be meaningless. This is also what keeps the option inert for other placements.
+    if (table->buffer == nullptr || !ggml_backend_buffer_is_host(table->buffer)) {
+        return;
+    }
+
+    std::vector<int32_t> sorted = rows;
+    std::sort(sorted.begin(), sorted.end());
+    sorted.erase(std::unique(sorted.begin(), sorted.end()), sorted.end());
+
+    // Merge consecutive rows so that neighbouring tokens become one range rather than many.
+    std::vector<llama_prefetch_range> ranges;
+    for (size_t first = 0; first < sorted.size();) {
+        size_t last = first + 1;
+        while (last < sorted.size() && sorted[last] == sorted[last - 1] + 1) {
+            ++last;
+        }
+        llama_prefetch_range range;
+        range.addr = (const char *) table->data + (size_t) sorted[first] * table->nb[1];
+        range.size = (size_t) (sorted[last - 1] - sorted[first] + 1) * table->nb[1];
+        ranges.push_back(range);
+        first = last;
+    }
+
+    llama_prefetch_ranges(ranges.data(), ranges.size());
+}
