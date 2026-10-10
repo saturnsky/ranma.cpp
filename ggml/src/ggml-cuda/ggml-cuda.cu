@@ -2943,6 +2943,12 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_ARGSORT:
             ggml_cuda_op_argsort(ctx, dst);
+#if defined(GGML_USE_HIP)
+            // ranma expert cache: the prediction of the next routed layer's experts (RANMA_EXPERT_PREFETCH)
+            if (strncmp(dst->name, "ffn_moe_pred-", 13) == 0) {
+                ggml_cuda_expert_prefetch_publish(ctx, dst);
+            }
+#endif
             break;
         case GGML_OP_FLASH_ATTN_EXT:
             ggml_cuda_flash_attn_ext(ctx, dst);

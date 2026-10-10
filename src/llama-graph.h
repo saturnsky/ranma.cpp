@@ -828,6 +828,11 @@ struct llm_graph_params {
 
     llm_graph_result * res;
 
+    // the expert cache's prefetch: layers whose experts the graph predicts (bit l of the word l/64), and the
+    // version of that choice (ggml_expert_iface::prefetch_layers)
+    uint64_t expert_pred_mask[2] = { 0, 0 };
+    uint32_t expert_pred_version = 0;
+
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
     bool allow_reuse(const llm_graph_params & other) const {
@@ -864,6 +869,10 @@ struct llm_graph_params {
         }
 
         if (n_outputs != other.n_outputs) {
+            return false;
+        }
+
+        if (expert_pred_version != other.expert_pred_version) {
             return false;
         }
 
@@ -1061,6 +1070,8 @@ struct llm_graph_context {
     const llm_graph_cb & cb_func;
 
     llm_graph_result * res;
+
+    uint64_t expert_pred_mask[2];   // see llm_graph_params
 
     ggml_context * ctx0 = nullptr;
     ggml_cgraph  * gf   = nullptr;

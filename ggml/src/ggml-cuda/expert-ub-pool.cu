@@ -63,6 +63,8 @@ struct ub_step_args {
     uint32_t * last_miss;    // [E] of the layer; used only when ghost > 0
     ub_pool_live * live;     // [L] mapped host memory, or null
     uint64_t pos_bytes;
+    ub_pf_dev pf;            // prefetch staging (pf_on)
+    int pf_on;
 };
 
 // The admission rule of the step kernel, for an expert not in a position: not an L1
@@ -88,7 +90,88 @@ static __device__ __forceinline__ bool ub_ghost_ok(const uint32_t last, const ui
 }
 
 static __device__ __forceinline__ bool ub_eligible(const ub_step_args & a, const int off, const uint32_t t, const int p) {
-    return a.owner[off + p] < 0 || a.stamp[off + p] != t;
+    const int32_t o = a.owner[off + p];
+    if (o == ub_pending || (o >= 0 && a.pf_on && a.pf.inplace && a.pf.pdown[off + p] != 0)) {
+        return false;   // a copy may still write it
+    }
+    return o < 0 || a.stamp[off + p] != t;
+}
+
+// inplace prefetch: one thread settles the pending positions of a layer (see expert-ub-pool.cuh).
+static __device__ void ub_pf_settle(const ub_pool_layer & L, const ub_pf_dev & pf, const int off, const int r, const uint32_t t,
+        int32_t * owner, uint32_t * stamp, int16_t * pos_of, uint64_t * home, const uint64_t * addr) {
+    for (int p = 0; p < r; ++p) {
+        const int q = off + p;
+        if (owner[q] != ub_pending) {
+            continue;
+        }
+        const uint32_t g = pf.pend_gen[q];
+        if (__hip_atomic_load(&pf.done[size_t(q)*2], __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM) != g) {
+            continue;   // up/gate not finished (or never issued)
+        }
+        const bool down = __hip_atomic_load(&pf.done[size_t(q)*2 + 1], __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM) == g;
+        const int e = pf.pend_e[q];
+        if (pos_of[e] >= 0 || !ub_admissible(L, e)) {
+            if (down) {
+                owner[q] = -1;   // complete and not needed; until the down copy finished it stays pending
+            }
+            continue;
+        }
+        for (int kind = 0; kind < 3; ++kind) {
+            uint64_t * table = L.kind[kind].addresses;
+            home[size_t(q)*3 + kind] = table != nullptr ? table[e] : 0;
+            if (table != nullptr && (kind < 2 || down)) {
+                table[e] = addr[size_t(q)*3 + kind];
+            }
+        }
+        pf.pdown[q] = down ? 0u : g;
+        owner[q]  = e;
+        stamp[q]  = t - 1;
+        pos_of[e] = (int16_t) p;
+    }
+    // owned positions whose down copy finished since
+    for (int p = 0; p < r; ++p) {
+        const int q = off + p;
+        const uint32_t g = pf.pdown[q];
+        if (g == 0) {
+            continue;
+        }
+        const int e = owner[q];
+        if (e < 0) {
+            pf.pdown[q] = 0;
+            continue;
+        }
+        if (__hip_atomic_load(&pf.done[size_t(q)*2 + 1], __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM) == g) {
+            if (L.kind[2].addresses != nullptr) {
+                L.kind[2].addresses[e] = addr[size_t(q)*3 + 2];
+            }
+            pf.pdown[q] = 0;
+        }
+    }
+}
+
+// inplace: before the down matmul of a layer (its own launch, after the up/gate matmuls)
+static __global__ void ub_settle_down_kernel(const ub_pool_layer * layers, const ub_pool_meta * meta, const ub_pf_dev pf,
+        int32_t * owner, const uint64_t * addr, const int layer) {
+    if (threadIdx.x != 0) {
+        return;
+    }
+    const int r = meta[layer].r, off = meta[layer].offset;
+    const ub_pool_layer & L = layers[layer];
+    for (int p = 0; p < r; ++p) {
+        const int q = off + p;
+        const uint32_t g = pf.pdown[q];
+        if (g == 0 || owner[q] < 0) {
+            continue;
+        }
+        if (__hip_atomic_load(&pf.done[size_t(q)*2 + 1], __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM) == g) {
+            if (L.kind[2].addresses != nullptr) {
+                L.kind[2].addresses[owner[q]] = addr[size_t(q)*3 + 2];
+            }
+            pf.pdown[q] = 0;
+        }
+    }
+    __threadfence_system();
 }
 
 // empty positions first, then the oldest stamp, then the lower position
@@ -119,6 +202,10 @@ static __global__ void __launch_bounds__(ub_pool_threads) ub_step_kernel(const u
     __shared__ int32_t s_miss_key[ub_pool_max_experts];
     __shared__ int32_t s_victim[ub_pool_max_rcap];
     __shared__ uint8_t s_missed[ub_pool_max_experts];   // ghost filter: 1 a miss, 2 an admissible miss it rejected
+    __shared__ int8_t  s_pfidx[ub_pool_max_experts];    // prefetch: the arrived staging slot holding the expert, -1
+    __shared__ int32_t s_pf_owner[ub_pf_max_slots];
+    __shared__ uint32_t s_pf_expect, s_pf_arrived, s_pf_taken;
+    __shared__ int s_pf_set;
 
     const int tid = threadIdx.x;
     const int E   = a.n_experts;
@@ -136,6 +223,36 @@ static __global__ void __launch_bounds__(ub_pool_threads) ub_step_kernel(const u
         s_n_miss = 0;
         s_n_victims = 0;
         s_hits = s_over = s_fills = s_evict = s_rejected = 0;
+        s_pf_arrived = s_pf_taken = 0;
+        s_pf_set = 0;
+        s_pf_expect = 0;
+        if (a.pf_on && a.pf.inplace && s_r > 0) {
+            // the copies that finished become owned positions before anything of this step looks at the layer
+            ub_pf_settle(L, a.pf, s_off, s_r, s_t, a.owner, a.stamp, a.pos_of + size_t(a.layer)*a.n_experts, a.home, a.addr);
+            s_pf_expect = __hip_atomic_load(&a.pf.expect[a.layer], __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+            const int n = a.pf.res_n[a.layer];
+            for (int j = 0; j < n; ++j) {
+                const int q = a.pf.res_q[a.layer*a.pf.slots + j];
+                if (a.owner[q] == a.pf.res_e[a.layer*a.pf.slots + j]) {
+                    s_pf_arrived |= 1u << j;
+                }
+            }
+        } else if (a.pf_on && s_r > 0) {
+            // a slot whose generation is the layer's expected one holds the complete bytes of its owner
+            const uint32_t ex = __hip_atomic_load(&a.pf.expect[a.layer], __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+            const int set = a.layer % a.pf.ring;
+            s_pf_expect = ex;
+            s_pf_set = set;
+            for (int j = 0; j < a.pf.slots; ++j) {
+                const int idx = set*a.pf.slots + j;
+                const uint32_t g = __hip_atomic_load(&a.pf.gen[idx], __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM);
+                s_pf_owner[j] = -1;
+                if (ex != 0 && g == ex) {
+                    s_pf_owner[j] = __hip_atomic_load(&a.pf.owner[idx], __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+                    s_pf_arrived |= 1u << j;
+                }
+            }
+        }
     }
     __syncthreads();
     const int r = s_r;
@@ -150,8 +267,19 @@ static __global__ void __launch_bounds__(ub_pool_threads) ub_step_kernel(const u
     for (int e = tid; e < E; e += blockDim.x) {
         s_key[e] = -1;
         s_missed[e] = 0;
+        s_pfidx[e] = -1;
     }
     __syncthreads();
+    const bool pf_on = a.pf_on && !a.pf.inplace && s_pf_arrived != 0;
+    if (pf_on) {
+        if (tid < a.pf.slots) {
+            const int o = s_pf_owner[tid];
+            if ((unsigned) o < (unsigned) E) {
+                s_pfidx[o] = (int8_t) tid;
+            }
+        }
+        __syncthreads();
+    }
 
     const int n = a.n_rows*a.n_used;
     unsigned int hits = 0;
@@ -175,16 +303,18 @@ static __global__ void __launch_bounds__(ub_pool_threads) ub_step_kernel(const u
             if (ghost) { s_missed[id] = 1; }
             continue;
         }
+        // a staged expert is admitted ahead of the other misses and without the admission filter
+        const bool staged = pf_on && s_pfidx[id] >= 0;
         if (ghost) {
             // every selection of one expert in this launch reads the same stamp, so they agree
-            if (!ub_ghost_ok(a.last_miss[id], t, (uint32_t) a.ghost)) {
+            if (!staged && !ub_ghost_ok(a.last_miss[id], t, (uint32_t) a.ghost)) {
                 s_missed[id] = 2;
                 continue;
             }
             s_missed[id] = 1;
         }
         // later rows first, then the first router slot of that row
-        atomicMax(&s_key[id], row*a.n_used + (a.n_used - 1 - k));
+        atomicMax(&s_key[id], (staged ? 0x40000000 : 0) + row*a.n_used + (a.n_used - 1 - k));
     }
     if (hits != 0) {
         atomicAdd(&s_hits, hits);
@@ -256,7 +386,14 @@ static __global__ void __launch_bounds__(ub_pool_threads) ub_step_kernel(const u
             a.owner[q] = e;
             a.stamp[q] = t;
             pos_of[e]  = (int16_t) p;
-            a.copy[off + rank] = { e, q };
+            if (a.pf_on && a.pf.inplace) {
+                a.pf.pdown[q] = 0;
+            }
+            const int pj = pf_on ? (int) s_pfidx[e] : -1;
+            a.copy[off + rank] = { e, q, pj >= 0 ? s_pf_set*a.pf.slots + pj : -1 };
+            if (pj >= 0) {
+                atomicOr(&s_pf_taken, 1u << pj);
+            }
             fills++;
         }
         if (tid == 0) {
@@ -275,6 +412,39 @@ static __global__ void __launch_bounds__(ub_pool_threads) ub_step_kernel(const u
             if (s_missed[e] != 0) {
                 a.last_miss[e] = t;
             }
+        }
+    }
+    if (a.pf_on) {
+        // the host's budget record: the experts the layer's positions hold now, then the step's clock and slots
+        ub_pf_stat & st = a.pf.stat[a.layer];
+        if (a.pf.inplace && tid == 0) {
+            const int n = a.pf.res_n[a.layer];
+            for (int j = 0; j < n; ++j) {
+                const int q = a.pf.res_q[a.layer*a.pf.slots + j];
+                if (a.owner[q] == a.pf.res_e[a.layer*a.pf.slots + j] && a.stamp[q] == t) {
+                    s_pf_taken |= 1u << j;
+                }
+            }
+        }
+        for (int w = tid; w < (E + 31)/32; w += blockDim.x) {
+            uint32_t m = 0;
+            for (int b = 0; b < 32; ++b) {
+                const int e = w*32 + b;
+                const int p = e < E ? pos_of[e] : -1;
+                m |= (p >= 0 && p < r) ? 1u << b : 0u;
+            }
+            st.pooled[w] = m;
+        }
+        __syncthreads();
+        if (tid == 0) {
+            st.arrived = s_pf_arrived;
+            st.taken   = s_pf_taken;
+            st.n_rows  = (uint32_t) a.n_rows;
+            st.t_step  = (uint64_t) wall_clock64();
+            __threadfence_system();
+            __hip_atomic_store(&st.gen, s_pf_expect, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+            if (s_pf_taken)   { atomicAdd(&a.counters[ub_pool_pf_fills], (unsigned long long) __popc(s_pf_taken)); }   // inplace: hits
+            if (s_pf_arrived) { atomicAdd(&a.counters[ub_pool_pf_arrived], (unsigned long long) __popc(s_pf_arrived)); }
         }
     }
     if (tid == 0) {
@@ -316,15 +486,18 @@ static __device__ __forceinline__ void ub_copy_bytes(const char * src, char * ds
     }
 }
 
-// This lane's share of the three kinds of one listed expert, from its home.
+// This lane's share of the three kinds of one listed expert, from its home, or from a prefetch staging slot
+// laid out as a position (`koff` = the kind offsets of the layer).
 static __device__ __forceinline__ void ub_copy_entry(const ub_pool_layer & L, const ub_pool_copy en, const uint64_t * addr,
-        const uint64_t * home, const int lane, const int n_lanes) {
+        const uint64_t * home, const int lane, const int n_lanes, const char * staging, const uint64_t slot_bytes, const uint64_t * koff) {
 #pragma unroll
     for (int k = 0; k < 3; ++k) {
         const ub_pool_kind & c = L.kind[k];
         const uint64_t h = home[size_t(en.pos)*3 + k];
         const char * src;
-        if (h != 0) {
+        if (en.pf >= 0) {
+            src = staging + size_t(en.pf)*slot_bytes + koff[k];
+        } else if (h != 0) {
             src = (const char *) (uintptr_t) h;
         } else {
             const int32_t channel = c.host_slots != nullptr ? c.host_slots[en.expert] : en.expert;
@@ -337,12 +510,202 @@ static __device__ __forceinline__ void ub_copy_entry(const ub_pool_layer & L, co
 // Block (j, y) copies its share of the j-th expert the step listed.
 static __global__ void __launch_bounds__(ub_pool_threads) ub_copy_kernel(const ub_pool_layer * layers, const int layer,
         const ub_pool_copy * __restrict__ list, const int32_t * __restrict__ count, const uint64_t * __restrict__ addr,
-        const uint64_t * __restrict__ home) {
+        const uint64_t * __restrict__ home, const char * staging, const uint64_t slot_bytes, const size_t * sizes, const int n_layers) {
     const int j = blockIdx.x;
     if (j >= *count) {
         return;
     }
-    ub_copy_entry(layers[layer], list[j], addr, home, blockIdx.y*blockDim.x + threadIdx.x, gridDim.y*blockDim.x);
+    const ub_pool_copy en = list[j];
+    uint64_t koff[3] = { 0, 0, 0 };
+    if (en.pf >= 0) {
+        // the copy engine wrote the slot: drop any line of it the GPU caches still hold from an earlier use
+        __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "");
+        uint64_t o = 0;
+        for (int k = 0; k < 3; ++k) {
+            koff[k] = o;
+            o += (sizes[size_t(layer)*3 + k] + sizes[size_t(n_layers)*3 + size_t(layer)*3 + k] + 255) & ~uint64_t(255);
+        }
+    }
+    ub_copy_entry(layers[layer], en, addr, home, blockIdx.y*blockDim.x + threadIdx.x, gridDim.y*blockDim.x, staging, slot_bytes, koff);
+}
+
+// inplace publish of layer `a.layer`: settle, choose the experts and the tail positions, reserve them, publish.
+static __global__ void __launch_bounds__(ub_pool_threads) ub_publish_inplace_kernel(const ub_step_args a, const int k) {
+    __shared__ int32_t s_score[ub_pool_max_experts];
+    __shared__ uint8_t s_pend[ub_pool_max_experts];
+    __shared__ int32_t s_victim[ub_pool_max_rcap];
+    __shared__ int32_t s_pick[ub_pf_max_slots];
+    __shared__ unsigned long long s_best;
+    __shared__ int s_r, s_off, s_n, s_b;
+    __shared__ uint32_t s_t;
+    const int tid = threadIdx.x;
+    const int E = a.n_experts;
+    const ub_pool_layer & L = a.layers[a.layer];
+    const ub_pf_dev & pf = a.pf;
+    int16_t * pos_of = a.pos_of + size_t(a.layer)*E;
+    const int rows = min(a.n_rows, ub_pf_max_rows);
+    const int kk   = min(k, ub_pf_max_k);
+    if (tid == 0) {
+        const ub_pool_meta & m = a.meta[a.layer];
+        s_r = m.r;
+        s_off = m.offset;
+        s_t = m.step;
+        s_n = 0;
+        const int bucket = rows <= 1 ? 0 : rows <= 3 ? 1 : 2;
+        int b = __hip_atomic_load(&pf.budget[a.layer*3 + bucket], __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+        s_b = s_r > 0 ? max(0, min(b, pf.slots)) : 0;
+        if (s_r > 0) {
+            ub_pf_settle(L, pf, s_off, s_r, s_t, a.owner, a.stamp, pos_of, a.home, a.addr);
+        }
+    }
+    for (int e = tid; e < E; e += blockDim.x) {
+        s_score[e] = 0;
+        s_pend[e] = 0;
+    }
+    __syncthreads();
+    const int r = s_r, off = s_off;
+    const uint32_t t = s_t;
+    for (int p = tid; p < r; p += blockDim.x) {
+        if (a.owner[off + p] == ub_pending) {
+            const int e = pf.pend_e[off + p];
+            if ((unsigned) e < (unsigned) E) {
+                s_pend[e] = 1;
+            }
+        }
+    }
+    for (int i = tid; i < rows*kk; i += blockDim.x) {
+        const int row = i/kk;
+        const int c = i - row*kk;
+        const int e = a.ids[row*a.row_stride + c];
+        pf.mail[a.layer].ids[row*ub_pf_max_k + c] = e;
+        if ((unsigned) e < (unsigned) E) {
+            atomicAdd(&s_score[e], kk - c);
+        }
+    }
+    __syncthreads();
+    // the b best predicted experts that a reservation can take (highest summed rank score, then the lower id)
+    for (int j = 0; j < s_b; ++j) {
+        if (tid == 0) {
+            s_best = 0;
+        }
+        __syncthreads();
+        unsigned long long best = 0;
+        for (int e = tid; e < E; e += blockDim.x) {
+            const int sc = s_score[e];
+            if (sc > 0 && !s_pend[e] && pos_of[e] < 0 && ub_admissible(L, e)) {
+                const unsigned long long key = ((unsigned long long) sc << 32) | (unsigned long long) (0xFFFFFFFFu - (uint32_t) e);
+                best = key > best ? key : best;
+            }
+        }
+        if (best != 0) {
+            atomicMax(&s_best, best);
+        }
+        __syncthreads();
+        if (s_best == 0) {
+            break;
+        }
+        if (tid == 0) {
+            const int e = (int) (0xFFFFFFFFu - (uint32_t) (s_best & 0xFFFFFFFFull));
+            s_pick[s_n++] = e;
+            s_score[e] = 0;
+        }
+        __syncthreads();
+    }
+    const int n = s_n;
+    // the positions: unfinished reservations first, then empty, then the oldest stamp, then the lower index
+    if (n > 0) {
+        for (int p = tid; p < r; p += blockDim.x) {
+            const int op = a.owner[off + p];
+            const int cp = op == ub_pending ? 0 : op < 0 ? 1 : pf.pdown[off + p] != 0 ? 3 : 2;
+            int rank = 0;
+            for (int q = 0; q < r; ++q) {
+                if (q == p) {
+                    continue;
+                }
+                const int oq = a.owner[off + q];
+                const int cq = oq == ub_pending ? 0 : oq < 0 ? 1 : pf.pdown[off + q] != 0 ? 3 : 2;
+                bool before = cq < cp;
+                if (cq == cp) {
+                    const uint32_t aq = t - a.stamp[off + q], ap = t - a.stamp[off + p];
+                    before = cq == 2 && aq != ap ? aq > ap : q < p;
+                }
+                rank += before;
+            }
+            if (rank < n && cp != 3) {
+                s_victim[rank] = p;
+            } else if (rank < n) {
+                s_victim[rank] = -1;   // only positions with a down copy due are left: not taken
+            }
+        }
+    }
+    __syncthreads();
+    if (tid == 0) {
+        const uint32_t seq = pf.seq[a.layer] + 1;
+        pf.seq[a.layer] = seq;
+        const uint32_t gen = (seq << 7) | (uint32_t) (a.layer & 127);
+        ub_pf_mail & m = pf.mail[a.layer];
+        int nn = min(n, r);
+        for (int j = 0; j < nn; ++j) {
+            if (s_victim[j] < 0) {
+                nn = j;
+                break;
+            }
+        }
+        for (int j = 0; j < nn; ++j) {
+            const int q = off + s_victim[j];
+            const int old = a.owner[q];
+            if (old >= 0) {
+                // the old owner is not used before this layer's step, and its last launch is complete
+                for (int kind = 0; kind < 3; ++kind) {
+                    if (L.kind[kind].addresses != nullptr) {
+                        L.kind[kind].addresses[old] = a.home[size_t(q)*3 + kind];
+                    }
+                }
+                pos_of[old] = -1;
+            }
+            a.owner[q] = ub_pending;
+            pf.pend_e[q] = s_pick[j];
+            pf.pend_gen[q] = gen;
+            pf.res_q[a.layer*pf.slots + j] = q;
+            pf.res_e[a.layer*pf.slots + j] = s_pick[j];
+            m.res_q[j] = q;
+            m.res_e[j] = s_pick[j];
+        }
+        pf.res_n[a.layer] = nn;
+        pf.expect[a.layer] = gen;
+        m.n_res  = nn;
+        m.n_rows = rows;
+        m.k      = kk;
+        m.t_pub  = (uint64_t) wall_clock64();
+        __threadfence_system();
+        __hip_atomic_store(&m.gen, gen, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+    }
+}
+
+// The publish of a prediction for layer `layer`: the ids into the mapped mailbox, a new generation
+// (seq << 7 | layer) as the layer's expected one, then the mailbox's generation, last.
+static __global__ void ub_publish_kernel(const ub_pf_dev pf, const int layer, const int32_t * __restrict__ ids, const int n_rows,
+        const int row_stride, const int k) {
+    ub_pf_mail & m = pf.mail[layer];
+    const int rows = min(n_rows, ub_pf_max_rows);
+    const int kk   = min(k, ub_pf_max_k);
+    for (int i = threadIdx.x; i < rows*kk; i += blockDim.x) {
+        const int r = i/kk;
+        const int c = i - r*kk;
+        m.ids[r*ub_pf_max_k + c] = ids[r*row_stride + c];
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        const uint32_t seq = pf.seq[layer] + 1;
+        pf.seq[layer] = seq;
+        const uint32_t gen = (seq << 7) | (uint32_t) (layer & 127);
+        pf.expect[layer] = gen;
+        m.n_rows = rows;
+        m.k      = kk;
+        m.t_pub  = (uint64_t) wall_clock64();
+        __threadfence_system();
+        __hip_atomic_store(&m.gen, gen, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+    }
 }
 
 struct ub_lend_args {
@@ -397,7 +760,7 @@ static __global__ void __launch_bounds__(ub_pool_threads) ub_lend_kernel(const u
 
 // reclaim: the entries of every owner back to their homes, then r = 0
 static __global__ void ub_reclaim_kernel(const ub_pool_layer * layers, ub_pool_meta * meta, const uint64_t * home,
-        int32_t * owner, int16_t * pos_of, int n_experts) {
+        int32_t * owner, int16_t * pos_of, int n_experts, uint32_t * pdown) {
     const int layer = blockIdx.x;
     ub_pool_meta & m = meta[layer];
     const int r = m.r;
@@ -405,7 +768,11 @@ static __global__ void ub_reclaim_kernel(const ub_pool_layer * layers, ub_pool_m
     for (int p = threadIdx.x; p < r; p += blockDim.x) {
         const int q = m.offset + p;
         const int e = owner[q];
+        if (pdown != nullptr) {
+            pdown[q] = 0;
+        }
         if (e < 0) {
+            owner[q] = -1;   // empty, or a pending prefetch (its copy finished before the reclaim)
             continue;
         }
         for (int k = 0; k < 3; ++k) {
@@ -435,6 +802,12 @@ ub_pool::~ub_pool() {
     if (h_addr_ != nullptr) { (void) cudaFreeHost(h_addr_); }
     if (h_counters_ != nullptr) { (void) cudaFreeHost(h_counters_); }
     if (h_live_ != nullptr) { (void) hipHostFree(h_live_); }
+    if (pf_alloc_ != nullptr) { (void) cudaFree(pf_alloc_); }
+    if (pf_staging_ != nullptr) { (void) cudaFree(pf_staging_); }
+    if (h_pf_stat_ != nullptr) { (void) hipHostFree(h_pf_stat_); }
+    if (h_pf_mail_ != nullptr) { (void) hipHostFree(h_pf_mail_); }
+    if (h_pf_budget_ != nullptr) { (void) hipHostFree(h_pf_budget_); }
+    if (pf_in_alloc_ != nullptr) { (void) cudaFree(pf_in_alloc_); }
 }
 
 bool ub_pool::allocate(int device, const std::vector<ub_pool_layer> & layers,
@@ -594,7 +967,7 @@ void ub_pool::reclaim(cudaStream_t stream) {
     ggml_cuda_set_device(device_);
     const ggml_cuda_kernel_launch_params launch(dim3(n_layers_), dim3(256), 0, stream);
     ggml_cuda_kernel_launch(ub_reclaim_kernel, launch, (const ub_pool_layer *) d_layers_, d_meta_, (const uint64_t *) d_home_,
-        d_owner_, d_pos_of_, n_experts_);
+        d_owner_, d_pos_of_, n_experts_, pf_.inplace ? pf_.pdown : (uint32_t *) nullptr);
     r_ = 0;
     base_ = nullptr;
     lent_bytes_ = 0;
@@ -624,6 +997,8 @@ void ub_pool::launch_step(int layer, const int32_t * ids, int n_rows, int row_st
     a.last_miss  = d_last_miss_ + size_t(layer)*n_experts_;
     a.live       = d_live_;
     a.pos_bytes  = pos_bytes_[(size_t) layer];
+    a.pf         = pf_;
+    a.pf_on      = pf_.staging != nullptr ? 1 : 0;
     const ggml_cuda_kernel_launch_params launch(dim3(1), dim3(ub_pool_threads), 0, stream);
     ggml_cuda_kernel_launch(ub_step_kernel, launch, a);
 }
@@ -632,7 +1007,140 @@ void ub_pool::launch_copy(int layer, cudaStream_t stream) {
     const ggml_cuda_kernel_launch_params launch(dim3(r_cap_, ub_pool_copy_blocks), dim3(ub_pool_threads), 0, stream);
     ggml_cuda_kernel_launch(ub_copy_kernel, launch, (const ub_pool_layer *) d_layers_, layer,
         (const ub_pool_copy *) d_copy_ + size_t(layer)*r_cap_, (const int32_t *) d_count_ + layer,
-        (const uint64_t *) d_addr_, (const uint64_t *) d_home_);
+        (const uint64_t *) d_addr_, (const uint64_t *) d_home_, (const char *) pf_.staging, pf_.slot_bytes,
+        (const size_t *) d_sizes_, n_layers_);
+}
+
+bool ub_pool::enable_prefetch(int ring, int slots, bool inplace) {
+    if (blob_ == nullptr || prefetch_on() || ring < 1 || slots < 1 || slots > ub_pf_max_slots || n_layers_ > 128) {
+        return false;
+    }
+    if (inplace) {
+        ring = 1;   // the fill staging is not used; one small set keeps the shared code paths valid
+    }
+    size_t slot_bytes = 0;
+    for (int l = 0; l < n_layers_; ++l) {
+        slot_bytes = std::max(slot_bytes, pos_bytes_[(size_t) l]);
+    }
+    if (slot_bytes == 0) {
+        return false;
+    }
+    const size_t L = (size_t) n_layers_, S = size_t(ring)*size_t(slots);
+    ggml_cuda_set_device(device_);
+    const size_t o_gen = 0, o_owner = o_gen + S*sizeof(uint32_t), o_expect = o_owner + S*sizeof(int32_t),
+                 o_seq = o_expect + L*sizeof(uint32_t), state = o_seq + L*sizeof(uint32_t);
+    if (cudaMalloc(&pf_alloc_, state) != cudaSuccess || cudaMalloc((void **) &pf_staging_, S*slot_bytes) != cudaSuccess) {
+        (void) cudaGetLastError();
+        if (pf_alloc_ != nullptr) { (void) cudaFree(pf_alloc_); pf_alloc_ = nullptr; }
+        pf_staging_ = nullptr;
+        return false;
+    }
+    CUDA_CHECK(cudaMemset(pf_alloc_, 0, state));
+    CUDA_CHECK(cudaMemset((char *) pf_alloc_ + o_owner, 0xFF, S*sizeof(int32_t)));
+    ub_pf_stat * d_stat = nullptr;
+    ub_pf_mail * d_mail = nullptr;
+    if (hipHostMalloc((void **) &h_pf_stat_, L*sizeof(ub_pf_stat), hipHostMallocMapped | hipHostMallocCoherent) != hipSuccess ||
+        hipHostMalloc((void **) &h_pf_mail_, L*sizeof(ub_pf_mail), hipHostMallocMapped | hipHostMallocCoherent) != hipSuccess ||
+        hipHostGetDevicePointer((void **) &d_stat, h_pf_stat_, 0) != hipSuccess ||
+        hipHostGetDevicePointer((void **) &d_mail, h_pf_mail_, 0) != hipSuccess) {
+        (void) hipGetLastError();
+        if (h_pf_stat_ != nullptr) { (void) hipHostFree(h_pf_stat_); h_pf_stat_ = nullptr; }
+        if (h_pf_mail_ != nullptr) { (void) hipHostFree(h_pf_mail_); h_pf_mail_ = nullptr; }
+        (void) cudaFree(pf_alloc_);
+        (void) cudaFree(pf_staging_);
+        pf_alloc_ = nullptr;
+        pf_staging_ = nullptr;
+        return false;
+    }
+    memset(h_pf_stat_, 0, L*sizeof(ub_pf_stat));
+    memset(h_pf_mail_, 0, L*sizeof(ub_pf_mail));
+    char * b = (char *) pf_alloc_;
+    pf_.gen        = (const uint32_t *) (b + o_gen);
+    pf_.owner      = (const int32_t *) (b + o_owner);
+    pf_.expect     = (uint32_t *) (b + o_expect);
+    pf_.seq        = (uint32_t *) (b + o_seq);
+    pf_.staging    = pf_staging_;
+    pf_.stat       = d_stat;
+    pf_.mail       = d_mail;
+    pf_.slot_bytes = slot_bytes;
+    pf_.ring       = ring;
+    pf_.slots      = slots;
+    pf_.inplace    = inplace ? 1 : 0;
+    if (inplace) {
+        const size_t P = L*(size_t) r_cap_;
+        const size_t o_pe = 0, o_pg = o_pe + P*sizeof(int32_t), o_dn = o_pg + P*sizeof(uint32_t),
+                     o_pd = o_dn + 2*P*sizeof(uint32_t),
+                     o_rq = o_pd + P*sizeof(uint32_t), o_re = o_rq + L*size_t(slots)*sizeof(int32_t),
+                     o_rn = o_re + L*size_t(slots)*sizeof(int32_t), in_bytes = o_rn + L*sizeof(int32_t);
+        int32_t * d_budget = nullptr;
+        if (cudaMalloc(&pf_in_alloc_, in_bytes) != cudaSuccess ||
+            hipHostMalloc((void **) &h_pf_budget_, L*3*sizeof(int32_t), hipHostMallocMapped | hipHostMallocCoherent) != hipSuccess ||
+            hipHostGetDevicePointer((void **) &d_budget, h_pf_budget_, 0) != hipSuccess) {
+            (void) hipGetLastError();
+            return false;   // the destructor frees what was allocated; prefetch_on() stays false below
+        }
+        CUDA_CHECK(cudaMemset(pf_in_alloc_, 0, in_bytes));
+        CUDA_CHECK(cudaMemset(pf_in_alloc_, 0xFF, P*sizeof(int32_t)));
+        memset(h_pf_budget_, 0, L*3*sizeof(int32_t));
+        char * c = (char *) pf_in_alloc_;
+        pf_.pend_e   = (int32_t *) (c + o_pe);
+        pf_.pend_gen = (uint32_t *) (c + o_pg);
+        pf_.done     = (const uint32_t *) (c + o_dn);
+        pf_.pdown    = (uint32_t *) (c + o_pd);
+        pf_.res_q    = (int32_t *) (c + o_rq);
+        pf_.res_e    = (int32_t *) (c + o_re);
+        pf_.res_n    = (int32_t *) (c + o_rn);
+        pf_.budget   = d_budget;
+    }
+    CUDA_CHECK(cudaDeviceSynchronize());
+    return true;
+}
+
+void ub_pool::launch_publish(int layer, const int32_t * ids, int n_rows, int row_stride, int k, cudaStream_t stream) {
+    if (!prefetch_on()) {
+        return;
+    }
+    if (!pf_.inplace) {
+        const ggml_cuda_kernel_launch_params launch(dim3(1), dim3(64), 0, stream);
+        ggml_cuda_kernel_launch(ub_publish_kernel, launch, pf_, layer, ids, n_rows, row_stride, k);
+        return;
+    }
+    ub_step_args a{};
+    a.ids        = ids;
+    a.n_rows     = n_rows;
+    a.row_stride = row_stride;
+    a.n_used     = k;
+    a.n_experts  = n_experts_;
+    a.layer      = layer;
+    a.r_cap      = r_cap_;
+    a.layers     = d_layers_;
+    a.meta       = d_meta_;
+    a.addr       = d_addr_;
+    a.home       = d_home_;
+    a.owner      = d_owner_;
+    a.stamp      = d_stamp_;
+    a.pos_of     = d_pos_of_;
+    a.pf         = pf_;
+    a.pf_on      = 1;
+    const ggml_cuda_kernel_launch_params launch(dim3(1), dim3(ub_pool_threads), 0, stream);
+    ggml_cuda_kernel_launch(ub_publish_inplace_kernel, launch, a, k);
+}
+
+void ub_pool::launch_settle_down(int layer, cudaStream_t stream) {
+    if (!prefetch_on() || !pf_.inplace) {
+        return;
+    }
+    const ggml_cuda_kernel_launch_params launch(dim3(1), dim3(32), 0, stream);
+    ggml_cuda_kernel_launch(ub_settle_down_kernel, launch, (const ub_pool_layer *) d_layers_, (const ub_pool_meta *) d_meta_, pf_,
+        d_owner_, (const uint64_t *) d_addr_, layer);
+}
+
+char * ub_pool::pf_kind_address(int layer, int set, int j, int kind) const {
+    size_t o = 0;
+    for (int k = 0; k < kind; ++k) {
+        o += (kind_bytes_[(size_t) layer][(size_t) k] + kind_tails_[(size_t) layer][(size_t) k] + 255) & ~size_t(255);
+    }
+    return pf_staging_ + (size_t(set)*(size_t) pf_.slots + (size_t) j)*pf_.slot_bytes + o;
 }
 
 bool ub_pool::read_counters(std::array<uint64_t, ub_pool_n_counters> & out) const {

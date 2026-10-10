@@ -1543,6 +1543,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     samplers         (params.samplers),
     cb_func          (params.cb),
     res              (params.res),
+    expert_pred_mask { params.expert_pred_mask[0], params.expert_pred_mask[1] },
     ctx0             (res->get_ctx()),
     gf               (res->get_gf()) {
         res->set_params(params);

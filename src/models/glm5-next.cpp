@@ -349,17 +349,6 @@ static ggml_tensor * dsv4_view_1d(ggml_context * ctx, ggml_tensor * t, int64_t n
     return ggml_view_1d(ctx, t, ne0, dsv4_elem_offset(t, i0));
 }
 
-// RANMA_EXPERT_PREFETCH (with RANMA_EXPERT_UB_POOL): the decode graphs end every layer with a prediction of the
-// next routed layer's experts for the expert cache's prefetch (ggml-cuda expert-ub-pool.cuh).
-static bool glm5_next_expert_prefetch() {
-    static const bool on = [] {
-        const char * p = getenv("RANMA_EXPERT_PREFETCH");
-        const char * u = getenv("RANMA_EXPERT_UB_POOL");
-        return p != nullptr && atoi(p) != 0 && u != nullptr && atoi(u) != 0;
-    }();
-    return on;
-}
-
 ggml_tensor * llama_model_glm5_next::graph::build_hc_mean(ggml_tensor * x) const {
     const int64_t hc = x->ne[1];
 
@@ -793,10 +782,11 @@ llama_model_glm5_next::graph::graph(const llama_model & model, const llm_graph_p
         inpL = build_cvec(inpL, il);
         cb(inpL, "l_out", il);
 
-        // the prediction of layer il+1's experts from this output: the mHC pre-mix of il+1's FFN block and its
-        // ffn_norm applied to l_out (only the attention of il+1 is skipped), then il+1's router selection score;
-        // the expert cache's prefetch reads the descending order of the scores ("ffn_moe_pred-<il+1>")
-        if (glm5_next_expert_prefetch() && n_tokens <= 8 && il + 1 < n_layer &&
+        // the prediction of layer il+1's experts from this output, for the layers the expert cache's prefetch asks
+        // for (expert_pred_mask): the mHC pre-mix of il+1's FFN block and its ffn_norm applied to l_out (only the
+        // attention of il+1 is skipped), then il+1's router selection score; the cache reads the descending order
+        // of the scores ("ffn_moe_pred-<il+1>")
+        if (il + 1 < 128 && ((expert_pred_mask[(il + 1)/64] >> ((il + 1)%64)) & 1) && n_tokens <= 8 && il + 1 < n_layer &&
                 (uint32_t) (il + 1) >= hparams.n_layer_dense_lead &&
                 hparams.expert_gating_func == LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID) {
             const auto & nl = model.layers[il + 1];
