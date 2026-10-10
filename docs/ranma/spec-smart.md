@@ -176,6 +176,60 @@ below.
   request.
 - Without the counts (another backend, the pool off) the times are taken as measured, as before.
 
+## Trigram confidence
+
+On by default, the trigram confidence replaces the acceptance cells in the decisions by a logistic model that also
+sees what the request itself has written so far. It scores one drafter candidate at every step.
+
+- **Why on, and why k = 1.** On GLM-5.3-Flash roleplay in Korean the model calibrates the acceptance better than the
+  cells (top-1 log-loss 0.496 against 0.509 of the cells and 0.591 of the raw probability) and costs no measurable
+  time (the draft step median was 3193 us with it, 3270 us without). Its throughput was the same as without it
+  (24.04 against 24.05 tokens / s, one run each), and an offline replay found the gain where the cells let the draft
+  length collapse (up to 2.5 % there). k = 3 was not faster either (24.10), and k >= 2 changes the drafted tokens, so
+  k = 1 (the top token, only its acceptance changes) is the default.
+- **Trigram table.** Per request and sequence: for every two-token context of the prompt and of the generated tokens,
+  the tokens that followed it and how often, counted apart by the role of the following token: RA (the assistant: the
+  assistant messages of the prompt and the generated tokens) and RU (all other roles). It is built at the first draft
+  of the request from the prompt and grows by the new tokens at every later draft (each token once); the drafted
+  tokens are not in it.
+- **Roles.** At startup the server formats a conversation with one message per role through the chat template and
+  takes the token sequence that opens each role (for example `<|assistant|>`, or `<|im_start|>assistant`); a control
+  token that opens no known role (an end-of-turn token, a tool response marker) starts a message of another role. The
+  reasoning tags `<think>` and `</think>` do not change the role. Without markers (a template that cannot be formatted)
+  the prompt counts as RU and the generated tokens as RA. The startup log says how many markers were found.
+- **Acceptance of a candidate.** For candidate i of the drafter (its probability p_i, the softmax over the drafter's top
+  10 that the draft step already has on the host):
+
+      q_i = sigmoid(b . x_i),  x_i = [1, lg p_i, f_RA, g_RA, f_RU, g_RU, f_PM, g_PM, f_PX, g_PX, f_PU, g_PU, mid, sw_i]
+      g_s = N_s / (N_s + 3),  f_s = g_s lg((n_s + 0.5) / (N_s + 1))   (both 0 when N_s = 0)
+
+  with lg the logit, per source s the count n_s of the candidate after the last two tokens and the observations N_s
+  of that context, `mid` when the context ends inside an unfinished UTF-8 sequence (the next token continues a
+  character) and `sw_i` when the candidate starts a word (its first byte is a space, a newline, a tab or ASCII
+  punctuation). The sources PM, PX and PU are those of the trigram profile; without a profile they are 0, and so is
+  everything they add. The decisions use q of the drafted token, clamped to 0.01..0.99, where they would use
+  q(position, p) of the cells, also for the lookahead. The cells keep learning as before (the store is unchanged).
+- **k = 1** scores the drafter's top token only: only its probability is read, and the controller learns from it
+  alone. It is the calibration of the top token by the trigram counts.
+- **k >= 2** scores the first k candidates and drafts the one with the highest q, which may be a candidate below the
+  drafter's top one. The candidates are already on the host (the draft sampler's top 10), so no transfer is added.
+  With probabilistic drafting (`--spec-draft-sampling probabilistic`) the sampled token is kept and only its q is
+  computed (provisional: whether to draw from the calibrated candidates instead is open).
+- **Learning.** The coefficients start at a static fit for k (constants in the source: GLM-5.3-Flash MTP logs of
+  roleplay in Japanese, English and Chinese and of code at temperature 0, the request's tokens split by role; the k
+  candidates of every verified position; the profile columns 0) and follow every verified position by AdaGrad
+  (learning rate 0.15), with the labels of the same k candidates: 1 for the target's token, 0 for the others. An
+  accepted position is learnt when the verification ends; a rejected one needs the target's token, which is the first
+  token of the next draft, and is learnt then (k = 1 needs none: the only candidate was rejected). A rejected position
+  whose next draft does not follow it (the request ended) is not learnt. The coefficients are not stored: every
+  process starts at the static fit.
+- **Cost.** The table takes about 8 ms per 100k prompt tokens once per request and a few bytes per token; a draft step
+  takes 0.1 (k = 1) to 0.3 us (k = 10) on the host. The token pieces of the vocabulary are read once at startup.
+- The round log adds per verified draft step `tc_i` (the drafter rank of the drafted token, 0 = its top), `tc_n` (the
+  trigram observations of its context in the request, both roles) and `tc_src` (per source RA, RU, PM, PX, PU the
+  count of the drafted token and the observations of the context, 10 numbers); the request summary adds k, the
+  updates, the steps that drafted another candidate than the top one and the coefficients.
+
 ## The store
 
 `--spec-smart-store PATH` is a cache. It holds the level, the shape per width (mean and variance), the acceptance cells and the

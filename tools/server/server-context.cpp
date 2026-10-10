@@ -68,6 +68,86 @@ static std::string server_spec_smart_key(const common_params & params) {
             (double) params.expert_weight_target, (double) params.expert_weight_draft, dft.n_gpu_layers);
 }
 
+// --spec-smart trigram confidence: the role markers of the chat template. A conversation with one message per role and
+// a sentinel text in each is formatted; the marker of a role is the tokens between the sentinel before it and its own
+// sentinel, from the last control token on (reasoning tags left out, trailing white space dropped), e.g. <|assistant|>
+// or <|im_start|>assistant. The control tokens of the vocabulary (reasoning tags left out) open a message of another
+// role when they end no marker. A template that cannot be formatted gives no markers.
+static void server_spec_roles(const common_chat_templates * tmpls, const llama_vocab * vocab, const common_params & params,
+                              std::vector<std::pair<llama_tokens, bool>> & markers, std::vector<uint8_t> & ctrl) {
+    const int32_t n_vocab = llama_vocab_n_tokens(vocab);
+    std::vector<uint8_t> think(n_vocab, 0);
+    ctrl.assign(n_vocab, 0);
+    for (int32_t t = 0; t < n_vocab; ++t) {
+        const std::string piece = common_token_to_piece(vocab, t, true);
+        think[t] = piece == "<think>" || piece == "</think>";
+        ctrl[t]  = (llama_vocab_get_attr(vocab, t) & LLAMA_TOKEN_ATTR_CONTROL) != 0 && !think[t];
+    }
+    markers.clear();
+    try {
+        struct probe { const char * role; const char * text; bool assistant; };
+        const probe P[] = {
+            { "system",    "ZQSENTSYS", false }, { "user", "ZQSENTUSA", false },
+            { "assistant", "ZQSENTAST", true  }, { "user", "ZQSENTUSB", false },
+        };
+        common_chat_templates_inputs inputs;
+        inputs.use_jinja             = params.use_jinja;
+        inputs.chat_template_kwargs  = params.default_template_kwargs;
+        inputs.add_generation_prompt = true;
+        for (const auto & pr : P) {
+            common_chat_msg msg;
+            msg.role    = pr.role;
+            msg.content = pr.text;
+            inputs.messages.push_back(msg);
+        }
+        const std::string prompt = common_chat_templates_apply(tmpls, inputs).prompt;
+
+        auto add = [&](const std::string & seg, bool assistant) {
+            const llama_tokens toks = common_tokenize(vocab, seg, false, true);
+            int32_t j = -1;
+            for (int32_t i = 0; i < (int32_t) toks.size(); ++i) {
+                if (ctrl[toks[i]]) {
+                    j = i;
+                }
+            }
+            if (j < 0) {
+                return;
+            }
+            llama_tokens m;
+            for (int32_t i = j; i < (int32_t) toks.size() && !think[toks[i]]; ++i) {
+                m.push_back(toks[i]);
+            }
+            while (m.size() > 1) {
+                const std::string piece = common_token_to_piece(vocab, m.back(), true);
+                if (piece.find_first_not_of(" \t\r\n") != std::string::npos) {
+                    break;
+                }
+                m.pop_back();
+            }
+            for (const auto & x : markers) {
+                if (x.first == m) {
+                    return;
+                }
+            }
+            markers.emplace_back(std::move(m), assistant);
+        };
+        size_t from = 0;
+        for (const auto & pr : P) {
+            const size_t at = prompt.find(pr.text, from);
+            if (at == std::string::npos) {
+                markers.clear();
+                return;
+            }
+            add(prompt.substr(from, at - from), pr.assistant);
+            from = at + strlen(pr.text);
+        }
+        add(prompt.substr(from), true); // the generation prompt
+    } catch (const std::exception & e) {
+        SRV_WRN("trigram confidence: the chat template gives no role markers: %s\n", e.what());
+        markers.clear();
+    }
+}
+
 static common_speculative_output_limits server_output_limits(const common_params & params) {
     if (params.embedding ||
             (params.pooling_type != LLAMA_POOLING_TYPE_UNSPECIFIED && params.pooling_type != LLAMA_POOLING_TYPE_NONE)) {
@@ -1729,6 +1809,13 @@ private:
                 SRV_ERR("%s: please consider disabling jinja via --no-jinja, or use a custom chat template via --chat-template\n", __func__);
                 SRV_ERR("%s: for example: --no-jinja --chat-template chatml\n", __func__);
                 return false;
+            }
+
+            if (spec) {
+                std::vector<std::pair<llama_tokens, bool>> markers;
+                std::vector<uint8_t> ctrl;
+                server_spec_roles(chat_templates.get(), vocab, params_base, markers, ctrl);
+                common_speculative_set_roles(spec.get(), markers, ctrl);
             }
 
             // IMPORTANT: chat_params is reused across sleeping / resuming states,

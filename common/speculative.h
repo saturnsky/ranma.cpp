@@ -86,6 +86,11 @@ common_speculative_draft_params & common_speculative_get_draft_params(common_spe
 // optionally call once at the beginning of a new generation
 void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, const llama_tokens & prompt);
 
+// --spec-smart trigram confidence: the role markers of the chat template (the token sequence that opens a message, and
+// whether it is the assistant's) and per token whether it is a control token other than a reasoning tag
+void common_speculative_set_roles(common_speculative * spec, const std::vector<std::pair<llama_tokens, bool>> & markers,
+                                  const std::vector<uint8_t> & ctrl);
+
 // process the batch and update the internal state of the speculative context
 bool common_speculative_process(common_speculative * spec, const common_batch & batch);
 
