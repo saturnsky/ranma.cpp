@@ -11843,6 +11843,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_mul_mat_had(type_a, GGML_TYPE_F16, 512, 384, 20, 8, 4, false, 128, 0, 0, prec));
         }
         test_cases.emplace_back(new test_mul_mat_had(GGML_TYPE_EXL3_M3, GGML_TYPE_F32, 256, 384, 24, 4, 3, true, 128, 0, 0, prec)); // ids, broadcast b
+        // ids with 2 to 8 tokens (the GEMV passes of 2 or 4 rows of one expert): the experts are shared by several tokens
+        for (int tokens : { 2, 3, 4, 8 }) {
+            test_cases.emplace_back(new test_mul_mat_had(GGML_TYPE_EXL3_M3, GGML_TYPE_F16, 256, 384, tokens, 6, 4, false, 128, 0, 0, prec));
+            test_cases.emplace_back(new test_mul_mat_had(GGML_TYPE_EXL3_M3, GGML_TYPE_F16, 256, 384, tokens, 3, 3, false, 128, 0, 0, prec));
+        }
         test_cases.emplace_back(new test_mul_mat_had(GGML_TYPE_EXL3_G3, GGML_TYPE_F16, 256, 384, 5, 4, 6, false, 128, 0, 0, prec)); // duplicate ids
         test_cases.emplace_back(new test_mul_mat_had(GGML_TYPE_EXL3_T3, GGML_TYPE_F16, 256, 384, 5, 4, 6, false, 128, 0, 0, prec));
         test_cases.emplace_back(new test_mul_mat_had(GGML_TYPE_EXL3_M4, GGML_TYPE_F16, 256, 256, 24, 3, 2, false, 128, 640, 0, prec)); // view of experts
