@@ -36,7 +36,11 @@
 #define MMH_GEMV_WAVES  1280 // GEMV waves the k split aims at
 #define MMH_GEMV_MIN_KSLICES 16 // fewest 16-value k slices per GEMV wave from the k split
 #define MMH_GEMV_MAX_SPLIT 64 // largest k split
-#define MMH_GEMV_IDS_ROWS  2 // rows of one expert per GEMV pass with ids and several tokens
+// rows of one expert per GEMV pass with ids and several tokens: 2 for 2 tokens, 4 for 3 or more (the 4-row instance decodes a
+// tile once for up to 4 rows; for 2 tokens it measured 3-4% slower in VRAM, from 3 tokens it is 6-9% faster with the verify
+// batch sharing of GLM-5.3 and 0.5-5% faster without sharing, in VRAM and host memory; 8 rows are slower in VRAM)
+#define MMH_GEMV_IDS_ROWS_2TOK 2
+#define MMH_GEMV_IDS_ROWS      4
 
 // src1 precision of an op that does not set one (GGML_PREC_F32 = F32 GEMV only, GGML_PREC_F16 = fp16 GEMM)
 #define MMH_PREC_DEFAULT GGML_PREC_F16
@@ -1502,7 +1506,8 @@ static void mmh_launch(ggml_backend_cuda_context & ctx, const mmh_params & p, co
         const int64_t n_items = p.ids ? p.n_rows : p.n_exp;
         // with ids, an expert of several tokens is decoded once for up to MMH_GEMV_IDS_ROWS of its rows per pass (an
         // expert of one token takes the one-row pass of the same kernel)
-        const int     rows    = p.ids && p.ne2 > 1 ? MMH_GEMV_IDS_ROWS : (int) std::min<int64_t>(MMH_GEMV_TOKENS, per_exp);
+        const int     rows    = p.ids && p.ne2 > 1 ? (p.ne2 <= 2 ? MMH_GEMV_IDS_ROWS_2TOK : MMH_GEMV_IDS_ROWS) :
+                                (int) std::min<int64_t>(MMH_GEMV_TOKENS, per_exp);
 
         // k split S = ksplit*kblocks: the power of 2 nearest (in log scale) to the split that gives about
         // MMH_GEMV_WAVES waves, with at least MMH_GEMV_MIN_KSLICES k slices per wave; S >= 2 splits k over 2 waves of
