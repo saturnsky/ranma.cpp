@@ -189,9 +189,10 @@ static bool llama_dsv4_hc_coef_fused_enabled() {
     return enabled;
 }
 
-// Stored batch shapes per context when LLAMA_GRAPH_REUSE_SHAPES is not set: a speculative server uses up to 16
-// verification widths, and the rest leaves room for a second graph variant of a width.
-static constexpr int LLAMA_GRAPH_REUSE_SHAPES_DEFAULT = 24;
+// Stored batch shapes per context when LLAMA_GRAPH_REUSE_SHAPES is not set: a batch shape includes the KV length
+// (padded to 256 cells), so a speculative server needs its verification widths at every length it passes; 64 (the
+// most) keeps the rare widths of a long generation. About 15 MiB of host memory per stored graph.
+static constexpr int LLAMA_GRAPH_REUSE_SHAPES_DEFAULT = 64;
 
 // LLAMA_GRAPH_REUSE_SHAPES, read once per process: 0 = off (one graph per output class, rebuilt on every batch
 // shape change), 1 = on with up to 8 stored batch shapes per context, N > 1 = on with up to N (at most 64).

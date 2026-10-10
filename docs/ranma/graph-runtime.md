@@ -281,8 +281,8 @@ its instantiated graph directly.
 
 | Name | Kind | Default | Effect |
 | --- | --- | --- | --- |
-| `GGML_CUDA_GRAPH_PER_SHAPE` | env | `1` in HIP builds, `0` in CUDA builds | `0` keys the stored graphs by the first node only, the upstream keying; `1` keys them by first node and batch shape with at most 32 graphs per context; `N > 1` allows at most `N` (capped at 256). Read once per process. |
-| `GGML_CUDA_GRAPH_EVICT_SECONDS` | env | `60` | A per-shape graph that was not used for this many seconds is dropped by the sweep that runs every 5 s; `0` drops per-shape graphs only at the per-context bound. Graphs keyed by the first node only (per-shape keying off) keep the upstream 10 s, since nothing else bounds their number. Read once per process. |
+| `GGML_CUDA_GRAPH_PER_SHAPE` | env | `1` in HIP builds, `0` in CUDA builds | `0` keys the stored graphs by the first node only, the upstream keying; `1` keys them by first node and batch shape with at most 96 graphs per context; `N > 1` allows at most `N` (capped at 256). Read once per process. |
+| `GGML_CUDA_GRAPH_EVICT_SECONDS` | env | `0` | A per-shape graph that was not used for this many seconds is dropped by the sweep that runs every 5 s; `0` (the default since 2026-10-10, before: 60) drops per-shape graphs only at the per-context bound. Graphs keyed by the first node only (per-shape keying off) keep the upstream 10 s, since nothing else bounds their number. Read once per process. |
 | `GGML_CUDA_GRAPH_QUICK_CAPTURE` | env | `1` | `1` captures a changed graph at once, without the direct warmup call, when a graph of the same family was captured and replayed in the same context before (see below). Needs the per-shape keying, so it only acts where that is on (HIP builds by default). `0` always warms a changed graph up with a direct call. Read once per process. |
 | `GGML_CUDA_GRAPH_DEFER_FREE` | env | `1` | `1` destroys a graph dropped at the per-context bound after a later graph compute of its context, once an event recorded at the drop shows that the work queued before it has finished; graphs dropped unused by the sweep are destroyed there too. At most one graph is destroyed per compute. `0` destroys them where they are dropped, at the bound after a synchronization of the stream. Read once per process. |
 
@@ -398,11 +398,21 @@ least recently used shape is evicted.
 
 | Name | Kind | Default | Effect |
 | --- | --- | --- | --- |
-| `LLAMA_GRAPH_REUSE_SHAPES` | env | `24` when not set | `0` keeps one graph per output class, the behaviour before this change; `1` keeps up to 8 batch shapes per context; `N > 1` keeps up to `N` (capped at 64). Read once per process. |
+| `LLAMA_GRAPH_REUSE_SHAPES` | env | `64` when not set (before 2026-10-10: 24) | `0` keeps one graph per output class, the behaviour before this change; `1` keeps up to 8 batch shapes per context; `N > 1` keeps up to `N` (capped at 64). Read once per process. |
 
 24 covers the up to 16 verification widths of a speculative server and leaves
 room for a second graph variant of a width (DeepSeek V4 Flash alternates two
 graph plans at some widths).
+
+Since 2026-10-10 the defaults are 64 llama graphs, 96 HIP graphs and no timed sweep. A batch shape
+includes the KV length (padded to 256 cells), so a speculative server needs every verification width
+again at every length it passes; with 24 / 32 / 60 s the rare widths were evicted or swept before they
+came back and were built and captured again (8 + 16 ms of host time each). GLM-5.3 3.05 bpw, smart MTP,
+roleplay-ko preset of 17 requests (one run each): llama graphs built 181 -> 139 (target) and 154 -> 95
+(MTP), HIP graphs dropped unused 108 -> 0, isolated width-2 rounds reusing their graph 21 -> 53 of about
+60, decode 24.39 -> 24.76 t/s, server working set +1.3 GiB (83.7 -> 85.0 GiB; about 15 MiB per stored
+llama graph after the metadata trim, plus the HIP graph instances). Even 64 do not hold every width at
+every length of a long generation (75 / 30 evictions in that run).
 
 ### Limits
 

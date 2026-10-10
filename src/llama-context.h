@@ -466,7 +466,7 @@ private:
     // env: LLAMA_GRAPH_REUSE_SHAPES - keep the built graphs of up to this many batch shapes, each with its split
     // and allocation in a graph slot of the scheduler, so that a batch shape seen before reuses its graph instead of
     // building, splitting and allocating it again. 0 = one graph per output class (gf_res_prev). Default when the
-    // variable is not set: 24.
+    // variable is not set: 64.
     struct gf_res_shape {
         llm_graph_result_ptr res;
         bool     allocated = false; // built and allocated by the scheduler, not reset since
