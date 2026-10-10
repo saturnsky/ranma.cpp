@@ -67,6 +67,8 @@ enum ub_pool_counter : int {
     ub_pool_evictions,     // filled positions whose previous owner left
     ub_pool_steps,         // step launches with r > 0
     ub_pool_rejected,      // admissible misses the admission filter turned away
+    ub_pool_pf_fills,      // fills whose copy read a prefetch staging slot
+    ub_pool_pf_arrived,    // staging slots whose generation matched at the step
     ub_pool_n_counters,
 };
 
@@ -103,7 +105,105 @@ struct ub_pool_live {
 struct ub_pool_copy {
     int32_t expert;
     int32_t pos;     // absolute position index
+    int32_t pf;      // prefetch staging slot (set*slots + j) the copy reads instead of the home, -1 = none
 };
+
+// ---- prefetch (RANMA_EXPERT_PREFETCH) ------------------------------------------------------------
+//
+// Two modes (RANMA_EXPERT_PREFETCH_MODE).
+//
+// inplace (default): the copy engine writes straight into positions of the pool. The publish kernel of
+// layer T (after the predictor, on the compute stream, so before T's step and matmuls) first settles
+// the layer's earlier reservations (below), then picks up to budget[T][rows] predicted experts that are
+// admissible, not pooled and not reserved, and reserves as many positions at the tail of the layer's
+// LRU (an unfinished earlier reservation first, then empty, then the oldest stamp): an owner's entries
+// go back to its home, and the position becomes "pending (expert, generation)". The mailbox lists the
+// (position, expert) pairs; the host thread copies each expert's up and gate into the position, writes
+// the position's first done word = generation, then copies the down kind and writes the second. The
+// down matmul runs after the up/gate matmuls, so the down copy has that much longer. Settling a pending
+// position (the step and the publish do it, one thread, before anything else of the layer): the first
+// done word == generation means up and gate are complete; the position becomes the expert's (its up and
+// gate entries published, stamp = previous step) unless the expert has a position already; its down
+// entry is published once the second done word matches (at once, by the settle kernel before the down
+// matmul, or at a later settle); until then the down reads its home. A position with a copy still due
+// (pending, or owned with the down pending) is never a victim of an ordinary fill (the copy engine may
+// still write it); only a later reservation reuses a pending one, and all copies go through one in-order
+// stream, so the last reservation's bytes and done words are what remain. A routed miss of a pending
+// expert is an ordinary miss. Before a reclaim the controller stops issuing and the compute stream waits for the
+// copy stream, so no copy lands in a reclaimed region; the reclaim empties pending positions.
+//
+// fill: staging slots outside the pool, see below.
+//
+// A copy engine (SDMA) prefetch of the experts a device prediction names for the next routed layer,
+// into staging slots outside the pool; the step kernel turns a staged expert into an ordinary fill
+// whose copy reads the staging slot instead of the host home. Nothing else changes: the address
+// tables only ever point at a position or a home, as without the prefetch.
+//
+// Per prediction a one-thread publish kernel on the compute stream (after the predictor of layer T)
+// bumps the layer's generation (seq << 6 | T), stores it as the layer's expected generation and
+// publishes the predicted ids into a mapped mailbox. A host thread polls the mailboxes and, on the
+// copy stream, first invalidates the generation word of every slot it is going to overwrite, then
+// copies the three kinds of each chosen expert from its host home into the slot (the position
+// layout), then writes the slot's owner and, last, its generation. Staging slots are a ring of
+// `ring` sets of `slots`, set T % ring for layer T.
+//
+// The step of layer T reads the generation of every slot of its set: a slot whose generation equals
+// the layer's expected one holds the complete bytes of its owner. A routed miss that is such an owner
+// is admitted ahead of the other misses and without the admission filter, and its copy reads the
+// slot (VRAM) instead of the home. Any mismatch (late, wrong prediction, stale slot) leaves the miss
+// to the ordinary rules, so the result never depends on the timing. The step also writes, into
+// mapped memory, its clock, the slots that had arrived and were taken, and the experts the pool
+// holds after it, for the host's budget.
+
+static constexpr int ub_pf_max_slots = 8;
+static constexpr int ub_pf_max_rows  = 8;
+static constexpr int ub_pf_max_k     = 16;
+
+struct ub_pf_mail {             // mapped host memory, one per layer; written by the publish kernel
+    uint32_t gen;               // last: the host reads the rest after it changed
+    int32_t  n_rows;
+    int32_t  k;
+    int32_t  n_res;             // inplace: reserved positions
+    int32_t  res_q[ub_pf_max_slots];   // inplace: absolute position index
+    int32_t  res_e[ub_pf_max_slots];   // inplace: expert
+    uint64_t t_pub;             // device wall clock at the publish
+    int32_t  ids[ub_pf_max_rows*ub_pf_max_k];
+};
+
+struct ub_pf_stat {             // mapped host memory, one per layer; written by the step kernel
+    uint32_t gen;               // last: the expected generation of the step that wrote the record
+    uint32_t arrived;           // slots whose generation matched
+    uint32_t taken;             // slots whose owner was filled from the slot
+    uint32_t n_rows;
+    uint64_t t_step;            // device wall clock at the step
+    uint32_t pooled[ub_pool_max_experts/32];   // the experts in the layer's positions after the step
+};
+
+struct ub_pf_dev {              // device state of the prefetch, passed to the step and copy kernels
+    const uint32_t * gen;       // [ring*slots] generation of each staging slot (written by the copy engine)
+    const int32_t *  owner;     // [ring*slots]
+    uint32_t *       expect;    // [L] expected generation of the layer's last publish
+    uint32_t *       seq;       // [L]
+    char *           staging;   // [ring*slots][slot_bytes]
+    ub_pf_stat *     stat;      // [L] mapped
+    ub_pf_mail *     mail;      // [L] mapped
+    uint64_t         slot_bytes;
+    int32_t          ring;
+    int32_t          slots;
+    int32_t          inplace;   // mode inplace (else fill)
+    int32_t          pad;
+    int32_t *        pend_e;    // inplace [P] expert of a pending position
+    uint32_t *       pend_gen;  // inplace [P] its generation
+    const uint32_t * done;      // inplace [P][2] generation whose copy finished: [0] up and gate, [1] down (copy engine)
+    uint32_t *       pdown;     // inplace [P] generation of an owned position whose down copy is still due, 0
+    int32_t *        res_q;     // inplace [L][slots] positions reserved by the layer's last publish
+    int32_t *        res_e;     // inplace [L][slots]
+    int32_t *        res_n;     // inplace [L]
+    const int32_t *  budget;    // inplace [L][3] mapped: positions to reserve per publish of 1, 2-3, 4+ rows (host writes)
+};
+
+static constexpr int32_t ub_pending = -2;   // owner of a position reserved by the inplace prefetch
+
 
 class ub_pool {
 public:
@@ -143,6 +243,25 @@ public:
         uint32_t * prof_counts = nullptr, size_t prof_bank_stride = 0, uint32_t prof_n_banks = 0,
         const profile_selection * prof_selection = nullptr);
     void launch_copy(int layer, cudaStream_t stream);
+
+    // Prefetch staging (see above): once, after allocate and before any graph capture. `ring` sets of
+    // `slots` staging slots of the largest position. False (and no prefetch) when it cannot allocate.
+    bool enable_prefetch(int ring, int slots, bool inplace);
+    bool prefetch_on() const { return pf_.staging != nullptr; }
+    // inplace: before the down matmul of `layer` (after its up/gate matmuls), on the compute stream: the down
+    // kinds whose copy finished since the step are published.
+    void launch_settle_down(int layer, cudaStream_t stream);
+    // The publish of layer `layer`'s prediction (ids: n_rows rows of k, row_stride apart), on the compute stream.
+    void launch_publish(int layer, const int32_t * ids, int n_rows, int row_stride, int k, cudaStream_t stream);
+    const ub_pf_dev & prefetch() const { return pf_; }
+    ub_pf_mail * pf_mail_host() const { return h_pf_mail_; }
+    ub_pf_stat * pf_stat_host() const { return h_pf_stat_; }
+    int32_t * pf_budget_host() const { return h_pf_budget_; }
+    // inplace: device address of kind `kind` of absolute position q of the current lend (host mirror of the lend)
+    uint64_t pos_kind_address(int q, int kind) const { return h_addr_[size_t(q)*3 + (size_t) kind]; }
+    // Device address of kind `kind` of staging slot (set, j) laid out for layer `layer`.
+    char * pf_kind_address(int layer, int set, int j, int kind) const;
+    size_t kind_bytes(int layer, int kind) const { return kind_bytes_[(size_t) layer][(size_t) kind]; }
 
     // Device must be idle (or `stream` synchronized by the caller). Cumulative since allocate.
     bool read_counters(std::array<uint64_t, ub_pool_n_counters> & out) const;
@@ -188,6 +307,15 @@ private:
     unsigned long long * h_counters_ = nullptr;   // read_counters
     ub_pool_live *  h_live_ = nullptr;   // [L] mapped host memory, null when it could not be allocated
     ub_pool_live *  d_live_ = nullptr;   // its device address
+
+    // prefetch staging
+    ub_pf_dev       pf_{};
+    void *          pf_alloc_ = nullptr;  // gen, owner, expect, seq
+    char *          pf_staging_ = nullptr;
+    ub_pf_stat *    h_pf_stat_ = nullptr;
+    ub_pf_mail *    h_pf_mail_ = nullptr;
+    int32_t *       h_pf_budget_ = nullptr;
+    void *          pf_in_alloc_ = nullptr;   // inplace: pend_e, pend_gen, done, res_q, res_e, res_n
 };
 
 } // namespace ggml_cuda_expert
