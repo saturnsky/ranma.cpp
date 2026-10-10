@@ -10,6 +10,9 @@ positions, each holding a copy of one expert whose home is host memory (inclusiv
 that reaches into the lent region (a prompt ubatch, a large catch-up), the pool takes the region
 back in stream order, and the next small graph lends it again.
 
+`RANMA_EXPERT_PREFETCH` (experimental, GLM-5.3 Flash) fills pool positions with predicted experts before their
+layer runs: [expert-prefetch.md](expert-prefetch.md).
+
 It is always on with the expert cache. Nothing moves
 either way: an L1 resident stays where it is, the static plan does not change, and an expert in a
 position is still in its host home. The pool changes only which address a matmul reads, so the
