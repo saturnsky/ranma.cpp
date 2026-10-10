@@ -454,7 +454,7 @@ static void build_dspark_markov_head(llm_graph_context & g, const llama_model & 
             ggml_tensor * conf_inp_i = ggml_view_2d(ctx0, conf_inp, conf_inp->ne[0], n_blocks,
                                                     (size_t) block_drafts * conf_inp->nb[1], i*conf_inp->nb[1]);
             ggml_tensor * feat = ggml_concat(ctx0, ggml_cont(ctx0, conf_inp_i), w1_prev, 0);
-            ggml_tensor * conf = ggml_mul_mat(ctx0, model.dspark_conf_proj, feat);
+            ggml_tensor * conf = g.build_mm(model.dspark_conf_proj, feat);
             if (model.dspark_conf_proj_b) {
                 conf = ggml_add(ctx0, conf, model.dspark_conf_proj_b);
             }
