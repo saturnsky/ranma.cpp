@@ -114,6 +114,10 @@ bool ggml_is_exl3_row(enum ggml_type type) {
     return type >= GGML_TYPE_EXL3R_M1 && type <= GGML_TYPE_EXL3R_M8;
 }
 
+bool ggml_is_row_gather_only(enum ggml_type type) {
+    return ggml_is_exl3_row(type) || type == GGML_TYPE_MXFP8;
+}
+
 static void ggml_exl3r_dequantize(const uint8_t * x, float * y, int64_t k, int bits) {
     enum { ROW = 160 };
     GGML_ASSERT(k % ROW == 0);

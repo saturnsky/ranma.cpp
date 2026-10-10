@@ -2601,6 +2601,61 @@ struct test_get_rows_exl3r : public test_case {
     }
 };
 
+// GGML_OP_GET_ROWS on a GGML_TYPE_MXFP8 table (DeepSeek V4.1 engram rows: 256 E4M3 values + 8 E8M0 scales per block)
+struct test_get_rows_mxfp8 : public test_case {
+    const int n; // values per row (a multiple of 256)
+    const int m; // table rows
+    const int r; // gathered rows
+
+    std::string vars() override {
+        return VARS_TO_STR3(n, m, r);
+    }
+
+    test_get_rows_mxfp8(int n = 256, int m = 64, int r = 32)
+        : n(n), m(m), r(r) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * in = ggml_new_tensor_2d(ctx, GGML_TYPE_MXFP8, n, m);
+        ggml_set_name(in, "in");
+        ggml_tensor * rows = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, r);
+        ggml_set_name(rows, "rows");
+        ggml_tensor * out = ggml_get_rows(ctx, in, rows);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 rng(1234);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->type == GGML_TYPE_I32) {
+                std::vector<int> data(ggml_nelements(t));
+                for (size_t i = 0; i < data.size(); i++) {
+                    data[i] = rng() % m;
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size() * sizeof(int));
+            } else if (t->type == GGML_TYPE_MXFP8) {
+                std::vector<uint8_t> data(ggml_nbytes(t));
+                const size_t block = ggml_type_size(t->type); // 256 E4M3 values, then 8 E8M0 scales
+                for (size_t off = 0; off < data.size(); off += block) {
+                    for (size_t j = 0; j < 256; ++j) {
+                        uint8_t b = (uint8_t) rng();
+                        if ((b & 0x7F) == 0x7F) { // E4M3 NaN
+                            b ^= 0x01;
+                        }
+                        data[off + j] = b;
+                    }
+                    for (size_t j = 256; j < block; ++j) {
+                        data[off + j] = (uint8_t) (110 + rng() % 30); // E8M0 scale, 2^-17 .. 2^12
+                    }
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size());
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // GGML_OP_GET_ROWS_BACK
 struct test_get_rows_back : public test_case {
     const ggml_type type;
@@ -12245,6 +12300,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
     test_cases.emplace_back(new test_get_rows_exl3r(GGML_TYPE_EXL3R_M5, 320, 50, 7));
     test_cases.emplace_back(new test_get_rows_exl3r(GGML_TYPE_EXL3R_M6, 160, 5000, 16*512, 16));
+
+    // MXFP8 rows as stored by the DeepSeek V4.1 engram tables (256 values = 8 blocks)
+    test_cases.emplace_back(new test_get_rows_mxfp8(256, 64, 32));
+    test_cases.emplace_back(new test_get_rows_mxfp8(256, 5000, 8*64));
+    test_cases.emplace_back(new test_get_rows_mxfp8(512, 50, 7));
 
     // MUL_MAT_HAD: EXL3 types, F16/F32 weights and other Hadamard sizes, ids with duplicates and broadcast b,
     // batched and broadcast b without ids, 128-row views, zero-padded K/N; src1 precision F32 and F16

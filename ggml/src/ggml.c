@@ -758,6 +758,14 @@ static const struct ggml_type_traits type_traits[GGML_TYPE_COUNT] = {
         .to_float                 = (ggml_to_float_t) dequantize_row_mxfp4,
         .from_float_ref           = (ggml_from_float_t)quantize_row_mxfp4_ref,
     },
+    // layout of upstream PR #26157; id moves to upstream's when it merges. Rows are gathered, never multiplied
+    [GGML_TYPE_MXFP8] = {
+        .type_name                = "mxfp8",
+        .blck_size                = QK_MXFP8,
+        .type_size                = sizeof(block_mxfp8),
+        .is_quantized             = true,
+        .to_float                 = (ggml_to_float_t) dequantize_row_mxfp8,
+    },
     [GGML_TYPE_NVFP4] = {
         .type_name                = "nvfp4",
         .blck_size                = QK_NVFP4,
@@ -3582,7 +3590,7 @@ struct ggml_tensor * ggml_mul_mat(
     GGML_ASSERT(ggml_can_mul_mat(a, b));
     GGML_ASSERT(!ggml_is_transposed(a));
     GGML_ASSERT(!ggml_is_exl3(a->type) && "EXL3 weights need ggml_mul_mat_had");
-    GGML_ASSERT(!ggml_is_exl3_row(a->type) && "EXL3 row codec tables are read with ggml_get_rows");
+    GGML_ASSERT(!ggml_is_row_gather_only(a->type) && "EXL3 row codec and MXFP8 tables are read with ggml_get_rows");
 
     const int64_t ne[4] = { a->ne[1], b->ne[1], b->ne[2], b->ne[3] };
     struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
@@ -3635,7 +3643,7 @@ struct ggml_tensor * ggml_mul_mat_id(
         struct ggml_tensor  * ids) {
     GGML_ASSERT(!ggml_is_transposed(as));
     GGML_ASSERT(!ggml_is_exl3(as->type) && "EXL3 weights need ggml_mul_mat_had");
-    GGML_ASSERT(!ggml_is_exl3_row(as->type) && "EXL3 row codec tables are read with ggml_get_rows");
+    GGML_ASSERT(!ggml_is_row_gather_only(as->type) && "EXL3 row codec and MXFP8 tables are read with ggml_get_rows");
     GGML_ASSERT(ids->type == GGML_TYPE_I32);
 
     GGML_ASSERT(as->ne[3] == 1); // as is 3d (one matrix per expert)
