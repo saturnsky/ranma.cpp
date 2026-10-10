@@ -202,6 +202,10 @@ struct ggml_expert_iface {
     int32_t (*compact_rows)(void);
     // The counts of the decode pool; false when it is not allocated. Never waits for the device.
     bool (*pool_counts)(struct ggml_expert_pool_counts * out);
+    // The expert prefetch (RANMA_EXPERT_PREFETCH): the routed layers whose experts a graph of `n_rows` rows should
+    // predict (bit l of mask[l/64]), for the first model of the cache. Returns a version that changes whenever a
+    // mask changes (a graph built with another version must be rebuilt), 0 when nothing is predicted.
+    uint32_t (*prefetch_layers)(int32_t n_rows, uint64_t * mask, int32_t n_words);
 };
 
 typedef const struct ggml_expert_iface * (*ggml_backend_expert_iface_t)(void);

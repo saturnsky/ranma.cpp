@@ -26,6 +26,10 @@ ggml_cuda_expert_lookup ggml_cuda_expert_lookup_tensor(const ggml_tensor * src0)
 // selected for this compute. No-op unless the cache is installed.
 void ggml_cuda_expert_profile_ids(ggml_backend_cuda_context & ctx, const ggml_tensor * ids);
 
+// The device prediction of a routed layer's experts ("ffn_moe_pred-<layer>", the descending I32 argsort of the
+// predicted router scores, [n_experts, n_rows]) for the expert prefetch (RANMA_EXPERT_PREFETCH). No-op unless on.
+void ggml_cuda_expert_prefetch_publish(ggml_backend_cuda_context & ctx, const ggml_tensor * order);
+
 // The GPU has read the last kind of a routed layer, so the SSD tier may reuse that layer's ring
 // slots. No-op unless the tier is built.
 void ggml_cuda_expert_layer_done(ggml_backend_cuda_context & ctx, const ggml_tensor * src0);

@@ -34,6 +34,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <thread>
 #include <string>
 #include <vector>
 
@@ -1262,6 +1263,7 @@ public:
                 // the graphs of the lending context read the pool on its own stream
                 CUDA_CHECK(cudaStreamSynchronize(ub_stream_));
             }
+            xp_pause_locked(stream);
             ub_reclaim_locked(stream, same ? "a graph reaches into the pool" : "the compute buffer moved");
         }
         if (base == nullptr) {
@@ -1294,6 +1296,7 @@ public:
         }
         const int r = ub_->lend((char *) base + begin, size - begin, stream);
         if (r > 0) {
+            xp_resume_locked();
             ub_owner_     = cctx;
             ub_stream_    = stream;
             ub_begin_     = begin;
@@ -1348,6 +1351,7 @@ public:
             return;
         }
         ggml_cuda_set_device(device_);
+        xp_pause_locked(nullptr);
         CUDA_CHECK(cudaStreamSynchronize(ub_stream_));
         if (verify_all_) {
             std::string reason;
@@ -1372,11 +1376,12 @@ public:
             return;
         }
         GGML_LOG_INFO("expert cache: decode pool counters (%s): lends=%llu reclaims=%llu steps=%llu hits=%llu fills=%llu "
-                      "(%.1f MiB) over=%llu evictions=%llu rejected=%llu\n", why,
+                      "(%.1f MiB) over=%llu evictions=%llu rejected=%llu prefetch_fills=%llu prefetch_arrived=%llu\n", why,
             (unsigned long long) ub_lends_,
             (unsigned long long) ub_reclaims_, (unsigned long long) c[ub_pool_steps], (unsigned long long) c[ub_pool_hits],
             (unsigned long long) c[ub_pool_fills], c[ub_pool_fill_bytes]/1048576.0, (unsigned long long) c[ub_pool_over],
-            (unsigned long long) c[ub_pool_evictions], (unsigned long long) c[ub_pool_rejected]);
+            (unsigned long long) c[ub_pool_evictions], (unsigned long long) c[ub_pool_rejected],
+            (unsigned long long) c[ub_pool_pf_fills], (unsigned long long) c[ub_pool_pf_arrived]);
     }
 
     void allocate_ub_pool_locked() {
@@ -1482,9 +1487,592 @@ public:
         GGML_LOG_INFO("expert cache: decode pool on: %d layers, up to %d positions each, launches of up to %d rows, "
                       "%zu KiB of state, admission filter %s%s%s\n", ub_n_layers_, ub_cfg_.r_cap, ub_rows_,
             ub_->device_bytes()/1024, filter_text, own_tables ? ", own address tables" : "", "");
+        xp_start_locked();
+    }
+
+    // ---- the expert prefetch (RANMA_EXPERT_PREFETCH; expert-ub-pool.cuh "prefetch staging") ----------
+    //
+    // The model publishes, after the output of layer l, a device prediction of the experts of the next
+    // routed layer T (the argsort "ffn_moe_pred-<T>"). Mode inplace (default): the publish kernel reserves LRU
+    // tail positions of T for the best predicted experts and lists them in a mapped mailbox; the relay thread
+    // below copies each expert from its host home into its position with the copy engine (hipMemcpyAsync, then
+    // hipStreamWriteValue32 of the position's done word) and the step of T settles the finished ones into owned
+    // positions, no copy (see the pool). Mode fill: the relay picks the experts and copies them into staging
+    // slots; the step's fill copies from the slot. Before a reclaim the relay stops and the compute stream waits
+    // for its stream; it resumes after the next lend.
+    //
+    // The budget (experts per layer and publish) adapts per layer and row count (1, 2-3, 4+ rows): the step
+    // records its clock and which slots had arrived, so the window (publish -> step) and whether the last
+    // copy made it are known one token later. Cold start: `cold` publishes with no copies (windows only),
+    // then the budget that fits the 10th percentile window under the transfer model (start + b * bytes / bw);
+    // afterwards every `window` publishes: down when fewer than 90 % of the last copies arrived (at once when
+    // the last 8 fall below 75 %), up when at least 98 % arrived and one more expert fits. A window that
+    // changes with the context depth moves the recent samples, so the budget follows it.
+
+    struct xp_config {
+        bool   on = false;
+        bool   inplace = true;
+        int    slots = 4, ring = 4, k = 8, cold = 8, window = 32, test = 0;
+        int    hold = 512, probe = 4096;   // predicted layer set: kept at least `hold` graphs, all layers again every `probe`
+        bool   skip = true;                // layers whose budget is 0 do not predict
+        double bw_gbps = 55.0, start_us = 70.0, margin_us = 10.0;
+        bool   log = false;
+    };
+
+    struct xp_bucket {
+        int b = 0, seen = 0, since = 0;
+        bool init = false;
+        float w[64] = {};      // recent windows, us
+        int8_t ok[64] = {};    // recent: 1 the last issued copy arrived, 0 not, -1 nothing issued
+        int n = 0, at = 0;
+    };
+
+    struct xp_layer {
+        uint32_t last_gen = 0;      // generation of the last publish handled
+        int      issued = 0, bucket = 0;
+        uint64_t t_pub = 0;
+        xp_bucket bk[3];
+        uint64_t n_pub = 0, n_issue = 0, n_arrive = 0, n_take = 0, n_skip_lock = 0;
+    };
+
+    static xp_config xp_config_from_env() {
+        auto num = [](const char * name, double def) {
+            const char * v = getenv(name);
+            return v != nullptr && *v != '\0' ? atof(v) : def;
+        };
+        xp_config c;
+        c.on        = num("RANMA_EXPERT_PREFETCH", 0) != 0;
+        if (const char * m = getenv("RANMA_EXPERT_PREFETCH_MODE"); m != nullptr && *m != '\0') {
+            if (strcmp(m, "fill") == 0) {
+                c.inplace = false;
+            } else if (strcmp(m, "inplace") != 0) {
+                GGML_LOG_WARN("expert cache: RANMA_EXPERT_PREFETCH_MODE='%s' is not inplace or fill; inplace\n", m);
+            }
+        }
+        c.slots     = std::min(std::max((int) num("RANMA_EXPERT_PREFETCH_SLOTS", c.slots), 1), ub_pf_max_slots);
+        c.ring      = std::min(std::max((int) num("RANMA_EXPERT_PREFETCH_RING", c.ring), 2), 16);
+        c.k         = std::min(std::max((int) num("RANMA_EXPERT_PREFETCH_K", c.k), 1), ub_pf_max_k);
+        c.cold      = std::max((int) num("RANMA_EXPERT_PREFETCH_COLD", c.cold), 1);
+        c.window    = std::min(std::max((int) num("RANMA_EXPERT_PREFETCH_WINDOW", c.window), 8), 64);
+        c.test      = (int) num("RANMA_EXPERT_PREFETCH_TEST", 0);
+        c.bw_gbps   = std::max(num("RANMA_EXPERT_PREFETCH_BW_GBPS", c.bw_gbps), 1.0);
+        c.start_us  = std::max(num("RANMA_EXPERT_PREFETCH_START_US", c.start_us), 0.0);
+        c.margin_us = std::max(num("RANMA_EXPERT_PREFETCH_MARGIN_US", c.margin_us), 0.0);
+        c.log       = num("RANMA_EXPERT_PREFETCH_LOG", 0) != 0;
+        c.hold      = std::max((int) num("RANMA_EXPERT_PREFETCH_HOLD", c.hold), 16);
+        c.probe     = std::max((int) num("RANMA_EXPERT_PREFETCH_PROBE", c.probe), c.hold);
+        c.skip      = num("RANMA_EXPERT_PREFETCH_SKIP", 1) != 0;
+        return c;
+    }
+
+    // Once, right after the pool is on (before any graph capture).
+    void xp_start_locked() {
+        xp_cfg_ = xp_config_from_env();
+        if (!xp_cfg_.on) {
+            return;
+        }
+        if (!ub_->enable_prefetch(xp_cfg_.ring, xp_cfg_.slots, xp_cfg_.inplace)) {
+            GGML_LOG_WARN("expert cache: prefetch: staging not allocated; off\n");
+            return;
+        }
+        int khz = 0;
+        if (hipDeviceGetAttribute(&khz, hipDeviceAttributeWallClockRate, device_) != hipSuccess || khz <= 0) {
+            (void) hipGetLastError();
+            khz = 100000;
+        }
+        xp_tick_us_ = 1000.0/(double) khz;
+        CUDA_CHECK(cudaStreamCreateWithFlags(&xp_stream_, cudaStreamNonBlocking));
+        CUDA_CHECK(cudaEventCreateWithFlags(&xp_event_, cudaEventDisableTiming));
+        xp_paused_ = false;
+        xp_l_.assign((size_t) geo_.n_layers, xp_layer{});
+        xp_reset_.assign((size_t) geo_.n_layers*3, 0);
+        xp_layers_.clear();
+        for (int l = 0; l < geo_.n_layers; ++l) {
+            if (ub_layer_[(size_t) l]) {
+                xp_layers_.push_back(l);
+            }
+        }
+        {
+            std::lock_guard<std::mutex> lk(xp_mask_mutex_);
+            for (int b = 0; b < 3; ++b) {
+                xp_profile_[b] = 2;   // every layer learns first
+            }
+            xp_graphs_ = 0;
+            xp_next_eval_ = (uint64_t) xp_cfg_.hold;
+            xp_next_probe_ = (uint64_t) xp_cfg_.probe;
+            xp_mask_changes_ = 0;
+        }
+        xp_stop_.store(false);
+        xp_thread_ = std::thread([this] { xp_loop(); });
+        xp_on_.store(true, std::memory_order_release);
+        GGML_LOG_INFO("expert cache: prefetch on (%s): %d layers, %s %d x %d of %.2f MiB, top %d per row, "
+                      "adaptive budget (start %.0f us, %.0f GB/s, margin %.0f us, cold %d, window %d)%s\n",
+            xp_cfg_.inplace ? "inplace" : "fill", (int) xp_layers_.size(), xp_cfg_.inplace ? "positions per publish up to" : "staging",
+            xp_cfg_.inplace ? 1 : xp_cfg_.ring, xp_cfg_.slots, ub_->prefetch().slot_bytes/1048576.0, xp_cfg_.k,
+            xp_cfg_.start_us, xp_cfg_.bw_gbps, xp_cfg_.margin_us, xp_cfg_.cold,
+            xp_cfg_.window, xp_cfg_.test ? " (test mode)" : "");
+    }
+
+    void xp_stop_locked() {
+        if (!xp_on_.load(std::memory_order_acquire)) {
+            return;
+        }
+        xp_on_.store(false, std::memory_order_release);
+        xp_stop_.store(true);
+        if (xp_thread_.joinable()) {
+            xp_thread_.join();
+        }
+        if (xp_stream_ != nullptr) {
+            (void) cudaStreamSynchronize(xp_stream_);
+            (void) cudaStreamDestroy(xp_stream_);
+            xp_stream_ = nullptr;
+        }
+        if (xp_event_ != nullptr) {
+            (void) cudaEventDestroy(xp_event_);
+            xp_event_ = nullptr;
+        }
+        uint64_t pub = 0, iss = 0, arr = 0, take = 0, skip = 0;
+        std::string budgets;
+        for (int l : xp_layers_) {
+            const xp_layer & s = xp_l_[(size_t) l];
+            pub += s.n_pub; iss += s.n_issue; arr += s.n_arrive; take += s.n_take; skip += s.n_skip_lock;
+            char b[32];
+            snprintf(b, sizeof(b), " %d:%d/%d/%d", l, s.bk[0].b, s.bk[1].b, s.bk[2].b);
+            budgets += b;
+        }
+        GGML_LOG_INFO("expert cache: prefetch: %llu publishes, %llu experts issued, %llu arrived in the window, %llu filled from "
+                      "staging, %llu publishes skipped (busy), %llu profile changes\n", (unsigned long long) pub,
+            (unsigned long long) iss, (unsigned long long) arr, (unsigned long long) take, (unsigned long long) skip,
+            (unsigned long long) xp_mask_changes_);
+        if (xp_cfg_.log) {
+            GGML_LOG_INFO("expert cache: prefetch budgets (layer:1/2-3/4+ rows):%s\n", budgets.c_str());
+        }
+    }
+
+    // ggml_expert_iface::prefetch_layers: the layers a graph of n_rows rows predicts, as one of three profiles per row
+    // bucket (1, 2-3, 4+ rows): 0 none, 1 the MLA layers (joint layer % 4 == 3), 2 every pool layer. The profile is the
+    // graph's reuse key, so each (shape, profile) graph is built once and picked again later. Called by the compute
+    // thread for every graph's parameters, so the calls are the clock: a profile is kept at least `hold` calls; then it
+    // is 2 when at least a quarter of the KDA layers still learn or have a budget, else 1 when an MLA layer does, else 0;
+    // every `probe` calls it is 2 again and the zero budgets start over.
+    static int xp_profile_has(int profile, int layer) {
+        return profile == 2 || (profile == 1 && layer % 4 == 3);
+    }
+
+    uint32_t prefetch_layers(int32_t n_rows, uint64_t * mask, int32_t n_words) {
+        if (!xp_on_.load(std::memory_order_acquire) || mask == nullptr || n_words <= 0) {
+            return 0;
+        }
+        std::lock_guard<std::mutex> lk(xp_mask_mutex_);
+        ++xp_graphs_;
+        if (xp_cfg_.skip && xp_graphs_ >= xp_next_eval_) {
+            xp_next_eval_ = xp_graphs_ + (uint64_t) xp_cfg_.hold;
+            const bool probe = xp_graphs_ >= xp_next_probe_;
+            if (probe) {
+                xp_next_probe_ = xp_graphs_ + (uint64_t) xp_cfg_.probe;
+            }
+            for (int b = 0; b < 3; ++b) {
+                int kda = 0, kda_on = 0, mla_on = 0;
+                for (int l : xp_layers_) {
+                    // read without the relay's ordering: a stale value only delays the change by one evaluation
+                    xp_bucket & bk = xp_l_[(size_t) l].bk[b];
+                    const bool on = !bk.init || bk.b > 0;
+                    if (l % 4 == 3) {
+                        mla_on += on;
+                    } else {
+                        ++kda;
+                        kda_on += on;
+                    }
+                    if (probe && bk.init && bk.b == 0) {
+                        xp_reset_[(size_t) l*3 + b] = 1;   // the relay restarts this bucket's learning
+                    }
+                }
+                const int prof = probe || (kda > 0 && 4*kda_on >= kda) ? 2 : mla_on > 0 ? 1 : 0;
+                if (prof != xp_profile_[b]) {
+                    xp_profile_[b] = prof;
+                    ++xp_mask_changes_;
+                    if (xp_cfg_.log) {
+                        GGML_LOG_INFO("expert cache: prefetch: %s rows predict profile %d (KDA %d/%d, MLA %d; after %llu graphs%s)\n",
+                            b == 0 ? "1" : b == 1 ? "2-3" : "4+", prof, kda_on, kda, mla_on, (unsigned long long) xp_graphs_,
+                            probe ? ", probe" : "");
+                    }
+                }
+            }
+        }
+        const int b = n_rows <= 1 ? 0 : n_rows <= 3 ? 1 : 2;
+        const int prof = xp_profile_[b];
+        uint64_t m[2] = { 0, 0 };
+        const int moff = members_[ub_member_].offset;
+        for (int l : xp_layers_) {
+            const int ml = l - moff;
+            if (ml >= 0 && ml < 128 && xp_profile_has(prof, l)) {
+                m[ml/64] |= 1ull << (ml%64);
+            }
+        }
+        for (int w = 0; w < n_words; ++w) {
+            mask[w] = w < 2 ? m[w] : 0;
+        }
+        return 1 + (uint32_t) prof;   // the reuse key: one graph per (shape, profile)
+    }
+
+    // inplace: after an up/gate matmul of a routed layer, before its down matmul.
+    void xp_layer_done(ggml_backend_cuda_context & ctx, const ggml_tensor * src0) {
+        if (!xp_on_.load(std::memory_order_acquire) || !xp_cfg_.inplace || src0 == nullptr || ctx.device != device_) {
+            return;
+        }
+        int layer = -1, kind = -1;
+        if (!resolve(src0, layer, kind) || kind == 2 || layer < 0 || layer >= geo_.n_layers || !ub_layer_[(size_t) layer] ||
+                member_of(&ctx) != ub_member_) {
+            return;
+        }
+        ub_->launch_settle_down(layer, ctx.stream());
+    }
+
+    // Before a reclaim: no further copies, and `stream` (null: the host) waits for the issued ones, so that no copy
+    // lands in a region the compute takes back. The lock is the relay's issue section.
+    void xp_pause_locked(cudaStream_t stream) {
+        if (!xp_on_.load(std::memory_order_acquire)) {
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> lk(xp_issue_mutex_);
+            xp_paused_ = true;
+        }
+        if (stream != nullptr) {
+            CUDA_CHECK(cudaEventRecord(xp_event_, xp_stream_));
+            CUDA_CHECK(cudaStreamWaitEvent(stream, xp_event_, 0));
+        } else {
+            CUDA_CHECK(cudaStreamSynchronize(xp_stream_));
+        }
+    }
+
+    void xp_resume_locked() {
+        if (!xp_on_.load(std::memory_order_acquire)) {
+            return;
+        }
+        std::lock_guard<std::mutex> lk(xp_issue_mutex_);
+        xp_paused_ = false;
+    }
+
+    // The publish after the predictor of layer T (`order`: "ffn_moe_pred-<l>", I32 argsort [n_experts, n_rows],
+    // descending). On the compute stream; no mutex (like the pool's step).
+    void xp_publish(ggml_backend_cuda_context & ctx, const ggml_tensor * order) {
+        if (!xp_on_.load(std::memory_order_acquire) || order->type != GGML_TYPE_I32 || ctx.device != device_) {
+            return;
+        }
+        static constexpr const char prefix[] = "ffn_moe_pred-";
+        char * end = nullptr;
+        const long layer = strtol(order->name + sizeof(prefix) - 1, &end, 10);
+        if (end == order->name + sizeof(prefix) - 1 || *end != '\0' || layer < 0) {
+            return;
+        }
+        const int member = member_of(&ctx);
+        if (member != ub_member_ || layer >= members_[member].geo.n_layers) {
+            return;
+        }
+        const long joint = members_[member].offset + layer;
+        if (joint < 0 || joint >= geo_.n_layers || !ub_layer_[(size_t) joint] || order->ne[1] > std::min<int64_t>(ub_rows_, ub_pf_max_rows) ||
+                order->ne[2] != 1 || order->nb[0] != sizeof(int32_t)) {
+            return;
+        }
+        ub_->launch_publish((int) joint, (const int32_t *) order->data, (int) order->ne[1], (int) (order->nb[1]/sizeof(int32_t)),
+            (int) std::min<int64_t>(xp_cfg_.k, order->ne[0]), ctx.stream());
+    }
+
+    // Budget of layer T for a publish of `bucket` rows; `s` is updated by xp_learn.
+    int xp_budget(int T, xp_bucket & bk) {
+        const int cap = xp_cfg_.slots;
+        ++bk.seen;
+        if (bk.seen <= xp_cfg_.cold || bk.n < 4) {
+            return 0;
+        }
+        const double us_per_expert = (double) ub_->prefetch().slot_bytes/(xp_cfg_.bw_gbps*1e3);
+        auto w10 = [&bk]() {
+            float v[64];
+            const int n = bk.n;
+            for (int i = 0; i < n; ++i) { v[i] = bk.w[i]; }
+            std::sort(v, v + n);
+            return (double) v[n/10];
+        };
+        // the step needs up and gate (2/3 of an expert) of the last copy; the down kind has until the down matmul
+        auto fits = [&](int b) {
+            const double need = xp_cfg_.inplace ? (b - 1.0/3.0)*us_per_expert : b*us_per_expert;
+            return xp_cfg_.start_us + need <= w10() - xp_cfg_.margin_us;
+        };
+        if (!bk.init) {
+            bk.init = true;
+            int b = 0;
+            while (b < cap && fits(b + 1)) { ++b; }
+            bk.b = b;
+            bk.since = 0;
+            return bk.b;
+        }
+        ++bk.since;
+        // arrival rate of the last copy over the recent publishes that issued the current budget
+        auto rate = [&bk](int last) {
+            int n = 0, ok = 0;
+            for (int i = 0; i < std::min(last, bk.n); ++i) {
+                const int8_t o = bk.ok[(bk.at - 1 - i + 64) % 64];
+                if (o >= 0) { ++n; ok += o; }
+            }
+            return n == 0 ? -1.0 : (double) ok/n;
+        };
+        const double r8 = rate(8);
+        if (bk.b > 0 && r8 >= 0.0 && r8 < 0.75) {
+            --bk.b;
+            bk.since = 0;
+        } else if (bk.since >= xp_cfg_.window) {
+            const double r = rate(xp_cfg_.window);
+            if (bk.b > 0 && r >= 0.0 && r < 0.90) {
+                --bk.b;
+            } else if (bk.b < cap && (bk.b == 0 || r >= 0.98) && fits(bk.b + 1)) {
+                ++bk.b;
+            }
+            bk.since = 0;
+        }
+        GGML_UNUSED(T);
+        return bk.b;
+    }
+
+    // The step record of the previous publish of layer T (stat.gen == its generation): window and arrivals.
+    void xp_learn(int T, xp_layer & s, const ub_pf_stat & st) {
+        const uint32_t sg = __atomic_load_n(&st.gen, __ATOMIC_ACQUIRE);
+        if (s.last_gen == 0 || sg != s.last_gen) {
+            return;
+        }
+        xp_bucket & bk = s.bk[s.bucket];
+        const double w = (double) (st.t_step - s.t_pub)*xp_tick_us_;
+        const uint32_t mask = s.issued > 0 ? (1u << s.issued) - 1 : 0;
+        bk.w[bk.at] = (float) w;
+        bk.ok[bk.at] = s.issued == 0 ? -1 : (int8_t) ((st.arrived >> (s.issued - 1)) & 1);
+        bk.at = (bk.at + 1) % 64;
+        bk.n = std::min(bk.n + 1, 64);
+        s.n_arrive += (uint64_t) __builtin_popcount(st.arrived & mask);
+        s.n_take   += (uint64_t) __builtin_popcount(st.taken & mask);
+        s.last_gen = 0;
+        GGML_UNUSED(T);
+    }
+
+    void xp_handle(int T, uint32_t gen, const ub_pf_mail & m, const ub_pf_stat & st) {
+        xp_layer & s = xp_l_[(size_t) T];
+        for (int b = 0; b < 3; ++b) {
+            uint8_t & r = xp_reset_[(size_t) T*3 + b];
+            if (__atomic_load_n(&r, __ATOMIC_ACQUIRE)) {
+                __atomic_store_n(&r, (uint8_t) 0, __ATOMIC_RELEASE);
+                s.bk[b] = xp_bucket{};
+            }
+        }
+        xp_learn(T, s, st);
+        const int rows = std::min(std::max(m.n_rows, 0), ub_pf_max_rows);
+        const int k    = std::min(std::max(m.k, 0), ub_pf_max_k);
+        const int bucket = rows <= 1 ? 0 : rows <= 3 ? 1 : 2;
+        int b = xp_budget(T, s.bk[bucket]);
+        ++s.n_pub;
+        s.t_pub  = m.t_pub;
+        s.bucket = bucket;
+        s.issued = 0;
+        s.last_gen = gen;
+        if (xp_cfg_.inplace) {
+            // the device reserved with the budget of the previous publish; this one sets the next
+            ub_->pf_budget_host()[T*3 + bucket] = b;
+            xp_copy_inplace(T, gen, m, s);
+            return;
+        }
+        if (b <= 0 || rows == 0 || k == 0) {
+            return;
+        }
+        // candidates: the predicted experts by rank summed over the rows, without L1 residents and the experts
+        // the layer's positions held at its last step
+        const int E = geo_.n_experts;
+        std::vector<int> score((size_t) E, 0);
+        for (int r = 0; r < rows; ++r) {
+            for (int i = 0; i < k; ++i) {
+                const int e = m.ids[r*ub_pf_max_k + i];
+                if ((unsigned) e < (unsigned) E) {
+                    score[(size_t) e] += k - i;
+                }
+            }
+        }
+        std::vector<int> cand;
+        for (int e = 0; e < E; ++e) {
+            if (score[(size_t) e] > 0 && !((st.pooled[e/32] >> (e%32)) & 1u)) {
+                cand.push_back(e);
+            }
+        }
+        std::stable_sort(cand.begin(), cand.end(), [&score](int a, int c) { return score[(size_t) a] > score[(size_t) c]; });
+        if (xp_cfg_.test == 2) {
+            // test: a wrong prediction (the lowest-ranked candidates first)
+            std::reverse(cand.begin(), cand.end());
+        }
+        struct pick_t { int e; const void * src[3]; };
+        std::vector<pick_t> pick;
+        {
+            std::unique_lock<std::mutex> lock(mutex_, std::defer_lock);
+            const auto t0 = std::chrono::steady_clock::now();
+            while (!lock.try_lock()) {
+                if (std::chrono::steady_clock::now() - t0 > std::chrono::microseconds(50)) {
+                    ++s.n_skip_lock;
+                    return;
+                }
+                std::this_thread::yield();
+            }
+            if (!l1_ || (size_t) T >= l1_->host_slots().size()) {
+                return;
+            }
+            const std::vector<int32_t> & vram = l1_->host_slots()[(size_t) T];
+            const auto & homes = l1_->locations()[(size_t) T];
+            for (int e : cand) {
+                if ((int) pick.size() >= b) {
+                    break;
+                }
+                if (vram[(size_t) e] >= 0 || homes[(size_t) e].storage != expert_storage::host) {
+                    continue;
+                }
+                pick_t p{ e, { nullptr, nullptr, nullptr } };
+                bool ok = true;
+                for (int kind = 0; kind < geometry::n_kinds && ok; ++kind) {
+                    p.src[kind] = l1_->host_address(T, kind, e);
+                    ok = p.src[kind] != nullptr;
+                }
+                if (ok) {
+                    pick.push_back(p);
+                }
+            }
+        }
+        if (pick.empty()) {
+            return;
+        }
+        if (xp_cfg_.test == 3) {
+            // test: a late copy (arrives after the step)
+            std::this_thread::sleep_for(std::chrono::milliseconds(3));
+        }
+        const ub_pf_dev & pf = ub_->prefetch();
+        const int set = T % pf.ring;
+        cudaStream_t st_ = xp_stream_;
+        bool ok = true;
+        for (size_t j = 0; j < pick.size(); ++j) {
+            uint32_t * g = const_cast<uint32_t *>(pf.gen) + set*pf.slots + (int) j;
+            ok = ok && hipStreamWriteValue32(st_, g, 0, 0) == hipSuccess;
+        }
+        for (size_t j = 0; j < pick.size() && ok; ++j) {
+            for (int kind = 0; kind < geometry::n_kinds && ok; ++kind) {
+                ok = cudaMemcpyAsync(ub_->pf_kind_address(T, set, (int) j, kind), pick[j].src[kind], ub_->kind_bytes(T, kind),
+                    cudaMemcpyHostToDevice, st_) == cudaSuccess;
+            }
+            int32_t * o = const_cast<int32_t *>(pf.owner) + set*pf.slots + (int) j;
+            ok = ok && hipStreamWriteValue32(st_, o, (uint32_t) pick[j].e, 0) == hipSuccess;
+        }
+        const uint32_t mark = xp_cfg_.test == 1 ? gen ^ 0x80u : gen;   // test 1: a generation that never matches
+        for (size_t j = 0; j < pick.size() && ok; ++j) {
+            uint32_t * g = const_cast<uint32_t *>(pf.gen) + set*pf.slots + (int) j;
+            ok = hipStreamWriteValue32(st_, g, mark, 0) == hipSuccess;
+        }
+        (void) hipStreamQuery(st_);
+        if (!ok) {
+            (void) cudaGetLastError();
+            return;
+        }
+        s.issued = (int) pick.size();
+        s.n_issue += (uint64_t) pick.size();
+    }
+
+    // inplace: copy the reserved (position, expert) pairs of the mailbox, then each position's done word.
+    void xp_copy_inplace(int T, uint32_t gen, const ub_pf_mail & m, xp_layer & s) {
+        const int n = std::min(std::max(m.n_res, 0), ub_pf_max_slots);
+        if (n == 0) {
+            return;
+        }
+        struct pick_t { int q; int e; const void * src[3]; };
+        pick_t pick[ub_pf_max_slots];
+        int np = 0;
+        {
+            std::unique_lock<std::mutex> lock(mutex_, std::defer_lock);
+            const auto t0 = std::chrono::steady_clock::now();
+            while (!lock.try_lock()) {
+                if (std::chrono::steady_clock::now() - t0 > std::chrono::microseconds(50)) {
+                    ++s.n_skip_lock;
+                    return;   // the positions stay pending; a later publish reserves them again
+                }
+                std::this_thread::yield();
+            }
+            if (!l1_) {
+                return;
+            }
+            for (int j = 0; j < n; ++j) {
+                pick_t p{ m.res_q[j], m.res_e[j], { nullptr, nullptr, nullptr } };
+                if ((unsigned) p.e >= (unsigned) geo_.n_experts) {
+                    continue;
+                }
+                bool ok = true;
+                for (int kind = 0; kind < geometry::n_kinds && ok; ++kind) {
+                    p.src[kind] = l1_->host_address(T, kind, p.e);
+                    ok = p.src[kind] != nullptr;
+                }
+                if (ok) {
+                    pick[np++] = p;
+                }
+            }
+        }
+        if (xp_cfg_.test == 3) {
+            // test: a late copy (finishes after the step)
+            std::this_thread::sleep_for(std::chrono::milliseconds(3));
+        }
+        std::lock_guard<std::mutex> lk(xp_issue_mutex_);
+        if (xp_paused_) {
+            return;
+        }
+        const ub_pf_dev & pf = ub_->prefetch();
+        cudaStream_t st_ = xp_stream_;
+        bool ok = true;
+        int issued = 0;
+        // test 1: done words that never match (the positions stay pending)
+        const uint32_t mark = xp_cfg_.test == 1 ? gen ^ 0x40u : gen;
+        for (int j = 0; j < np && ok; ++j) {
+            // up and gate, their done word, then down and its own: the down matmul comes later
+            for (int kind = 0; kind < 2 && ok; ++kind) {
+                ok = cudaMemcpyAsync((void *) (uintptr_t) ub_->pos_kind_address(pick[j].q, kind), pick[j].src[kind],
+                    ub_->kind_bytes(T, kind), cudaMemcpyHostToDevice, st_) == cudaSuccess;
+            }
+            ok = ok && hipStreamWriteValue32(st_, const_cast<uint32_t *>(pf.done) + size_t(pick[j].q)*2, mark, 0) == hipSuccess;
+        }
+        for (int j = 0; j < np && ok; ++j) {
+            ok = cudaMemcpyAsync((void *) (uintptr_t) ub_->pos_kind_address(pick[j].q, 2), pick[j].src[2],
+                ub_->kind_bytes(T, 2), cudaMemcpyHostToDevice, st_) == cudaSuccess;
+            ok = ok && hipStreamWriteValue32(st_, const_cast<uint32_t *>(pf.done) + size_t(pick[j].q)*2 + 1, mark, 0) == hipSuccess;
+            issued += ok ? 1 : 0;
+        }
+        (void) hipStreamQuery(st_);
+        if (!ok) {
+            (void) cudaGetLastError();
+        }
+        s.issued = n;   // the device's reservation count: the last of them decides the arrival record
+        s.n_issue += (uint64_t) issued;
+    }
+
+    void xp_loop() {
+        ggml_cuda_set_device(device_);
+        const ub_pf_mail * mail = ub_->pf_mail_host();
+        const ub_pf_stat * stat = ub_->pf_stat_host();
+        std::vector<uint32_t> seen((size_t) geo_.n_layers, 0);
+        while (!xp_stop_.load(std::memory_order_relaxed)) {
+            bool any = false;
+            for (int T : xp_layers_) {
+                const uint32_t g = __atomic_load_n(&mail[T].gen, __ATOMIC_ACQUIRE);
+                if (g == seen[(size_t) T]) {
+                    continue;
+                }
+                seen[(size_t) T] = g;
+                any = true;
+                xp_handle(T, g, mail[T], stat[T]);
+            }
+            if (!any) {
+                std::this_thread::yield();
+            }
+        }
     }
 
     void free_ub_pool_locked() {
+        xp_stop_locked();
         ub_on_.store(false, std::memory_order_release);
         ub_.reset();
         if (ub_tables_ != nullptr) {
@@ -1506,6 +2094,7 @@ public:
 
     void layer_done(ggml_backend_cuda_context & ctx, const ggml_tensor * src0) {
         tier_layer_done(ctx, src0);
+        xp_layer_done(ctx, src0);
     }
 
     // The member whose joint layer range holds `layer`; a layer past the joint geometry counts as
@@ -3925,6 +4514,22 @@ private:
     uint64_t ub_lends_ = 0, ub_reclaims_ = 0, ub_calls_ = 0;
     size_t   ub_max_size_ = 0;              // the largest compute buffer (view) seen
     std::map<const void *, size_t> ub_hwm_of_;   // decode high-water mark per compute buffer base
+    // the expert prefetch (RANMA_EXPERT_PREFETCH)
+    xp_config xp_cfg_;
+    std::atomic<bool> xp_on_{ false };      // read by xp_publish without the mutex
+    std::atomic<bool> xp_stop_{ false };
+    std::thread xp_thread_;
+    cudaStream_t xp_stream_ = nullptr;
+    cudaEvent_t xp_event_ = nullptr;
+    std::mutex xp_issue_mutex_;             // the relay's issue section against a reclaim
+    bool xp_paused_ = false;                // under xp_issue_mutex_
+    double xp_tick_us_ = 0.01;
+    std::vector<xp_layer> xp_l_;            // [joint layer], the relay thread's own
+    std::vector<uint8_t> xp_reset_;         // [joint layer][3] restart learning (set by prefetch_layers, cleared by the relay)
+    std::mutex xp_mask_mutex_;
+    int xp_profile_[3] = { 2, 2, 2 };       // predicted layer profile per row bucket (see prefetch_layers)
+    uint64_t xp_graphs_ = 0, xp_next_eval_ = 0, xp_next_probe_ = 0, xp_mask_changes_ = 0;
+    std::vector<int> xp_layers_;            // the layers with positions
 };
 
 static controller & instance() {
@@ -4135,6 +4740,10 @@ void ggml_cuda_expert_profile_ids(ggml_backend_cuda_context & ctx, const ggml_te
     instance().profile_ids(ctx, ids);
 }
 
+void ggml_cuda_expert_prefetch_publish(ggml_backend_cuda_context & ctx, const ggml_tensor * order) {
+    instance().xp_publish(ctx, order);
+}
+
 void ggml_cuda_expert_layer_done(ggml_backend_cuda_context & ctx, const ggml_tensor * src0) {
     instance().layer_done(ctx, src0);
 }
@@ -4201,6 +4810,9 @@ static bool iface_compute_spare(ggml_backend_t backend, void * base, size_t size
     return instance().compute_spare(backend, base, size, extent, n_tokens);
 }
 static int32_t iface_compact_rows(void) { return instance().compact_rows(); }
+static uint32_t iface_prefetch_layers(int32_t n_rows, uint64_t * mask, int32_t n_words) {
+    return instance().prefetch_layers(n_rows, mask, n_words);
+}
 static bool iface_pool_counts(ggml_expert_pool_counts * out) { return instance().pool_counts(out); }
 
 static const ggml_expert_iface g_expert_iface = {
@@ -4225,6 +4837,7 @@ static const ggml_expert_iface g_expert_iface = {
     /* .compute_spare    = */ iface_compute_spare,
     /* .compact_rows     = */ iface_compact_rows,
     /* .pool_counts      = */ iface_pool_counts,
+    /* .prefetch_layers  = */ iface_prefetch_layers,
 };
 
 const ggml_expert_iface * ggml_backend_cuda_expert_iface(void) {
