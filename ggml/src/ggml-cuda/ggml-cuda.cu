@@ -3253,8 +3253,8 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 
 int ggml_cuda_graph_per_shape_max() {
     // GGML_CUDA_GRAPH_PER_SHAPE: 0 = one stored graph per first node (the plain keying), 1 = one per first
-    // node and batch shape with at most 32 per context, N > 1 = at most N per context. Default: 1 on HIP, 0 otherwise.
-    // 32 leaves room above the 24 llama graphs that LLAMA_GRAPH_REUSE_SHAPES keeps by default.
+    // node and batch shape with at most 96 per context, N > 1 = at most N per context. Default: 1 on HIP, 0 otherwise.
+    // 96 leaves room above the 64 llama graphs that LLAMA_GRAPH_REUSE_SHAPES keeps by default.
     static const int max_entries = [] {
 #if defined(GGML_USE_HIP)
         int v = 1;
@@ -3265,7 +3265,7 @@ int ggml_cuda_graph_per_shape_max() {
         if (env != nullptr) {
             v = atoi(env);
         }
-        v = v <= 0 ? 0 : v == 1 ? 32 : std::min(v, 256);
+        v = v <= 0 ? 0 : v == 1 ? 96 : std::min(v, 256);
         if (v > 0) {
             GGML_LOG_INFO("%s: per-shape graphs on, at most %d per context (GGML_CUDA_GRAPH_PER_SHAPE)\n", __func__, v);
         } else if (env != nullptr) {
@@ -3278,11 +3278,11 @@ int ggml_cuda_graph_per_shape_max() {
 
 int64_t ggml_cuda_graph_per_shape_evict_us() {
     // GGML_CUDA_GRAPH_EVICT_SECONDS: a per-shape graph unused for this many seconds is dropped by the periodic
-    // sweep; 0 drops it only at the per-context limit. Default 60. The graphs keyed by first node only keep
+    // sweep; 0 (the default) drops it only at the per-context limit. The graphs keyed by first node only keep
     // the upstream 10 s, since nothing else bounds their number. A speculative verification uses its rarer
-    // widths less often than every 10 s, so the shorter time ran them without a graph and captured them again.
+    // widths less often than once a minute, so a timed sweep ran them without a graph and captured them again.
     static const int64_t evict_us = [] {
-        int64_t v = 60;
+        int64_t v = 0;
         const char * env = getenv("GGML_CUDA_GRAPH_EVICT_SECONDS");
         if (env != nullptr) {
             v = std::max<int64_t>(0, atoll(env));
