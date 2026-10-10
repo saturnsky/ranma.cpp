@@ -198,6 +198,7 @@ struct common_spec_tconf_pos {
     int32_t id     = -1; // the drafted token
     int32_t N      = 0;  // trigram observations of the context in the request (both roles)
     float   src[2 * common_spec_tconf::N_SRC] = {}; // round log: n_s, N_s of the drafted candidate per source
+    uint8_t ms     = 0;  // round log: mid (1) and sw (2) of the drafted candidate
     std::vector<int32_t> ids; // the n candidates scored
     std::vector<double>  X;   // n rows of common_spec_tconf::DIM
 };
