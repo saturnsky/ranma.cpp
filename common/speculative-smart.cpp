@@ -126,7 +126,8 @@ common_spec_smart::common_spec_smart(const common_spec_smart_config & cfg_in, in
             smart_json_num(l, cfg.level_half_life);
             l += ",\"reprobe_n\":";
             smart_json_num(l, cfg.reprobe_n);
-            l += ",\"reprobe_every\":" + std::to_string(cfg.reprobe_every) + ",\"conf_cap\":";
+            l += ",\"reprobe_every\":" + std::to_string(cfg.reprobe_every) + ",\"cost_graph\":" +
+                 (cfg.cost_graph ? "true" : "false") + ",\"lend_skip\":" + std::to_string(cfg.lend_skip) + ",\"conf_cap\":";
             smart_json_num(l, cfg.conf_cap);
             l += ",\"lookahead_mix\":";
             smart_json_num(l, cfg.lookahead_mix);
@@ -139,9 +140,10 @@ common_spec_smart::common_spec_smart(const common_spec_smart_config & cfg_in, in
 
     SMT_INF("n_max = %d, %s, half-life %.0f rounds, level half-life %.0f rounds, extension to a width below %.1f "
             "observations at most every %d rounds, wait confidence cap %.0f (0: none), lookahead %.2f q(last) + %.2f "
-            "qbar(position)\n",
+            "qbar(position), graph builds and captures %s, rounds of a decode pool lend not observed: %d\n",
             cfg.n_max, store_loaded ? "warm" : "cold", cfg.half_life, cfg.level_half_life,
-            cfg.reprobe_n, cfg.reprobe_every, cfg.conf_cap, cfg.lookahead_mix, 1.0 - cfg.lookahead_mix);
+            cfg.reprobe_n, cfg.reprobe_every, cfg.conf_cap, cfg.lookahead_mix, 1.0 - cfg.lookahead_mix,
+            cfg.cost_graph ? "taken out of the times" : "counted", cfg.lend_skip);
 }
 
 common_spec_smart::~common_spec_smart() {
@@ -388,9 +390,11 @@ void common_spec_smart::shrink_calibration(double cap) {
     }
 }
 
-void common_spec_smart::add_draft_step(double us) {
+void common_spec_smart::add_draft_step(double us, double graph_us) {
     if (us >= 0.0) {
-        draft_cell.add(us, decay, n_closed);
+        // a graph built or captured inside the step is a cost of the graph runtime, not of the draft step
+        const double x = cfg.cost_graph ? std::max(us - std::max(graph_us, 0.0), 0.0) : us;
+        draft_cell.add(x, decay, n_closed);
     }
     if (log) {
         // the step belongs to every sequence that drafted in it
@@ -472,8 +476,22 @@ void common_spec_smart::close_round(int32_t seq, int64_t t_us, const common_spec
 
     const double us = (double) (t_us - st.t_drafted);
     wr_last = false;
-    if (st.timed) {
-        observe_cost(st.k, us);
+    // the verification time without the graph builds and captures of the target and the draft context in it
+    double obs = us;
+    if (cfg.cost_graph && graphs != nullptr) {
+        auto graph_us = [](const common_spec_smart_graph & a, const common_spec_smart_graph & b) {
+            return a.valid && b.valid ? (double) ((b.build_us - a.build_us) + (b.capture_us - a.capture_us)) : 0.0;
+        };
+        obs = std::max(1.0, us - graph_us(st.graph_drafted.tgt, graphs->tgt) - graph_us(st.graph_drafted.dft, graphs->dft));
+    }
+    // the round of a lend of the decode pool and the next ones fill its positions: not a time of the width
+    const bool lend_round = cfg.lend_skip > 0 && pool != nullptr && pool->valid && pool_since_lend >= 0 &&
+                            pool_since_lend < cfg.lend_skip;
+    st.log_obs_us = -1.0;
+    st.log_skip   = !st.timed ? "untimed" : lend_round ? "lend" : nullptr;
+    if (st.timed && !lend_round) {
+        observe_cost(st.k, obs);
+        st.log_obs_us = obs;
         st.obs_sum_k[st.k] += us;
         st.obs_n_k[st.k]++;
     }
@@ -702,6 +720,13 @@ void common_spec_smart::log_round(int32_t seq, const char * end, double verify_u
     smart_json_num(l, st.log_draft_us, "%.1f");
     l += ",\"verify_us\":";
     smart_json_num(l, verify_us >= 0.0 ? verify_us : NAN, "%.1f");
+    if (std::string(end) == "closed") {
+        // the time the cost model took (without graph builds and captures), or why it took none
+        l += ",\"obs_us\":";
+        smart_json_num(l, st.log_obs_us >= 0.0 ? st.log_obs_us : NAN, "%.1f");
+        l += ",\"obs_skip\":";
+        l += st.log_skip != nullptr ? std::string("\"") + st.log_skip + "\"" : std::string("null");
+    }
     l += ",\"accepted\":";
     if (st.k == 0) {
         l += "0";
