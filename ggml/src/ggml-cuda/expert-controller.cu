@@ -602,8 +602,7 @@ public:
             verify_all_locked();
             GGML_LOG_INFO("expert cache: owned host install: %zu MiB in VRAM (%zu of %zu slices), "
                           "%zu MiB in the host arena, %d spare slots per class\n",
-                l1_->device_bytes()/(1024*1024), resident_slices_locked(),
-                size_t(geo_.n_routed_layers())*size_t(geo_.n_experts),
+                l1_->device_bytes()/(1024*1024), resident_slices_locked(), total_slices_locked(),
                 host_->host_bytes()/(1024*1024), cfg_.spare_slots);
             log_aux_locked("at model load");
             if (tier_) {
@@ -812,13 +811,11 @@ public:
                 continue;
             }
             const member_state & mb = members_[m];
-            const size_t begin = size_t(mb.offset)*geo_.n_experts;
-            const size_t end   = begin + size_t(mb.geo.n_layers)*geo_.n_experts;
             std::vector<uint64_t> part;
             if (!joint_) {
                 part = delta;
             } else {
-                part.assign(delta.begin() + begin, delta.begin() + std::min(end, delta.size()));
+                part = member_rows_locked(mb, delta);
             }
             uint64_t part_total = 0;
             for (uint64_t v : part) {
@@ -2127,7 +2124,7 @@ public:
         std::lock_guard<std::mutex> lock(mutex_);
         int layer = -1;
         int kind  = -1;
-        if (!tier_ || tensor == nullptr || !resolve(tensor, layer, kind) || expert < 0 || expert >= geo_.n_experts) {
+        if (!tier_ || tensor == nullptr || !resolve(tensor, layer, kind) || expert < 0 || expert >= geo_.experts(layer)) {
             return true;
         }
         return tier_->wanted(layer, expert);
@@ -2180,15 +2177,8 @@ private:
         first.key       = member_key(first.identity, first.signature);
         first.ctx       = ctx;
         first.bound     = true;
-        // Declared members must route as many experts as this one; the others cannot join.
-        for (size_t m = members_.size(); m-- > 1; ) {
-            if (members_[m].geo.n_experts != geo.n_experts) {
-                GGML_LOG_WARN("expert cache: model %s routes %d experts, this model %d; it is not cached\n",
-                    members_[m].key.c_str(), members_[m].geo.n_experts, geo.n_experts);
-                members_[m].free_meta();
-                members_.erase(members_.begin() + m);
-            }
-        }
+        // Declared members may route another number of experts: the joint tables take the largest count as
+        // their stride, and a layer's experts past its own count do not exist (geometry::layer_experts).
         joint_ = members_.size() > 1;
         if (joint_) {
             std::vector<const geometry *> parts;
@@ -2218,12 +2208,13 @@ private:
         if (joint_) {
             for (size_t m = 0; m < members_.size(); ++m) {
                 const member_state & mb = members_[m];
-                GGML_LOG_INFO("expert cache: model %zu %s: joint layers %d..%d, weight %.3f%s\n", m, mb.key.c_str(),
-                    mb.offset, mb.offset + mb.geo.n_layers - 1, (double) mb.weight, mb.bound ? "" : ", joins later");
+                GGML_LOG_INFO("expert cache: model %zu %s: joint layers %d..%d, %d experts, weight %.3f%s\n", m, mb.key.c_str(),
+                    mb.offset, mb.offset + mb.geo.n_layers - 1, mb.geo.n_experts, (double) mb.weight,
+                    mb.bound ? "" : ", joins later");
             }
             for (size_t cls = 0; cls < geo_.class_bytes.size(); ++cls) {
-                GGML_LOG_INFO("expert cache: size class %zu: %d layers, %zu KiB per expert\n",
-                    cls, geo_.class_layers[cls], geo_.class_total_bytes((int) cls)/1024);
+                GGML_LOG_INFO("expert cache: size class %zu: %d layers, %d experts, %zu KiB per expert\n",
+                    cls, geo_.class_layers[cls], geo_.class_slices((int) cls), geo_.class_total_bytes((int) cls)/1024);
             }
         }
         return true;
@@ -2389,6 +2380,15 @@ private:
         return out;
     }
 
+    // Expert slices of every routed layer of the cache.
+    size_t total_slices_locked() const {
+        size_t n = 0;
+        for (size_t c = 0; c < geo_.class_bytes.size(); ++c) {
+            n += (size_t) std::max(geo_.class_slices((int) c), 0);
+        }
+        return n;
+    }
+
     // Per model: experts and bytes in VRAM and in host memory (and in the file with the SSD tier).
     void log_members_locked(const char * what) const {
         if (!l1_ || members_.empty()) {
@@ -2408,7 +2408,7 @@ private:
                 if ((size_t) l < selected.size()) {
                     for (int32_t e : selected[l]) { in_l1[e] = 1; }
                 }
-                for (int e = 0; e < geo_.n_experts; ++e) {
+                for (int e = 0; e < geo_.experts(l); ++e) {
                     if (in_l1[e]) { n_l1++; b_l1 += bytes; continue; }
                     if (tier_ && !tier_->locations()[l][e].resident()) { n_file++; b_file += bytes; continue; }
                     n_host++; b_host += bytes;
@@ -2474,7 +2474,7 @@ private:
         for (size_t c = 0; c < redraw_max_static_.size(); ++c) {
             const size_t bytes = geo_.class_vram_bytes((int) c);
             const size_t n = bytes == 0 ? 0 : budget/bytes;
-            redraw_max_static_[c] = (int) std::min<size_t>(n, size_t(geo_.class_layers[c])*size_t(geo_.n_experts));
+            redraw_max_static_[c] = (int) std::min<size_t>(n, (size_t) std::max(geo_.class_slices((int) c), 0));
         }
         l1_->enable_vmm(redraw_max_static_, redraw_.handle_bytes);
     }
@@ -2520,13 +2520,17 @@ private:
         lo.assign(classes, 0);
         hi.assign(classes, 0);
         for (size_t c = 0; c < classes; ++c) {
-            hi[c] = std::min(redraw_max_static_[c], geo_.class_layers[c]*geo_.n_experts);
+            hi[c] = std::min(redraw_max_static_[c], geo_.class_slices((int) c));
             if (tier_ && c < host_capacities_base_.size()) {
                 const int cut = host_capacities_base_[c];
                 if (cfg_.mode == GGML_EXPERT_MODE_INCLUSIVE) {
                     hi[c] = std::min(hi[c], cut);
                 } else if (c < file_cap_.size()) {
-                    lo[c] = std::max(0, geo_.class_layers[c]*(geo_.n_experts - file_cap_[c]) - cut);
+                    int kept = 0;   // what the class's layers cannot leave in the file: experts past a full ring
+                    for (int l = 0; l < geo_.n_layers; ++l) {
+                        if (geo_.layer_class[l] == int(c)) { kept += std::max(0, geo_.experts(l) - file_cap_[c]); }
+                    }
+                    lo[c] = std::max(0, kept - cut);
                 }
             }
             lo[c] = std::min(lo[c], capacities_[c]);
@@ -2650,7 +2654,7 @@ private:
             std::vector<int> host_up(classes, 0);
             const std::vector<int> host_now = host_->capacities();
             for (size_t c = 0; c < classes; ++c) {
-                host_final[c] = geo_.class_layers[c]*geo_.n_experts - caps_new[c];
+                host_final[c] = geo_.class_slices((int) c) - caps_new[c];
                 host_up[c]    = std::max(host_now[c], host_final[c]);
             }
             std::string why;
@@ -2889,12 +2893,12 @@ private:
                 const int c = geo_.layer_class[l];
                 if (c < 0) { continue; }
                 const int s = st.storage_of[c];
-                limit[s] += geo_.n_experts;
+                limit[s] += geo_.experts(l);
                 int resident = 0;
-                for (int e = 0; e < geo_.n_experts; ++e) {
+                for (int e = 0; e < geo_.experts(l); ++e) {
                     resident += tier_vram_[l][e] >= 0 || std::binary_search(base.selected[l].begin(), base.selected[l].end(), e) ? 1 : 0;
                 }
-                demand[s] += uint64_t(geo_.n_experts - resident)*geo_.class_total_bytes(c);
+                demand[s] += uint64_t(geo_.experts(l) - resident)*geo_.class_total_bytes(c);
             }
             ring = split_ring(st, floors, demand, limit, requested);
             if (ring_bytes(floors) > requested) {
@@ -2903,7 +2907,7 @@ private:
         } else if (factor > 1.0) {
             // factor x floor per class, as far as the budget left above the minimum (the floors) allows
             std::vector<int> limit(n, 0);
-            for (int c = 0; c < (int) classes; ++c) { limit[st.storage_of[c]] += geo_.class_layers[c]*geo_.n_experts; }
+            for (int c = 0; c < (int) classes; ++c) { limit[st.storage_of[c]] += geo_.class_slices(c); }
             const std::vector<int> want = factor_rings(floors, factor, limit);
             require(floors);   // the minimum stays the floors; the factor never refuses a budget
             const auto minimum = minimum_host_budget(geo_, capacities_, base_fixed + ring_bytes(floors), inclusive);
@@ -3125,13 +3129,13 @@ private:
             // model whose whole host share went to the file) is compared against a VRAM resident,
             // read back. Only a layer with no loaded expert at all has nothing to compare with.
             int expert = -1;
-            for (int candidate = 0; candidate < geo_.n_experts && expert < 0; ++candidate) {
+            for (int candidate = 0; candidate < geo_.experts(layer) && expert < 0; ++candidate) {
                 if (gpu_table[layer][candidate] < 0 && host_table[layer][candidate] >= 0) {
                     expert = candidate;
                 }
             }
             bool in_vram = false;
-            for (int candidate = 0; candidate < geo_.n_experts && expert < 0; ++candidate) {
+            for (int candidate = 0; candidate < geo_.experts(layer) && expert < 0; ++candidate) {
                 if (gpu_table[layer][candidate] >= 0) {
                     expert  = candidate;
                     in_vram = true;
@@ -3287,7 +3291,7 @@ private:
             if (geo_.layer_class[layer] < 0) {
                 continue;
             }
-            for (int expert = 0; expert < geo_.n_experts; ++expert) {
+            for (int expert = 0; expert < geo_.experts(layer); ++expert) {
                 if (gpu_table[layer][expert] >= 0)       { ++vram; }
                 else if (host_table[layer][expert] >= 0) { ++host; }
                 else if (tier_->locations()[layer][expert].storage == expert_storage::lent) { ++borrowed; }
@@ -3309,7 +3313,7 @@ private:
             if (cls < 0) {
                 continue;
             }
-            for (int expert = 0; expert < geo_.n_experts; ++expert) {
+            for (int expert = 0; expert < geo_.experts(layer); ++expert) {
                 if (host_table[layer][expert] >= 0) {
                     payload += geo_.class_total_bytes(cls);
                     ++placed;
@@ -3951,7 +3955,7 @@ private:
 
         std::vector<int> host_capacities(geo_.class_bytes.size(), 0);
         for (int cls = 0; cls < (int) geo_.class_bytes.size(); ++cls) {
-            host_capacities[cls] = geo_.class_layers[cls]*geo_.n_experts - capacities_[cls];
+            host_capacities[cls] = geo_.class_slices((int) cls) - capacities_[cls];
             if (host_capacities[cls] < 0) {
                 disable_locked("more VRAM slots than experts");
                 return false;
@@ -4064,7 +4068,7 @@ private:
         const bool aligned = offset % stride == 0 && size % stride == 0;
         const int  first   = int(offset/stride);
         const int  last    = int((offset + size + stride - 1)/stride);
-        for (int expert = first; expert < last && expert < geo_.n_experts; ++expert) {
+        for (int expert = first; expert < last && expert < geo_.experts(layer); ++expert) {
             const size_t index = digest_index_locked(layer, kind, expert);
             if (!aligned) {
                 digest_known_[index] = 0;
@@ -4087,7 +4091,7 @@ private:
                 const member_state & mb = members_[(size_t) member_of_layer(l)];
                 if (!mb.loaded || mb.dropped) { continue; }
             }
-            for (int e = 0; e < geo_.n_experts; ++e) for (int k = 0; k < geometry::n_kinds; ++k) {
+            for (int e = 0; e < geo_.experts(l); ++e) for (int k = 0; k < geometry::n_kinds; ++k) {
                 const int gpu = l1_->host_slots()[l][e];
                 const void * home = l1_->host_address(l, k, e);
                 if ((gpu < 0 && !home) || (!digest_known_[digest_index_locked(l, k, e)] && !tier_)) { skipped += k == 0; continue; }
@@ -4129,7 +4133,7 @@ private:
         for (int l = 0; l < geo_.n_layers; ++l) {
             const int cls = geo_.layer_class[l];
             if (cls < 0) { continue; }
-            for (int e = 0; e < geo_.n_experts; ++e) {
+            for (int e = 0; e < geo_.experts(l); ++e) {
                 const uint64_t bytes = delta[size_t(l)*geo_.n_experts + e]*geo_.class_total_bytes(cls);
                 if (l1_->host_slots()[l][e] >= 0) { vram += bytes; }
                 else if (!tier_ || tier_->locations()[l][e].resident()) { host += bytes; }
@@ -4254,6 +4258,21 @@ private:
         assemble_joint_scores_locked(joint_sources_locked(b), out, nullptr);
     }
 
+    // A member's rows of a joint [layer][expert] table, in the member's own stride: what its profile store keeps.
+    // With one expert count this is the plain slice of the member's layers.
+    std::vector<uint64_t> member_rows_locked(const member_state & mb, const std::vector<uint64_t> & joint) const {
+        const size_t width = (size_t) std::max(mb.geo.n_experts, 0), stride = (size_t) geo_.n_experts;
+        std::vector<uint64_t> out;
+        out.reserve(size_t(mb.geo.n_layers)*width);
+        for (int l = 0; l < mb.geo.n_layers; ++l) {
+            const size_t row = size_t(mb.offset + l)*stride;
+            for (size_t e = 0; e < width && row + e < joint.size(); ++e) {
+                out.push_back(joint[row + e]);
+            }
+        }
+        return out;
+    }
+
     // The usable store of every member in bank b (null where there is none).
     std::vector<const profile_store *> joint_sources_locked(const bank_state & b) const {
         std::vector<const profile_store *> out(members_.size(), nullptr);
@@ -4311,10 +4330,15 @@ private:
             }
             const double f = factor[m]/total;
             const std::vector<uint64_t> & part = sources[m]->scores();
-            const size_t begin = size_t(members_[m].offset)*geo_.n_experts;
-            const size_t n     = size_t(members_[m].geo.n_layers)*geo_.n_experts;
-            for (size_t i = 0; i < part.size() && i < n && begin + i < out.size(); ++i) {
-                out[begin + i] = (uint64_t) std::llround(double(part[i])*f);
+            // the store keeps the model's own [layer][expert] rows (its expert count); the joint rows
+            // have the joint stride, and the experts a model does not have stay 0
+            const size_t width = (size_t) std::max(members_[m].geo.n_experts, 0);
+            const size_t n     = size_t(members_[m].geo.n_layers)*width;
+            for (size_t i = 0; i < part.size() && i < n; ++i) {
+                const size_t at = (size_t(members_[m].offset) + i/width)*size_t(geo_.n_experts) + i%width;
+                if (at < out.size()) {
+                    out[at] = (uint64_t) std::llround(double(part[i])*f);
+                }
             }
         }
         if (what != nullptr) {
@@ -4403,7 +4427,7 @@ private:
                 p.label     = label;
                 p.signature = mb.signature;
                 p.n_layers  = mb.geo.n_layers;
-                p.n_experts = geo_.n_experts;
+                p.n_experts = mb.geo.n_experts;   // the model's own count: its records do not depend on the joint stride
                 p.archive   = cfg_.profile_archive;
                 b.stores[m].reset(new profile_store(p));
                 if (cfg_.profile_reset) {
