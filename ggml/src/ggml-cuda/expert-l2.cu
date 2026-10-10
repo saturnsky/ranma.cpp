@@ -443,7 +443,7 @@ bool l2_tier::open_files(std::string & reason, const std::vector<uint8_t> * laye
                     " has no file behind it";
                 return false;
             }
-            const uint64_t need = b.offset + uint64_t(geo_.n_experts)*geo_.class_bytes[cls][kind];
+            const uint64_t need = b.offset + uint64_t(geo_.experts(layer))*geo_.class_bytes[cls][kind];
             const uint64_t have = expert_os::file_size(files_[(size_t) b.file]);
             if (need > have) {
                 reason = "layer " + std::to_string(layer) + " kind " + std::to_string(kind) +
@@ -515,8 +515,10 @@ void l2_tier::publish_tables() {
     any_lent_ = false;
     if (serve_host_ != nullptr) { memset(serve_host_, 0, bitmap_bytes()); }
     for (int layer = 0; layer < geo_.n_layers; ++layer) {
-        const bool routed = geo_.layer_class[layer] >= 0;
+        const int present = geo_.experts(layer);
         for (int expert = 0; expert < geo_.n_experts; ++expert) {
+            // an expert past the layer's count does not exist: no address, never served
+            const bool routed = geo_.layer_class[layer] >= 0 && expert < present;
             const bool ssd = routed && !wanted(layer, expert);
             any_lent_ = any_lent_ || (routed && homes_[layer][expert].storage == expert_storage::lent);
             any_ssd_ = any_ssd_ || ssd;
@@ -545,7 +547,7 @@ void l2_tier::set_homes(const std::vector<std::vector<int32_t>> & vram,
         for (int layer = 0; layer < geo_.n_layers && layer < (int) homes_.size(); ++layer) {
             const int cls = geo_.layer_class[layer];
             if (cls < 0) { continue; }
-            for (int expert = 0; expert < geo_.n_experts; ++expert) {
+            for (int expert = 0; expert < geo_.experts(layer); ++expert) {
                 const expert_location at = homes_[layer][expert];
                 if (at.storage == expert_storage::file) { continue; }
                 GGML_ASSERT(at.storage == expert_storage::host && at.slot >= 0 && at.slot < storage_.resident_slots[cls]);
@@ -562,7 +564,7 @@ void l2_tier::set_homes(const std::vector<std::vector<int32_t>> & vram,
         for (int layer = 0; layer < geo_.n_layers && layer < (int) homes_.size(); ++layer) {
             const int cls = geo_.layer_class[layer];
             if (cls < 0) { continue; }
-            for (int expert = 0; expert < geo_.n_experts; ++expert) {
+            for (int expert = 0; expert < geo_.experts(layer); ++expert) {
                 const expert_location at = homes_[layer][expert];
                 if (at.storage == expert_storage::file) { continue; }
                 GGML_ASSERT(at.storage == expert_storage::host && at.slot >= 0 && at.slot < storage_.resident_slots[cls]);
@@ -1071,7 +1073,7 @@ void l2_tier::serve_staged(int layer, uint32_t seq, const std::vector<l2_read> &
 
 void l2_tier::publish_layer(int layer) {
     const size_t words = bitmap_words();
-    for (int expert = 0; expert < geo_.n_experts; ++expert) {
+    for (int expert = 0; expert < geo_.experts(layer); ++expert) {
         if (served_only_ && !(serve_host_[(size_t) layer*words + size_t(expert/32)] & (1u << (expert%32)))) {
             continue;
         }
@@ -1085,7 +1087,7 @@ void l2_tier::publish_layer(int layer) {
 
 void l2_tier::publish_layer_kind(int layer, int kind) {
     const size_t words = bitmap_words();
-    for (int expert = 0; expert < geo_.n_experts; ++expert) {
+    for (int expert = 0; expert < geo_.experts(layer); ++expert) {
         if (served_only_ && !(serve_host_[(size_t) layer*words + size_t(expert/32)] & (1u << (expert%32)))) {
             continue;
         }
@@ -1096,7 +1098,7 @@ void l2_tier::publish_layer_kind(int layer, int kind) {
 
 void l2_tier::verify_addresses(int demanded_layer, const std::vector<int> & ids) {
     for (int layer = 0; layer < geo_.n_layers; ++layer) {
-        for (int expert = 0; expert < geo_.n_experts; ++expert) {
+        for (int expert = 0; expert < geo_.experts(layer); ++expert) {
             if (served_only_ && !(serve_host_[(size_t) layer*bitmap_words() + size_t(expert/32)] & (1u << (expert%32)))) {
                 continue;   // the decode pool may own this entry
             }
@@ -1117,7 +1119,7 @@ void l2_tier::verify_addresses(int demanded_layer, const std::vector<int> & ids)
         return;
     }
     for (int expert : ids) {
-        if (expert < 0 || expert >= geo_.n_experts) {
+        if (expert < 0 || expert >= geo_.experts(demanded_layer)) {
             GGML_ABORT("expert cache: invalid demanded expert %d in layer %d", expert, demanded_layer);
         }
         if (wanted(demanded_layer, expert)) {
