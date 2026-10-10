@@ -987,8 +987,8 @@ class DeepseekV4DSparkModel(DeepseekV4Model):
             return None
         return super().filter_tensors((cls._rekey_mtp_tensor_name(name), gen))
 
-    @staticmethod
-    def _rekey_mtp_tensor_name(name: str) -> str:
+    @classmethod
+    def _rekey_mtp_tensor_name(cls, name: str) -> str:
         match = re.match(r"mtp\.(\d+)\.(.+)$", name)
         if match is None:
             raise ValueError(f"Unexpected DSpark tensor {name!r}")
@@ -1001,7 +1001,7 @@ class DeepseekV4DSparkModel(DeepseekV4Model):
             "hc_head_base",
             "hc_head_scale",
         )
-        if rest in DeepseekV4DSparkModel._DSPARK_ROOT_MAP or rest in root_names:
+        if rest in cls._DSPARK_ROOT_MAP or rest in root_names:
             return rest
         return f"layers.{stage}.{rest}"
 
@@ -1017,13 +1017,15 @@ class DeepseekV4DSparkModel(DeepseekV4Model):
             return
         yield from super().modify_tensors(data_torch, name, bid)
 
-    def set_vocab(self):
+    def _dspark_vocab_dir(self) -> Path:
         if self.target_model_dir is None:
             raise ValueError("DeepSeek-V4 DSpark requires --target-model-dir with the target tokenizer")
+        return self.target_model_dir
 
+    def set_vocab(self):
         original_dir = self.dir_model
         try:
-            self.dir_model = self.target_model_dir
+            self.dir_model = self._dspark_vocab_dir()
             super().set_vocab()
         finally:
             self.dir_model = original_dir
@@ -1491,3 +1493,45 @@ class DeepseekV41Model(DeepseekV4Model):
             if tensor_name in v41_only:
                 return v41_only[tensor_name]
         return super()._map_dsv4_tensor_name(name, bid)
+
+
+@ModelBase.register("DeepseekV41DSparkModel")
+@ModelBase.example("deepseek-ai/DeepSeek-V4.1-Flash")
+class DeepseekV41DSparkModel(DeepseekV4DSparkModel, DeepseekV41Model):
+    """DSpark draft of DeepSeek V4.1 (the mtp.* stages of the V4.1 checkpoint, FP8 or EXL3).
+
+    The V4 DSpark rules (mtp.* only, rekeyed to layers.<stage>., root tensors, plain DFLASH tensors) come first in
+    the MRO and the V4.1 rules (nested text_config, FP8 [32, 32] blocks) after them. Differences from the V4 repo:
+      * markov_head.embed / markov_head.head instead of markov_w1 / markov_w2 (same shapes and meaning, see _DSPARK_ROOT_MAP)
+      * the draft is smaller than the body: dspark_n_routed_experts / dspark_num_experts_per_tok
+      * the draft has no engram layers and no two level candidate mask (the stages are uncompressed)
+      * the tokenizer lives in the same directory, so --target-model-dir is optional
+    """
+
+    model_arch = gguf.MODEL_ARCH.DFLASH
+    supports_mtp_export = False  # --dspark selects this class; the NextN/--mtp export of the body does not apply
+
+    _DSPARK_ROOT_MAP = {
+        **DeepseekV4DSparkModel._DSPARK_ROOT_MAP,
+        # reference: logits_bias = head(embed(prev_token)), embed [vocab, rank] and head [vocab, rank] (no transpose);
+        # runtime: markov_w1 rows are gathered by the previous token, markov_w2 is the [vocab, rank] matmul weight
+        "markov_head.embed.weight": (gguf.MODEL_TENSOR.DSPARK_MARKOV_W1, ".weight"),
+        "markov_head.head.weight": (gguf.MODEL_TENSOR.DSPARK_MARKOV_W2, ".weight"),
+    }
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        hparams = self.hparams
+        hparams["n_routed_experts"] = hparams["dspark_n_routed_experts"]
+        hparams["num_experts_per_tok"] = hparams["dspark_num_experts_per_tok"]
+        # the draft stages have neither engram tables nor the candidate mask of the body
+        hparams["engram_layer_ids"] = None
+        hparams["candidate_source_layer_id"] = None
+
+    def index_tensors(self, remote_hf_model_id: str | None = None) -> dict[str, Callable[[], Tensor]]:
+        self._v41_flatten_hparams()
+        return super().index_tensors(remote_hf_model_id=remote_hf_model_id)
+
+    def _dspark_vocab_dir(self) -> Path:
+        return self.target_model_dir or self.dir_model
