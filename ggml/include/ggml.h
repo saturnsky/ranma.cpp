@@ -469,7 +469,8 @@ extern "C" {
         GGML_TYPE_EXL3R_M6 = 309,
         GGML_TYPE_EXL3R_M7 = 310,
         GGML_TYPE_EXL3R_M8 = 311,
-        GGML_TYPE_COUNT    = 312,
+        GGML_TYPE_MXFP8    = 320, // OCP MXFP8 rows kept as stored: E8M0 scale + 32 E4M3 values (33 bytes per 32), gather only
+        GGML_TYPE_COUNT    = 321,
     };
 
     // [TAG_GGML_PREC]
@@ -824,6 +825,9 @@ extern "C" {
     GGML_API void    ggml_exl3_decode_group(enum ggml_type type, const void * group, int64_t k, ggml_fp16_t * dst);
     // EXL3 row codec rows (n-gram embedding tables) decode alone with to_float; they are read with ggml_get_rows only
     GGML_API bool    ggml_is_exl3_row(enum ggml_type type);
+    // types that are only read with ggml_get_rows (no mul_mat, no from_float, never uploaded to a device):
+    // the EXL3 row codecs and GGML_TYPE_MXFP8
+    GGML_API bool    ggml_is_row_gather_only(enum ggml_type type);
 
     // TODO: temporary until model loading of ggml examples is refactored
     GGML_API enum ggml_type ggml_ftype_to_ggml_type(enum ggml_ftype ftype);

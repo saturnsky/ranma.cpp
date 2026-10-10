@@ -724,7 +724,13 @@ llama_model_loader::llama_model_loader(
     // for other data. Such tensors are accepted only from a model with the metadata that the EXL3 converter writes:
     // quantize.exl3.version (the format version of the source) and quantize.exl3.codebook (mul1, mcg or 3inst).
     // gguf-split writes the metadata only to the first split, so the keys of the first file decide for every split.
+    // GGML_TYPE_MXFP8 (320) is in that band but is no EXL3 type: it is accepted without the metadata for an n-gram table
+    // (a DeepSeek V4.1 engram table or a PLE table, also the pieces of a table set), the only tensors that have it.
     {
+        auto ngram_table = [](const std::string & name) {
+            return (name.rfind("blk.", 0) == 0 && name.find(".engram_embd.") != std::string::npos) ||
+                name.rfind("per_layer_token_embd.", 0) == 0;
+        };
         std::string missing;
         const int64_t version_idx  = gguf_find_key(metadata, "quantize.exl3.version");
         const int64_t codebook_idx = gguf_find_key(metadata, "quantize.exl3.codebook");
@@ -742,7 +748,7 @@ llama_model_loader::llama_model_loader(
         if (!missing.empty()) {
             for (const auto & it : weights_map) {
                 const ggml_tensor * cur = it.second.tensor;
-                if (cur->type >= GGML_TYPE_EXL3_M1) {
+                if (cur->type >= GGML_TYPE_EXL3_M1 && !(cur->type == GGML_TYPE_MXFP8 && ngram_table(ggml_get_name(cur)))) {
                     throw std::runtime_error(format("tensor '%s' has ggml type %d (%s) of the EXL3 range, but the model has no "
                         "valid EXL3 metadata (missing: %s): it may use the type ID for other data",
                         ggml_get_name(cur), (int) cur->type, ggml_type_name(cur->type), missing.c_str()));
