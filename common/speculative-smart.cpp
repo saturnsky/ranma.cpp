@@ -430,7 +430,8 @@ void common_spec_smart::request_begin(int32_t seq) {
     shrink_calibration(cfg.cap_request);
 }
 
-void common_spec_smart::close_round(int32_t seq, int64_t t_us, const common_spec_smart_pool * pool) {
+void common_spec_smart::close_round(int32_t seq, int64_t t_us, const common_spec_smart_pool * pool,
+                                    const common_spec_smart_graphs * graphs) {
     if (seq < 0 || seq >= (int32_t) seqs.size()) {
         return;
     }
@@ -441,6 +442,9 @@ void common_spec_smart::close_round(int32_t seq, int64_t t_us, const common_spec
     st.pool_end   = now;
     st.pool_end.valid = now.valid && st.pool_start.valid && st.pool_drafted.valid;
     st.pool_next  = now;
+    st.graph_start = st.graph_next;
+    st.graph_end   = graphs != nullptr ? *graphs : common_spec_smart_graphs();
+    st.graph_next  = st.graph_end;
     if (now.valid) {
         if (now.lends != pool_lends) {
             pool_since_lend = 0;
@@ -591,9 +595,11 @@ int32_t common_spec_smart::after_step(int32_t seq, float p_top) {
     return r;
 }
 
-void common_spec_smart::drafted(int32_t seq, int32_t k, int64_t t_us, const common_spec_smart_pool * pool) {
+void common_spec_smart::drafted(int32_t seq, int32_t k, int64_t t_us, const common_spec_smart_pool * pool,
+                                const common_spec_smart_graphs * graphs) {
     auto & st = seqs[seq];
-    st.pool_drafted = pool != nullptr ? *pool : common_spec_smart_pool();
+    st.pool_drafted  = pool != nullptr ? *pool : common_spec_smart_pool();
+    st.graph_drafted = graphs != nullptr ? *graphs : common_spec_smart_graphs();
     k = std::clamp<int32_t>(k, 0, std::min<int32_t>(cfg.n_max, (int32_t) st.p.size()));
     st.drafting  = false;
     st.active    = true;
@@ -720,6 +726,41 @@ void common_spec_smart::log_round(int32_t seq, const char * end, double verify_u
         l += ",\"verify\":";
         part(b, c);
         l += ",\"since_lend\":" + std::to_string(pool_since_lend) + ",\"lend\":" + std::to_string(c.lends) + "}";
+    }
+    // the graphs of the target and the draft context in the draft steps and in the verification
+    if (std::string(end) == "closed") {
+        auto gpart = [&](const common_spec_smart_graph & x, const common_spec_smart_graph & y) {
+            if (!x.valid || !y.valid) {
+                l += "null";
+                return;
+            }
+            l += "{\"calls\":" + std::to_string(y.calls - x.calls) + ",\"builds\":" + std::to_string(y.builds - x.builds) +
+                 ",\"build_ms\":";
+            smart_json_num(l, (double) (y.build_us - x.build_us) / 1000.0, "%.3f");
+            l += ",\"nt\":";
+            l += y.builds > x.builds ? std::to_string(y.last_nt) : std::string("null");
+            if (x.backend && y.backend) {
+                l += ",\"captures\":" + std::to_string(y.captures - x.captures) + ",\"capture_ms\":";
+                smart_json_num(l, (double) (y.capture_us - x.capture_us) / 1000.0, "%.3f");
+                l += ",\"direct\":" + std::to_string(y.direct - x.direct) + ",\"direct_ms\":";
+                smart_json_num(l, (double) (y.direct_us - x.direct_us) / 1000.0, "%.3f");
+            }
+            l += "}";
+        };
+        const auto & a = st.graph_start;
+        const auto & b = st.graph_drafted;
+        const auto & c = st.graph_end;
+        if (a.tgt.valid && b.tgt.valid && c.tgt.valid) {
+            l += ",\"graph\":{\"draft\":{\"tgt\":";
+            gpart(a.tgt, b.tgt);
+            l += ",\"dft\":";
+            gpart(a.dft, b.dft);
+            l += "},\"verify\":{\"tgt\":";
+            gpart(b.tgt, c.tgt);
+            l += ",\"dft\":";
+            gpart(b.dft, c.dft);
+            l += "}}";
+        }
     }
     l += ",\"wait_reset\":";
     const bool wr = std::string(end) == "closed" && wr_last;
