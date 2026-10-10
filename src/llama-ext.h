@@ -27,6 +27,8 @@ struct llama_graph_counts {
     int64_t builds;
     int64_t build_us;
     int32_t last_nt;
+    size_t  last_extent; // the last graph: how far it reached into the compute buffer of the expert backend (0: unknown)
+    int32_t last_pos;    // ... and the highest position of its ubatch (-1: none)
     bool    has_backend;
     int64_t captures;
     int64_t capture_us;

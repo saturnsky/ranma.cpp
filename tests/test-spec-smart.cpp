@@ -2316,7 +2316,7 @@ static int test_round_log_pool() {
     CHECK(lines[0].find("\"graph\":{\"draft\":{\"tgt\":{\"calls\":0,\"builds\":0,\"build_ms\":0.000,\"nt\":null,"
                         "\"captures\":0,\"capture_ms\":0.000,\"direct\":0,\"direct_ms\":0.000},\"dft\":{\"calls\":0,"
                         "\"builds\":0,\"build_ms\":0.000,\"nt\":null}},\"verify\":{\"tgt\":{\"calls\":1,") != std::string::npos);
-    CHECK(lines[1].find("\"verify\":{\"tgt\":{\"calls\":1,\"builds\":1,\"build_ms\":1.500,\"nt\":2,\"captures\":1,"
+    CHECK(lines[1].find("\"verify\":{\"tgt\":{\"calls\":1,\"builds\":1,\"build_ms\":1.500,\"nt\":2,\"extent_mib\":0.00,\"pos\":-1,\"captures\":1,"
                         "\"capture_ms\":2.500,") != std::string::npos);
     CHECK(lines[2].find("\"graph\"") != std::string::npos); // the graph counts do not depend on the pool counts
     std::filesystem::remove(path);
