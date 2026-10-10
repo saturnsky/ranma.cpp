@@ -225,6 +225,7 @@ exit, and whenever 1 MiB is buffered.
 | `draft_us` | the measured time of the draft steps of the round (us) |
 | `verify_us` | the measured time from the end of the draft to the next draft (the verification time, see above); null when the round ended with the request or was not verified |
 | `accepted` | draft tokens accepted (0 when k = 0); null when the draft was not verified |
+| `pool` | only with the expert cache's decode pool and its counts read at the round's start, end of draft and end of verification: `draft` and `verify`, the pool's work in the draft steps (round start to the end of the draft) and in the verification (end of the draft to the next draft), each with `fills` (positions copied by the step of a launch) and `fill_mib`, `hits`, `lends` and `reclaims`; `since_lend`, the closed rounds since the last lend (0: a lend in this round, -1: none seen); `lend`, the lends so far. The counts are read from host memory the pool's kernels write, without a synchronize, right after the host has the results of the draft or of the verification; work still running then counts in the next part |
 | `wait_reset` | true when the time of this round was the observation of a waiting width, whose old mean was cut to its wait confidence (see "Extension"); false otherwise |
 | `wr_n` | only with `wait_reset` true: the confidence of the old mean before the cut and after it (the wait confidence), before the observation |
 | `end` | `closed`, `dropped` (the request ended, no verification time) or `unverified` (the slot stopped before the verification) |
@@ -253,4 +254,6 @@ observation of the round moves the estimates after it is logged.
 - The round log keeps one line per round in memory until the end of the request (a few hundred bytes a round); a
   server that is killed loses the lines of the current request. The verification time is not split into the target
   batch and the rest.
+- The decode pool counts of the round log are those of the whole process: with `--parallel` > 1 a round's counts
+  include the work of other slots.
 - The controller cost per step is a few microseconds (tables of at most n-max + 1 widths); not measured in the server.

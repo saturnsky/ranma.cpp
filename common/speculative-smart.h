@@ -53,6 +53,17 @@ struct common_spec_smart_diag {
 
 struct common_spec_smart_log; // round log writer (speculative-smart.cpp)
 
+// round log only: the cumulative counts of the expert cache's decode pool (ggml_expert_pool_counts), read by the caller
+// at the end of the draft steps and at the end of the verification. The decisions never read them.
+struct common_spec_smart_pool {
+    bool     valid      = false;
+    uint64_t lends      = 0;
+    uint64_t reclaims   = 0;
+    uint64_t hits       = 0;
+    uint64_t fills      = 0;
+    uint64_t fill_bytes = 0;
+};
+
 // decayed mean over time: the weight of an observation halves every half_life closed rounds of the controller,
 // whether or not the cell is observed. The decay is lazy: n is the confidence at round t and is read as
 // n * decay^(now - t). Time lowers only the confidence; the mean and the variance change only with a new observation.
@@ -100,11 +111,12 @@ struct common_spec_smart {
     //   after_step      after each draft step with its top probability; -1: one more step, else keep that many tokens
     //   drafted         with the final draft length
     //   accepted        after the target verified the draft (k > 0 only)
+    //   pool            (round log only, may be null) the decode pool counts at that moment, for close_round and drafted
     void    request_begin(int32_t seq);
-    void    close_round(int32_t seq, int64_t t_us);
+    void    close_round(int32_t seq, int64_t t_us, const common_spec_smart_pool * pool = nullptr);
     bool    begin_round(int32_t seq, int32_t n_max_seq);
     int32_t after_step(int32_t seq, float p_top);
-    void    drafted(int32_t seq, int32_t k, int64_t t_us);
+    void    drafted(int32_t seq, int32_t k, int64_t t_us, const common_spec_smart_pool * pool = nullptr);
     void    accepted(int32_t seq, int32_t n_accepted);
     void    add_draft_step(double us);
 
@@ -138,6 +150,7 @@ struct common_spec_smart {
 
     // round log: write the buffered lines to the file (at the end of a request); no effect without --spec-smart-log
     void log_flush() const;
+    bool logging() const { return log != nullptr; } // the round log is on: the caller reads the pool counts
 
     bool save(const std::string & path) const;
     bool load(const std::string & path, std::string * why = nullptr);
@@ -169,6 +182,8 @@ struct common_spec_smart {
     double  wr_n_before  = 0.0;   // ... the confidence of the mean before it and after the cut (before the observation)
     double  wr_n_after   = 0.0;
     int64_t last_extend  = 0; // n_closed at the last one
+    uint64_t pool_lends  = 0;  // round log: the lend count at the last close_round
+    int64_t pool_since_lend = -1; // round log: closed rounds since the last lend (0: a lend in this round), -1: none seen
     int64_t n_closed_saved = 0;
     bool    save_failed  = false;
 
@@ -198,6 +213,10 @@ struct common_spec_smart {
         std::vector<float>  log_p;       // top probability of every draft step
         std::vector<double> log_la_next; // before draft step i: the predicted acceptance of position i
         common_spec_smart_diag log_diag; // the last decision of the round
+        common_spec_smart_pool pool_next;    // decode pool counts at the last close_round: the start of the next round
+        common_spec_smart_pool pool_start;   // ... when the draft of the closed round started
+        common_spec_smart_pool pool_drafted; // ... when the draft ended (drafted)
+        common_spec_smart_pool pool_end;     // ... when the verification ended (close_round); valid: all three were read
 
         // request statistics
         int64_t n_rounds = 0;
