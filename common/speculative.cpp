@@ -142,6 +142,8 @@ static common_spec_smart_graph spec_smart_graph(const llama_context * ctx) {
         g.builds     = c.builds;
         g.build_us   = c.build_us;
         g.last_nt    = c.last_nt;
+        g.last_extent = c.last_extent;
+        g.last_pos   = c.last_pos;
         g.backend    = c.has_backend;
         g.captures   = c.captures;
         g.capture_us = c.capture_us;
