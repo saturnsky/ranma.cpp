@@ -7,3 +7,5 @@ from .tensor_mapping import *
 from .vocab import *
 from .utility import *
 from .metadata import *
+
+from . import mxfp8
