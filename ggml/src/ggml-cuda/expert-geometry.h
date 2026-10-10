@@ -24,7 +24,7 @@ using expert_aux_bytes   = std::array<std::array<size_t, 2>, 3>;              //
 
 struct geometry {
     int n_layers  = 0;                // routed layer index span = max routed layer + 1
-    int n_experts = 0;
+    int n_experts = 0;                // the stride of every [layer][expert] table: the largest expert count of a layer
     static constexpr int n_kinds = 3; // 0 = up, 1 = gate, 2 = down
     static constexpr int n_aux   = 2; // 0 = rot_in, 1 = rot_out
 
@@ -37,9 +37,36 @@ struct geometry {
     std::vector<expert_aux_tensors>    aux;                  // [layer]
     std::vector<expert_aux_bytes>      aux_nb;               // [layer]
     std::vector<expert_aux_bytes>      class_aux;            // [class]
+    // Experts of each layer. A joint cache of models with different expert counts keeps the tables rectangular
+    // (stride n_experts, the largest count) and the experts e >= experts(layer) of a layer do not exist: no plan,
+    // tier, home or loop visits them. Empty (one model, or joined models with the same count): every layer has
+    // n_experts.
+    std::vector<int>                   layer_experts;        // [layer]
+    std::vector<int>                   class_experts;        // [class] experts of all layers of the class
 
     size_t n_counts() const {
         return (size_t) n_layers*(size_t) n_experts;
+    }
+
+    int experts(int layer) const {
+        return layer >= 0 && (size_t) layer < layer_experts.size() ? layer_experts[layer] : n_experts;
+    }
+
+    // Expert slices of the class: what a class can hold in all tiers together.
+    int class_slices(int cls) const {
+        if (cls >= 0 && (size_t) cls < class_experts.size()) {
+            return class_experts[cls];
+        }
+        return cls >= 0 && (size_t) cls < class_layers.size() ? class_layers[cls]*n_experts : 0;
+    }
+
+    bool uniform_experts() const {
+        for (int count : layer_experts) {
+            if (count != n_experts) {
+                return false;
+            }
+        }
+        return true;
     }
 
     // Weight bytes of one expert of the class, all kinds: what the host and file tiers hold.
@@ -189,6 +216,7 @@ inline void assign_size_classes(geometry & out) {
     out.class_bytes.clear();
     out.class_layers.clear();
     out.class_aux.clear();
+    out.class_experts.clear();
     out.layer_class.assign(out.n_layers, -1);
     // the aux rows are part of a layer's slice layout: two layers share a class only with the same aux strides
     auto aux_of = [&](int layer) {
@@ -220,10 +248,12 @@ inline void assign_size_classes(geometry & out) {
             out.class_bytes.push_back(out.nb2[layer]);
             out.class_aux.push_back(aux_of(layer));
             out.class_layers.push_back(0);
+            out.class_experts.push_back(0);
             cls = (int) reference.size() - 1;
         }
         out.layer_class[layer] = cls;
         ++out.class_layers[cls];
+        out.class_experts[cls] += out.experts(layer);
     }
 }
 
@@ -354,7 +384,8 @@ inline bool build_geometry(const ggml_context * ctx, geometry & out, std::string
 
 // Joint cache: the geometries of several models laid end to end. Part i's layer l is joint layer
 // offsets[i] + l, and the size classes are recomputed over the union, so two models whose expert
-// slices have the same layout share a class. All parts must route the same number of experts.
+// slices have the same layout share a class. Parts may route different numbers of experts: the joint
+// stride is the largest count and layer_experts holds each layer's own.
 inline bool concat_geometry(const std::vector<const geometry *> & parts, geometry & out,
         std::vector<int> & offsets, std::string & reason) {
     out = geometry();
@@ -365,14 +396,12 @@ inline bool concat_geometry(const std::vector<const geometry *> & parts, geometr
             reason = "a joined model has no routed layers";
             return false;
         }
-        if (out.n_experts != 0 && part->n_experts != out.n_experts) {
-            char message[160];
-            snprintf(message, sizeof(message), "joined models route %d and %d experts; the cache needs one expert count",
-                out.n_experts, part->n_experts);
-            reason = message;
+        if (part->n_experts <= 0 || !part->uniform_experts()) {
+            reason = "a joined model has no expert count";
             return false;
         }
-        out.n_experts = part->n_experts;
+        out.n_experts = std::max(out.n_experts, part->n_experts);
+        out.layer_experts.insert(out.layer_experts.end(), (size_t) part->n_layers, part->n_experts);
         offsets.push_back(out.n_layers);
         out.n_layers += part->n_layers;
         out.nb2.insert(out.nb2.end(), part->nb2.begin(), part->nb2.end());
@@ -383,6 +412,10 @@ inline bool concat_geometry(const std::vector<const geometry *> & parts, geometr
         aux_nb.resize(part->n_layers);
         out.aux.insert(out.aux.end(), aux.begin(), aux.end());
         out.aux_nb.insert(out.aux_nb.end(), aux_nb.begin(), aux_nb.end());
+    }
+    // one expert count: the tables of a single model, no per-layer counts (the same bytes and loops as before)
+    if (out.uniform_experts()) {
+        out.layer_experts.clear();
     }
     assign_size_classes(out);
     return true;

@@ -127,7 +127,6 @@ inline class_storage plan_storage_classes(const geometry & geo, const std::vecto
             while (at > 0 && out.stride(order[at - 1]) > out.stride(c)) { --at; }
             order.insert(order.begin() + (std::ptrdiff_t) at, c);
         }
-        const uint64_t experts = (uint64_t) std::max(geo.n_experts, 0);
         for (int c : order) {
             const int own = out.storage_of[c];
             if (geo.class_layers[c] > 2 || out.members[own].size() != 1) { continue; }
@@ -141,8 +140,8 @@ inline class_storage plan_storage_classes(const geometry & geo, const std::vecto
             for (int k = 0; k < geometry::n_kinds; ++k) { merged[k] = std::max(merged[k], out.pitch[own][k]); }
             const size_t merged_stride = merged[0] + merged[1] + merged[2];
             uint64_t waste = 0;
-            for (int m : out.members[target]) { waste += (uint64_t) geo.class_layers[m]*experts*(merged_stride - out.stride(target)); }
-            waste += (uint64_t) geo.class_layers[c]*experts*(merged_stride - out.stride(own));
+            for (int m : out.members[target]) { waste += (uint64_t) std::max(geo.class_slices(m), 0)*(merged_stride - out.stride(target)); }
+            waste += (uint64_t) std::max(geo.class_slices(c), 0)*(merged_stride - out.stride(own));
             const uint64_t before = (uint64_t) floor_slots*(out.stride(own) + out.stride(target));
             const uint64_t after  = (uint64_t) floor_slots*merged_stride;
             if (before <= after || before - after <= waste) { continue; }
@@ -199,11 +198,12 @@ inline std::vector<int> storage_floors(const geometry & geo, const class_storage
             out[s] = bound;
             continue;
         }
-        std::vector<bool> resident((size_t) geo.n_experts, false);
-        for (int e = 0; e < geo.n_experts && (size_t) e < (*vram)[l].size(); ++e) { resident[e] = (*vram)[l][e] >= 0; }
-        for (int e : (*host)[l]) { if (e >= 0 && e < geo.n_experts) { resident[e] = true; } }
+        const int n = geo.experts(l);
+        std::vector<bool> resident((size_t) n, false);
+        for (int e = 0; e < n && (size_t) e < (*vram)[l].size(); ++e) { resident[e] = (*vram)[l][e] >= 0; }
+        for (int e : (*host)[l]) { if (e >= 0 && e < n) { resident[e] = true; } }
         int file = 0;
-        for (int e = 0; e < geo.n_experts; ++e) { file += resident[e] ? 0 : 1; }
+        for (int e = 0; e < n; ++e) { file += resident[e] ? 0 : 1; }
         out[s] = std::max(out[s], std::min(file, bound));
     }
     return out;
