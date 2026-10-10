@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import re
+import struct
+from dataclasses import dataclass
 from pathlib import Path
 
 from typing import Any, Callable, Iterable, TYPE_CHECKING
@@ -1190,6 +1192,72 @@ def _v41_compute_hash_multipliers(layer_ids: tuple[int, ...], max_ngram_size: in
     return torch.stack(rows)
 
 
+@dataclass
+class _SafetensorsEntry:
+    path: Path
+    offset: int   # absolute file offset of the tensor data
+    nbytes: int
+    dtype: str
+    shape: tuple[int, ...]
+
+
+class _Mxfp8Table:
+    """A DeepSeek V4.1 engram table as GGML_TYPE_MXFP8 rows, repacked from the checkpoint while it is written.
+
+    The checkpoint holds `.weight` F8_E4M3 [rows, 256] and `.scale` F8_E8M0 [rows, 8] (one scale per 32 columns of a
+    row). A GGUF MXFP8 block is 256 values followed by 8 scales, so a table row is the weight row followed by the
+    scale row: no value is converted. The object looks like a uint8 ndarray to GGUFWriter (shape, dtype, nbytes,
+    tofile), which calls tofile() when it writes the data: rows are read, joined and written in chunks, so there is
+    no staging file and the peak memory is one chunk (about 1.2 GB: the 2M-row read buffers and the packed rows).
+    """
+
+    CHUNK_ROWS = 1 << 21
+
+    def __init__(self, weight: _SafetensorsEntry, scale: _SafetensorsEntry):
+        block, sub, block_bytes = gguf.mxfp8.BLOCK, gguf.mxfp8.SUB, gguf.mxfp8.BLOCK_BYTES
+        if weight.dtype != "F8_E4M3" or scale.dtype != "F8_E8M0":
+            raise ValueError(
+                f"engram table dtypes {weight.dtype}/{scale.dtype}, expected F8_E4M3 values and F8_E8M0 scales "
+                f"(value * 2^(e - 127) per 32 columns)")
+        if len(weight.shape) != 2 or weight.shape[1] != block or scale.shape != (weight.shape[0], block // sub):
+            raise ValueError(f"engram weight {weight.shape} and scale {scale.shape} are not [rows, {block}] and [rows, {block // sub}]")
+        rows = weight.shape[0]
+        if weight.nbytes != rows * block or scale.nbytes != rows * (block // sub):
+            raise ValueError("engram table byte sizes do not match their shapes")
+        for e in (weight, scale):
+            if e.offset + e.nbytes > e.path.stat().st_size:
+                raise ValueError(f"{e.path.name} is shorter than its header says (incomplete download?)")
+        self.weight, self.scale = weight, scale
+        self.rows = rows
+        self.shape = (rows, block_bytes)
+        self.dtype = np.dtype(np.uint8)
+        self.nbytes = rows * block_bytes
+
+    def byteswap(self, inplace: bool = False):
+        return self  # bytes
+
+    def tofile(self, fout) -> None:
+        block, sub = gguf.mxfp8.BLOCK, gguf.mxfp8.SUB
+        nsc = block // sub
+        chunk = min(self.CHUNK_ROWS, self.rows)
+        w = np.empty((chunk, block), dtype=np.uint8)
+        sc = np.empty((chunk, nsc), dtype=np.uint8)
+        out = np.empty((chunk, gguf.mxfp8.BLOCK_BYTES), dtype=np.uint8)
+        with open(self.weight.path, "rb") as fw, open(self.scale.path, "rb") as fs:
+            for start in range(0, self.rows, chunk):
+                n = min(chunk, self.rows - start)
+                fw.seek(self.weight.offset + start * block)
+                if fw.readinto(memoryview(w).cast("B")[: n * block]) != n * block:
+                    raise ValueError(f"short read of {self.weight.path.name}")
+                fs.seek(self.scale.offset + start * nsc)
+                if fs.readinto(memoryview(sc).cast("B")[: n * nsc]) != n * nsc:
+                    raise ValueError(f"short read of {self.scale.path.name}")
+                gguf.mxfp8.repack_rows(w[:n], sc[:n], out[:n])
+                fout.write(memoryview(out).cast("B")[: n * gguf.mxfp8.BLOCK_BYTES])
+                if (start // chunk) % 8 == 0:
+                    logger.info("  engram table: %d / %d rows", start + n, self.rows)
+
+
 @ModelBase.register("DeepseekV41ForCausalLM")
 @ModelBase.example("deepseek-ai/DeepSeek-V4.1-Flash")
 class DeepseekV41Model(DeepseekV4Model):
@@ -1377,106 +1445,60 @@ class DeepseekV41Model(DeepseekV4Model):
                         multipliers.shape, primes_array.shape, offsets_array.shape, len(token_map))
 
 
-    # rows per block when rewriting an engram table; 1M rows is about 1 GB of float32 scratch
-    _V41_ENGRAM_CHUNK_ROWS = 1_000_000
+    # Folder holding the original FP8 checkpoint's engram tables (--engram-source); None: look in dir_model.
+    engram_source: Path | None = None
 
-    def _write_engram_table(self, bid: int) -> list[str]:
-        """Quantize one engram table in row blocks, accumulating into a disk-backed memmap.
+    def _find_engram_entry(self, name: str) -> "_SafetensorsEntry | None":
+        """Header of tensor `name` in the first folder that has it (engram_source, then dir_model)."""
+        folders = [self.engram_source] if self.engram_source is not None else []
+        folders.append(self.dir_model)
+        for folder in folders:
+            shard: str | None = None
+            index = folder / "model.safetensors.index.json"
+            if index.is_file():
+                shard = json.loads(index.read_text(encoding="utf-8"))["weight_map"].get(name)
+            paths = [folder / shard] if shard is not None else sorted(folder.glob("*.safetensors"))
+            for path in paths:
+                if not path.is_file():
+                    continue
+                with open(path, "rb") as f:
+                    n, = struct.unpack("<Q", f.read(8))
+                    header = json.loads(f.read(n))
+                if (e := header.get(name)) is not None:
+                    begin, end = e["data_offsets"]
+                    return _SafetensorsEntry(path, 8 + n + begin, end - begin, e["dtype"], tuple(e["shape"]))
+        return None
 
-        The inherited FP8 path cannot be used here. It computes weight.float() * scale over the
-        whole tensor, and one engram table is 384,006,168 x 256, so 98.3 billion elements, which
-        is 393 GB as float32. A run that reaches this tensor collapses from 118 GiB free to 13 GiB
-        and is killed. Every other tensor in the model converts normally.
-
-        The scale layout also differs from the rest of the checkpoint. Linear weights carry a
-        [rows/32, cols/32] scale matching weight_block_size [32, 32], while the engram scale is
-        [rows, 8], which is one scale per 32 columns within a single row. Broadcasting it the way
-        the generic path does would corrupt the table, so it is expanded along columns only.
-
-        Reading is done straight from the safetensors shard rather than through the lazy tensor
-        wrapper, because to_eager materializes the whole tensor before any slicing takes effect.
-        """
-        import json as _json
-        import os as _os
-        import tempfile as _tempfile
-
-        import numpy as _np
-        from safetensors import safe_open as _safe_open
-
+    def _engram_table(self, bid: int) -> "_Mxfp8Table":
         weight_name = f"layers.{bid}.engram.embed.weight"
         scale_name = f"layers.{bid}.engram.embed.scale"
-
-        index_path = self.dir_model / "model.safetensors.index.json"
-        with open(index_path, "r", encoding="utf-8") as f:
-            weight_map = _json.load(f)["weight_map"]
-        shard = self.dir_model / weight_map[weight_name]
-
-        qtype = gguf.GGMLQuantizationType.Q8_0
-        block_elems = gguf.GGML_QUANT_SIZES[qtype][0]
-
-        with _safe_open(str(shard), framework="pt") as f:
-            wsl = f.get_slice(weight_name)
-            n_rows, n_cols = (int(x) for x in wsl.get_shape())
-            has_scale = scale_name in f.keys()
-            ssl = f.get_slice(scale_name) if has_scale else None
-            scale_groups = int(ssl.get_shape()[1]) if has_scale else 0
-
-            if n_cols % block_elems:
-                raise ValueError(
-                    f"engram row width {n_cols} is not a multiple of the {qtype.name} block {block_elems}"
-                )
-            if has_scale and n_cols % scale_groups:
-                raise ValueError(
-                    f"engram row width {n_cols} is not divisible by its {scale_groups} scale groups"
-                )
-            per_group = n_cols // scale_groups if has_scale else 0
-
-            row_bytes = int(gguf.quantize(_np.zeros((1, n_cols), dtype=_np.float32), qtype).nbytes)
-            rows_per_chunk = min(int(self._V41_ENGRAM_CHUNK_ROWS), n_rows)
-            n_chunks = (n_rows + rows_per_chunk - 1) // rows_per_chunk
-
-            tmp_dir = _os.environ.get("V41_ENGRAM_TMPDIR") or _tempfile.gettempdir()
-            tmp_path = _os.path.join(tmp_dir, f"engram_{bid}_{qtype.name}.bin")
-            logger.info(
-                "engram layer %d: %d x %d, scale groups %d, %s in %d blocks of %d rows, staging %.1f GB at %s",
-                bid, n_rows, n_cols, scale_groups, qtype.name, n_chunks, rows_per_chunk,
-                n_rows * row_bytes / 1e9, tmp_path,
+        weight = self._find_engram_entry(weight_name)
+        scale = self._find_engram_entry(scale_name)
+        if weight is None or scale is None:
+            raise ValueError(
+                f"engram layer {bid}: {weight_name if weight is None else scale_name} not found in "
+                f"{self.engram_source if self.engram_source is not None else self.dir_model}; the engram tables "
+                f"are not in the EXL3 conversion, pass the original FP8 checkpoint folder with --engram-source"
             )
-
-            out = _np.memmap(tmp_path, dtype=_np.uint8, mode="w+", shape=(n_rows, row_bytes))
-            for ci, start in enumerate(range(0, n_rows, rows_per_chunk)):
-                stop = min(start + rows_per_chunk, n_rows)
-                chunk = wsl[start:stop, :].float()
-                if has_scale:
-                    s = self._e8m0_to_float(ssl[start:stop, :])
-                    chunk = chunk * s.repeat_interleave(per_group, 1)[:, :n_cols]
-                out[start:stop] = gguf.quantize(
-                    chunk.cpu().numpy().astype(_np.float32), qtype
-                ).reshape(stop - start, row_bytes)
-                del chunk
-                if ci % 25 == 0:
-                    logger.info("  engram layer %d: %d / %d rows", bid, stop, n_rows)
-            out.flush()
-
-        new_name = self.format_tensor_name(gguf.MODEL_TENSOR.ENGRAM_EMBD, bid, ".weight")
-        self.gguf_writer.add_tensor(new_name, out, raw_dtype=qtype)
-        logger.info("engram layer %d: wrote %s as %s", bid, new_name, qtype.name)
-
-        consumed = [weight_name]
-        if has_scale:
-            consumed.append(scale_name)
-        return consumed
+        return _Mxfp8Table(weight, scale)
 
     def generate_extra_tensors(self):
         yield from super().generate_extra_tensors()
 
-        consumed: list[str] = []
-        for bid in (self.hparams.get("engram_layer_ids") or []):
-            if f"layers.{bid}.engram.embed.weight" in self.model_tensors:
-                consumed.extend(self._write_engram_table(int(bid)))
-        for name in consumed:
-            if name in self.model_tensors:
-                del self.model_tensors[name]
+        engram_ids = self.hparams.get("engram_layer_ids") or []
+        if self.mtp_only:
+            return
+        counts = self.hparams.get("engram_num_embeddings") or []
+        for i, bid in enumerate(engram_ids):
+            table = self._engram_table(int(bid))
+            if i < len(counts) and int(counts[i]) != table.rows:
+                raise ValueError(f"engram layer {bid}: config has {counts[i]} rows, the table has {table.rows}")
+            new_name = self.format_tensor_name(gguf.MODEL_TENSOR.ENGRAM_EMBD, int(bid), ".weight")
+            logger.info("engram layer %d: %s as MXFP8, %d rows x %d, %.1f GB, streamed from %s",
+                        bid, new_name, table.rows, gguf.mxfp8.BLOCK, table.nbytes / 1e9, table.weight.path.name)
+            self.gguf_writer.add_tensor(new_name, table, raw_dtype=gguf.GGMLQuantizationType.MXFP8)
+            for name in (f"layers.{bid}.engram.embed.weight", f"layers.{bid}.engram.embed.scale"):
+                self.model_tensors.pop(name, None)
 
     def _map_dsv4_tensor_name(self, name: str, bid):
         match = re.match(r"layers\.(\d+)\.(.+)$", name)
