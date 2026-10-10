@@ -439,3 +439,23 @@ graph plans at some widths).
   The extra time of the call after a width change and of the call after it
   (from the per-round log) was +3.6 to +9.8 ms in A and about 0 (within
   +-0.8 ms) in B.
+
+## Graph metadata given back
+
+### What it is
+
+Every stored graph (a graph slot of the scheduler, an `llm_graph_result` per stored batch shape) was sized for the
+worst case of the context: the scheduler's hash set, backend ids and copies for `graph_size` nodes (14 MiB per slot at
+327680 nodes) and the graph metadata buffer for `max_nodes` (132 MiB at 327680 nodes), fully committed, although a
+decode graph uses a small part of them. With 64 stored batch shapes per context that is several GiB of host memory.
+
+- After a slot is split and allocated, its tables are rehashed to twice the used entries (at least
+  `n_nodes + n_leafs`); the full tables come back when the next graph is built in the slot, and before a reserve or an
+  allocation that finds smaller ones. Slot 0 also gives back the worst-case context buffer it adopted from the
+  scheduler.
+- The metadata buffer is reserved address space (`llama_vmem`): a reset commits all of it, so a graph of any size
+  still fits, and after a graph is built the pages past its last object are given back (`llm_graph_result::trim`).
+
+### Options
+
+None: the worst-case tables, context buffer and metadata pages are always given back.
