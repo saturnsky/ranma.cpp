@@ -176,6 +176,12 @@ def parse_args() -> argparse.Namespace:
              "or omit (development) the table, its PLE module and its PLE keys",
     )
 
+    parser.add_argument(
+        "--engram-source", type=Path, default=None,
+        help="DeepSeek V4.1: folder of the original FP8 checkpoint to read the engram tables from (they are not in "
+             "an EXL3 conversion); written as MXFP8 without changing a value. Default: the model folder",
+    )
+
     args = parser.parse_args()
     if not args.print_supported_models and args.model is None:
         parser.error("the following arguments are required: model")
@@ -287,6 +293,15 @@ def main() -> None:
                 model_class.no_mtp = True
             if args.mtp:
                 model_class.mtp_only = True
+
+        if args.engram_source is not None:
+            if not hasattr(model_class, "engram_source"):
+                logger.error("--engram-source is not supported for %s", model_architecture)
+                sys.exit(1)
+            if not args.engram_source.is_dir():
+                logger.error("--engram-source %s is not a folder", args.engram_source)
+                sys.exit(1)
+            model_class.engram_source = args.engram_source
 
         if not is_mistral_format:
             from conversion import exl3
