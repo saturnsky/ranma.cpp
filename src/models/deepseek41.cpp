@@ -599,7 +599,7 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention_v41(
         llm_graph_input_dsv4 * inp_dsv4,
         ggml_tensor * cur,
         ggml_tensor * inp_pos,
-        ggml_tensor * & top_k_carry,
+        dsv41_top_k_carry & top_k_carry,
         int il) const {
     const auto & layer = model.layers[il];
     llm_graph_input_dsv4_raw * inp_attn = inp_dsv4->get_raw();
@@ -746,14 +746,16 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention_v41(
                     ctx0, persist_score, inp_comp.state_persist_dst_idxs, il));
     }
 
-    // an index source picks the positions; the layers in between reuse what it picked. Without
-    // the carry a reusing layer would fall back to the full causal mask and attend to every
-    // compressed row, which matches the reference only while a source has <= index_topk rows.
+    // an index source picks the positions; the layers in between reuse what it picked. Without the
+    // carry a reusing layer would fall back to the full causal mask and attend to every compressed
+    // row, which matches the reference only while a source has <= index_topk rows
     if (hparams.dsv41_is_index_source(il)) {
-        top_k_carry = build_indexer_top_k(model, inp_dsv4, inp_comp, qr, cur, inp_pos, il);
+        top_k_carry.top_k = build_indexer_top_k(model, inp_dsv4, inp_comp, qr, cur, inp_pos, il);
+        top_k_carry.il    = (int32_t) il;
     }
-    GGML_ASSERT(top_k_carry && "a compressed layer needs the top-k of an earlier index source");
-    ggml_tensor * top_k = top_k_carry;
+    GGML_ASSERT(top_k_carry.top_k != nullptr && top_k_carry.il == hparams.dsv41_topk_source[il] &&
+            "a compressed layer needs the top-k of its index source");
+    ggml_tensor * top_k = top_k_carry.top_k;
 
     ggml_tensor * k_rot = inp_attn->self_k_rot;
     if (k_rot) {
@@ -833,7 +835,7 @@ llama_model_deepseek41::graph::graph(const llama_model & model, const llm_graph_
     cb(pre_mix, "hc_pre_init", -1);
 
     // the positions picked by the most recent index source, reused by the layers that follow it
-    ggml_tensor * top_k_carry = nullptr;
+    dsv41_top_k_carry top_k_carry;
 
     for (int il = 0; il < n_layer; ++il) {
         if ((size_t) il < cparams.embeddings_layer_inp.size() && cparams.embeddings_layer_inp[il]) {

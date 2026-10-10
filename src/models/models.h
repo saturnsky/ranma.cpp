@@ -1400,6 +1400,12 @@ struct llama_model_deepseek4 : public llama_model_base {
 };
 
 
+// the top-k of the last index source, handed on to the compressed layers that reuse it
+struct dsv41_top_k_carry {
+    ggml_tensor * top_k = nullptr;
+    int32_t       il    = -1;
+};
+
 // DeepSeek-V4.1. Same machinery as V4, minus the hash layers, the MTP block and the learned
 // hyper-connection head, plus the engram n-gram tables. See src/models/deepseek41.cpp.
 struct llama_model_deepseek41 : public llama_model_deepseek4 {
@@ -1461,7 +1467,7 @@ struct llama_model_deepseek41 : public llama_model_deepseek4 {
                 llm_graph_input_dsv4 * inp_dsv4,
                 ggml_tensor * cur,
                 ggml_tensor * inp_pos,
-                ggml_tensor * & top_k_carry,
+                dsv41_top_k_carry & top_k_carry,
                 int il) const;
     };
 
