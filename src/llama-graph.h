@@ -4,6 +4,7 @@
 #include "llama-batch.h"
 #include "llama-hparams.h"
 #include "llama-adapter.h"
+#include "llama-mmap.h"
 #include "llama-weight-aux.h"
 
 #include <cstdint>
@@ -936,6 +937,10 @@ public:
 
     void reset();
 
+    // give back the pages of the metadata buffer past the built graph; the next reset() takes them again
+    // env: LLAMA_GRAPH_META_TRIM=0 keeps them
+    void trim();
+
     void set_inputs(const llama_ubatch * ubatch);
     void set_outputs(const llm_graph_params & params);
 
@@ -981,7 +986,8 @@ public:
     ggml_context_ptr ctx_compute;
 
     // memory buffers used to evaluate the model
-    std::vector<uint8_t> buf_compute_meta;
+    // sized for max_nodes, but a graph usually needs much less of it (see trim)
+    llama_vmem buf_compute_meta;
 
     ggml_cgraph * gf;
 
