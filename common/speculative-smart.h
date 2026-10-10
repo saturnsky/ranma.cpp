@@ -71,6 +71,8 @@ struct common_spec_smart_graph {
     int64_t builds     = 0;  // of them, built and allocated anew
     int64_t build_us   = 0;
     int32_t last_nt    = 0;  // rows of the last graph built
+    size_t  last_extent = 0; // the last graph computed: its compute buffer extent and highest position
+    int32_t last_pos   = -1;
     bool    backend    = false; // the GPU backend counts its graph calls
     int64_t captures   = 0;  // calls that captured a HIP graph
     int64_t capture_us = 0;

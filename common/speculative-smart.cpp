@@ -739,6 +739,12 @@ void common_spec_smart::log_round(int32_t seq, const char * end, double verify_u
             smart_json_num(l, (double) (y.build_us - x.build_us) / 1000.0, "%.3f");
             l += ",\"nt\":";
             l += y.builds > x.builds ? std::to_string(y.last_nt) : std::string("null");
+            if (y.calls > x.calls) {
+                // the last graph of the part: how far it reached into the compute buffer, and its highest position
+                l += ",\"extent_mib\":";
+                smart_json_num(l, (double) y.last_extent / 1048576.0, "%.2f");
+                l += ",\"pos\":" + std::to_string(y.last_pos);
+            }
             if (x.backend && y.backend) {
                 l += ",\"captures\":" + std::to_string(y.captures - x.captures) + ",\"capture_ms\":";
                 smart_json_num(l, (double) (y.capture_us - x.capture_us) / 1000.0, "%.3f");
