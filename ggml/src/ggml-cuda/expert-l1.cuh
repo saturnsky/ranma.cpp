@@ -178,6 +178,8 @@ public:
     // take before the host slot table. Null without a tier.
     using address_source = std::function<const uint64_t * (int layer, int kind)>;
     void attach_addresses(address_source addresses) { addresses_ = std::move(addresses); }
+    // The decode pool's own address table, for the lookups that get none from the tier or the host arena.
+    void attach_pool_addresses(address_source addresses) { pool_addresses_ = std::move(addresses); }
 
     bool write_gpu_slice(int cls, int kind, int slot, const void * src, bool src_is_device);
     bool read_gpu_slice(int cls, int kind, int slot, void * dst);
@@ -308,6 +310,7 @@ private:
     // exclusive mode
     host_arena * host_ = nullptr;
     address_source addresses_;
+    address_source pool_addresses_;
     tier_reader    tier_;
     int          spare_slots_ = 0;
     std::vector<std::vector<int32_t>> arena_slots_;    // [layer][expert] host arena slot or -1

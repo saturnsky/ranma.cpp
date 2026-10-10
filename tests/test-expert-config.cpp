@@ -115,7 +115,7 @@ int main() {
     // ABI 7: the model loader's token-routed layers; none unless the loader declares them
     {
         const auto rc = expert_config_from_params(p);
-        CHECK(rc.abi_version == GGML_EXPERT_ABI_VERSION && rc.abi_version == 7 && rc.early_route_layers == nullptr &&
+        CHECK(rc.abi_version == GGML_EXPERT_ABI_VERSION && rc.abi_version == 11 && rc.early_route_layers == nullptr &&
               rc.n_early_route_layers == 0);
     }
     bench_expert_options o; o.supplied = true;

@@ -23,7 +23,7 @@
 extern "C" {
 #endif
 
-#define GGML_EXPERT_ABI_VERSION      7
+#define GGML_EXPERT_ABI_VERSION      11
 #define GGML_EXPERT_IFACE_PROC_NAME  "ggml_backend_expert_iface"
 
 #define GGML_EXPERT_BANK_NONE        0xFFFFFFFFu
@@ -129,6 +129,17 @@ struct ggml_expert_status {
     uint32_t n_banks;
 };
 
+// The decode pool (RANMA_EXPERT_UB_POOL), cumulative since the pool was allocated. Positions are counted, bytes are
+// the bytes copied for them. The step kernels write the per-layer counts into host memory as they finish, so
+// reading them never waits for the device; the work of graphs still running may be missing.
+struct ggml_expert_pool_counts {
+    uint64_t lends;       // the pool was lent (a lend starts it empty)
+    uint64_t reclaims;    // the pool was taken back (a graph reached into it, e.g. a prompt ubatch)
+    uint64_t hits;        // selections served by a position
+    uint64_t fills;       // positions filled by the step of a launch (copied right before the layer's matmuls)
+    uint64_t fill_bytes;
+};
+
 struct ggml_expert_iface {
     uint32_t abi_version;
 
@@ -179,6 +190,18 @@ struct ggml_expert_iface {
     // waits for the device. Returns false when the cache does not use hints for this model (the
     // caller may stop computing them); true otherwise, whether or not this hint was used.
     bool (*route_hint)(ggml_backend_t backend, const struct ggml_expert_route_hint * hints, int32_t n_hints);
+
+    // Before every graph computed on `backend`: [base, base + size) is its compute buffer and the graph
+    // uses it up to `extent` (ggml_backend_sched_get_buffer_extent); `n_tokens` is the rows of the batch,
+    // <= 0 for a graph that is not one. The cache may keep data in the unused part between graphs and takes
+    // it back, in stream order, before a graph that reaches into it (RANMA_EXPERT_UB_POOL). Returns false
+    // when it does not use compute buffers.
+    bool (*compute_spare)(ggml_backend_t backend, void * base, size_t size, size_t extent, int32_t n_tokens);
+    // Graphs of at most this many rows should be planned on their own (ggml_backend_sched_set_alloc_compact), so that
+    // they use only the start of the compute buffer; 0 = no preference.
+    int32_t (*compact_rows)(void);
+    // The counts of the decode pool; false when it is not allocated. Never waits for the device.
+    bool (*pool_counts)(struct ggml_expert_pool_counts * out);
 };
 
 typedef const struct ggml_expert_iface * (*ggml_backend_expert_iface_t)(void);

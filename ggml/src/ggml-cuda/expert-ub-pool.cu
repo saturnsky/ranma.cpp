@@ -1,0 +1,746 @@
+#include "expert-ub-pool.cuh"
+
+#if defined(GGML_USE_HIP)
+
+#include <algorithm>
+#include <cstdlib>
+#include <cstring>
+
+namespace ggml_cuda_expert {
+
+static size_t ub_env_mib(const char * name, size_t fallback) {
+    const char * v = getenv(name);
+    if (v == nullptr || *v == '\0') {
+        return fallback;
+    }
+    return size_t(std::max(0LL, atoll(v))) << 20;
+}
+
+static int ub_env_int(const char * name, int fallback) {
+    const char * v = getenv(name);
+    return v == nullptr || *v == '\0' ? fallback : atoi(v);
+}
+
+ub_pool_config ub_pool_config_from_env() {
+    ub_pool_config c;
+    c.enabled   = ub_env_int("RANMA_EXPERT_UB_POOL", 1) != 0;
+    c.min_bytes = ub_env_mib("RANMA_EXPERT_UB_POOL_MIN_MIB", c.min_bytes);
+    c.margin    = ub_env_mib("RANMA_EXPERT_UB_POOL_MARGIN_MIB", c.margin);
+    c.r_cap     = std::min(std::max(ub_env_int("RANMA_EXPERT_UB_POOL_RCAP", c.r_cap), 1), ub_pool_max_rcap);
+    c.rows      = std::max(ub_env_int("RANMA_EXPERT_UB_POOL_ROWS", 0), 0);
+    c.log       = ub_env_int("RANMA_EXPERT_UB_POOL_LOG", 0) != 0;
+    if (const char * f = getenv("RANMA_EXPERT_UB_POOL_FILTER"); f != nullptr && *f != '\0') {
+        const std::string s = f;
+        const int k = s.rfind("ghost:", 0) == 0 ? atoi(s.c_str() + 6) : -1;
+        if (s == "0" || s == "off" || s == "none") {
+            c.ghost = 0;
+        } else if (k >= 1 && k <= 65535) {
+            c.ghost = k;
+        } else {
+            GGML_LOG_WARN("expert cache: RANMA_EXPERT_UB_POOL_FILTER='%s' is not ghost:K (1..65535) or off; no filter\n", f);
+        }
+    }
+    return c;
+}
+
+// ---- kernels ---------------------------------------------------------------------------------------
+
+static constexpr uint32_t ub_never = 0xFFFFFFFFu;   // last miss of an expert that never missed
+
+struct ub_step_args {
+    const int32_t * ids;
+    int n_rows, row_stride, n_used, n_experts, layer, r_cap, admit, ghost;
+    const ub_pool_layer * layers;
+    ub_pool_meta * meta;
+    const uint64_t * addr;   // [P][3]
+    uint64_t * home;         // [P][3]
+    int32_t * owner;
+    uint32_t * stamp;
+    int16_t * pos_of;        // [L][E]
+    ub_pool_copy * copy;
+    int32_t * count;
+    unsigned long long * counters;
+    uint32_t * last_miss;    // [E] of the layer; used only when ghost > 0
+    ub_pool_live * live;     // [L] mapped host memory, or null
+    uint64_t pos_bytes;
+};
+
+// The admission rule of the step kernel, for an expert not in a position: not an L1
+// resident, not one the SSD worker serves, and with a host home.
+static __device__ __forceinline__ bool ub_admissible(const ub_pool_layer & L, const int id) {
+    if (L.slots[id] >= 0) {
+        return false;
+    }
+    if (L.serve != nullptr && (L.serve[id/32] & (1u << (id%32))) != 0) {
+        return false;   // a file resident or ring occupant: only the SSD worker places it
+    }
+    if (L.kind[0].host_slots != nullptr && L.kind[0].addresses != nullptr && L.kind[0].addresses[id] == 0 &&
+            L.kind[0].host_slots[id] < 0) {
+        return false;   // no host home
+    }
+    return true;
+}
+
+// The recent pool's ghost term (RANMA_EXPERT_RECENT_FILTER, 2026-09): `last` = the step of the expert's
+// last miss, `t` = the step now.
+static __device__ __forceinline__ bool ub_ghost_ok(const uint32_t last, const uint32_t t, const uint32_t k) {
+    return last != ub_never && last != t && t - last <= k;
+}
+
+static __device__ __forceinline__ bool ub_eligible(const ub_step_args & a, const int off, const uint32_t t, const int p) {
+    return a.owner[off + p] < 0 || a.stamp[off + p] != t;
+}
+
+// empty positions first, then the oldest stamp, then the lower position
+static __device__ __forceinline__ bool ub_precedes(const ub_step_args & a, const int off, const uint32_t t, const int x, const int y) {
+    const bool ex = a.owner[off + x] < 0;
+    const bool ey = a.owner[off + y] < 0;
+    if (ex != ey) {
+        return ex;
+    }
+    if (!ex) {
+        const uint32_t ax = t - a.stamp[off + x];
+        const uint32_t ay = t - a.stamp[off + y];
+        if (ax != ay) {
+            return ax > ay;
+        }
+    }
+    return x < y;
+}
+
+// One block per launch of a routed layer. Everything of the layer is written by this block, or by
+// the copy kernel that follows it on the same stream.
+static __global__ void __launch_bounds__(ub_pool_threads) ub_step_kernel(const ub_step_args a) {
+    __shared__ uint32_t s_t;
+    __shared__ int s_r, s_off, s_n_miss, s_n_victims;
+    __shared__ unsigned int s_hits, s_over, s_fills, s_evict, s_rejected;
+    __shared__ int32_t s_key[ub_pool_max_experts];
+    __shared__ int32_t s_miss[ub_pool_max_experts];
+    __shared__ int32_t s_miss_key[ub_pool_max_experts];
+    __shared__ int32_t s_victim[ub_pool_max_rcap];
+    __shared__ uint8_t s_missed[ub_pool_max_experts];   // ghost filter: 1 a miss, 2 an admissible miss it rejected
+
+    const int tid = threadIdx.x;
+    const int E   = a.n_experts;
+    const ub_pool_layer & L = a.layers[a.layer];
+    if (tid == 0) {
+        ub_pool_meta & m = a.meta[a.layer];
+        s_r   = m.r;
+        s_off = m.offset;
+        // the copy kernel of this launch reads only the list of this step
+        *a.count = 0;
+        if (s_r > 0) {
+            m.step = m.step + 1;
+        }
+        s_t = m.step;
+        s_n_miss = 0;
+        s_n_victims = 0;
+        s_hits = s_over = s_fills = s_evict = s_rejected = 0;
+    }
+    __syncthreads();
+    const int r = s_r;
+    if (r <= 0) {
+        return;
+    }
+    const uint32_t t = s_t;
+    const int off = s_off;
+    int16_t * pos_of = a.pos_of + size_t(a.layer)*E;
+    const bool ghost = a.ghost > 0;
+
+    for (int e = tid; e < E; e += blockDim.x) {
+        s_key[e] = -1;
+        s_missed[e] = 0;
+    }
+    __syncthreads();
+
+    const int n = a.n_rows*a.n_used;
+    unsigned int hits = 0;
+    for (int i = tid; i < n; i += blockDim.x) {
+        const int row = i/a.n_used;
+        const int k   = i - row*a.n_used;
+        const int id  = a.ids[row*a.row_stride + k];
+        if ((unsigned) id >= (unsigned) E) {
+            continue;
+        }
+        const int p = pos_of[id];
+        if (p >= 0 && p < r) {
+            a.stamp[off + p] = t;
+            hits++;
+            continue;
+        }
+        if (L.slots[id] >= 0) {
+            continue;   // static: not a miss
+        }
+        if (!a.admit || !ub_admissible(L, id)) {
+            if (ghost) { s_missed[id] = 1; }
+            continue;
+        }
+        if (ghost) {
+            // every selection of one expert in this launch reads the same stamp, so they agree
+            if (!ub_ghost_ok(a.last_miss[id], t, (uint32_t) a.ghost)) {
+                s_missed[id] = 2;
+                continue;
+            }
+            s_missed[id] = 1;
+        }
+        // later rows first, then the first router slot of that row
+        atomicMax(&s_key[id], row*a.n_used + (a.n_used - 1 - k));
+    }
+    if (hits != 0) {
+        atomicAdd(&s_hits, hits);
+    }
+    __syncthreads();
+
+    unsigned int rejected = 0;
+    for (int e = tid; e < E; e += blockDim.x) {
+        if (s_key[e] >= 0) {
+            const int j = atomicAdd(&s_n_miss, 1);
+            s_miss[j]     = e;
+            s_miss_key[j] = s_key[e];
+        }
+        rejected += s_missed[e] == 2;
+    }
+    if (rejected != 0) {
+        atomicAdd(&s_rejected, rejected);
+    }
+    __syncthreads();
+    const int n_miss = s_n_miss;
+
+    if (n_miss > 0) {
+        // ranked by counting, so the order is deterministic
+        for (int p = tid; p < r; p += blockDim.x) {
+            if (!ub_eligible(a, off, t, p)) {
+                continue;
+            }
+            int rank = 0;
+            for (int q = 0; q < r; ++q) {
+                rank += q != p && ub_eligible(a, off, t, q) && ub_precedes(a, off, t, q, p);
+            }
+            s_victim[rank] = p;
+            atomicAdd(&s_n_victims, 1);
+        }
+        __syncthreads();
+        const int n_fill = min(n_miss, s_n_victims);
+        unsigned int fills = 0, over = 0, evict = 0;
+        for (int j = tid; j < n_miss; j += blockDim.x) {
+            const int key = s_miss_key[j];
+            int rank = 0;
+            for (int i = 0; i < n_miss; ++i) {
+                rank += s_miss_key[i] > key;
+            }
+            if (rank >= n_fill) {
+                over++;
+                continue;
+            }
+            const int p = s_victim[rank];
+            const int q = off + p;
+            const int e = s_miss[j];
+            const int old = a.owner[q];
+            if (old >= 0) {
+                // the old owner is not used by this launch, and the previous launch is complete
+                for (int kind = 0; kind < 3; ++kind) {
+                    if (L.kind[kind].addresses != nullptr) {
+                        L.kind[kind].addresses[old] = a.home[size_t(q)*3 + kind];
+                    }
+                }
+                pos_of[old] = -1;
+                evict++;
+            }
+            for (int kind = 0; kind < 3; ++kind) {
+                uint64_t * table = L.kind[kind].addresses;
+                a.home[size_t(q)*3 + kind] = table != nullptr ? table[e] : 0;
+                if (table != nullptr) {
+                    table[e] = a.addr[size_t(q)*3 + kind];
+                }
+            }
+            a.owner[q] = e;
+            a.stamp[q] = t;
+            pos_of[e]  = (int16_t) p;
+            a.copy[off + rank] = { e, q };
+            fills++;
+        }
+        if (tid == 0) {
+            *a.count = n_fill;
+        }
+        if (fills) { atomicAdd(&s_fills, fills); }
+        if (over)  { atomicAdd(&s_over, over); }
+        if (evict) { atomicAdd(&s_evict, evict); }
+    }
+    // the tables may be mapped host memory, which the next kernels read
+    __threadfence_system();
+    __syncthreads();
+    if (ghost) {
+        // the misses of this step, stamped after its decisions, so that a miss never admits itself
+        for (int e = tid; e < E; e += blockDim.x) {
+            if (s_missed[e] != 0) {
+                a.last_miss[e] = t;
+            }
+        }
+    }
+    if (tid == 0) {
+        atomicAdd(&a.counters[ub_pool_steps], 1ull);
+        if (s_hits)  { atomicAdd(&a.counters[ub_pool_hits], (unsigned long long) s_hits); }
+        if (s_fills) {
+            atomicAdd(&a.counters[ub_pool_fills], (unsigned long long) s_fills);
+            atomicAdd(&a.counters[ub_pool_fill_bytes], (unsigned long long) s_fills*a.pos_bytes);
+        }
+        if (s_over)  { atomicAdd(&a.counters[ub_pool_over], (unsigned long long) s_over); }
+        if (s_evict) { atomicAdd(&a.counters[ub_pool_evictions], (unsigned long long) s_evict); }
+        if (s_rejected) { atomicAdd(&a.counters[ub_pool_rejected], (unsigned long long) s_rejected); }
+        if ((s_hits || s_fills) && a.live != nullptr) {
+            // the layer's own totals: only this layer's launches write them, in stream order
+            ub_pool_meta & m = a.meta[a.layer];
+            m.n_hits  += s_hits;
+            m.n_fills += s_fills;
+            a.live[a.layer].hits  = m.n_hits;
+            a.live[a.layer].fills = m.n_fills;
+            __threadfence_system();
+        }
+    }
+}
+
+typedef int32_t ub_i4 __attribute__((ext_vector_type(4)));
+
+static __device__ __forceinline__ void ub_copy_bytes(const char * src, char * dst, const size_t bytes, const int lane, const int n_lanes) {
+    const uintptr_t al = (uintptr_t) src | (uintptr_t) dst | (uintptr_t) bytes;
+    if (al % 16 == 0) {
+        const ub_i4 * s = (const ub_i4 *) src;
+        ub_i4 * d = (ub_i4 *) dst;
+        for (size_t i = lane; i < bytes/16; i += n_lanes) {
+            d[i] = s[i];
+        }
+        return;
+    }
+    for (size_t i = lane; i < bytes; i += n_lanes) {
+        dst[i] = src[i];
+    }
+}
+
+// This lane's share of the three kinds of one listed expert, from its home.
+static __device__ __forceinline__ void ub_copy_entry(const ub_pool_layer & L, const ub_pool_copy en, const uint64_t * addr,
+        const uint64_t * home, const int lane, const int n_lanes) {
+#pragma unroll
+    for (int k = 0; k < 3; ++k) {
+        const ub_pool_kind & c = L.kind[k];
+        const uint64_t h = home[size_t(en.pos)*3 + k];
+        const char * src;
+        if (h != 0) {
+            src = (const char *) (uintptr_t) h;
+        } else {
+            const int32_t channel = c.host_slots != nullptr ? c.host_slots[en.expert] : en.expert;
+            src = c.tensor + size_t(channel)*c.stride;
+        }
+        ub_copy_bytes(src, (char *) (uintptr_t) addr[size_t(en.pos)*3 + k], c.stride, lane, n_lanes);
+    }
+}
+
+// Block (j, y) copies its share of the j-th expert the step listed.
+static __global__ void __launch_bounds__(ub_pool_threads) ub_copy_kernel(const ub_pool_layer * layers, const int layer,
+        const ub_pool_copy * __restrict__ list, const int32_t * __restrict__ count, const uint64_t * __restrict__ addr,
+        const uint64_t * __restrict__ home) {
+    const int j = blockIdx.x;
+    if (j >= *count) {
+        return;
+    }
+    ub_copy_entry(layers[layer], list[j], addr, home, blockIdx.y*blockDim.x + threadIdx.x, gridDim.y*blockDim.x);
+}
+
+struct ub_lend_args {
+    const ub_pool_layer * layers;
+    ub_pool_meta * meta;
+    const uint64_t * addr;
+    uint64_t * home;
+    int32_t * owner;
+    uint32_t * stamp;
+    int32_t * count;
+    const size_t * strides;   // [L][3]
+    const size_t * tails;     // [L][3]
+    int r;
+};
+
+// lend: the r positions of every enabled layer, empty, their tails zeroed. The step count is kept.
+static __global__ void __launch_bounds__(ub_pool_threads) ub_lend_kernel(const ub_lend_args a) {
+    const int layer = blockIdx.x;
+    const int tid = threadIdx.x;
+    const ub_pool_layer & L = a.layers[layer];
+    ub_pool_meta & m = a.meta[layer];
+    if (!L.enabled) {
+        if (tid == 0) {
+            m.r = 0;
+            a.count[layer] = 0;
+        }
+        return;
+    }
+    const int r = a.r;
+    const int off = m.offset;
+    for (int p = 0; p < r; ++p) {
+        const int q = off + p;
+        if (tid == 0) {
+            a.owner[q] = -1;
+            a.stamp[q] = 0;
+        }
+        for (int k = 0; k < 3; ++k) {
+            char * tail = (char *) (uintptr_t) a.addr[size_t(q)*3 + k] + a.strides[size_t(layer)*3 + k];
+            const size_t n = a.tails[size_t(layer)*3 + k];
+            for (size_t i = tid; i < n; i += blockDim.x) {
+                tail[i] = 0;
+            }
+        }
+    }
+    if (tid == 0) {
+        a.count[layer] = 0;
+        m.r = r;
+    }
+    // the tables may be mapped host memory, which the next kernels read
+    __threadfence_system();
+}
+
+// reclaim: the entries of every owner back to their homes, then r = 0
+static __global__ void ub_reclaim_kernel(const ub_pool_layer * layers, ub_pool_meta * meta, const uint64_t * home,
+        int32_t * owner, int16_t * pos_of, int n_experts) {
+    const int layer = blockIdx.x;
+    ub_pool_meta & m = meta[layer];
+    const int r = m.r;
+    const ub_pool_layer & L = layers[layer];
+    for (int p = threadIdx.x; p < r; p += blockDim.x) {
+        const int q = m.offset + p;
+        const int e = owner[q];
+        if (e < 0) {
+            continue;
+        }
+        for (int k = 0; k < 3; ++k) {
+            if (L.kind[k].addresses != nullptr) {
+                L.kind[k].addresses[e] = home[size_t(q)*3 + k];
+            }
+        }
+        pos_of[size_t(layer)*n_experts + e] = -1;
+        owner[q] = -1;
+    }
+    __threadfence_system();
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        m.r = 0;
+    }
+}
+
+// ---- host side --------------------------------------------------------------------------------------
+
+ub_pool::ub_pool(int n_layers, int n_experts, int r_cap) : n_layers_(n_layers), n_experts_(n_experts), r_cap_(r_cap) {}
+
+ub_pool::~ub_pool() {
+    if (blob_ != nullptr) {
+        ggml_cuda_set_device(device_);
+        (void) cudaFree(blob_);
+    }
+    if (h_addr_ != nullptr) { (void) cudaFreeHost(h_addr_); }
+    if (h_counters_ != nullptr) { (void) cudaFreeHost(h_counters_); }
+    if (h_live_ != nullptr) { (void) hipHostFree(h_live_); }
+}
+
+bool ub_pool::allocate(int device, const std::vector<ub_pool_layer> & layers,
+        const std::vector<std::array<size_t, 3>> & kind_bytes, const std::vector<std::array<size_t, 3>> & kind_tails, int ghost) {
+    GGML_ASSERT(blob_ == nullptr);
+    if ((int) layers.size() != n_layers_ || n_experts_ > ub_pool_max_experts || r_cap_ > ub_pool_max_rcap) {
+        return false;
+    }
+    device_     = device;
+    ghost_      = std::max(ghost, 0);
+    layers_     = layers;
+    kind_bytes_ = kind_bytes;
+    kind_tails_ = kind_tails;
+    pos_bytes_.assign((size_t) n_layers_, 0);
+    for (int l = 0; l < n_layers_; ++l) {
+        if (!layers_[l].enabled) {
+            continue;
+        }
+        size_t b = 0;
+        for (int k = 0; k < 3; ++k) {
+            b += (kind_bytes_[l][k] + kind_tails_[l][k] + 255) & ~size_t(255);
+        }
+        pos_bytes_[l] = b;
+    }
+
+    const size_t L = (size_t) n_layers_, E = (size_t) n_experts_, P = L*(size_t) r_cap_;
+    size_t at = 0;
+    auto take = [&at](size_t bytes) { const size_t here = at; at += (bytes + 255) & ~size_t(255); return here; };
+    const size_t o_layers = take(L*sizeof(ub_pool_layer));
+    const size_t o_meta   = take(L*sizeof(ub_pool_meta));
+    const size_t o_addr   = take(P*3*sizeof(uint64_t));
+    const size_t o_home   = take(P*3*sizeof(uint64_t));
+    const size_t o_owner  = take(P*sizeof(int32_t));
+    const size_t o_stamp  = take(P*sizeof(uint32_t));
+    const size_t o_pos_of = take(L*E*sizeof(int16_t));
+    const size_t o_copy   = take(P*sizeof(ub_pool_copy));
+    const size_t o_count  = take(L*sizeof(int32_t));
+    const size_t o_cnt    = take(ub_pool_n_counters*sizeof(unsigned long long));
+    const size_t o_sizes  = take(L*3*sizeof(size_t)*2);
+    const size_t o_last   = take(L*E*sizeof(uint32_t));
+    bytes_ = at;
+
+    ggml_cuda_set_device(device_);
+    if (cudaMalloc(&blob_, bytes_) != cudaSuccess) {
+        (void) cudaGetLastError();
+        blob_ = nullptr;
+        return false;
+    }
+    char * b = (char *) blob_;
+    d_layers_   = (ub_pool_layer *) (b + o_layers);
+    d_meta_     = (ub_pool_meta *) (b + o_meta);
+    d_addr_     = (uint64_t *) (b + o_addr);
+    d_home_     = (uint64_t *) (b + o_home);
+    d_owner_    = (int32_t *) (b + o_owner);
+    d_stamp_    = (uint32_t *) (b + o_stamp);
+    d_pos_of_   = (int16_t *) (b + o_pos_of);
+    d_copy_     = (ub_pool_copy *) (b + o_copy);
+    d_count_    = (int32_t *) (b + o_count);
+    d_counters_ = (unsigned long long *) (b + o_cnt);
+    d_sizes_    = (size_t *) (b + o_sizes);
+    d_last_miss_ = (uint32_t *) (b + o_last);
+    size_t * d_sizes = d_sizes_;
+
+    CUDA_CHECK(cudaMemset(blob_, 0, bytes_));
+    CUDA_CHECK(cudaMemset(d_owner_, 0xFF, P*sizeof(int32_t)));
+    CUDA_CHECK(cudaMemset(d_pos_of_, 0xFF, L*E*sizeof(int16_t)));
+    CUDA_CHECK(cudaMemset(d_last_miss_, 0xFF, L*E*sizeof(uint32_t)));
+    CUDA_CHECK(cudaMemcpy(d_layers_, layers_.data(), L*sizeof(ub_pool_layer), cudaMemcpyHostToDevice));
+    std::vector<size_t> sizes(L*6, 0);
+    for (size_t l = 0; l < L; ++l) {
+        for (int k = 0; k < 3; ++k) {
+            sizes[l*3 + k]         = kind_bytes_[l][k];
+            sizes[L*3 + l*3 + k]   = kind_tails_[l][k];
+        }
+    }
+    CUDA_CHECK(cudaMemcpy(d_sizes, sizes.data(), sizes.size()*sizeof(size_t), cudaMemcpyHostToDevice));
+    std::vector<ub_pool_meta> meta(L);
+    for (size_t l = 0; l < L; ++l) {
+        meta[l] = { int32_t(l*(size_t) r_cap_), 0, 0, 0, 0, 0 };
+    }
+    CUDA_CHECK(cudaMemcpy(d_meta_, meta.data(), L*sizeof(ub_pool_meta), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMallocHost((void **) &h_addr_, P*3*sizeof(uint64_t)));
+    CUDA_CHECK(cudaMallocHost((void **) &h_counters_, ub_pool_n_counters*sizeof(unsigned long long)));
+    // the per-layer counts the host reads without a synchronize (read_live); without them only read_live fails
+    if (hipHostMalloc((void **) &h_live_, L*sizeof(ub_pool_live), hipHostMallocMapped | hipHostMallocCoherent) == hipSuccess) {
+        memset(h_live_, 0, L*sizeof(ub_pool_live));
+        if (hipHostGetDevicePointer((void **) &d_live_, h_live_, 0) != hipSuccess) {
+            (void) hipGetLastError();
+            (void) hipHostFree(h_live_);
+            h_live_ = nullptr;
+            d_live_ = nullptr;
+        }
+    } else {
+        (void) hipGetLastError();
+        h_live_ = nullptr;
+    }
+    CUDA_CHECK(cudaDeviceSynchronize());
+    return true;
+}
+
+int ub_pool::lend(void * base, size_t bytes, cudaStream_t stream) {
+    GGML_ASSERT(r_ == 0);
+    size_t per_round = 0;
+    for (int l = 0; l < n_layers_; ++l) {
+        per_round += pos_bytes_[l];
+    }
+    // the region starts 256-aligned
+    const uintptr_t start = ((uintptr_t) base + 255) & ~uintptr_t(255);
+    const size_t usable = bytes > size_t(start - (uintptr_t) base) ? bytes - size_t(start - (uintptr_t) base) : 0;
+    const int r = per_round == 0 ? 0 : (int) std::min<size_t>(usable/per_round, (size_t) r_cap_);
+    if (r <= 0) {
+        return 0;
+    }
+    uintptr_t at = start;
+    for (int l = 0; l < n_layers_; ++l) {
+        if (!layers_[l].enabled) {
+            continue;
+        }
+        for (int p = 0; p < r; ++p) {
+            const size_t q = size_t(l)*r_cap_ + p;
+            for (int k = 0; k < 3; ++k) {
+                h_addr_[q*3 + k] = (uint64_t) at;
+                at += (kind_bytes_[l][k] + kind_tails_[l][k] + 255) & ~size_t(255);
+            }
+        }
+    }
+    GGML_ASSERT(at <= (uintptr_t) base + bytes);
+    ggml_cuda_set_device(device_);
+    const size_t P = size_t(n_layers_)*r_cap_;
+    CUDA_CHECK(cudaMemcpyAsync(d_addr_, h_addr_, P*3*sizeof(uint64_t), cudaMemcpyHostToDevice, stream));
+    ub_lend_args a;
+    a.layers     = d_layers_;
+    a.meta       = d_meta_;
+    a.addr       = d_addr_;
+    a.owner      = d_owner_;
+    a.stamp      = d_stamp_;
+    a.count      = d_count_;
+    a.strides    = d_sizes_;
+    a.tails      = d_sizes_ + size_t(n_layers_)*3;
+    a.r          = r;
+    {
+        const ggml_cuda_kernel_launch_params launch(dim3(n_layers_), dim3(ub_pool_threads), 0, stream);
+        ggml_cuda_kernel_launch(ub_lend_kernel, launch, a);
+    }
+    // the staging must stay untouched until the uploads ran (the lend kernel itself is short)
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    r_ = r;
+    base_ = base;
+    lent_bytes_ = bytes;
+    return r;
+}
+
+void ub_pool::reclaim(cudaStream_t stream) {
+    if (r_ == 0) {
+        return;
+    }
+    ggml_cuda_set_device(device_);
+    const ggml_cuda_kernel_launch_params launch(dim3(n_layers_), dim3(256), 0, stream);
+    ggml_cuda_kernel_launch(ub_reclaim_kernel, launch, (const ub_pool_layer *) d_layers_, d_meta_, (const uint64_t *) d_home_,
+        d_owner_, d_pos_of_, n_experts_);
+    r_ = 0;
+    base_ = nullptr;
+    lent_bytes_ = 0;
+}
+
+void ub_pool::launch_step(int layer, const int32_t * ids, int n_rows, int row_stride, int n_used, bool admit, cudaStream_t stream) {
+    ub_step_args a;
+    a.ids        = ids;
+    a.n_rows     = n_rows;
+    a.row_stride = row_stride;
+    a.n_used     = n_used;
+    a.n_experts  = n_experts_;
+    a.layer      = layer;
+    a.r_cap      = r_cap_;
+    a.admit      = admit ? 1 : 0;
+    a.ghost      = ghost_;
+    a.layers     = d_layers_;
+    a.meta       = d_meta_;
+    a.addr       = d_addr_;
+    a.home       = d_home_;
+    a.owner      = d_owner_;
+    a.stamp      = d_stamp_;
+    a.pos_of     = d_pos_of_;
+    a.copy       = d_copy_;
+    a.count      = d_count_ + layer;
+    a.counters   = d_counters_;
+    a.last_miss  = d_last_miss_ + size_t(layer)*n_experts_;
+    a.live       = d_live_;
+    a.pos_bytes  = pos_bytes_[(size_t) layer];
+    const ggml_cuda_kernel_launch_params launch(dim3(1), dim3(ub_pool_threads), 0, stream);
+    ggml_cuda_kernel_launch(ub_step_kernel, launch, a);
+}
+
+void ub_pool::launch_copy(int layer, cudaStream_t stream) {
+    const ggml_cuda_kernel_launch_params launch(dim3(r_cap_, ub_pool_copy_blocks), dim3(ub_pool_threads), 0, stream);
+    ggml_cuda_kernel_launch(ub_copy_kernel, launch, (const ub_pool_layer *) d_layers_, layer,
+        (const ub_pool_copy *) d_copy_ + size_t(layer)*r_cap_, (const int32_t *) d_count_ + layer,
+        (const uint64_t *) d_addr_, (const uint64_t *) d_home_);
+}
+
+bool ub_pool::read_counters(std::array<uint64_t, ub_pool_n_counters> & out) const {
+    if (blob_ == nullptr) {
+        return false;
+    }
+    ggml_cuda_set_device(device_);
+    // Through the pinned buffer, filled with a value no counter reaches first: some runs logged stack contents
+    // as counters (a read that left a pageable stack array alone, never reproduced with this check in place).
+    unsigned long long * v = h_counters_;
+    for (int i = 0; i < ub_pool_n_counters; ++i) {
+        v[i] = ub_counters_sentinel;
+    }
+    if (cudaMemcpy(v, d_counters_, ub_pool_n_counters*sizeof(unsigned long long), cudaMemcpyDeviceToHost) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return false;
+    }
+    for (int i = 0; i < ub_pool_n_counters; ++i) {
+        if (v[i] == ub_counters_sentinel) {
+            GGML_LOG_WARN("expert cache: decode pool: the counter read left counter %d unwritten; not logged\n", i);
+            return false;
+        }
+        out[(size_t) i] = v[i];
+    }
+    return true;
+}
+
+bool ub_pool::read_live(uint64_t & hits, uint64_t & fills, uint64_t & fill_bytes) const {
+    hits = fills = fill_bytes = 0;
+    if (h_live_ == nullptr) {
+        return false;
+    }
+    const volatile ub_pool_live * v = h_live_;
+    for (int l = 0; l < n_layers_; ++l) {
+        const uint64_t h = v[l].hits, f = v[l].fills;
+        hits       += h;
+        fills      += f;
+        fill_bytes += f*pos_bytes_[(size_t) l];
+    }
+    return true;
+}
+
+long ub_pool::verify(std::string & reason) const {
+    if (blob_ == nullptr || r_ == 0) {
+        return 0;
+    }
+    ggml_cuda_set_device(device_);
+    const size_t L = (size_t) n_layers_, E = (size_t) n_experts_, P = L*(size_t) r_cap_;
+    std::vector<int32_t> owner(P);
+    std::vector<uint64_t> addr(P*3), home(P*3);
+    std::vector<int16_t> pos_of(L*E);
+    CUDA_CHECK(cudaMemcpy(owner.data(), d_owner_, P*sizeof(int32_t), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(addr.data(), d_addr_, P*3*sizeof(uint64_t), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(home.data(), d_home_, P*3*sizeof(uint64_t), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(pos_of.data(), d_pos_of_, L*E*sizeof(int16_t), cudaMemcpyDeviceToHost));
+    long checked = 0;
+    std::vector<char> a, b;
+    for (size_t l = 0; l < L; ++l) {
+        if (!layers_[l].enabled) {
+            continue;
+        }
+        for (int p = 0; p < r_; ++p) {
+            const size_t q = l*r_cap_ + p;
+            const int e = owner[q];
+            if (e < 0) {
+                continue;
+            }
+            if (pos_of[l*E + e] != p) {
+                reason = "layer " + std::to_string(l) + " position " + std::to_string(p) + ": the expert map disagrees";
+                return -1;
+            }
+            for (int k = 0; k < 3; ++k) {
+                const ub_pool_kind & c = layers_[l].kind[k];
+                if (c.addresses != nullptr) {
+                    uint64_t entry = 0;
+                    CUDA_CHECK(cudaMemcpy(&entry, c.addresses + e, sizeof(entry), hipMemcpyDefault));
+                    if (entry != addr[q*3 + k]) {
+                        reason = "layer " + std::to_string(l) + " expert " + std::to_string(e) + " kind " + std::to_string(k) +
+                            ": the address table does not point at its position";
+                        return -1;
+                    }
+                }
+                const char * src = nullptr;
+                if (home[q*3 + k] != 0) {
+                    src = (const char *) (uintptr_t) home[q*3 + k];
+                } else {
+                    int32_t channel = e;
+                    if (c.host_slots != nullptr) {
+                        CUDA_CHECK(cudaMemcpy(&channel, c.host_slots + e, sizeof(channel), hipMemcpyDefault));
+                    }
+                    src = c.tensor + size_t(channel)*c.stride;
+                }
+                a.resize(c.stride);
+                b.resize(c.stride);
+                CUDA_CHECK(cudaMemcpy(a.data(), src, c.stride, hipMemcpyDefault));
+                CUDA_CHECK(cudaMemcpy(b.data(), (const void *) (uintptr_t) addr[q*3 + k], c.stride, cudaMemcpyDeviceToHost));
+                if (memcmp(a.data(), b.data(), c.stride) != 0) {
+                    reason = "layer " + std::to_string(l) + " expert " + std::to_string(e) + " kind " + std::to_string(k) +
+                        ": the slot does not hold the home bytes";
+                    return -1;
+                }
+            }
+            ++checked;
+        }
+    }
+    return checked;
+}
+
+} // namespace ggml_cuda_expert
+
+#endif // GGML_USE_HIP
