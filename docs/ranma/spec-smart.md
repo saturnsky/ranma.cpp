@@ -13,6 +13,8 @@ flat.
 | `--spec-smart-store PATH` | `LLAMA_ARG_SPEC_SMART_STORE` | none | File that keeps the estimates across restarts. Without it every start is cold and nothing is kept. |
 | `--spec-smart-half-life N` | `LLAMA_ARG_SPEC_SMART_HALF_LIFE` | 250 | The confidence of every estimate but the level halves every N rounds of the server, whether the estimate is observed or not. |
 | `--spec-smart-log PATH` | `LLAMA_ARG_SPEC_SMART_LOG` | none | Append one JSON line per round to PATH for diagnosis (see "Round log"). The decisions do not change. |
+| `--spec-trigram-profile`, `--no-spec-trigram-profile` | `LLAMA_ARG_SPEC_TRIGRAM_PROFILE` | on | Keep the trigram counts of every request across requests and restarts in `<--spec-smart-store>.trigram` (see "Trigram profile"). Without `--spec-smart-store` there is none. |
+| `--spec-trigram-profile-mib N` | `LLAMA_ARG_SPEC_TRIGRAM_PROFILE_MIB` | 64 | Memory of the trigram profile's tables in MiB. |
 
 `--spec-draft-n-max` is the upper bound of the draft length. Without it the bound is 7 (the default of 3 belongs to
 the single-argument rule and is unchanged). The bound also sizes the target batch, the recurrent state rollback and
@@ -218,17 +220,82 @@ sees what the request itself has written so far. It scores one drafter candidate
 - **Learning.** The coefficients start at a static fit for k (constants in the source: GLM-5.3-Flash MTP logs of
   roleplay in Japanese, English and Chinese and of code at temperature 0, the request's tokens split by role; the k
   candidates of every verified position; the profile columns 0) and follow every verified position by AdaGrad
-  (learning rate 0.15), with the labels of the same k candidates: 1 for the target's token, 0 for the others. An
-  accepted position is learnt when the verification ends; a rejected one needs the target's token, which is the first
-  token of the next draft, and is learnt then (k = 1 needs none: the only candidate was rejected). A rejected position
-  whose next draft does not follow it (the request ended) is not learnt. The coefficients are not stored: every
-  process starts at the static fit.
+  (learning rate 0.15), with the labels of the same k candidates: 1 for the target's token, 0 for the others. The sum
+  of squared gradients of AdaGrad halves every 4096 updates, so that the step stays near 0.15 / 77 instead of going to
+  0, and coefficients kept for a long time still follow a change of task. An accepted position is learnt when the
+  verification ends; a rejected one needs the target's token, which is the first token of the next draft, and is
+  learnt then (k = 1 needs none: the only candidate was rejected). A rejected position whose next draft does not follow
+  it (the request ended) is not learnt.
+- **Kept coefficients.** Without a trigram profile every process starts at the static fit. With one, the
+  coefficients and the AdaGrad state are kept in the profile per target and draft model file (path, size and time)
+  and k, written with the profile; a process with the same models and k goes on from them (the startup log says how
+  many updates they have). Another model pair or k starts at the static fit and keeps its own block. The smart store is
+  unchanged.
 - **Cost.** The table takes about 8 ms per 100k prompt tokens once per request and a few bytes per token; a draft step
   takes 0.1 (k = 1) to 0.3 us (k = 10) on the host. The token pieces of the vocabulary are read once at startup.
 - The round log adds per verified draft step `tc_i` (the drafter rank of the drafted token, 0 = its top), `tc_n` (the
   trigram observations of its context in the request, both roles) and `tc_src` (per source RA, RU, PM, PX, PU the
   count of the drafted token and the observations of the context, 10 numbers); the request summary adds k, the
   updates, the steps that drafted another candidate than the top one and the coefficients.
+
+## Trigram profile
+
+The trigram profile keeps the trigram counts of every request in a file and gives them to the trigram confidence as
+three more sources: what this server generated (PM), assistant messages of a prompt that this server did
+not write (PX) and the other new text of a prompt (PU). A long conversation, or the next one with the same character,
+then starts with the counts of the earlier turns that the context no longer holds. The weights of the three sources are
+learnt like the others; they start at 0, so an empty profile changes nothing.
+
+- **File and switch.** The profile lives next to the smart store: with `--spec-smart-store PATH` it is `PATH.trigram`
+  (and `PATH.trigram.bak`, `.tmp`, `.lock`), so one store path names both, and a store per character or per use keeps
+  their counts apart too. Without `--spec-smart-store` there is no profile, as there is no store.
+  `--no-spec-trigram-profile` (or `LLAMA_ARG_SPEC_TRIGRAM_PROFILE=0`) keeps the store without the profile. It is on
+  by default, like the trigram confidence it feeds: the store is already the user's choice to keep what the server
+  learns, an empty profile changes nothing (its weights start at 0) and its cost is under a microsecond per draft step.
+  It needs the trigram confidence (always on). The two files have their own keys:
+  the store that of the build, models and cache settings, the profile that of the tokenizer, so a new build starts a
+  cold store but keeps the profile.
+
+- **What is counted, once.** At the end of every request (stopped, finished or cancelled) the server counts the tokens
+  it generated (M) and the new text of the prompt. The prompt is cut into chunks of its bytes with the white space and
+  the control tokens left out: at every control token and message start, else where a rolling hash of the bytes says
+  so (16 to 256 bytes, 64 on average), so that an insertion or a deletion changes only the chunks around it. A chunk
+  that was counted before, or generated here, is known and not counted again: a history sent again, messages cut off at
+  the front, a lorebook entry that moves, a system prompt sent every time, all count once. The ids of the known chunks
+  are kept (at most about 367 000, the ones seen longest ago go first).
+- **Sources.** The new chunks of a system, user or tool message are U. An assistant message of which no chunk is known
+  is X (a conversation from before the profile, or from elsewhere). The new chunks of an assistant message that is
+  partly known are an edit: U, unless they are a part of one of the last 64 answers generated here (an edge that the
+  template, the front end or the tokenizer changed, for example a stripped space or a cut incomplete sentence), which is
+  known.
+- **Regenerated answers.** Every answer is counted when its request ends, also one that the user swipes away: it shows
+  how the model writes. The m-th answer to the same prompt weighs 1 / (1 + (m - 1) / 2): answers to one prompt share its
+  scene, so they count less than as many answers to other prompts (1, 0.67, 0.5, ...).
+- **Saturation.** A request counts a trigram at most 4 times per source, so that an answer that loops does not fill
+  the profile with one phrase; the request's own table counts it in full.
+- **Decay.** Every count halves every 131072 generated tokens of the profile (about one long conversation;
+  `LLAMA_SPEC_TRIGRAM_PROFILE_HALF_LIFE` changes it). The clock is the number of tokens the server generated, so a long
+  conversation sent the first time does not age the rest. The decay is computed when a count is read or changed.
+- **Memory.** The tables take at most `--spec-trigram-profile-mib` (default 64; the sizes are powers of 2, so the
+  default allocates at most 46 MiB: 28 MiB for about 734 000 trigrams, 12 MiB for their contexts, 6 MiB for the chunk
+  ids). They grow as needed. When they are full the trigrams whose weight decayed below 0.25 go, then the lightest ones,
+  down to three quarters. A long roleplay is expected to keep a few hundred thousand trigrams (not measured yet).
+- **Cost.** A lookup takes well under a microsecond; the end of a request takes about 0.5 ms per thousand new tokens (45
+  ms for a new 100k-token prompt).
+- **File.** A binary file with the tokenizer's identity, the counts, the chunk ids, the last answers and a checksum,
+  written every 8 requests or 2 minutes and at exit, through `PATH.tmp`; the previous file is kept as `PATH.bak`, which
+  is read when `PATH` is missing or damaged. A process takes `PATH.lock`; a second process on the same file reads the
+  profile but never writes it (a warning says so).
+- **Errors.** A profile of another tokenizer, or a damaged file without a usable `PATH.bak`, is an error: the server
+  logs it, runs without the profile (the trigram confidence of the request goes on) and leaves the file as it is. A new
+  file is made only where there is none.
+- **Log.** At startup `trigram profile: PATH loaded|new: ... trigrams, ... contexts, ... chunks, ...`; at the end of every
+  request `spec-smart: trigram profile: commit N, counted M .. X .. U .. tokens (known .., absorbed .., saturated ..),
+  answer m to its prompt (weight w), ... trigrams ... MiB, clock C, T ms`. The round log adds a line
+  `{"ev":"tprof", ...}` per request with the same numbers and the coefficients.
+- **Limits.** One profile per server: with `--parallel` > 1 the requests of all slots go into it. A server that is
+  killed loses the requests since the last save. The roles come from the chat template; text sent through the
+  completion endpoint in another format counts as U (and what the server generates as M).
 
 ## The store
 

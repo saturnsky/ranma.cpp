@@ -22,6 +22,7 @@
 
 #define SMT_INF(fmt, ...) LOG_INF("spec-smart: " fmt, __VA_ARGS__)
 #define SMT_WRN(fmt, ...) LOG_WRN("spec-smart: " fmt, __VA_ARGS__)
+#define SMT_ERR(fmt, ...) LOG_ERR("spec-smart: " fmt, __VA_ARGS__)
 
 static const char * SMART_STORE_MAGIC = "ranma-spec-smart 6";
 
@@ -169,6 +170,8 @@ common_spec_smart::~common_spec_smart() {
             SMT_INF("saved %s\n", cfg.store_path.c_str());
         }
     }
+    tprof_put_coef();
+    tprof.reset(); // waits for a running save of the profile and saves it
 }
 
 int32_t common_spec_smart::bin(float p) const {
@@ -1075,6 +1078,8 @@ double common_spec_tconf::q(const double * x) const {
     return 1.0 / (1.0 + std::exp(-z));
 }
 
+static const double G_DECAY = std::exp2(-1.0 / common_spec_tconf::G_HALF_LIFE);
+
 void common_spec_tconf::update(const double * X, const double * lab, int32_t n) {
     // AdaGrad on the log-likelihood of the n candidates of one position, the gradient scaled by 1 / sqrt(n)
     double gr[DIM] = {};
@@ -1087,7 +1092,7 @@ void common_spec_tconf::update(const double * X, const double * lab, int32_t n) 
     const double sc = 1.0 / std::max(1.0, std::sqrt((double) n));
     for (int32_t d = 0; d < DIM; ++d) {
         gr[d] *= sc;
-        G[d]  += gr[d] * gr[d];
+        G[d]   = G[d] * G_DECAY + gr[d] * gr[d];
         b[d]  += lr * gr[d] / std::sqrt(G[d]);
     }
 }
@@ -1146,12 +1151,118 @@ void common_spec_smart::tconf_roles(common_spec_roles r) {
     }
 }
 
+void common_spec_smart::tconf_profile(common_spec_tprof_vocab voc, const std::string & tok_key) {
+    if (!cfg.tconf || cfg.tprof_path.empty()) {
+        return;
+    }
+    common_spec_tprof_config pc;
+    pc.path      = cfg.tprof_path;
+    pc.tok_key   = tok_key;
+    pc.cap_mib   = cfg.tprof_mib;
+    pc.half_life = cfg.tprof_half_life;
+    tprof = std::make_unique<common_spec_tprof>(pc, std::move(voc));
+    std::string why;
+    if (!tprof->open(&why)) {
+        // an abnormal input: the profile is off, the file is not touched; the server and the trigram confidence of the
+        // request go on
+        SMT_ERR("trigram profile %s not used: %s; the trigram profile is off (the file is kept as it is)\n",
+                cfg.tprof_path.c_str(), why.c_str());
+        tprof.reset();
+        return;
+    }
+    // the coefficients this model pair and k learnt before
+    tprof_coef_key = cfg.tprof_coef_key + " k=" + std::to_string(cfg.tconf_k) + " dim=" +
+                     std::to_string(common_spec_tconf::DIM);
+    common_spec_tprof_coef cf;
+    if (tprof->get_coef(tprof_coef_key, cf) && (int32_t) cf.b.size() == common_spec_tconf::DIM) {
+        std::copy(cf.b.begin(), cf.b.end(), tconf_model.b);
+        std::copy(cf.G.begin(), cf.G.end(), tconf_model.G);
+        tc_updates_kept = cf.updates;
+        SMT_INF("trigram profile: the coefficients of %lld updates are used\n", (long long) cf.updates);
+    } else {
+        SMT_INF("%s", "trigram profile: no coefficients of this model pair and k, the static ones are used\n");
+    }
+}
+
+void common_spec_smart::tprof_put_coef() {
+    if (!tprof) {
+        return;
+    }
+    common_spec_tprof_coef cf;
+    cf.key = tprof_coef_key;
+    cf.b.assign(tconf_model.b, tconf_model.b + common_spec_tconf::DIM);
+    cf.G.assign(tconf_model.G, tconf_model.G + common_spec_tconf::DIM);
+    cf.updates = tc_updates_kept + tc_updates;
+    tprof->put_coef(cf);
+}
+
 void common_spec_smart::tconf_request(int32_t seq, const int32_t * prompt, size_t n) {
-    (void) prompt;
     if (!cfg.tconf || seq < 0 || seq >= (int32_t) seqs.size()) {
         return;
     }
-    seqs[seq].tc_n_prompt = n;
+    auto & st = seqs[seq];
+    st.tc_n_prompt = n;
+    if (tprof) {
+        st.tc_prompt.assign(prompt, prompt + n);
+        st.tc_open = true;
+    }
+}
+
+void common_spec_smart::tconf_end(int32_t seq, const int32_t * gen, size_t n) {
+    if (!cfg.tconf || !tprof || seq < 0 || seq >= (int32_t) seqs.size()) {
+        return;
+    }
+    auto & st = seqs[seq];
+    if (!st.tc_open) {
+        return; // no request began on the sequence since the last one was counted
+    }
+    st.tc_open = false;
+    tprof->commit(st.tc_prompt.data(), st.tc_prompt.size(), gen, n, tc_roles);
+    st.tc_prompt.clear();
+    st.tc_prompt.shrink_to_fit();
+    tprof_put_coef();
+    tprof->maybe_save(false);
+    {
+        const auto & ps = tprof->stats();
+        SMT_INF("trigram profile%s: commit %lld, counted M %.0f X %.0f U %.0f tokens (known %.0f, absorbed %.0f, "
+                "saturated %.0f), answer %d to its prompt (weight %.2f), %zu trigrams %zu contexts %zu chunks %.1f MiB, "
+                "clock %.0f, %.1f ms\n", tprof->read_only() ? " (read-only)" : "", (long long) ps.req, ps.tok_m, ps.tok_x,
+                ps.tok_u, ps.tok_known, ps.tok_absorbed, ps.sat_cut, ps.regen_m, ps.weight, ps.nodes, ps.heads,
+                ps.chunks, ps.mib, ps.clock, ps.commit_ms);
+    }
+    if (log) {
+        const auto & ps = tprof->stats();
+        std::string l = "{\"ev\":\"tprof\",\"req\":" + std::to_string(st.log_req) + ",\"seq\":" + std::to_string(seq) +
+                        ",\"commit\":" + std::to_string(ps.req) + ",\"m\":";
+        smart_json_num(l, ps.tok_m, "%.0f");
+        l += ",\"x\":";
+        smart_json_num(l, ps.tok_x, "%.0f");
+        l += ",\"u\":";
+        smart_json_num(l, ps.tok_u, "%.0f");
+        l += ",\"known\":";
+        smart_json_num(l, ps.tok_known, "%.0f");
+        l += ",\"absorbed\":";
+        smart_json_num(l, ps.tok_absorbed, "%.0f");
+        l += ",\"sat_cut\":";
+        smart_json_num(l, ps.sat_cut, "%.0f");
+        l += ",\"answer\":" + std::to_string(ps.regen_m) + ",\"weight\":";
+        smart_json_num(l, ps.weight, "%.4g");
+        l += ",\"nodes\":" + std::to_string(ps.nodes) + ",\"heads\":" + std::to_string(ps.heads) +
+             ",\"chunks\":" + std::to_string(ps.chunks) + ",\"mib\":";
+        smart_json_num(l, ps.mib, "%.2f");
+        l += ",\"clock\":";
+        smart_json_num(l, ps.clock, "%.0f");
+        l += ",\"commit_ms\":";
+        smart_json_num(l, ps.commit_ms, "%.2f");
+        l += ",\"compact_ms\":";
+        smart_json_num(l, ps.compact_ms, "%.2f");
+        l += ",\"save_ms\":";
+        smart_json_num(l, ps.save_ms, "%.2f");
+        l += ",\"b\":";
+        smart_json_arr(l, std::vector<double>(tconf_model.b, tconf_model.b + common_spec_tconf::DIM));
+        l += "}";
+        log->put(l);
+    }
 }
 
 void common_spec_smart::tconf_begin(int32_t seq, const int32_t * toks, size_t n, int32_t id_last, int32_t pos0) {
@@ -1199,6 +1310,18 @@ int32_t common_spec_smart::tconf_pick(int32_t seq, const int32_t * ids, const fl
         for (int32_t i = 0; i < nc; ++i) {
             cn[i][0] = rc[2 * i + common_spec_roles::ASSIST];
             cn[i][1] = rc[2 * i + common_spec_roles::OTHER];
+        }
+        if (tprof) {
+            constexpr int32_t NP = common_spec_tprof::N_SRC;
+            double pc[NP * common_spec_tconf::K_MAX];
+            double pN[NP];
+            tprof->lookup(st.tc_ctx[m - 2], st.tc_ctx[m - 1], ids, nc, pc, pN);
+            for (int32_t s = 0; s < NP; ++s) {
+                cN[2 + s] = pN[s];
+                for (int32_t i = 0; i < nc; ++i) {
+                    cn[i][2 + s] = pc[NP * i + s];
+                }
+            }
         }
     }
     const bool mid = tconf_mid(st.tc_ctx);

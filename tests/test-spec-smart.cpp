@@ -13,11 +13,13 @@
 #include "speculative-smart.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <map>
 #include <random>
 #include <sstream>
 #include <string>
@@ -2571,7 +2573,8 @@ static void ref_counts(const std::vector<int32_t> & s, int32_t a, int32_t b, int
 }
 
 // a top-1 calibrator written from its definition: logistic of the drafter top probability and the trigram counts,
-// learnt by AdaGrad from the acceptance of the drafted token alone
+// learnt by AdaGrad (its sum of squared gradients halving every 4096 updates) from the acceptance of the drafted token
+// alone
 struct ref_top1 {
     static constexpr int D = common_spec_tconf::DIM;
     double b[D], G[D];
@@ -2603,7 +2606,7 @@ struct ref_top1 {
         const double r = y - q(x);
         for (int d = 0; d < D; ++d) {
             const double g = x[d] * r;
-            G[d] += g * g;
+            G[d] = G[d] * std::exp2(-1.0 / 4096.0) + g * g;
             b[d] += 0.15 * g / std::sqrt(G[d]);
         }
     }
@@ -2956,6 +2959,613 @@ static int test_tconf() {
     return 0;
 }
 
+// the trigram profile (common_spec_tprof): a toy vocabulary of words (tokens 0..NW-1, " w<t>") and control tokens
+namespace tpt {
+constexpr int32_t GMASK = 200, SYS = 201, USER = 202, AST = 203, THINK = 204, ETHINK = 205, EOS = 206, NV = 210;
+
+static common_spec_tprof_vocab vocab(int32_t n_words = 200) {
+    common_spec_tprof_vocab v;
+    const int32_t nv = std::max(NV, n_words);
+    v.piece.resize(nv);
+    v.special.assign(nv, 0);
+    for (int32_t t = 0; t < nv; ++t) {
+        if (t >= 200 && t < NV) {
+            v.piece[t]   = "<s" + std::to_string(t) + ">";
+            v.special[t] = 1;
+        } else {
+            v.piece[t] = " w" + std::to_string(t);
+        }
+    }
+    return v;
+}
+
+static common_spec_roles roles() {
+    common_spec_roles r;
+    r.markers.push_back({ { SYS }, common_spec_roles::OTHER });
+    r.markers.push_back({ { USER }, common_spec_roles::OTHER });
+    r.markers.push_back({ { AST }, common_spec_roles::ASSIST });
+    r.ctrl.assign(NV, 0);
+    r.ctrl[GMASK] = r.ctrl[SYS] = r.ctrl[USER] = r.ctrl[AST] = r.ctrl[EOS] = 1;
+    return r;
+}
+
+struct msg {
+    int                  role; // 0 system, 1 user, 2 assistant
+    std::vector<int32_t> toks;
+};
+
+// the template: [gMASK] then per message its marker (an assistant message also <think></think>) and its tokens, then
+// the generation prompt <|assistant|><think>
+static std::vector<int32_t> render(const std::vector<msg> & ms) {
+    std::vector<int32_t> out = { GMASK };
+    for (const auto & m : ms) {
+        out.push_back(m.role == 0 ? SYS : m.role == 1 ? USER : AST);
+        if (m.role == 2) {
+            out.push_back(THINK);
+            out.push_back(ETHINK);
+        }
+        out.insert(out.end(), m.toks.begin(), m.toks.end());
+    }
+    out.push_back(AST);
+    out.push_back(THINK);
+    return out;
+}
+
+static std::vector<int32_t> words(std::mt19937 & rng, int n, int32_t nw = 200) {
+    std::vector<int32_t> w(n);
+    for (auto & x : w) {
+        x = (int32_t) (rng() % nw);
+    }
+    return w;
+}
+
+// the generated tokens of an answer: </think>, the answer, the end token
+static std::vector<int32_t> gen(const std::vector<int32_t> & a) {
+    std::vector<int32_t> g = { ETHINK };
+    g.insert(g.end(), a.begin(), a.end());
+    g.push_back(EOS);
+    return g;
+}
+
+static std::string tmp(const char * name) {
+    return (std::filesystem::temp_directory_path() / name).string();
+}
+
+static void rm(const std::string & p) {
+    std::error_code ec;
+    for (const char * suf : { "", ".bak", ".tmp", ".lock" }) {
+        std::filesystem::remove(p + suf, ec);
+    }
+}
+} // namespace tpt
+
+static int test_tprof() {
+    using namespace tpt;
+    const auto R = roles();
+
+    // 1. content-defined chunks: white space does not change them, an insertion changes only the chunks around it
+    {
+        common_spec_tprof_config c;
+        c.path = tmp("test-spec-tprof-chunks.bin");
+        common_spec_tprof p(c, vocab());
+        std::mt19937 rng(1);
+        const auto a = words(rng, 300);
+        const auto ia = p.chunk_ids(a.data(), a.size());
+        CHECK(ia.size() >= 10);
+        // an insertion of 5 words at 150: the chunks before it and all but a few after it are the same
+        auto b = a;
+        b.insert(b.begin() + 150, { 1, 2, 3, 4, 5 });
+        const auto ib = p.chunk_ids(b.data(), b.size());
+        size_t pre = 0;
+        while (pre < ia.size() && pre < ib.size() && ia[pre] == ib[pre]) {
+            pre++;
+        }
+        size_t suf = 0;
+        while (suf < ia.size() && suf < ib.size() && ia[ia.size() - 1 - suf] == ib[ib.size() - 1 - suf]) {
+            suf++;
+        }
+        CHECK(pre + suf + 3 >= ia.size() && pre >= 3 && suf >= 3);
+        // the same text with other white space: the pieces of a vocabulary where word t is "w<t>  \n"
+        auto v2 = vocab();
+        for (int32_t t = 0; t < 200; ++t) {
+            v2.piece[t] = "w" + std::to_string(t) + ((t % 3) ? "  " : "\n");
+        }
+        common_spec_tprof p2(c, v2);
+        CHECK(p2.chunk_ids(a.data(), a.size()) == ia);
+    }
+
+    // 2. a conversation: what is counted, once, and from which source
+    {
+        common_spec_tprof_config c;
+        c.path      = tmp("test-spec-tprof-conv.bin");
+        c.half_life = 131072.0;
+        rm(c.path);
+        std::mt19937 rng(2);
+        const auto S  = words(rng, 120);
+        const auto U1 = words(rng, 80);
+        const auto A1 = words(rng, 200);
+        const auto U2 = words(rng, 70);
+        const auto A2 = words(rng, 180);
+        const auto A2b = words(rng, 160);
+        const auto U3 = words(rng, 60);
+        const auto A3 = words(rng, 150);
+        const auto U4 = words(rng, 50);
+        const auto A4 = words(rng, 150);
+        const auto U5 = words(rng, 40);
+        const auto L  = words(rng, 90);
+        const auto U6 = words(rng, 30);
+        const auto U7 = words(rng, 35);
+        {
+            common_spec_tprof p(c, vocab());
+            std::string why;
+            CHECK(p.open(&why) && !p.read_only());
+
+            // request 1: everything is new
+            auto pr = render({ { 0, S }, { 1, U1 } });
+            auto g  = gen(A1);
+            p.commit(pr.data(), pr.size(), g.data(), g.size(), R);
+            auto st = p.stats();
+            // ([gMASK] opens the prompt: no content, no trigram of its own)
+            CHECK(st.tok_u == (double) pr.size() - 1 && st.tok_x == 0 && st.tok_known == 1 && st.tok_m == (double) g.size());
+            CHECK(st.regen_m == 1 && st.weight == 1.0);
+            // the clock (generated tokens) moved by the answer after it was counted
+            double clk = (double) g.size();
+            auto dec = [&](double t_add) { return std::exp2(-(clk - t_add) / c.half_life); };
+            CHECK(std::fabs(p.weight(A1[10], A1[11], A1[12], common_spec_tprof::SRC_M) - dec(0)) < 1e-6);
+            CHECK(std::fabs(p.weight(U1[10], U1[11], U1[12], common_spec_tprof::SRC_U) - dec(0)) < 1e-6);
+
+            // request 2: the history is known (the answer as the template renders it); only the new user turn counts
+            pr = render({ { 0, S }, { 1, U1 }, { 2, A1 }, { 1, U2 } });
+            g  = gen(A2);
+            p.commit(pr.data(), pr.size(), g.data(), g.size(), R);
+            st = p.stats();
+            CHECK(st.tok_u == (double) U2.size() + 3 && st.tok_x == 0 && st.tok_absorbed == 0);
+            CHECK(st.tok_known == (double) pr.size() - st.tok_u);
+            // the counts of request 1 decayed by its generated tokens; nothing was counted twice
+            clk += (double) g.size();
+            CHECK(std::fabs(p.weight(A1[10], A1[11], A1[12], common_spec_tprof::SRC_M) - dec(0)) < 1e-5);
+            CHECK(p.weight(A1[10], A1[11], A1[12], common_spec_tprof::SRC_X) == 0 && p.weight(A1[10], A1[11], A1[12], common_spec_tprof::SRC_U) == 0);
+            CHECK(std::fabs(p.weight(U1[10], U1[11], U1[12], common_spec_tprof::SRC_U) - dec(0)) < 1e-5);
+
+            // request 3: a swipe of request 2: nothing of the prompt counts, the answer weighs 1 / (1 + 0.5)
+            g = gen(A2b);
+            p.commit(pr.data(), pr.size(), g.data(), g.size(), R);
+            st = p.stats();
+            CHECK(st.tok_u == 0 && st.tok_x == 0 && st.tok_known == (double) pr.size());
+            CHECK(st.regen_m == 2 && std::fabs(st.weight - 1.0 / 1.5) < 1e-12);
+            const double clk3 = clk;
+            clk += (double) g.size();
+            CHECK(std::fabs(p.weight(A2b[10], A2b[11], A2b[12], common_spec_tprof::SRC_M) - dec(clk3) / 1.5) < 1e-5);
+
+            // request 4: the user edited the middle of A1: only the chunks around the edit count, as U
+            auto A1e = A1;
+            for (int i = 100; i < 106; ++i) {
+                A1e[i] = (int32_t) (rng() % 200);
+            }
+            pr = render({ { 0, S }, { 1, U1 }, { 2, A1e }, { 1, U2 }, { 2, A2 }, { 1, U3 } });
+            g  = gen(A3);
+            p.commit(pr.data(), pr.size(), g.data(), g.size(), R);
+            st = p.stats();
+            CHECK(st.tok_x == 0 && st.tok_u > (double) U3.size() + 3 + 5 && st.tok_u < (double) U3.size() + 3 + 6 + 120);
+            CHECK(p.weight(A1e[101], A1e[102], A1e[103], common_spec_tprof::SRC_U) > 0.99);
+
+            // request 5: the front end cut the last word of A1 (an edge): it is found in a recent answer, not counted
+            auto A1t = A1;
+            A1t.pop_back();
+            pr = render({ { 0, S }, { 1, U1 }, { 2, A1t }, { 1, U2 }, { 2, A2 }, { 1, U3 }, { 2, A3 }, { 1, U4 } });
+            g  = gen(A4);
+            p.commit(pr.data(), pr.size(), g.data(), g.size(), R);
+            st = p.stats();
+            CHECK(st.tok_x == 0 && st.tok_u == (double) U4.size() + 3);
+
+            // request 6: the oldest messages were cut off: nothing new but the user turn
+            pr = render({ { 0, S }, { 1, U3 }, { 2, A3 }, { 1, U4 }, { 2, A4 }, { 1, U5 } });
+            g  = gen(words(rng, 100));
+            p.commit(pr.data(), pr.size(), g.data(), g.size(), R);
+            st = p.stats();
+            CHECK(st.tok_x == 0 && st.tok_u == (double) U5.size() + 3);
+
+            // request 7: a lorebook entry comes in (a system message in the middle) and counts once; request 8 moves it
+            const auto A6 = words(rng, 100);
+            pr = render({ { 0, S }, { 0, L }, { 1, U3 }, { 2, A3 }, { 1, U4 }, { 2, A4 }, { 1, U6 } });
+            g  = gen(A6);
+            p.commit(pr.data(), pr.size(), g.data(), g.size(), R);
+            st = p.stats();
+            CHECK(st.tok_x == 0 && st.tok_u == (double) L.size() + 1 + U6.size() + 3);
+            pr = render({ { 0, S }, { 1, U3 }, { 2, A3 }, { 0, L }, { 1, U4 }, { 2, A4 }, { 1, U6 }, { 2, A6 }, { 1, U7 } });
+            g  = gen(words(rng, 100));
+            p.commit(pr.data(), pr.size(), g.data(), g.size(), R);
+            st = p.stats();
+            CHECK(st.tok_x == 0 && st.tok_u == (double) U7.size() + 3);
+
+            // a request whose answer loops: a trigram counts at most 4 times
+            std::vector<int32_t> loop;
+            for (int i = 0; i < 50; ++i) {
+                loop.insert(loop.end(), { 5, 6, 7 });
+            }
+            const double w0 = p.weight(5, 6, 7, common_spec_tprof::SRC_M);
+            pr = render({ { 1, words(rng, 40) } });
+            g  = gen(loop);
+            p.commit(pr.data(), pr.size(), g.data(), g.size(), R);
+            st = p.stats();
+            CHECK(p.weight(5, 6, 7, common_spec_tprof::SRC_M) - w0 <= 4.0 + 1e-5 && st.sat_cut > 100);
+        }
+        // a conversation from elsewhere (a new profile): its assistant messages are X
+        rm(c.path);
+        {
+            common_spec_tprof p(c, vocab());
+            CHECK(p.open(nullptr));
+            const auto X1 = words(rng, 120);
+            const auto X2 = words(rng, 110);
+            const auto pr = render({ { 0, S }, { 1, U1 }, { 2, X1 }, { 1, U2 }, { 2, X2 }, { 1, U3 } });
+            const auto g  = gen(words(rng, 50));
+            p.commit(pr.data(), pr.size(), g.data(), g.size(), R);
+            const auto & st = p.stats();
+            CHECK(st.tok_x == (double) X1.size() + 3 + X2.size() + 3);
+            CHECK(st.tok_u == (double) pr.size() - st.tok_x - 1 && st.tok_known == 1);
+            CHECK(p.weight(X1[10], X1[11], X1[12], common_spec_tprof::SRC_X) > 0.99);
+        }
+        rm(c.path);
+    }
+
+    // 3. the decay: lazy (at the time of a read or an update) = halving every half_life generated tokens. The
+    //    trigram (207, 208, 209) of control tokens is not in the random words
+    {
+        common_spec_tprof_config c;
+        c.path      = tmp("test-spec-tprof-decay.bin");
+        c.half_life = 1000.0;
+        rm(c.path);
+        common_spec_tprof p(c, vocab());
+        CHECK(p.open(nullptr));
+        std::mt19937 rng(3);
+        auto pr = render({ { 1, words(rng, 30) } });
+        auto g  = gen({ 207, 208, 209 });
+        p.commit(pr.data(), pr.size(), g.data(), g.size(), R); // at clock 0, then clock 5
+        CHECK(std::fabs(p.weight(207, 208, 209, common_spec_tprof::SRC_M) - std::exp2(-5.0 / 1000.0)) < 1e-5);
+        pr = render({ { 1, words(rng, 30) } });
+        g  = gen(words(rng, 995));
+        p.commit(pr.data(), pr.size(), g.data(), g.size(), R); // clock 1002
+        const double w1 = std::exp2(-1002.0 / 1000.0);
+        CHECK(std::fabs(p.weight(207, 208, 209, common_spec_tprof::SRC_M) - w1) < 1e-5);
+        const double ctx0 = p.context_weight(207, 208, common_spec_tprof::SRC_M);
+        CHECK(std::fabs(ctx0 - w1) < 1e-5);
+        // an update decays the old count first, then adds; read 5 generated tokens later
+        pr = render({ { 1, words(rng, 30) } });
+        g  = gen({ 207, 208, 209 });
+        p.commit(pr.data(), pr.size(), g.data(), g.size(), R);
+        const double f = std::exp2(-5.0 / 1000.0);
+        CHECK(std::fabs(p.weight(207, 208, 209, common_spec_tprof::SRC_M) - (w1 + 1.0) * f) < 1e-5);
+        CHECK(std::fabs(p.context_weight(207, 208, common_spec_tprof::SRC_M) - (ctx0 + 1.0) * f) < 1e-5);
+        rm(c.path);
+    }
+
+    // 4. the file: a round trip, the lock, another tokenizer and a damaged file (errors: off, the file not touched),
+    //    the previous save when the main file is damaged
+    {
+        common_spec_tprof_config c;
+        c.path    = tmp("test-spec-tprof-file.bin");
+        c.tok_key = "toy 1";
+        rm(c.path);
+        std::mt19937 rng(4);
+        const auto U = words(rng, 100);
+        const auto A = words(rng, 200);
+        auto pr = render({ { 1, U } });
+        auto g  = gen(A);
+        std::vector<uint64_t> ids;
+        {
+            common_spec_tprof p(c, vocab());
+            CHECK(p.open(nullptr));
+            p.commit(pr.data(), pr.size(), g.data(), g.size(), R);
+            common_spec_tprof_coef cf;
+            cf.key = "pair k1";
+            cf.b.assign(14, 0.5);
+            cf.G.assign(14, 2.0);
+            cf.updates = 77;
+            p.put_coef(cf);
+            ids = p.chunk_ids(A.data(), A.size());
+            // a second process: the lock makes it read-only
+            common_spec_tprof q(c, vocab());
+            CHECK(q.open(nullptr) && q.read_only());
+        } // saved here
+        CHECK(std::filesystem::exists(c.path) && !std::filesystem::exists(c.path + ".lock"));
+        {
+            common_spec_tprof p(c, vocab());
+            CHECK(p.open(nullptr) && !p.read_only());
+            CHECK(std::fabs(p.weight(A[5], A[6], A[7], common_spec_tprof::SRC_M) - std::exp2(-(double) g.size() / c.half_life)) < 1e-5);
+            CHECK(std::fabs(p.weight(U[5], U[6], U[7], common_spec_tprof::SRC_U) - std::exp2(-(double) g.size() / c.half_life)) < 1e-5);
+            for (uint64_t id : ids) {
+                CHECK(p.known(id));
+            }
+            common_spec_tprof_coef cf;
+            CHECK(p.get_coef("pair k1", cf) && cf.b[3] == 0.5 && cf.G[13] == 2.0 && cf.updates == 77);
+            CHECK(!p.get_coef("pair k3", cf));
+            // the history of request 1 is known after the restart
+            const auto pr2 = render({ { 1, U }, { 2, A }, { 1, words(rng, 20) } });
+            const auto g2  = gen(words(rng, 30));
+            p.commit(pr2.data(), pr2.size(), g2.data(), g2.size(), R);
+            CHECK(p.stats().tok_u == 20 + 3 && p.stats().tok_x == 0);
+        } // saved: the first save is the .bak now
+        CHECK(std::filesystem::exists(c.path + ".bak"));
+        const std::string good = read_file(c.path);
+        // another tokenizer: an error, off, the file not touched
+        {
+            common_spec_tprof_config c2 = c;
+            c2.tok_key = "toy 2";
+            common_spec_tprof p(c2, vocab());
+            std::string why;
+            CHECK(!p.open(&why) && !p.on() && why.find("another tokenizer") != std::string::npos);
+            double cnt[3], N[3];
+            const int32_t t = A[7];
+            p.lookup(A[5], A[6], &t, 1, cnt, N);
+            CHECK(N[0] == 0 && cnt[0] == 0);
+            p.commit(pr.data(), pr.size(), g.data(), g.size(), R); // nothing
+            CHECK(p.stats().req == 0);
+        }
+        CHECK(read_file(c.path) == good && !std::filesystem::exists(c.path + ".lock"));
+        // a damaged main file: the previous save is used
+        {
+            std::string bad = good;
+            bad[bad.size() / 2] ^= 0x5a;
+            std::ofstream(c.path, std::ios::binary | std::ios::trunc).write(bad.data(), (std::streamsize) bad.size());
+            common_spec_tprof p(c, vocab());
+            CHECK(p.open(nullptr) && p.on());
+            CHECK(p.weight(A[5], A[6], A[7], common_spec_tprof::SRC_M) > 0.99);
+        }
+        // damaged and no previous save: an error, off, the file not touched
+        {
+            std::error_code ec;
+            std::filesystem::remove(c.path + ".bak", ec);
+            std::string bad = good;
+            bad[bad.size() / 3] ^= 0x5a;
+            std::ofstream(c.path, std::ios::binary | std::ios::trunc).write(bad.data(), (std::streamsize) bad.size());
+            {
+                common_spec_tprof p(c, vocab());
+                std::string why;
+                CHECK(!p.open(&why) && why.find("damaged") != std::string::npos);
+            }
+            CHECK(read_file(c.path) == bad);
+        }
+        rm(c.path);
+    }
+
+    // 5. the memory limit: the lightest trigrams go, the others keep their exact weights (the deletions of the open
+    //    addressing table keep every entry reachable)
+    {
+        common_spec_tprof_config c;
+        c.path      = tmp("test-spec-tprof-cap.bin");
+        c.cap_mib   = 8.0;
+        c.half_life = 1e9;
+        rm(c.path);
+        const int32_t NW = 5000;
+        common_spec_tprof p(c, vocab(NW));
+        CHECK(p.open(nullptr));
+        std::mt19937 rng(5);
+        std::map<std::array<int32_t, 3>, double> ref; // M counts (saturated per request, no decay to speak of)
+        size_t max_nodes = 0;
+        for (int r = 0; r < 40; ++r) {
+            std::vector<int32_t> a = words(rng, 1500, NW);
+            // a few heavy trigrams that must survive: (1, 2, 3) in every request
+            a.insert(a.end(), { 1, 2, 3, 1, 2, 3 });
+            for (auto & x : a) {
+                x = x >= 200 && x < NV ? x + NV : x; // no control tokens
+            }
+            const auto pr = render({ { 1, { (int32_t) (r + 300) } } });
+            const auto g  = gen(a);
+            p.commit(pr.data(), pr.size(), g.data(), g.size(), R);
+            std::map<std::array<int32_t, 3>, int> occ;
+            std::vector<int32_t> s = pr;
+            s.insert(s.end(), g.begin(), g.end());
+            for (size_t i = pr.size(); i < s.size(); ++i) {
+                occ[{ s[i - 2], s[i - 1], s[i] }]++;
+            }
+            for (const auto & [k, o] : occ) {
+                ref[k] += std::min(o, 4);
+            }
+            max_nodes = std::max(max_nodes, p.n_nodes());
+        }
+        CHECK(p.stats().mib <= 8.0);
+        size_t present = 0;
+        for (const auto & [k, w] : ref) {
+            const double x = p.weight(k[0], k[1], k[2], common_spec_tprof::SRC_M);
+            if (x > 0.0) {
+                present++;
+                CHECK(std::fabs(x - w) < 1e-3 * w);
+            }
+        }
+        // the prompts' trigrams (U) are in the table too
+        for (int r = 0; r < 40; ++r) {
+            const auto pr = render({ { 1, { (int32_t) (r + 300) } } });
+            for (size_t i = 2; i < pr.size(); ++i) {
+                if (p.weight(pr[i - 2], pr[i - 1], pr[i], common_spec_tprof::SRC_U) > 0.0 &&
+                    p.weight(pr[i - 2], pr[i - 1], pr[i], common_spec_tprof::SRC_M) == 0.0) {
+                    present++;
+                }
+            }
+        }
+        CHECK(present == p.n_nodes());       // every entry is reachable
+        CHECK(ref.size() > 2 * p.n_nodes()); // the limit was reached
+        CHECK(p.weight(1, 2, 3, common_spec_tprof::SRC_M) > 50.0);
+        fprintf(stderr, "tprof cap 8 MiB: %zu trigrams kept of %zu, at most %zu, %.2f MiB\n", p.n_nodes(), ref.size(),
+                max_nodes, p.stats().mib);
+        rm(c.path);
+    }
+
+    // 6. the trigram confidence with a profile: the counts of an earlier request reach the features (PM)
+    {
+        const std::string path = tmp("test-spec-tprof-smart.bin");
+        rm(path);
+        common_spec_smart_config c = base_cfg(3);
+        c.tconf      = true;
+        c.tprof_path = path;
+        {
+            common_spec_smart s(c, 1);
+            s.tconf_vocab(std::vector<uint32_t>(NV, (1u << 24) | 'w'), std::vector<uint8_t>(NV, 0));
+            s.tconf_roles(roles());
+            s.tconf_profile(vocab(), "toy");
+            CHECK(s.tprof_on());
+            set_identity(s, 0.6);
+            set_costs(s, { 30, 33, 36, 39 }, 2.0);
+            // request 1 generates (7, 8) -> 9 three times
+            const auto pr = render({ { 1, { 50, 51, 52, 53 } } });
+            s.request_begin(0);
+            s.tconf_request(0, pr.data(), pr.size());
+            const auto g = gen({ 7, 8, 9, 60, 7, 8, 9, 61, 7, 8, 9 });
+            s.tconf_end(0, g.data(), g.size());
+            s.tconf_end(0, g.data(), g.size()); // a second end of the same request: nothing
+            CHECK(s.tprof->stats().req == 1);
+            // request 2: the context ends with (7, 8)
+            const auto pr2 = render({ { 1, { 70, 71, 7, 8 } } });
+            s.request_begin(0);
+            s.tconf_request(0, pr2.data(), pr2.size() - 1);
+            s.close_round(0, 0);
+            s.tconf_begin(0, pr2.data(), pr2.size() - 1, pr2.back(), (int32_t) pr2.size());
+            // the stream is ... 7 8 <|assistant|> <think>; the context for the pick is the last two tokens
+            s.seqs[0].tc_ctx = { 70, 71, 7, 8 };
+            s.begin_round(0, 3);
+            const int32_t ids[3] = { 9, 1, 2 };
+            const float   p[3]   = { 0.5f, 0.3f, 0.2f };
+            double q = -1.0;
+            s.tconf_pick(0, ids, p, 3, -1, &q);
+            const auto & ps = s.seqs[0].tc_pos[0];
+            const double d = std::exp2(-(double) g.size() / c.tprof_half_life);
+            CHECK(std::fabs(ps.src[4] - 3.0 * d) < 1e-4 && std::fabs(ps.src[5] - 3.0 * d) < 1e-4); // PM: n 3, N 3
+            CHECK(ps.src[6] == 0 && ps.src[8] == 0);                                               // PX, PU
+            CHECK(s.tprof->stats().req == 1 && s.tprof->stats().tok_m == (double) g.size());
+        }
+        CHECK(std::filesystem::exists(path));
+        // a profile of another tokenizer: an error, the profile off, the confidence on
+        {
+            common_spec_smart s(c, 1);
+            s.tconf_profile(vocab(), "another");
+            CHECK(!s.tprof_on() && s.tconf_on());
+        }
+        rm(path);
+    }
+
+    // 6b. the coefficients of the trigram confidence are kept in the profile per model pair and k
+    {
+        const std::string path = tmp("test-spec-tprof-coef.bin");
+        rm(path);
+        common_spec_smart_config c = base_cfg(3);
+        c.tconf          = true;
+        c.tprof_path     = path;
+        c.tprof_coef_key = "target=a draft=b";
+        auto make = [&](const common_spec_smart_config & cc) {
+            auto s = std::make_unique<common_spec_smart>(cc, 1);
+            s->tconf_profile(vocab(), "toy");
+            return s;
+        };
+        common_spec_tconf st;
+        st.reset(1);
+        {
+            auto s = make(c);
+            CHECK(s->tprof_on() && s->tconf_model.b[3] == st.b[3]); // nothing kept: static
+            s->tconf_model.b[3] = 0.777;
+            s->tconf_model.G[3] = 12.5;
+            s->tc_updates       = 5;
+        } // kept at exit
+        {
+            auto s = make(c);
+            CHECK(s->tconf_model.b[3] == 0.777 && s->tconf_model.G[3] == 12.5 && s->tc_updates_kept == 5);
+            s->tc_updates = 2;
+        }
+        {
+            auto s = make(c);
+            CHECK(s->tc_updates_kept == 7);
+        }
+        // another model pair or another k: the static coefficients
+        common_spec_smart_config c2 = c;
+        c2.tprof_coef_key = "target=a draft=c";
+        CHECK(make(c2)->tconf_model.b[3] == st.b[3]);
+        common_spec_smart_config c3 = c;
+        c3.tconf_k = 3;
+        common_spec_tconf st3;
+        st3.reset(3);
+        CHECK(make(c3)->tconf_model.b[3] == st3.b[3]);
+        rm(path);
+    }
+
+    // 6d. the profile file: <--spec-smart-store>.trigram, on by default; --no-spec-trigram-profile or the environment
+    //     turns it off; no store, no profile
+    {
+        common_params p;
+        CHECK(parse_resolve({ "--spec-type", "draft-mtp" }, p) && p.speculative.draft.tprof);
+        CHECK(common_spec_tprof_path(p.speculative.draft.smart_store, p.speculative.draft.tprof).empty());
+        CHECK(parse_resolve({ "--spec-type", "draft-mtp", "--spec-smart-store", "J:/s/glm.txt" }, p));
+        CHECK(common_spec_tprof_path(p.speculative.draft.smart_store, p.speculative.draft.tprof) == "J:/s/glm.txt.trigram");
+        CHECK(parse_resolve({ "--spec-type", "draft-mtp", "--spec-smart-store", "J:/s/glm.txt", "--no-spec-trigram-profile" }, p));
+        CHECK(!p.speculative.draft.tprof &&
+              common_spec_tprof_path(p.speculative.draft.smart_store, p.speculative.draft.tprof).empty());
+        set_env("LLAMA_ARG_SPEC_TRIGRAM_PROFILE", "0");
+        CHECK(parse_resolve({ "--spec-type", "draft-mtp", "--spec-smart-store", "J:/s/glm.txt" }, p) && !p.speculative.draft.tprof);
+        set_env("LLAMA_ARG_SPEC_TRIGRAM_PROFILE", "1");
+        CHECK(parse_resolve({ "--spec-type", "draft-mtp", "--spec-smart-store", "J:/s/glm.txt" }, p) && p.speculative.draft.tprof);
+        set_env("LLAMA_ARG_SPEC_TRIGRAM_PROFILE", nullptr);
+        // the old form with a path is gone
+        CHECK(!parse_resolve({ "--spec-type", "draft-mtp", "--spec-trigram-profile", "J:/s/x.bin" }, p));
+    }
+
+    // 6c. the decayed AdaGrad: the sum of squared gradients stays near 1 / (1 - 2^(-1/4096)) under a steady gradient,
+    //     so the step does not go to 0
+    {
+        common_spec_tconf m;
+        m.reset(1);
+        double x[common_spec_tconf::DIM] = {};
+        x[0] = 1.0;
+        for (int it = 0; it < 100000; ++it) {
+            m.b[0] = -30.0; // q ~ 0: gradient 1 for the label 1
+            const double lab = 1.0;
+            m.update(x, &lab, 1);
+        }
+        const double lim = 1.0 / (1.0 - std::exp2(-1.0 / 4096.0));
+        CHECK(std::fabs(m.G[0] - lim) < 0.01 * lim);
+    }
+
+    // 7. host cost: a commit of a 100k-token prompt and a 1000-token answer, a lookup in a full profile
+    {
+        common_spec_tprof_config c;
+        c.path = tmp("test-spec-tprof-cost.bin");
+        rm(c.path);
+        const int32_t NW = 30000;
+        common_spec_tprof p(c, vocab(NW));
+        CHECK(p.open(nullptr));
+        std::mt19937 rng(7);
+        auto fix = [&](std::vector<int32_t> v) {
+            for (auto & x : v) {
+                x = x >= 200 && x < NV ? x + NV : x;
+            }
+            return v;
+        };
+        double ms_first = 0.0;
+        for (int r = 0; r < 8; ++r) {
+            const auto pr = render({ { 0, fix(words(rng, 100000, NW)) } });
+            const auto g  = gen(fix(words(rng, 1000, NW)));
+            const int64_t t0 = ggml_time_us();
+            p.commit(pr.data(), pr.size(), g.data(), g.size(), R);
+            if (r == 0) {
+                ms_first = (ggml_time_us() - t0) / 1000.0;
+            }
+        }
+        const int64_t t1 = ggml_time_us();
+        const int n_it = 200000;
+        double acc = 0.0;
+        for (int it = 0; it < n_it; ++it) {
+            int32_t ids[10];
+            for (int i = 0; i < 10; ++i) {
+                ids[i] = (int32_t) (rng() % NW);
+            }
+            double cnt[30], N[3];
+            p.lookup((int32_t) (rng() % NW), (int32_t) (rng() % NW), ids, it % 2 ? 10 : 1, cnt, N);
+            acc += N[2] + cnt[2];
+        }
+        const int64_t t2 = ggml_time_us();
+        fprintf(stderr, "tprof: commit of a 100k-token prompt %.1f ms; %zu trigrams %.1f MiB; lookup (1 or 10 candidates) "
+                "%.3f us (%g)\n", ms_first, p.n_nodes(), p.stats().mib, (double) (t2 - t1) / n_it, acc);
+        rm(c.path);
+    }
+    return 0;
+}
+
 int main() {
     ggml_time_init(); // common_time_meas in the speculative hooks
 
@@ -2988,6 +3598,7 @@ int main() {
     if (test_off())             { return 1; }
     if (test_resolve())         { return 1; }
     if (test_tconf())           { return 1; }
+    if (test_tprof())           { return 1; }
     fprintf(stderr, "test-spec-smart: OK\n");
     return 0;
 }
