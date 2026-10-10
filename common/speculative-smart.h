@@ -64,6 +64,26 @@ struct common_spec_smart_pool {
     uint64_t fill_bytes = 0;
 };
 
+// round log only: the cumulative graph counts of one context (llama_get_graph_counts), read with the pool counts
+struct common_spec_smart_graph {
+    bool    valid      = false;
+    int64_t calls      = 0;  // ubatch graphs computed
+    int64_t builds     = 0;  // of them, built and allocated anew
+    int64_t build_us   = 0;
+    int32_t last_nt    = 0;  // rows of the last graph built
+    bool    backend    = false; // the GPU backend counts its graph calls
+    int64_t captures   = 0;  // calls that captured a HIP graph
+    int64_t capture_us = 0;
+    int64_t direct     = 0;  // calls run without a graph (or a warmup call)
+    int64_t direct_us  = 0;
+};
+
+// the target and the draft context
+struct common_spec_smart_graphs {
+    common_spec_smart_graph tgt;
+    common_spec_smart_graph dft;
+};
+
 // decayed mean over time: the weight of an observation halves every half_life closed rounds of the controller,
 // whether or not the cell is observed. The decay is lazy: n is the confidence at round t and is read as
 // n * decay^(now - t). Time lowers only the confidence; the mean and the variance change only with a new observation.
@@ -111,12 +131,15 @@ struct common_spec_smart {
     //   after_step      after each draft step with its top probability; -1: one more step, else keep that many tokens
     //   drafted         with the final draft length
     //   accepted        after the target verified the draft (k > 0 only)
-    //   pool            (round log only, may be null) the decode pool counts at that moment, for close_round and drafted
+    //   pool, graphs    (round log only, may be null) the decode pool counts and the graph counts of the target and
+    //                   draft contexts at that moment, for close_round and drafted
     void    request_begin(int32_t seq);
-    void    close_round(int32_t seq, int64_t t_us, const common_spec_smart_pool * pool = nullptr);
+    void    close_round(int32_t seq, int64_t t_us, const common_spec_smart_pool * pool = nullptr,
+                        const common_spec_smart_graphs * graphs = nullptr);
     bool    begin_round(int32_t seq, int32_t n_max_seq);
     int32_t after_step(int32_t seq, float p_top);
-    void    drafted(int32_t seq, int32_t k, int64_t t_us, const common_spec_smart_pool * pool = nullptr);
+    void    drafted(int32_t seq, int32_t k, int64_t t_us, const common_spec_smart_pool * pool = nullptr,
+                    const common_spec_smart_graphs * graphs = nullptr);
     void    accepted(int32_t seq, int32_t n_accepted);
     void    add_draft_step(double us);
 
@@ -217,6 +240,7 @@ struct common_spec_smart {
         common_spec_smart_pool pool_start;   // ... when the draft of the closed round started
         common_spec_smart_pool pool_drafted; // ... when the draft ended (drafted)
         common_spec_smart_pool pool_end;     // ... when the verification ended (close_round); valid: all three were read
+        common_spec_smart_graphs graph_next, graph_start, graph_drafted, graph_end; // the same for the graph counts
 
         // request statistics
         int64_t n_rounds = 0;
