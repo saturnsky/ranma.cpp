@@ -6075,6 +6075,8 @@ class GGMLQuantizationType(IntEnum):
     EXL3R_M6 = 309
     EXL3R_M7 = 310
     EXL3R_M8 = 311
+    # MXFP8, layout of upstream PR ggml-org/llama.cpp#26157 (id moves to upstream's when it merges), gather only
+    MXFP8    = 320
 
 
 class ExpertGatingFuncType(IntEnum):
@@ -6321,6 +6323,7 @@ GGML_QUANT_SIZES: dict[GGMLQuantizationType, tuple[int, int]] = {
     GGMLQuantizationType.EXL3R_M6: (160, 122),
     GGMLQuantizationType.EXL3R_M7: (160, 142),
     GGMLQuantizationType.EXL3R_M8: (160, 162),
+    GGMLQuantizationType.MXFP8:    (256, 256 + 8),  # layout of upstream PR #26157
 }
 
 
