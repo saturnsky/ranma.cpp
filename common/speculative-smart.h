@@ -51,6 +51,13 @@ struct common_spec_smart_config {
     bool    tconf       = false;
     int32_t tconf_k     = 1;      // drafter candidates per step it scores and learns from (1..10); k >= 2 drafts the
                                   // candidate with the highest acceptance (greedy drafting only)
+    // the trigram profile (--spec-trigram-profile, with the trigram confidence only): the counts of every request kept
+    // across requests and restarts (see common_spec_tprof) in <--spec-smart-store>.trigram; empty path: none
+    std::string tprof_path;
+    double      tprof_mib       = 64.0;
+    double      tprof_half_life = 131072.0; // generated tokens (LLAMA_SPEC_TRIGRAM_PROFILE_HALF_LIFE)
+    std::string tprof_coef_key;             // the target and draft model files: the coefficients of the trigram
+                                            // confidence kept in the profile for another pair (or k) are not used
 };
 
 // what a decision saw (round log only): filled by decide() when asked, never read by the controller
@@ -163,13 +170,15 @@ struct common_spec_trigram {
 // after the last two tokens and the observations N_s of that context: RA / RU the request's own tokens of the assistant
 // / of the other roles, PM / PX / PU the trigram profile (--spec-trigram-profile; 0 without it). mid: the context ends
 // inside an unfinished UTF-8 sequence, sw_i: the candidate starts a word. The coefficients start at the static fit of k
-// and follow the verified positions by AdaGrad; only the k candidates scored are learnt.
+// and follow the verified positions by AdaGrad whose sum of squared gradients decays (half-life G_HALF_LIFE updates),
+// so that the step stays near lr / sqrt(G_HALF_LIFE / ln 2) instead of going to 0; only the k candidates scored are learnt.
 struct common_spec_tconf {
     static constexpr int32_t DIM   = 14;
     static constexpr int32_t K_MAX = 10;
     static constexpr int32_t N_SRC = 5;   // RA, RU, PM, PX, PU
     static constexpr int32_t X_MID = 12;  // index of mid in x
     static constexpr int32_t X_SW  = 13;  // index of sw in x
+    static constexpr double  G_HALF_LIFE = 4096.0; // updates
 
     double b[DIM] = {};
     double G[DIM] = {};
@@ -236,7 +245,13 @@ struct common_spec_smart {
     bool    tconf_on() const { return cfg.tconf; }
     void    tconf_vocab(std::vector<uint32_t> tail, std::vector<uint8_t> word_first);
     void    tconf_roles(common_spec_roles r);
+    //   tconf_profile once (cfg.tprof_path): the token pieces and the tokenizer identity; opens the profile (an
+    //                unusable one, of another tokenizer or damaged, is an error: the profile is off, the file is kept)
+    //   tconf_end    at the end of a request with its generated tokens: counted into the profile
+    void    tconf_profile(common_spec_tprof_vocab voc, const std::string & tok_key);
     void    tconf_request(int32_t seq, const int32_t * prompt, size_t n);
+    void    tconf_end(int32_t seq, const int32_t * gen, size_t n);
+    bool    tprof_on() const { return tprof != nullptr; }
     void    tconf_begin(int32_t seq, const int32_t * toks, size_t n, int32_t id_last, int32_t pos0);
     int32_t tconf_pick(int32_t seq, const int32_t * ids, const float * p, int32_t n, int32_t fixed, double * q);
     bool    tconf_mid(const std::vector<int32_t> & ctx) const; // the context ends inside an unfinished UTF-8 sequence
@@ -337,6 +352,8 @@ struct common_spec_smart {
         int32_t                 tc_pend_at = -1; // ... the position of that token (the next round's pos0)
         int32_t                 tc_pos0 = -1;    // pos0 of the current round
         size_t                  tc_n_prompt = SIZE_MAX; // prompt tokens of the request (the generated ones follow)
+        bool                    tc_open = false;        // a request began and was not counted into the profile yet
+        std::vector<int32_t>    tc_prompt;              // its prompt (with a profile)
 
         // round log only (not read by the decisions)
         int64_t log_req   = 0;     // request id of this sequence
@@ -373,6 +390,10 @@ struct common_spec_smart {
     std::vector<uint32_t> tc_tail;
     std::vector<uint8_t>  tc_wf;
     common_spec_roles     tc_roles;
+    std::unique_ptr<common_spec_tprof> tprof; // the trigram profile, nullptr: none (or off)
+    std::string           tprof_coef_key;     // the coefficient block of this process: model pair, k, layout
+    int64_t               tc_updates_kept = 0; // AdaGrad steps of the coefficients before this process (from the profile)
+    void tprof_put_coef();
     int64_t               tc_updates = 0; // AdaGrad steps of the process
     int64_t               tc_invert  = 0; // draft steps that drafted another candidate than the drafter's top one
     void tconf_learn(const tconf_pos & ps, int32_t target);

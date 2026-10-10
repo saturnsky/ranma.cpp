@@ -4497,6 +4497,29 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_SMART_LOG"));
     add_opt(common_arg(
+        {"--spec-trigram-profile"},
+        {"--no-spec-trigram-profile"},
+        string_format("--spec-smart trigram confidence: keep the trigram counts of every request across requests and "
+                      "restarts, by source (generated here, assistant text from elsewhere, other text; a text is counted "
+                      "once), in the file <--spec-smart-store>.trigram next to the store; without --spec-smart-store "
+                      "there is no profile. Only a profile of the same tokenizer is used; another one is an error and "
+                      "leaves the profile off (default: %s)", params.speculative.draft.tprof ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.speculative.draft.tprof = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_TRIGRAM_PROFILE"));
+    add_opt(common_arg(
+        {"--spec-trigram-profile-mib"}, "N",
+        string_format("--spec-trigram-profile: memory of its tables in MiB; the lightest trigrams go when they are full "
+                      "(default: %.0f)", (double) params.speculative.draft.tprof_mib),
+        [](common_params & params, const std::string & value) {
+            params.speculative.draft.tprof_mib = std::stof(value);
+            if (!(params.speculative.draft.tprof_mib >= 8.0f)) {
+                throw std::invalid_argument("--spec-trigram-profile-mib must be at least 8");
+            }
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_TRIGRAM_PROFILE_MIB"));
+    add_opt(common_arg(
         {"--spec-draft-backend-sampling"},
         {"--no-spec-draft-backend-sampling"},
         string_format("offload draft sampling to the backend (default: %s)",
