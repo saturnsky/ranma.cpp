@@ -532,7 +532,7 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention_tail(
     out = ggml_reshape_3d(ctx0, out, o_group_dim, n_groups, nt);
     out = ggml_permute(ctx0, out, 0, 2, 1, 3);
 
-    ggml_tensor * oa = ggml_mul_mat(ctx0, layer.wo_a, out);
+    ggml_tensor * oa = build_mm(layer.wo_a, out);
     cb(oa, "attn_wo_a", il);
 
     oa = ggml_permute(ctx0, oa, 0, 2, 1, 3);
@@ -1077,7 +1077,7 @@ llama_model_deepseek41::graph::graph(const llama_model & model, const llm_graph_
     cb(cur, "result_norm", -1);
     res->t_embd = cur;
 
-    cur = ggml_mul_mat(ctx0, model.output, cur);
+    cur = build_mm(model.output, cur);
     cb(cur, "result_output", -1);
     res->t_logits = cur;
 
