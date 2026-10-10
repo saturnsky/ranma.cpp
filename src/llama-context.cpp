@@ -1731,6 +1731,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
 
     n_graph_calls++;
+    graph_last_pos = -1;
+    for (uint32_t i = 0; i < ubatch.n_tokens && ubatch.pos != nullptr; ++i) {
+        graph_last_pos = std::max<int32_t>(graph_last_pos, (int32_t) ubatch.pos[i]);
+    }
 
     if (graph_reuse_shapes > 0 && shape_reused) {
         // can_reuse() of the chosen graph has already bound it to the memory context of this ubatch
@@ -3034,6 +3038,7 @@ ggml_status llama_context::graph_compute(
         size_t size   = 0;
         size_t extent = 0;
         if (ggml_backend_sched_get_buffer_extent(sched.get(), expert_backend, &base, &size, &extent)) {
+            graph_last_extent = extent;
             expert_iface->compute_spare(expert_backend, base, size, extent, n_tokens);
         } else {
             // unknown extent: the whole buffer may be used
@@ -4673,6 +4678,8 @@ void llama_context::graph_counts(llama_graph_counts & out) const {
     out.builds   = n_graph_builds;
     out.build_us = t_graph_build_us;
     out.last_nt  = graph_build_last_nt;
+    out.last_extent = graph_last_extent;
+    out.last_pos    = graph_last_pos;
     // the GPU backends that count their graph calls (ggml-cuda: captures and direct calls)
     for (const auto & backend : backends) {
         ggml_backend_dev_t dev = ggml_backend_get_device(backend.get());

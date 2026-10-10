@@ -488,6 +488,8 @@ private:
     int64_t t_graph_build_us  = 0;
     int64_t n_graph_calls     = 0;
     int32_t graph_build_last_nt = 0;
+    size_t  graph_last_extent   = 0;  // how far the last graph reached into the compute buffer of the expert backend
+    int32_t graph_last_pos      = -1; // the highest position of the last ubatch
 
     // drop every stored graph (they are rebuilt on their next use)
     void graph_reuse_invalidate();
