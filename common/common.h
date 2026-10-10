@@ -353,6 +353,11 @@ struct common_params_speculative_draft {
     std::string smart_key;              // set by the server: model files + build + cache settings of the store
     float       smart_half_life = 250.0f; // confidence of every estimate halves every this many rounds
     std::string smart_log;              // one JSON line per round, for diagnosis (empty: none)
+    bool        tprof     = true;       // --spec-trigram-profile: the trigram counts kept across restarts next to the
+                                        // --spec-smart-store file (<store>.trigram); without a store there is none
+    float       tprof_mib = 64.0f;      // memory of the trigram profile's tables
+    std::string tprof_key;              // set by the server: the target and draft model files (the coefficients of the
+                                        // trigram confidence kept in the profile belong to them)
 
     float p_min_at(int pos) const {
         GGML_ASSERT(pos >= 0);

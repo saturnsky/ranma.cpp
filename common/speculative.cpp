@@ -3332,6 +3332,13 @@ common_speculative * common_speculative_init(common_params_speculative & params,
                 if (const char * k = getenv("LLAMA_SPEC_TRIGRAM_TOPK"); k != nullptr) {
                     cfg.tconf_k = std::clamp(atoi(k), 1, 10);
                 }
+                // --spec-trigram-profile; LLAMA_SPEC_TRIGRAM_PROFILE_HALF_LIFE: its half-life in generated tokens
+                cfg.tprof_path     = common_spec_tprof_path(params.draft.smart_store, params.draft.tprof);
+                cfg.tprof_mib      = params.draft.tprof_mib;
+                cfg.tprof_coef_key = params.draft.tprof_key;
+                if (const char * h = getenv("LLAMA_SPEC_TRIGRAM_PROFILE_HALF_LIFE"); h != nullptr && atof(h) >= 1.0) {
+                    cfg.tprof_half_life = atof(h);
+                }
             }
 
             result->smart = std::make_unique<common_spec_smart>(cfg, (int32_t) n_seq);
@@ -3357,6 +3364,34 @@ common_speculative * common_speculative_init(common_params_speculative & params,
                     }
                 }
                 result->smart->tconf_vocab(std::move(tail), std::move(wf));
+
+                if (!cfg.tprof_path.empty()) {
+                    // the trigram profile: the bytes of every token, the control tokens and reasoning tags (no content),
+                    // and the identity of the tokenizer (the profile of another one is not used)
+                    common_spec_tprof_vocab voc;
+                    voc.piece.resize(n_vocab);
+                    voc.special.assign(n_vocab, 0);
+                    uint64_t h = 0xcbf29ce484222325ULL;
+                    auto fnv = [&](const void * p, size_t n) {
+                        for (size_t j = 0; j < n; ++j) {
+                            h ^= ((const uint8_t *) p)[j];
+                            h *= 0x100000001b3ULL;
+                        }
+                    };
+                    for (int32_t t = 0; t < n_vocab; ++t) {
+                        voc.piece[t] = common_token_to_piece(vocab, t, true);
+                        const uint32_t attr = (uint32_t) llama_vocab_get_attr(vocab, t);
+                        voc.special[t] = (attr & LLAMA_TOKEN_ATTR_CONTROL) != 0 || voc.piece[t] == "<think>" ||
+                                         voc.piece[t] == "</think>";
+                        const uint32_t len = (uint32_t) voc.piece[t].size();
+                        fnv(&len, 4);
+                        fnv(voc.piece[t].data(), len);
+                        fnv(&attr, 4);
+                    }
+                    char key[64];
+                    snprintf(key, sizeof(key), "vocab %d %016llx", n_vocab, (unsigned long long) h);
+                    result->smart->tconf_profile(std::move(voc), key);
+                }
             }
         }
     }
@@ -3421,6 +3456,13 @@ void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, co
         spec->smart->request_begin(seq_id);
         spec->smart->tconf_request(seq_id, prompt.data(), prompt.size());
     }
+}
+
+void common_speculative_end(common_speculative * spec, llama_seq_id seq_id, const llama_tokens & generated) {
+    if (spec == nullptr || !spec->smart) {
+        return;
+    }
+    spec->smart->tconf_end(seq_id, generated.data(), generated.size());
 }
 
 void common_speculative_set_roles(common_speculative * spec, const std::vector<std::pair<llama_tokens, bool>> & markers,

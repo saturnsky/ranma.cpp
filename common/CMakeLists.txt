@@ -111,6 +111,7 @@ add_library(${TARGET}
     speculative.h
     speculative-smart.cpp
     speculative-smart.h
+    speculative-tprof.cpp
     speculative-tprof.h
     subproc.cpp
     subproc.h
