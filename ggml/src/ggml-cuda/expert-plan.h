@@ -30,12 +30,14 @@ inline std::vector<uint64_t> seeded_expert_scores(const geometry & geo, uint32_t
         return z ^ (z >> 31);
     };
     std::vector<uint64_t> scores(geo.n_counts(), 0);
-    std::vector<int> ids(geo.n_experts);
+    std::vector<int> ids;
     for (int l = 0; l < geo.n_layers; ++l) {
         if (geo.layer_class[l] < 0) { continue; }
+        const int n = geo.experts(l);
+        ids.resize(n);
         std::iota(ids.begin(), ids.end(), 0);
-        for (int i = geo.n_experts - 1; i > 0; --i) { std::swap(ids[i], ids[next() % (i + 1)]); }
-        for (int i = 0; i < geo.n_experts; ++i) { scores[size_t(l)*geo.n_experts + ids[i]] = geo.n_experts - i; }
+        for (int i = n - 1; i > 0; --i) { std::swap(ids[i], ids[next() % (i + 1)]); }
+        for (int i = 0; i < n; ++i) { scores[size_t(l)*geo.n_experts + ids[i]] = n - i; }
     }
     return scores;
 }
@@ -131,7 +133,7 @@ inline std::vector<plan_candidate> sorted_candidates(const geometry & geo, const
         if (geo.layer_class[layer] < 0) {
             continue;
         }
-        for (int expert = 0; expert < geo.n_experts; ++expert) {
+        for (int expert = 0; expert < geo.experts(layer); ++expert) {
             const size_t index = (size_t) layer*(size_t) geo.n_experts + (size_t) expert;
             candidates.push_back({layer, expert, geo.layer_class[layer], counts ? counts[index] : uint64_t(0)});
         }
@@ -151,12 +153,18 @@ inline std::vector<plan_candidate> sorted_candidates(const geometry & geo, const
 // share and leave the rest to the greedy loop below, which favours the
 // smallest slice class. The loop only places the rounding remainder.
 // A VRAM slot costs geometry::class_vram_bytes: the weights and the aux rows that move with them.
+// With per-layer expert counts (a joint cache of models with different counts) the shares follow the
+// expert slices of each class instead of its layers; with one count both give the same quotient.
 inline std::vector<int> allocate_cold_capacities(const geometry & geo, size_t remaining) {
     const int n_classes = (int) geo.class_bytes.size();
     std::vector<int> capacity(n_classes, 0);
+    const bool by_slices = !geo.uniform_experts();
+    auto weight = [&](int cls) -> size_t {
+        return (size_t) std::max(by_slices ? geo.class_slices(cls) : geo.class_layers[cls], 0);
+    };
     size_t routed = 0;
     for (int cls = 0; cls < n_classes; ++cls) {
-        routed += (size_t) std::max(geo.class_layers[cls], 0);
+        routed += weight(cls);
     }
     if (n_classes == 0 || routed == 0) {
         return capacity;
@@ -164,8 +172,8 @@ inline std::vector<int> allocate_cold_capacities(const geometry & geo, size_t re
     size_t used = 0;
     for (int cls = 0; cls < n_classes; ++cls) {
         const size_t bytes = geo.class_vram_bytes(cls);
-        const size_t share = remaining*(size_t) geo.class_layers[cls]/routed;
-        capacity[cls] = std::min<int>(geo.class_layers[cls]*geo.n_experts, bytes == 0 ? 0 : int(share/bytes));
+        const size_t share = remaining*weight(cls)/routed;
+        capacity[cls] = std::min<int>(geo.class_slices(cls), bytes == 0 ? 0 : int(share/bytes));
         used += (size_t) capacity[cls]*bytes;
     }
     remaining -= std::min(remaining, used);
@@ -173,7 +181,7 @@ inline std::vector<int> allocate_cold_capacities(const geometry & geo, size_t re
         int best = -1;
         for (int cls = 0; cls < n_classes; ++cls) {
             const size_t bytes = geo.class_vram_bytes(cls);
-            if (capacity[cls] < geo.class_layers[cls]*geo.n_experts && bytes <= remaining &&
+            if (capacity[cls] < geo.class_slices(cls) && bytes <= remaining &&
                     (best < 0 || bytes < geo.class_vram_bytes(best))) {
                 best = cls;
             }
@@ -388,7 +396,7 @@ inline std::vector<tier_candidate> host_tier_candidates(const tier_inputs & in) 
         if (cls < 0) {
             continue;
         }
-        for (int expert = 0; expert < geo.n_experts; ++expert) {
+        for (int expert = 0; expert < geo.experts(layer); ++expert) {
             const bool in_vram = (*in.vram)[layer][expert] >= 0;
             if (!in.inclusive && in_vram) {
                 continue;
@@ -518,10 +526,10 @@ inline tier_plan plan_host_tier(const tier_inputs & in) {
             continue;
         }
         int resident = 0;
-        for (int expert = 0; expert < geo.n_experts; ++expert) {
+        for (int expert = 0; expert < geo.experts(layer); ++expert) {
             resident += ((*in.vram)[layer][expert] >= 0 || std::binary_search(out.selected[layer].begin(), out.selected[layer].end(), expert)) ? 1 : 0;
         }
-        const int ssd = geo.n_experts - resident;
+        const int ssd = geo.experts(layer) - resident;
         out.ssd_slices   += (size_t) ssd;
         out.ssd_bytes    += (size_t) ssd*geo.class_total_bytes(cls);
     }
@@ -565,11 +573,13 @@ struct mover_capability {
     int spare_slots = 0;
 };
 
-// The file is a valid fallback only when a finite tier is present.
+// The file is a valid fallback only when a finite tier is present. `experts` is the table stride;
+// `layer_experts` (geometry::layer_experts, empty = `experts` everywhere) holds the experts of each layer: an
+// expert past its layer's count does not exist and must have no home.
 inline bool verify_assignment(const expert_slot_table & gpu, const expert_locations & host,
         const std::vector<int> & layer_class, const install_layout & layout,
         const std::vector<std::vector<int>> & spares, int experts, mover_capability mover,
-        bool has_file, std::string & reason) {
+        bool has_file, std::string & reason, const std::vector<int> & layer_experts = {}) {
     auto fail = [&](const char * text) { reason = text; return false; };
     reason.clear();
     const size_t classes = layout.gpu.size();
@@ -596,9 +606,15 @@ inline bool verify_assignment(const expert_slot_table & gpu, const expert_locati
         if (gpu[l].size() != size_t(experts) || host[l].size() != size_t(experts)) { return fail("expert table dimensions"); }
         const int c = layer_class[l];
         if (c < -1 || c >= int(classes)) { return fail("invalid size class"); }
+        const int present = l < layer_experts.size() ? layer_experts[l] : experts;
+        if (present < 0 || present > experts) { return fail("expert table dimensions"); }
         for (int e = 0; e < experts; ++e) {
             const int g = gpu[l][e];
             const expert_location h = host[l][e];
+            if (e >= present) {
+                if (g != -1 || h != expert_location{}) { return fail("absent expert has a home"); }
+                continue;
+            }
             if (c < 0) {
                 if (g != -1 || h != expert_location{}) { return fail("dense layer has an expert home"); }
                 continue;
@@ -661,7 +677,7 @@ inline install_transaction plan_install(const geometry & geo,
     install_transaction out;
     auto fail = [&](const char * text) { out.valid = false; out.reason = text; return out; };
     if (!verify_assignment(previous_gpu, previous_host, geo.layer_class, before, gpu_spares,
-            geo.n_experts, mover, has_file, out.reason)) { return out; }
+            geo.n_experts, mover, has_file, out.reason, geo.layer_experts)) { return out; }
     const size_t classes = capacities.size(), layers = geo.n_layers;
     if (classes != before.gpu.size() || classes != after.gpu.size() || classes != geo.class_bytes.size() ||
             after.host.size() != classes || after.lent_begin.size() != classes || after.lent_count.size() != classes ||
@@ -676,14 +692,14 @@ inline install_transaction plan_install(const geometry & geo,
         const int c = geo.layer_class[l];
         if (c < 0 && (!gpu_selected[l].empty() || !host_selected[l].empty())) { return fail("dense layer selected"); }
         for (int e : gpu_selected[l]) {
-            if (e < 0 || e >= geo.n_experts || want_g[l][e]) { return fail("invalid GPU selection"); }
+            if (e < 0 || e >= geo.experts(int(l)) || want_g[l][e]) { return fail("invalid GPU selection"); }
             want_g[l][e] = true; ++count_g[c];
         }
         for (int e : host_selected[l]) {
-            if (e < 0 || e >= geo.n_experts || want_h[l][e]) { return fail("invalid host selection"); }
+            if (e < 0 || e >= geo.experts(int(l)) || want_h[l][e]) { return fail("invalid host selection"); }
             want_h[l][e] = true; ++count_h[c];
         }
-        for (int e = 0; e < geo.n_experts; ++e) {
+        for (int e = 0; e < geo.experts(int(l)); ++e) {
             if (want_g[l][e] && want_h[l][e] != mover.has_host_master) { return fail("selection violates mover inclusion"); }
             if (c >= 0 && !has_file && !want_g[l][e] && !want_h[l][e]) { return fail("selection loses an expert"); }
         }
@@ -714,7 +730,7 @@ inline install_transaction plan_install(const geometry & geo,
     for (size_t l = 0; l < layers; ++l) {
         const int c = geo.layer_class[l];
         if (c < 0) { continue; }
-        for (int e = 0; e < geo.n_experts; ++e) {
+        for (int e = 0; e < geo.experts(int(l)); ++e) {
             const expert_location old = previous_host[l][e];
             const int i = index(c, old);
             if (i >= 0 && (want_h[l][e] || want_g[l][e])) { occupied[c][i] = true; }
@@ -754,7 +770,7 @@ inline install_transaction plan_install(const geometry & geo,
         std::vector<bool> gpu_taken(after.gpu[c], false);
         for (size_t l = 0; l < layers; ++l) {
             if (geo.layer_class[l] != int(c)) { continue; }
-            for (int e = 0; e < geo.n_experts; ++e) {
+            for (int e = 0; e < geo.experts(int(l)); ++e) {
                 const int g = previous_gpu[l][e];
                 if (want_g[l][e] && g >= 0 && (retain || !mover.has_host_master)) {
                     if (g >= after.gpu[c]) { return fail("retained VRAM slot retires"); }
@@ -845,7 +861,7 @@ inline install_transaction plan_install(const geometry & geo,
         }
     }
     out.valid = verify_assignment(out.gpu_slots, out.host, geo.layer_class, after, out.gpu_spares,
-        geo.n_experts, mover, has_file, out.reason);
+        geo.n_experts, mover, has_file, out.reason, geo.layer_experts);
     return out;
 }
 

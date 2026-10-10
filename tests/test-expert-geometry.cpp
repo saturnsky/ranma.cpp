@@ -428,6 +428,143 @@ int main() {
         CHECK(plan_placement(plain).capacities[0] > 40);
     }
 
+    // Joint cache of models with different expert counts (DeepSeek V4.1 Flash 384 experts + its DSpark drafter
+    // with 128): the stride is the largest count, each joint layer keeps its own count, and no plan places an
+    // expert past it. Two models with one count keep the tables of a single model.
+    {
+        context_holder target_holder, draft_holder, same_holder;
+        for (int layer = 0; layer < 4; ++layer) {
+            add_routed_layer(target_holder.ctx, layer, GGML_TYPE_Q4_K, GGML_TYPE_Q4_K, 256, 512, 12);
+            add_routed_layer(same_holder.ctx, layer, GGML_TYPE_Q4_K, GGML_TYPE_Q4_K, 256, 512, 12);
+        }
+        for (int layer = 0; layer < 2; ++layer) {
+            add_routed_layer(draft_holder.ctx, layer, GGML_TYPE_Q4_K, GGML_TYPE_Q4_K, 256, 512, 4);   // same slice shape
+        }
+        add_routed_layer(draft_holder.ctx, 2, GGML_TYPE_Q4_0, GGML_TYPE_Q4_0, 256, 512, 4);          // a class of its own
+        geometry target, draft, same;
+        CHECK(build_geometry(target_holder.ctx, target, reason));
+        CHECK(build_geometry(draft_holder.ctx, draft, reason));
+        CHECK(build_geometry(same_holder.ctx, same, reason));
+        CHECK(target.layer_experts.empty() && target.uniform_experts() && target.experts(0) == 12);
+
+        // one count: identical to before (no per-layer counts, same signature and class slices)
+        std::vector<int> offsets;
+        geometry pair;
+        CHECK(concat_geometry({&target, &same}, pair, offsets, reason));
+        CHECK(pair.n_experts == 12 && pair.layer_experts.empty() && pair.class_slices(0) == 8*12);
+        CHECK(pair.class_experts.size() == 1 && pair.class_experts[0] == pair.class_layers[0]*pair.n_experts);
+
+        geometry joint;
+        CHECK(concat_geometry({&target, &draft}, joint, offsets, reason));
+        CHECK(offsets.size() == 2 && offsets[1] == 4 && joint.n_layers == 7 && joint.n_experts == 12);
+        CHECK(!joint.uniform_experts() && joint.layer_experts.size() == 7);
+        CHECK(joint.experts(0) == 12 && joint.experts(3) == 12 && joint.experts(4) == 4 && joint.experts(6) == 4);
+        CHECK(joint.class_bytes.size() == 2 && joint.layer_class[4] == 0 && joint.layer_class[6] == 1);
+        CHECK(joint.class_layers[0] == 6 && joint.class_slices(0) == 4*12 + 2*4 && joint.class_slices(1) == 4);
+        CHECK(joint.n_counts() == size_t(7*12));
+        // the member signatures (profile keys) do not depend on the joint
+        CHECK(draft.signature() == geometry(draft).signature() && draft.n_experts == 4);
+
+        auto absent = [&](const std::vector<std::vector<int32_t>> & selected) {
+            for (int l = 0; l < joint.n_layers; ++l) {
+                for (int e : selected[l]) { if (e < 0 || e >= joint.experts(l)) { return true; } }
+            }
+            return false;
+        };
+        const size_t slice = joint.class_vram_bytes(0);
+        // cold, exclusive: every slot filled, never with an absent expert; capacities within the class slices
+        placement_inputs in;
+        in.geo = &joint;
+        in.exclusive = true;
+        in.budget_bytes = 1000*slice;   // more than everything
+        placement all = plan_placement(in);
+        CHECK(all.capacities[0] == joint.class_slices(0) && all.capacities[1] == joint.class_slices(1));
+        CHECK(!absent(all.selected));
+        CHECK(all.selected[4].size() == 4 && all.selected[0].size() == 12);
+        in.budget_bytes = 30*slice;
+        placement cold = plan_placement(in);
+        CHECK(!absent(cold.selected) && cold.capacities[0] + cold.capacities[1] <= 30);
+        // the cold split follows the slices: class 1 has 4 of 60 slices
+        CHECK(cold.capacities[0] >= 25 && cold.capacities[0] <= 28);
+        // warm, with counts that put zero on every draft expert and a score on absent positions (which must
+        // never be read): an exclusive plan fills with zero-count experts, but only present ones
+        std::vector<uint64_t> counts(joint.n_counts(), 0);
+        for (int l = 0; l < 4; ++l) { for (int e = 0; e < 12; ++e) { counts[size_t(l)*12 + e] = 1 + (e % 5); } }
+        for (int l = 4; l < 7; ++l) { for (int e = 4; e < 12; ++e) { counts[size_t(l)*12 + e] = 1000; } }
+        in.counts = counts.data();
+        in.budget_bytes = 1000*slice;
+        placement warm = plan_placement(in);
+        CHECK(!absent(warm.selected) && warm.capacities[0] == joint.class_slices(0));
+        in.exclusive = false;
+        warm = plan_placement(in);
+        CHECK(!absent(warm.selected));
+        for (int l = 4; l < 7; ++l) { CHECK(warm.selected[l].empty()); }   // inclusive: zero counts stay out
+        // fixed capacities over the slices, exclusive fill
+        in.exclusive = true;
+        const std::vector<int> fixed = {joint.class_slices(0), joint.class_slices(1)};
+        in.fixed_capacities = &fixed;
+        CHECK(!absent(plan_placement(in).selected));
+        in.fixed_capacities = nullptr;
+        // the seeded (non adaptive) policy scores only present experts
+        const std::vector<uint64_t> seeded = seeded_expert_scores(joint, 7);
+        for (int l = 4; l < 7; ++l) {
+            for (int e = 4; e < 12; ++e) { CHECK(seeded[size_t(l)*12 + e] == 0); }
+            for (int e = 0; e < 4; ++e) { CHECK(seeded[size_t(l)*12 + e] >= 1 && seeded[size_t(l)*12 + e] <= 4); }
+        }
+        // with one count the seeded scores are those of a single model
+        CHECK(seeded_expert_scores(pair, 7) == seeded_expert_scores(pair, 7));
+
+        // host tier: the cut and the file count see only present experts
+        std::vector<std::vector<int32_t>> vram(joint.n_layers, std::vector<int32_t>(12, -1));
+        const std::vector<size_t> pitch = {joint.class_total_bytes(0), joint.class_total_bytes(1)};
+        tier_inputs tin;
+        tin.geo = &joint; tin.vram = &vram; tin.slot_pitch = &pitch; tin.counts = counts.data();
+        tin.budget_bytes = 1000*pitch[0];
+        tier_plan host_all = plan_host_tier(tin);
+        CHECK(host_all.valid && !absent(host_all.selected) && host_all.ssd_slices == 0);
+        CHECK(host_all.capacities[0] == joint.class_slices(0) && host_all.capacities[1] == joint.class_slices(1));
+        tin.budget_bytes = 10*pitch[0];
+        tier_plan host_some = plan_host_tier(tin);
+        CHECK(host_some.valid && !absent(host_some.selected));
+        size_t present = 0;
+        for (int c = 0; c < 2; ++c) { present += (size_t) joint.class_slices(c); }
+        size_t picked = 0;
+        for (const auto & s : host_some.selected) { picked += s.size(); }
+        CHECK(host_some.ssd_slices == present - picked);
+
+        // install: absent experts have no home; selecting one is refused
+        install_layout lay;
+        lay.gpu = {all.capacities[0], all.capacities[1]}; lay.host = {0, 0}; lay.lent_begin = {0, 0}; lay.lent_count = {0, 0};
+        const std::vector<std::vector<int>> no_spares(2);
+        const expert_slot_table empty_gpu(joint.n_layers, std::vector<int32_t>(12, -1));
+        const expert_locations no_homes(joint.n_layers, std::vector<expert_location>(12));
+        const expert_slot_table none(joint.n_layers);
+        auto tx = plan_install(joint, all.selected, none, empty_gpu, no_homes, all.capacities, lay, lay, no_spares,
+            {false, 0}, true, true, true);
+        CHECK(tx.valid);
+        for (int l = 4; l < 7; ++l) { for (int e = 4; e < 12; ++e) { CHECK(tx.gpu_slots[l][e] == -1); } }
+        expert_slot_table bad = all.selected;
+        bad[5].push_back(9);
+        CHECK(!plan_install(joint, bad, none, empty_gpu, no_homes, all.capacities, lay, lay, no_spares,
+            {false, 0}, true, true, true).valid);
+        std::string why;
+        expert_slot_table gpu_bad = tx.gpu_slots;
+        gpu_bad[4][7] = 0;
+        CHECK(!verify_assignment(gpu_bad, tx.host, joint.layer_class, lay, tx.gpu_spares, 12, {false, 0}, true, why,
+            joint.layer_experts));
+        CHECK(why == "absent expert has a home");
+        // without a file every present expert needs a home, an absent one does not
+        CHECK(verify_assignment(tx.gpu_slots, tx.host, joint.layer_class, lay, tx.gpu_spares, 12, {false, 0}, false, why,
+            joint.layer_experts));
+
+        // redraw and storage bounds use the slices
+        const std::vector<int> big = {1000, 1000};
+        const std::vector<int> cur = {all.capacities[0], all.capacities[1]};
+        const std::vector<int> zero = {0, 0};
+        const std::vector<int> caps = redraw_capacities(joint, counts.data(), 1000*slice, true, cur, zero, big);
+        CHECK(caps[0] <= joint.class_slices(0) && caps[1] <= joint.class_slices(1));
+    }
+
     // No MoE at all is a success with an empty geometry.
     {
         context_holder holder;
