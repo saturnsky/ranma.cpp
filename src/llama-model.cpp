@@ -1932,6 +1932,15 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         can_prefetch.insert(per_layer_tok_embd);
     }
 
+    // DeepSeek V4.1 engram tables are lazily mapped too: their gathers are prefetched like the per-layer embeddings
+    for (const auto & layer : layers) {
+        if (layer.engram_embd && ml.lazy.has(layer.engram_embd)) {
+            LLAMA_LOG_INFO("%s: enabling prefetch for '%s'\n", __func__, layer.engram_embd->name);
+
+            can_prefetch.insert(layer.engram_embd);
+        }
+    }
+
     // Tied NVFP4 output is valid when no separate LM-head scale tensors are present.
     // If sidecar scales exist, the output weight must be an actual output tensor.
     GGML_ASSERT(!(output && tok_embd &&
