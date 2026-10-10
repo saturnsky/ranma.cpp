@@ -4,11 +4,14 @@
 // measured verification cost per width and a calibrated acceptance of the draft top probability.
 // See docs/ranma/spec-smart.md. This file has no llama dependency, so that the controller can be tested on the CPU.
 
+#include "speculative-tprof.h"
+
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 struct common_spec_smart_config {
@@ -42,6 +45,12 @@ struct common_spec_smart_config {
     int32_t lend_skip   = 5;      // the verification time of the round in which the decode pool was lent and of the
                                   // next lend_skip - 1 rounds is not observed (0: every round is)
     std::string log_path;         // round log (JSON lines, appended); empty: none. The decisions do not depend on it
+    // trigram confidence (LLAMA_SPEC_TRIGRAM_CONF, see common_spec_tconf): the acceptance of a draft token is a logistic
+    // of its drafter probability and of the request's own trigram counts instead of the calibration cells. The server
+    // turns it on (LLAMA_SPEC_TRIGRAM_CONF=0: off); here it is off, so that the tests of the cells stay as they are
+    bool    tconf       = false;
+    int32_t tconf_k     = 1;      // drafter candidates per step it scores and learns from (1..10); k >= 2 drafts the
+                                  // candidate with the highest acceptance (greedy drafting only)
 };
 
 // what a decision saw (round log only): filled by decide() when asked, never read by the controller
@@ -122,9 +131,72 @@ struct common_spec_smart_cell {
     }
 };
 
+// trigram counts of one request: the next tokens after every two-token context of its prompt and generated tokens,
+// counted apart by the role of the next token (common_spec_roles: ASSIST, OTHER)
+struct common_spec_trigram {
+    // makes the table hold every trigram of the stream toks[0..n) + last; a stream that does not continue the one
+    // inserted so far (another request, a rollback) is inserted anew. roles (may be null: every token OTHER) and
+    // gen_from (the first generated token: ASSIST) give the role of every token
+    void sync(const int32_t * toks, size_t n, int32_t last, const common_spec_roles * roles = nullptr,
+              size_t gen_from = SIZE_MAX);
+    void clear();
+    // N[r] = observations after (a, b) of role r, cnt[2 i + r] = those of toks[i]
+    void lookup(int32_t a, int32_t b, const int32_t * toks, int32_t n, int32_t * cnt, int32_t * N) const;
+    size_t size() const { return n_ins; }
+
+  private:
+    void add(int32_t a, int32_t b, int32_t c, uint8_t r);
+    struct node { int32_t tok, cnt[2], next; };
+    struct head { int32_t first, n[2]; };
+    std::unordered_map<uint64_t, head> map;
+    std::vector<node> nodes;
+    size_t  n_ins     = 0;  // stream tokens inserted
+    int32_t tok_prev  = -1; // the last two of them
+    int32_t tok_last  = -1;
+    uint8_t role_last = common_spec_roles::OTHER; // the role of the last one (the markers)
+};
+
+// trigram confidence: per drafter candidate i, q_i = sigmoid(b . x_i) with
+//   x_i = [1, lg p_i, f_RA, g_RA, f_RU, g_RU, f_PM, g_PM, f_PX, g_PX, f_PU, g_PU, mid, sw_i]
+//   g_s = N_s / (N_s + 3), f_s = g_s lg((n_s + 0.5) / (N_s + 1)) (both 0 at N_s = 0), lg = logit
+// p_i the drafter probability of the candidate (softmax over its top 10); per source s the count n_s of the candidate
+// after the last two tokens and the observations N_s of that context: RA / RU the request's own tokens of the assistant
+// / of the other roles, PM / PX / PU the trigram profile (--spec-trigram-profile; 0 without it). mid: the context ends
+// inside an unfinished UTF-8 sequence, sw_i: the candidate starts a word. The coefficients start at the static fit of k
+// and follow the verified positions by AdaGrad; only the k candidates scored are learnt.
+struct common_spec_tconf {
+    static constexpr int32_t DIM   = 14;
+    static constexpr int32_t K_MAX = 10;
+    static constexpr int32_t N_SRC = 5;   // RA, RU, PM, PX, PU
+    static constexpr int32_t X_MID = 12;  // index of mid in x
+    static constexpr int32_t X_SW  = 13;  // index of sw in x
+
+    double b[DIM] = {};
+    double G[DIM] = {};
+    double lr = 0.15;
+
+    void   reset(int32_t k);  // the static coefficients of k
+    double q(const double * x) const;
+    void   update(const double * X, const double * lab, int32_t n); // n rows of DIM
+    // n[s], N[s]: the count of the candidate and the observations of the context per source
+    static void features(double p, const double * n, const double * N, bool mid, bool sw, double * x);
+};
+
+// one draft step of the trigram confidence
+struct common_spec_tconf_pos {
+    int32_t n      = 0;  // candidates scored
+    int32_t chosen = 0;  // index of the drafted one among the drafter candidates (may be >= n for a fixed one)
+    int32_t id     = -1; // the drafted token
+    int32_t N      = 0;  // trigram observations of the context in the request (both roles)
+    float   src[2 * common_spec_tconf::N_SRC] = {}; // round log: n_s, N_s of the drafted candidate per source
+    std::vector<int32_t> ids; // the n candidates scored
+    std::vector<double>  X;   // n rows of common_spec_tconf::DIM
+};
+
 struct common_spec_smart {
     static constexpr int32_t N_GROUPS = 3;  // draft positions 0, 1 and 2+ share calibration cells
     static constexpr int32_t N_QBAR_MAX = 16; // mean acceptance per position 0..n_max, the last cell for all beyond
+    using tconf_pos = common_spec_tconf_pos;
 
     common_spec_smart(const common_spec_smart_config & cfg, int32_t n_seq);
     ~common_spec_smart();
@@ -145,11 +217,29 @@ struct common_spec_smart {
     void    close_round(int32_t seq, int64_t t_us, const common_spec_smart_pool * pool = nullptr,
                         const common_spec_smart_graphs * graphs = nullptr);
     bool    begin_round(int32_t seq, int32_t n_max_seq);
-    int32_t after_step(int32_t seq, float p_top);
+    int32_t after_step(int32_t seq, float p_top, double q_direct = -1.0); // q_direct >= 0: the trigram confidence
     void    drafted(int32_t seq, int32_t k, int64_t t_us, const common_spec_smart_pool * pool = nullptr,
                     const common_spec_smart_graphs * graphs = nullptr);
     void    accepted(int32_t seq, int32_t n_accepted);
     void    add_draft_step(double us, double graph_us = 0.0); // graph_us: graph builds and captures inside the step
+
+    // trigram confidence (cfg.tconf; every call returns at once without it):
+    //   tconf_vocab  once: per token its last bytes (up to 3: the count in bits 24..25, the last byte in bits 0..7)
+    //                and whether it starts a word
+    //   tconf_roles  once (the server, from the chat template): the role markers and the control tokens
+    //   tconf_request at the start of a request with its prompt: the generated tokens start after it
+    //   tconf_begin  at every draft of the sequence: the context (prompt and generated tokens before id_last) and
+    //                id_last at position pos0. Inserts the new tokens into the request's trigram table and learns the
+    //                rejected position of the last round, whose target token is id_last
+    //   tconf_pick   at every draft step with the drafter candidates (sorted, n of them): scores the first min(k, n)
+    //                and returns the one to draft (fixed >= 0: that one, e.g. a sampled token), q its acceptance
+    bool    tconf_on() const { return cfg.tconf; }
+    void    tconf_vocab(std::vector<uint32_t> tail, std::vector<uint8_t> word_first);
+    void    tconf_roles(common_spec_roles r);
+    void    tconf_request(int32_t seq, const int32_t * prompt, size_t n);
+    void    tconf_begin(int32_t seq, const int32_t * toks, size_t n, int32_t id_last, int32_t pos0);
+    int32_t tconf_pick(int32_t seq, const int32_t * ids, const float * p, int32_t n, int32_t fixed, double * q);
+    bool    tconf_mid(const std::vector<int32_t> & ctx) const; // the context ends inside an unfinished UTF-8 sequence
 
     // one line per request: mean k, share per width, predicted / observed cost per width, acceptance
     std::string request_summary(int32_t seq) const;
@@ -157,13 +247,15 @@ struct common_spec_smart {
     // decision after n_drafted steps with top probabilities p[0..n_drafted): -1 = draft one more, else the number of
     // tokens to keep (0..n_drafted). Expected throughput = (expected accepted + 1) / (draft time so far + cost(k)).
     // diag (round log only): what the decision saw; nullptr: nothing is recorded (the result is the same)
-    int32_t decide(const float * p, int32_t n_drafted, int32_t n_max_seq, common_spec_smart_diag * diag = nullptr) const;
+    // qd (trigram confidence): the acceptance of every drafted position, used instead of q(i, p)
+    int32_t decide(const float * p, int32_t n_drafted, int32_t n_max_seq, common_spec_smart_diag * diag = nullptr,
+                   const double * qd = nullptr) const;
 
     std::vector<double> cost_table() const; // predicted verification time per width 0..n_max: level x shape
     double cost(int32_t k) const { return cost_table()[k]; }
     double q(int32_t i, float p) const;     // calibrated acceptance of a draft token at position i with top probability p
     double qbar(int32_t i) const;           // mean acceptance at position i (lookahead for steps not drafted yet)
-    double lookahead(int32_t j, const float * p, int32_t n_drafted) const; // predicted acceptance at position j >= n_drafted
+    double lookahead(int32_t j, const float * p, int32_t n_drafted, const double * qd = nullptr) const; // predicted acceptance at position j >= n_drafted
     double draft_step() const;              // time of one draft step (its mean)
     double conf(const common_spec_smart_cell & c) const { return c.n_at(n_closed, decay); } // confidence now
     double level_conf() const { return level_cell.n_at(n_closed, level_decay); }            // confidence of the level
@@ -234,6 +326,17 @@ struct common_spec_smart {
         int32_t k         = 0;
         int64_t t_drafted = 0;
         std::vector<float> p;
+        std::vector<double> qd;          // trigram confidence of every draft step (empty without it)
+
+        // trigram confidence
+        common_spec_trigram     tri;
+        std::vector<int32_t>    tc_ctx;  // the last tokens of the context, id_last and the drafted ones
+        std::vector<tconf_pos>  tc_pos;  // per draft step
+        tconf_pos               tc_pend; // the rejected position of the last round, waiting for its target token
+        bool                    tc_pend_valid = false;
+        int32_t                 tc_pend_at = -1; // ... the position of that token (the next round's pos0)
+        int32_t                 tc_pos0 = -1;    // pos0 of the current round
+        size_t                  tc_n_prompt = SIZE_MAX; // prompt tokens of the request (the generated ones follow)
 
         // round log only (not read by the decisions)
         int64_t log_req   = 0;     // request id of this sequence
@@ -264,6 +367,16 @@ struct common_spec_smart {
         std::vector<int64_t> obs_n_k;
     };
     std::vector<seq_state> seqs;
+
+    // trigram confidence
+    common_spec_tconf     tconf_model;
+    std::vector<uint32_t> tc_tail;
+    std::vector<uint8_t>  tc_wf;
+    common_spec_roles     tc_roles;
+    int64_t               tc_updates = 0; // AdaGrad steps of the process
+    int64_t               tc_invert  = 0; // draft steps that drafted another candidate than the drafter's top one
+    void tconf_learn(const tconf_pos & ps, int32_t target);
+    void tconf_accepted(int32_t seq, int32_t n_accepted);
 
     std::unique_ptr<common_spec_smart_log> log; // --spec-smart-log, nullptr when off
     void log_round(int32_t seq, const char * end, double verify_us);
