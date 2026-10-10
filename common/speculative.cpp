@@ -98,6 +98,41 @@ static std::string common_speculative_get_devices_str(const std::vector<ggml_bac
 }
 
 // format a per-draft-position threshold list for logging, e.g. "0.33,0.60,0.60,0.00"
+// --spec-smart round log: the decode pool counts of the expert cache (ggml_expert_iface::pool_counts) of the first
+// backend that has the cache; nullptr when none (looked up once)
+static const ggml_expert_iface * spec_expert_iface() {
+    static const ggml_expert_iface * iface = [] {
+        for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+            ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+            auto * get = (ggml_backend_expert_iface_t) ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(dev),
+                                                                                        GGML_EXPERT_IFACE_PROC_NAME);
+            const ggml_expert_iface * f = get ? get() : nullptr;
+            if (f != nullptr && f->abi_version == GGML_EXPERT_ABI_VERSION && f->pool_counts != nullptr) {
+                return f;
+            }
+        }
+        return (const ggml_expert_iface *) nullptr;
+    }();
+    return iface;
+}
+
+// the counts now; invalid without a round log, a cache, or a decode pool. Never waits for the device: it is read
+// right after the host has the results of the draft steps or of the verification
+static common_spec_smart_pool spec_smart_pool(const common_spec_smart * smart) {
+    common_spec_smart_pool out;
+    const ggml_expert_iface * iface = smart != nullptr && smart->logging() ? spec_expert_iface() : nullptr;
+    ggml_expert_pool_counts c{};
+    if (iface != nullptr && iface->pool_counts(&c)) {
+        out.valid      = true;
+        out.lends      = c.lends;
+        out.reclaims   = c.reclaims;
+        out.hits       = c.hits;
+        out.fills      = c.fills;
+        out.fill_bytes = c.fill_bytes;
+    }
+    return out;
+}
+
 static std::string spec_threshold_list_str(const std::vector<float> & thresholds) {
     if (thresholds.empty()) {
         return "off";
@@ -1879,7 +1914,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
             if (smart) {
                 // the previous round of this sequence ends here: its verification time is known now
-                smart->close_round(seq_id, ggml_time_us());
+                const int64_t t_close = ggml_time_us();
+                const common_spec_smart_pool pool = spec_smart_pool(smart);
+                smart->close_round(seq_id, t_close, &pool);
 
                 const int32_t n_max_seq = dp.n_max > 0 ? std::min(params.n_max, dp.n_max) : params.n_max;
                 if (!smart->begin_round(seq_id, n_max_seq)) {
@@ -2078,7 +2115,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
 
             if (smart) {
-                smart->drafted(seq_id, (int32_t) dp.result->size(), ggml_time_us());
+                const int64_t t_drafted = ggml_time_us();
+                const common_spec_smart_pool pool = spec_smart_pool(smart);
+                smart->drafted(seq_id, (int32_t) dp.result->size(), t_drafted, &pool);
             }
         }
     }
