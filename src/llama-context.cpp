@@ -179,9 +179,10 @@ static const llm_fused_op_probe llm_fused_op_dsv4_compress_probe = {
     /*.n_tokens_per_seq =*/ 1,
 };
 
-// Stored batch shapes per context: a speculative server uses up to 16 verification widths, and the rest leaves room
-// for a second graph variant of a width.
-static constexpr int LLAMA_GRAPH_N_SHAPES = 24;
+// Stored batch shapes per context: a batch shape includes the KV length (padded to 256 cells), so a speculative
+// server needs its verification widths at every length it passes; 64 keeps the rare widths of a long generation.
+// About 15 MiB of host memory per stored graph.
+static constexpr int LLAMA_GRAPH_N_SHAPES = 64;
 
 llama_context::llama_context(
         const llama_model & model,

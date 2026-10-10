@@ -279,8 +279,6 @@ its instantiated graph directly.
 The per-shape keying has no switch: it is on in HIP builds (at most 96 graphs per
 context) and off elsewhere. The quick capture of a changed graph of a replayed
 family (see below) has no switch either; it needs the per-shape keying.
-| `GGML_CUDA_GRAPH_PER_SHAPE` | env | `1` in HIP builds, `0` in CUDA builds | `0` keys the stored graphs by the first node only, the upstream keying; `1` keys them by first node and batch shape with at most 32 graphs per context; `N > 1` allows at most `N` (capped at 256). Read once per process. |
-| `GGML_CUDA_GRAPH_EVICT_SECONDS` | env | `60` | A per-shape graph that was not used for this many seconds is dropped by the sweep that runs every 5 s; `0` drops per-shape graphs only at the per-context bound. Graphs keyed by the first node only (per-shape keying off) keep the upstream 10 s, since nothing else bounds their number. Read once per process. |
 
 The default bound was 16 until the llama graph per batch shape (next section)
 was turned on by default. Each llama graph it keeps is a graph of its own for
@@ -394,11 +392,20 @@ least recently used shape is evicted.
 ### Options
 
 No switch: a context keeps up to 64 batch shapes (before 2026-10-10: 24) where the reuse is possible (see Limits).
-| `LLAMA_GRAPH_REUSE_SHAPES` | env | `24` when not set | `0` keeps one graph per output class, the behaviour before this change; `1` keeps up to 8 batch shapes per context; `N > 1` keeps up to `N` (capped at 64). Read once per process. |
 
 24 covers the up to 16 verification widths of a speculative server and leaves
 room for a second graph variant of a width (DeepSeek V4 Flash alternates two
 graph plans at some widths).
+
+Since 2026-10-10 the defaults are 64 llama graphs, 96 HIP graphs and no timed sweep. A batch shape
+includes the KV length (padded to 256 cells), so a speculative server needs every verification width
+again at every length it passes; with 24 / 32 / 60 s the rare widths were evicted or swept before they
+came back and were built and captured again (8 + 16 ms of host time each). GLM-5.3 3.05 bpw, smart MTP,
+roleplay-ko preset of 17 requests (one run each): llama graphs built 181 -> 139 (target) and 154 -> 95
+(MTP), HIP graphs dropped unused 108 -> 0, isolated width-2 rounds reusing their graph 21 -> 53 of about
+60, decode 24.39 -> 24.76 t/s, server working set +1.3 GiB (83.7 -> 85.0 GiB; about 15 MiB per stored
+llama graph after the metadata trim, plus the HIP graph instances). Even 64 do not hold every width at
+every length of a long generation (75 / 30 evictions in that run).
 
 ### Limits
 

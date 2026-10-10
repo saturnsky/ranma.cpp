@@ -93,8 +93,12 @@ applies, how to switch it, and its limits. The main features are summarized in t
   Same page.
 - **One HIP graph per batch shape** - the backend keys the graphs it captured by the batch shape as well as by
   the first node, so a speculative verification whose width changes between rounds launches the graph it already
-  captured for that width. On by default in HIP builds; `GGML_CUDA_GRAPH_PER_SHAPE=0` restores the keying by the
-  first node. Same page.
+  captured for that width. HIP builds only, at most 96 graphs per context. Same page.
+- **One llama graph per batch shape** - a context keeps the built graph of up to 64 batch shapes together with
+  its scheduler split and allocation, so a verification width seen before is made current again instead of
+  being built, split and allocated anew. With both
+  defaults, decode with MTP (`--spec-draft-n-max 7`) in English roleplay is +11.1 % (Qwen3.8-Flash-Next) and
+  +8.6 % (DeepSeek V4 Flash) with identical replies. Same page.
 
 ### MoE decode kernels (HIP)
 

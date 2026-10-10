@@ -3250,12 +3250,12 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 }
 
 int ggml_cuda_graph_per_shape_max() {
-    // HIP: one stored graph per first node and batch shape, at most 32 per context. Other builds: one per first
+    // HIP: one stored graph per first node and batch shape, at most 96 per context. Other builds: one per first
     // node, the plain keying (0).
-    // 32 leaves room above the 24 llama graphs that LLAMA_GRAPH_REUSE_SHAPES keeps by default.
+    // 96 leaves room above the 64 llama graphs that a context keeps per batch shape.
     static const int max_entries = [] {
 #if defined(GGML_USE_HIP)
-        const int v = 32;
+        const int v = 96;
         GGML_LOG_INFO("%s: per-shape graphs on, at most %d per context\n", __func__, v);
 #else
         const int v = 0;
@@ -3265,9 +3265,6 @@ int ggml_cuda_graph_per_shape_max() {
     return max_entries;
 }
 
-    // sweep; 0 drops it only at the per-context limit. Default 60. The graphs keyed by first node only keep
-    // widths less often than every 10 s, so the shorter time ran them without a graph and captured them again.
-        int64_t v = 60;
 // Shape signature of a ggml graph: the node count and the shapes of the first and the last node. llama keeps
 // the topology of a graph when only the batch size changes, and those two nodes are activations whose token
 // dimension follows the batch size; tensors sized by the KV cache usually sit in between, so a growing cache
