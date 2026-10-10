@@ -93,7 +93,8 @@ int main() {
         p.speculative.draft.tensor_buft_overrides.push_back({"exps", nullptr});
         CHECK(!validate_expert_params(p).ok);
         p.speculative.draft.tensor_buft_overrides.clear();
-        p.speculative.types = {COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK}; CHECK(!validate_expert_params(p).ok);
+        // a GPU-resident DSpark block drafter outside the joint cache is checked like a resident MTP head
+        p.speculative.types = {COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK}; CHECK(validate_expert_params(p).ok == os);
         p.speculative.types = {COMMON_SPECULATIVE_TYPE_DRAFT_MTP, COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE};
         CHECK(!validate_expert_params(p).ok);
     }
