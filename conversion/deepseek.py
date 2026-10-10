@@ -1280,6 +1280,12 @@ class DeepseekV41Model(DeepseekV4Model):
     def set_gguf_parameters(self):
         super().set_gguf_parameters()
         hparams = self.hparams
+        # the two level top-k: all three come from the config together, or the file has no
+        # candidate mask and the runtime leaves it off (a negative source layer means the same)
+        if (candidate_source := hparams.get("candidate_source_layer_id")) is not None and candidate_source >= 0:
+            self.gguf_writer.add_indexer_candidate_source_layer(candidate_source)
+            self.gguf_writer.add_indexer_candidate_topk_blocks(hparams["candidate_topk_blocks"])
+            self.gguf_writer.add_indexer_candidate_block_size(hparams["candidate_block_size"])
         if (engram_ids := hparams.get("engram_layer_ids")) is not None:
             # These MUST carry the arch prefix, not a literal "deepseek4.". llama.cpp resolves
             # every LLM_KV_* as "{arch}.{key}", so a hardcoded prefix means the runtime looks up

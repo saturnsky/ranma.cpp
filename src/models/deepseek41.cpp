@@ -29,9 +29,12 @@
 // it derives index keys from that shared latent rather than from a second compressor. See
 // build_attention_v41().
 //
-// Not implemented: the two level candidate mask. Measured against the reference, it selects every
-// block until the compressed length passes candidate_topk_blocks * candidate_block_size, so it
-// changes nothing below that and the context is capped there instead.
+// Two level top-k. The candidate source layer scores blocks of candidate_block_size compressed
+// positions by their best index score and keeps the best candidate_topk_blocks, always including
+// the block with the query's newest position. The index sources after it rank positions only
+// inside those blocks. Until the compressed length passes candidate_topk_blocks *
+// candidate_block_size (16384 tokens on the ratio 1 stream) every block is kept, so nothing is
+// built there. The carry holds one entry per block, not per position. See build_candidate_keep().
 
 // mean over the hyper-connection copies; deepseek4.cpp keeps its own copy of this
 static ggml_tensor * dsv41_hc_mean(ggml_context * ctx, ggml_tensor * x) {
@@ -61,6 +64,29 @@ void llama_model_deepseek41::load_arch_hparams(llama_model_loader & ml) {
         throw std::runtime_error(format("DeepSeek-V4.1 engram layer count %u is out of range", engram_n_layer));
     }
     ml.get_arr(LLM_KV_ENGRAM_LAYER_IDS, hparams.engram_layer_ids);
+
+    // A file without the candidate keys runs without the two level mask. That matches the
+    // reference while the index sources see at most candidate_topk_blocks * candidate_block_size
+    // compressed rows. Layers 20 and up compress at ratio 1, so a row is a token and the limit is
+    // 16384 tokens for the released model, and only there.
+    uint32_t candidate_source = 0;
+    if (ml.get_key(LLM_KV_ATTENTION_INDEXER_CANDIDATE_SOURCE_LAYER, candidate_source, false)) {
+        hparams.candidate_source_layer = (int32_t) candidate_source;
+    }
+    if (hparams.candidate_source_layer >= 0) {
+        ml.get_key(LLM_KV_ATTENTION_INDEXER_CANDIDATE_TOPK_BLOCKS, hparams.candidate_topk_blocks);
+        ml.get_key(LLM_KV_ATTENTION_INDEXER_CANDIDATE_BLOCK_SIZE,  hparams.candidate_block_size);
+
+        if (hparams.candidate_topk_blocks == 0 || hparams.candidate_block_size == 0) {
+            throw std::runtime_error("DeepSeek-V4.1 candidate mask needs a nonzero block count and block size");
+        }
+        if ((uint32_t) hparams.candidate_source_layer >= hparams.n_layer()) {
+            throw std::runtime_error(format("candidate source layer %d is out of range", hparams.candidate_source_layer));
+        }
+    } else {
+        LLAMA_LOG_WARN("%s: no candidate mask keys in the file, so the two level top-k is off; "
+                "results can differ from the reference beyond 16384 tokens of context (ratio 1 stream)\n", __func__);
+    }
 
     ml.get_key(LLM_KV_ENGRAM_HEAD_COUNT,     hparams.engram_n_head);
     ml.get_key(LLM_KV_ENGRAM_KEY_LENGTH,     hparams.engram_key_length);
@@ -244,6 +270,11 @@ void llama_model_deepseek41::load_arch_tensors(llama_model_loader & ml) {
         hparams.dsv41_kv_source[i]        = last_kv_source;
         hparams.dsv41_index_key_source[i] = last_key_owner;
         hparams.dsv41_topk_source[i]      = last_index_source;
+    }
+
+    // the mask is built from an index source's own score
+    if (hparams.candidate_source_layer >= 0 && !hparams.dsv41_is_index_source(hparams.candidate_source_layer)) {
+        throw std::runtime_error(format("candidate source layer %d is not an index source", hparams.candidate_source_layer));
     }
 
     // a compressor with no gate only makes sense where there is nothing to pool
@@ -509,6 +540,7 @@ ggml_tensor * llama_model_deepseek41::graph::build_indexer_top_k(
         ggml_tensor * qr,
         ggml_tensor * cur,
         ggml_tensor * inp_pos,
+        dsv41_top_k_carry & top_k_carry,
         int il) const {
     const auto & layer = model.layers[il];
 
@@ -581,12 +613,95 @@ ggml_tensor * llama_model_deepseek41::graph::build_indexer_top_k(
     score = ggml_add(ctx0, score, mask);
     cb(score, "idx_score", il);
 
+    // Level two: a source after the candidate source ranks only the positions inside its blocks.
+    // The candidate source itself ranks everything, so its mask never touches its own top-k.
+    ggml_tensor * ranked = score;
+    if (hparams.candidate_source_layer >= 0 && il > hparams.candidate_source_layer && top_k_carry.cand_keep) {
+        const int64_t bs = hparams.candidate_block_size;
+        ggml_tensor * keep = top_k_carry.cand_keep;
+        GGML_ASSERT(keep->ne[0] == 1 && keep->ne[1]*bs == score->ne[0] && keep->ne[2] == score->ne[1] && keep->ne[3] == score->ne[3]);
+
+        // each block's entry broadcasts over its positions. Nothing else reads this score, so it
+        // is masked in place; the score is contiguous, and so is the reshape.
+        ranked = ggml_reshape_4d(ctx0, score, bs, keep->ne[1], score->ne[1], score->ne[3]);
+        ranked = ggml_add_inplace(ctx0, ranked, keep);
+        ranked = ggml_reshape_4d(ctx0, ranked, score->ne[0], score->ne[1], 1, score->ne[3]);
+        cb(ranked, "idx_score_cand", il);
+    }
+
     const uint32_t n_top_k = score->ne[0] < hparams.indexer_top_k ? score->ne[0] : hparams.indexer_top_k;
 
-    ggml_tensor * top_k = ggml_cont(ctx0, ggml_top_k(ctx0, score, n_top_k));
+    ggml_tensor * top_k = ggml_cont(ctx0, ggml_top_k(ctx0, ranked, n_top_k));
     cb(top_k, "idx_top_k", il);
 
+    if (il == hparams.candidate_source_layer) {
+        top_k_carry.cand_keep = build_candidate_keep(score, mask, il);
+    }
+
     return top_k;
+}
+
+// Level one of the two level top-k, as select_candidate_blocks() in the reference. Blocks of
+// candidate_block_size consecutive positions are scored by their best position, the block holding
+// the query's newest position is pinned in, and the best candidate_topk_blocks blocks stay.
+// Returns 0 / -inf per block, F32 [1, n_blocks, nt, n_stream], to be broadcast over the block's
+// positions by the caller, or null when every block would stay anyway.
+//
+//   score    F32 [n_comp, nt, 1, n_stream]  index score, -inf on the positions the query cannot reach
+//   kq_mask  same shape and type            0 on the reachable prefix, -inf after it
+ggml_tensor * llama_model_deepseek41::graph::build_candidate_keep(
+        ggml_tensor * score,
+        ggml_tensor * kq_mask,
+        int il) const {
+    const int64_t bs     = hparams.candidate_block_size;
+    const int64_t n_comp = score->ne[0];
+    const int64_t nt     = score->ne[1];
+    const int64_t ns     = score->ne[3];
+
+    GGML_ASSERT(score->type == GGML_TYPE_F32 && kq_mask->type == GGML_TYPE_F32);
+    GGML_ASSERT(score->ne[2] == 1 && ggml_are_same_shape(score, kq_mask));
+    // the compressed length is padded to 256 rows, so blocks never straddle the end
+    GGML_ASSERT(n_comp % bs == 0);
+
+    const int64_t n_blocks = n_comp / bs;
+    const int64_t n_top    = std::min<int64_t>(hparams.candidate_topk_blocks, n_blocks);
+
+    // Taking every block is the same as taking none away: a block the query cannot reach has no
+    // finite position, and the attention mask hides those anyway.
+    if (n_blocks <= (int64_t) hparams.candidate_topk_blocks) {
+        return nullptr;
+    }
+
+    // block score = best position in it. A block with no reachable position comes out as
+    // -FLT_MAX rather than -inf, which still ranks below every real score (they are >= 0).
+    ggml_tensor * blk = ggml_pool_2d(ctx0, score, GGML_OP_POOL_MAX, bs, 1, bs, 1, 0, 0);
+    cb(blk, "cand_block_score", il);
+
+    // The newest block is the last one with a reachable position. Pooling the mask marks each
+    // block 0 (reachable) or -FLT_MAX; clamping to -1 turns the sum over blocks into minus the
+    // number of unreachable ones, so the last reachable index is n_blocks - 1 minus that.
+    ggml_tensor * dark = ggml_clamp(ctx0, ggml_pool_2d(ctx0, kq_mask, GGML_OP_POOL_MAX, bs, 1, bs, 1, 0, 0), -1.0f, 0.0f);
+    ggml_tensor * last = ggml_scale_bias(ctx0, ggml_sum_rows(ctx0, dark), 1.0f, (float) (n_blocks - 1));
+    // a query that sees nothing yet has no newest block; pin block 0, which the mask hides
+    last = ggml_clamp(ctx0, last, 0.0f, (float) (n_blocks - 1));
+    ggml_tensor * last_idx = ggml_reshape_3d(ctx0, ggml_cast(ctx0, last, GGML_TYPE_I32), 1, nt, ns);
+    cb(last_idx, "cand_last_block", il);
+
+    // pin it: write +inf over that block's score, one row of one element per query
+    ggml_tensor * rows   = ggml_reshape_4d(ctx0, blk, 1, n_blocks, nt, ns);
+    ggml_tensor * pinned = ggml_fill(ctx0, ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, 1, 1, nt, ns), INFINITY);
+    rows = ggml_set_rows(ctx0, rows, pinned, last_idx);
+
+    ggml_tensor * top = ggml_cont(ctx0, ggml_top_k(ctx0, ggml_reshape_4d(ctx0, rows, n_blocks, nt, 1, ns), n_top));
+    cb(top, "cand_top_blocks", il);
+
+    // chosen blocks -> 0 in a -inf row per query
+    ggml_tensor * keep  = ggml_fill(ctx0, ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, 1, n_blocks, nt, ns), -INFINITY);
+    ggml_tensor * zeros = ggml_fill(ctx0, ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, 1, n_top,    nt, ns), 0.0f);
+    keep = ggml_set_rows(ctx0, keep, zeros, ggml_reshape_3d(ctx0, top, n_top, nt, ns));
+    cb(keep, "cand_keep", il);
+
+    return keep;
 }
 
 // DeepSeek-V4.1 attention: a sliding window of raw KV, plus, where the layer uses one, the
@@ -750,7 +865,7 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention_v41(
     // carry a reusing layer would fall back to the full causal mask and attend to every compressed
     // row, which matches the reference only while a source has <= index_topk rows
     if (hparams.dsv41_is_index_source(il)) {
-        top_k_carry.top_k = build_indexer_top_k(model, inp_dsv4, inp_comp, qr, cur, inp_pos, il);
+        top_k_carry.top_k = build_indexer_top_k(model, inp_dsv4, inp_comp, qr, cur, inp_pos, top_k_carry, il);
         top_k_carry.il    = (int32_t) il;
     }
     GGML_ASSERT(top_k_carry.top_k != nullptr && top_k_carry.il == hparams.dsv41_topk_source[il] &&
