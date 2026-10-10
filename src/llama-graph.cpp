@@ -1391,6 +1391,11 @@ int64_t llm_graph_result::get_max_nodes() const {
     return max_nodes;
 }
 
+void llm_graph_result::trim() {
+    // the objects of the context are placed one after another from the start of the buffer
+    buf_compute_meta.release_tail(ggml_used_mem(ctx_compute.get()));
+}
+
 void llm_graph_result::reset() {
     t_inp_tokens  = nullptr;
     t_inp_embd    = nullptr;
