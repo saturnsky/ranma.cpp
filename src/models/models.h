@@ -1438,10 +1438,12 @@ struct llama_model_deepseek4 : public llama_model_base {
 };
 
 
-// the top-k of the last index source, handed on to the compressed layers that reuse it
+// the top-k of the last index source, handed on to the compressed layers that reuse it, and the
+// block level candidate mask the candidate source layer made for the index sources after it
 struct dsv41_top_k_carry {
-    ggml_tensor * top_k = nullptr;
-    int32_t       il    = -1;
+    ggml_tensor * top_k     = nullptr;
+    int32_t       il        = -1;
+    ggml_tensor * cand_keep = nullptr; // F32 [1, n_blocks, n_tokens/n_stream, n_stream], 0 or -inf; null = every block
 };
 
 // DeepSeek-V4.1. Same machinery as V4, minus the hash layers, the MTP block and the learned
@@ -1498,6 +1500,13 @@ struct llama_model_deepseek41 : public llama_model_deepseek4 {
                 ggml_tensor * qr,
                 ggml_tensor * cur,
                 ggml_tensor * inp_pos,
+                dsv41_top_k_carry & top_k_carry,
+                int il) const;
+
+        // level one of the two level top-k: the blocks of positions worth ranking
+        ggml_tensor * build_candidate_keep(
+                ggml_tensor * score,
+                ggml_tensor * kq_mask,
                 int il) const;
 
         ggml_tensor * build_attention_v41(
