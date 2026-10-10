@@ -1949,6 +1949,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 const common_spec_smart_pool   pool   = spec_smart_pool(smart);
                 const common_spec_smart_graphs graphs = spec_smart_graphs(smart, params.ctx_tgt, params.ctx_dft);
                 smart->close_round(seq_id, t_close, &pool, &graphs);
+                if (smart->tconf_on() && dp.prompt != nullptr) {
+                    smart->tconf_begin(seq_id, dp.prompt->data(), dp.prompt->size(), dp.id_last, dp.pos0);
+                }
 
                 const int32_t n_max_seq = dp.n_max > 0 ? std::min(params.n_max, dp.n_max) : params.n_max;
                 if (!smart->begin_round(seq_id, n_max_seq)) {
@@ -2041,8 +2044,35 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 }
 
                 // add drafted token for each sequence
-                const llama_token id    = dparams.at(seq_id).result_q ? id_sampled : cur_p->data[0].id;
-                const float       p_top = cur_p->data[0].p;
+                llama_token id    = dparams.at(seq_id).result_q ? id_sampled : cur_p->data[0].id;
+                float       p_top = cur_p->data[0].p;
+
+                // --spec-smart trigram confidence: the acceptance of the drafted token, and with k >= 2 candidates the
+                // one most likely accepted is drafted (greedy drafting only; a sampled token stays as sampled)
+                double q_tc = -1.0;
+                if (smart && smart->tconf_on() && cur_p->size > 0) {
+                    const int32_t n_c = (int32_t) std::min<size_t>(cur_p->size, 10);
+                    int32_t ids_c[10];
+                    float   p_c[10];
+                    int32_t fixed = -1;
+                    for (int32_t c = 0; c < n_c; ++c) {
+                        ids_c[c] = cur_p->data[c].id;
+                        p_c[c]   = cur_p->data[c].p;
+                        if (dparams.at(seq_id).result_q && ids_c[c] == id) {
+                            fixed = c;
+                        }
+                    }
+                    if (!dparams.at(seq_id).result_q || fixed >= 0) {
+                        const int32_t i_c = smart->tconf_pick(seq_id, ids_c, p_c, n_c, fixed, &q_tc);
+                        id    = ids_c[i_c];
+                        p_top = p_c[i_c];
+                    } else {
+                        // a sampled token outside the candidates (not expected: the drafter samples from them), scored
+                        // alone so that the steps stay aligned
+                        const float p_0 = 0.0f;
+                        smart->tconf_pick(seq_id, &id, &p_0, 1, 0, &q_tc);
+                    }
+                }
 
                 auto & dp = dparams.at(seq_id);
                 auto & result = *dp.result;
@@ -2057,7 +2087,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                         dp.result_q->emplace_back(cur_p->data, cur_p->data + cur_p->size);
                     }
 
-                    const int32_t n_keep = smart->after_step(seq_id, p_top);
+                    const int32_t n_keep = smart->after_step(seq_id, p_top, q_tc);
                     if (n_keep >= 0) {
                         result.resize(n_keep);
                         if (dp.result_q) {
@@ -3291,9 +3321,43 @@ common_speculative * common_speculative_init(common_params_speculative & params,
             cfg.store_key  = params.draft.smart_key;
             cfg.half_life  = params.draft.smart_half_life;
             cfg.log_path   = params.draft.smart_log;
+            // the acceptance of a draft token from its drafter probability and the request's trigram counts, on by
+            // default (LLAMA_SPEC_TRIGRAM_CONF=0: off); LLAMA_SPEC_TRIGRAM_TOPK=k (1..10, default 1): drafter
+            // candidates scored per step
+            cfg.tconf = true;
+            if (const char * e = getenv("LLAMA_SPEC_TRIGRAM_CONF"); e != nullptr && atoi(e) == 0) {
+                cfg.tconf = false;
+            }
+            if (cfg.tconf) {
+                if (const char * k = getenv("LLAMA_SPEC_TRIGRAM_TOPK"); k != nullptr) {
+                    cfg.tconf_k = std::clamp(atoi(k), 1, 10);
+                }
+            }
 
             result->smart = std::make_unique<common_spec_smart>(cfg, (int32_t) n_seq);
             mtp->smart    = result->smart.get();
+
+            if (cfg.tconf) {
+                // per token: its last bytes (the UTF-8 state of a context) and whether it starts a word
+                const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(mtp->params.ctx_dft));
+                const int32_t n_vocab = llama_vocab_n_tokens(vocab);
+                std::vector<uint32_t> tail(n_vocab, 0);
+                std::vector<uint8_t>  wf(n_vocab, 0);
+                for (int32_t t = 0; t < n_vocab; ++t) {
+                    const std::string piece = common_token_to_piece(vocab, t, true);
+                    const size_t c = std::min<size_t>(piece.size(), 3);
+                    uint32_t v = (uint32_t) c << 24;
+                    for (size_t j = 0; j < c; ++j) {
+                        v |= (uint32_t) (uint8_t) piece[piece.size() - 1 - j] << (8 * j);
+                    }
+                    tail[t] = v;
+                    if (!piece.empty()) {
+                        const unsigned char b = (unsigned char) piece[0];
+                        wf[t] = b == ' ' || b == '\n' || b == '\t' || (b < 0x80 && !((b >= '0' && b <= '9') || (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z')));
+                    }
+                }
+                result->smart->tconf_vocab(std::move(tail), std::move(wf));
+            }
         }
     }
 
@@ -3355,7 +3419,24 @@ void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, co
 
     if (spec->smart) {
         spec->smart->request_begin(seq_id);
+        spec->smart->tconf_request(seq_id, prompt.data(), prompt.size());
     }
+}
+
+void common_speculative_set_roles(common_speculative * spec, const std::vector<std::pair<llama_tokens, bool>> & markers,
+                                  const std::vector<uint8_t> & ctrl) {
+    if (spec == nullptr || !spec->smart) {
+        return;
+    }
+    common_spec_roles r;
+    for (const auto & [toks, assistant] : markers) {
+        common_spec_roles::marker m;
+        m.toks = toks;
+        m.role = assistant ? common_spec_roles::ASSIST : common_spec_roles::OTHER;
+        r.markers.push_back(std::move(m));
+    }
+    r.ctrl = ctrl;
+    spec->smart->tconf_roles(std::move(r));
 }
 
 bool common_speculative_process(common_speculative * spec, const common_batch & batch) {

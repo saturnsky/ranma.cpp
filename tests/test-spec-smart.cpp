@@ -2554,6 +2554,408 @@ static int test_resolve() {
     return 0;
 }
 
+//
+// trigram confidence (LLAMA_SPEC_TRIGRAM_CONF)
+//
+
+// the trigram counts of a stream, counted directly
+static void ref_counts(const std::vector<int32_t> & s, int32_t a, int32_t b, int32_t tok, int32_t & cnt, int32_t & N) {
+    cnt = 0;
+    N   = 0;
+    for (size_t i = 2; i < s.size(); ++i) {
+        if (s[i - 2] == a && s[i - 1] == b) {
+            N++;
+            cnt += s[i] == tok;
+        }
+    }
+}
+
+// a top-1 calibrator written from its definition: logistic of the drafter top probability and the trigram counts,
+// learnt by AdaGrad from the acceptance of the drafted token alone
+struct ref_top1 {
+    static constexpr int D = common_spec_tconf::DIM;
+    double b[D], G[D];
+    static double lg(double x) {
+        x = std::min(std::max(x, 1e-4), 1.0 - 1e-4);
+        return std::log(x / (1.0 - x));
+    }
+    // the request's counts of the other roles (RU): no role markers and no prompt length given
+    void x_of(double p, int cnt, int N, bool mid, bool sw, double * x) const {
+        const double g = N > 0 ? N / (N + 3.0) : 0.0;
+        for (int d = 0; d < D; ++d) {
+            x[d] = 0.0;
+        }
+        x[0]  = 1.0;
+        x[1]  = lg(p);
+        x[4]  = N > 0 ? g * lg((cnt + 0.5) / (N + 1.0)) : 0.0;
+        x[5]  = g;
+        x[12] = mid;
+        x[13] = sw;
+    }
+    double q(const double * x) const {
+        double z = 0.0;
+        for (int d = 0; d < D; ++d) {
+            z += b[d] * x[d];
+        }
+        return 1.0 / (1.0 + std::exp(-std::min(std::max(z, -30.0), 30.0)));
+    }
+    void learn(const double * x, double y) {
+        const double r = y - q(x);
+        for (int d = 0; d < D; ++d) {
+            const double g = x[d] * r;
+            G[d] += g * g;
+            b[d] += 0.15 * g / std::sqrt(G[d]);
+        }
+    }
+};
+
+// the features of a request's counts: RA and RU
+static void tc_features(double p, int cA, int NA, int cU, int NU, bool mid, bool sw, double * x) {
+    const double n[common_spec_tconf::N_SRC] = { (double) cA, (double) cU, 0, 0, 0 };
+    const double N[common_spec_tconf::N_SRC] = { (double) NA, (double) NU, 0, 0, 0 };
+    common_spec_tconf::features(p, n, N, mid, sw, x);
+}
+
+static int test_tconf() {
+    // 1. the features and the static coefficients against the offline fit (tconf_fit2.py reference points, k = 1)
+    {
+        struct pt { double p; int cA, NA, cU, NU, mid, sw; double q; };
+        const pt R[] = {
+            { 0.4, 4, 10, 0, 0, 0, 1, 0.2305283658606285 },  { 0.3, 0, 0, 9, 10, 0, 1, 0.5416871315347813 },
+            { 0.9, 1, 5, 0, 20, 1, 0, 0.6573225453247713 },  { 0.05, 0, 0, 0, 0, 0, 0, 0.04846946976832208 },
+            { 0.99, 3, 3, 2, 2, 1, 1, 0.992394076381946 },
+        };
+        for (const auto & r : R) {
+            common_spec_tconf m;
+            m.reset(1);
+            double x[common_spec_tconf::DIM];
+            tc_features(r.p, r.cA, r.NA, r.cU, r.NU, r.mid != 0, r.sw != 0, x);
+            CHECK(std::fabs(m.q(x) - r.q) < 1e-5); // the table keeps 6 decimals
+        }
+        // the profile columns start at 0 for every k
+        for (int k = 1; k <= common_spec_tconf::K_MAX; ++k) {
+            common_spec_tconf m;
+            m.reset(k);
+            for (int d = 6; d < 12; ++d) {
+                CHECK(m.b[d] == 0.0);
+            }
+        }
+    }
+
+    // 2. the trigram table: incremental insertion = counting the whole stream; a stream that does not continue it
+    //    is inserted anew
+    {
+        std::mt19937 rng(7);
+        std::vector<int32_t> s;
+        common_spec_trigram tri;
+        for (int step = 0; step < 300; ++step) {
+            const int n_new = 1 + (int) (rng() % 4);
+            for (int i = 0; i < n_new; ++i) {
+                s.push_back((int32_t) (rng() % 6));
+            }
+            tri.sync(s.data(), s.size() - 1, s.back()); // context + id_last
+            CHECK(tri.size() == s.size());
+            if (step % 37 == 0) {
+                for (int32_t a = 0; a < 6; ++a) {
+                    for (int32_t b = 0; b < 6; ++b) {
+                        int32_t toks[6] = { 0, 1, 2, 3, 4, 5 };
+                        int32_t cnt[12], N[2];
+                        tri.lookup(a, b, toks, 6, cnt, N);
+                        for (int32_t t = 0; t < 6; ++t) {
+                            int32_t rc, rN;
+                            ref_counts(s, a, b, t, rc, rN);
+                            CHECK(rc == cnt[2 * t] && rN == N[0] && cnt[2 * t + 1] == 0 && N[1] == 0); // no roles: other
+                        }
+                    }
+                }
+            }
+        }
+        // a rollback: the stream is cut and continues differently
+        s.resize(s.size() - 5);
+        s.push_back(5);
+        s.push_back(5);
+        tri.sync(s.data(), s.size() - 1, s.back());
+        int32_t toks[1] = { 5 };
+        int32_t cnt[2], N[2], rc, rN;
+        tri.lookup(5, 5, toks, 1, cnt, N);
+        ref_counts(s, 5, 5, 5, rc, rN);
+        CHECK(cnt[0] == rc && N[0] == rN);
+    }
+
+    // 2b. roles: the markers (100 opens the assistant, 103 104 and 101 another role; the control token 102 another
+    //     role too) and the generated tokens; incremental insertion counts by the roles of the whole stream
+    {
+        common_spec_roles roles;
+        roles.markers.push_back({ { 100 }, common_spec_roles::ASSIST });
+        roles.markers.push_back({ { 103, 104 }, common_spec_roles::OTHER }); // a two-token marker
+        roles.markers.push_back({ { 101 }, common_spec_roles::OTHER });
+        roles.ctrl.assign(110, 0);
+        roles.ctrl[100] = roles.ctrl[101] = roles.ctrl[102] = roles.ctrl[103] = 1;
+        const std::vector<int32_t> s = { 101, 1, 2, 3, 100, 1, 2, 4, 102, 1, 2, 5, 100, 1, 2, 6, 103, 104, 1, 2, 7, 100, 1, 2 };
+        const size_t gen_from = 22; // the last two tokens are generated
+        const auto r = roles.of(s.data(), s.size(), gen_from);
+        const std::vector<uint8_t> want = { 0, 0, 0, 0, 1, 1, 1, 1, 0, 0, 0, 0, 1, 1, 1, 1, 0, 0, 0, 0, 0, 1, 1, 1 };
+        CHECK(r == want);
+        common_spec_trigram tri;
+        for (size_t n = 3; n <= s.size(); n += 5) {
+            tri.sync(s.data(), n - 1, s[n - 1], &roles, gen_from);
+        }
+        tri.sync(s.data(), s.size() - 1, s.back(), &roles, gen_from);
+        const int32_t toks[5] = { 3, 4, 5, 6, 7 };
+        int32_t cnt[10], N[2];
+        tri.lookup(1, 2, toks, 5, cnt, N);
+        CHECK(N[common_spec_roles::ASSIST] == 2 && N[common_spec_roles::OTHER] == 3); // after (1, 2): 4, 6 / 3, 5, 7
+        CHECK(cnt[2 * 1 + common_spec_roles::ASSIST] == 1 && cnt[2 * 2 + common_spec_roles::OTHER] == 1 &&
+              cnt[2 * 4 + common_spec_roles::OTHER] == 1 && cnt[2 * 3 + common_spec_roles::ASSIST] == 1 &&
+              cnt[2 * 0 + common_spec_roles::OTHER] == 1 && cnt[2 * 1 + common_spec_roles::OTHER] == 0);
+        // without markers: the prompt is other, the generated tokens the assistant
+        common_spec_roles none;
+        std::vector<uint8_t> want2(s.size(), 0);
+        want2[22] = want2[23] = 1;
+        CHECK(none.of(s.data(), s.size(), gen_from) == want2);
+    }
+
+    // a vocabulary of 40 tokens: token t has the byte 'a' + t (t < 26, inside a word; t % 5 == 0 starts a word),
+    // 30 = the first two bytes of a three-byte UTF-8 sequence, 31 = its last byte
+    std::vector<uint32_t> tail(40, 0);
+    std::vector<uint8_t>  wf(40, 0);
+    for (int t = 0; t < 26; ++t) {
+        tail[t] = (1u << 24) | (uint32_t) ('a' + t);
+        wf[t]   = t % 5 == 0;
+    }
+    tail[30] = (2u << 24) | (0xEAu << 8) | 0xB0u; // last byte 0xB0, before it 0xEA
+    tail[31] = (1u << 24) | 0x80u;
+
+    // 3. the UTF-8 state of a context
+    {
+        common_spec_smart_config c = base_cfg(3);
+        c.tconf = true;
+        common_spec_smart s(c, 1);
+        s.tconf_vocab(tail, wf);
+        CHECK(!s.tconf_mid({ 1, 2 }));
+        CHECK(s.tconf_mid({ 1, 30 }));      // 0xEA 0xB0: one byte missing
+        CHECK(!s.tconf_mid({ 1, 30, 31 })); // complete
+        CHECK(!s.tconf_mid({}));
+    }
+
+    // 4. k = 1 is the top-1 calibrator: the same decisions and coefficients as ref_top1, whether the drafter gives one
+    //    candidate or ten (the others are neither scored nor learnt)
+    {
+        int64_t updates[2] = { 0, 0 };
+        std::vector<double> qs[2];
+        double b_end[2][common_spec_tconf::DIM];
+        for (int variant = 0; variant < 2; ++variant) {
+            common_spec_smart_config c = base_cfg(3);
+            c.tconf   = true;
+            c.tconf_k = 1;
+            common_spec_smart s(c, 1);
+            s.tconf_vocab(tail, wf);
+            set_identity(s, 0.6);
+            set_costs(s, { 30, 33, 36, 39 }, 2.0);
+
+            ref_top1 ref;
+            for (int d = 0; d < common_spec_tconf::DIM; ++d) {
+                ref.b[d] = s.tconf_model.b[d];
+                ref.G[d] = 1e-3;
+            }
+
+            std::mt19937 rng(11);
+            std::vector<int32_t> ctx = { 1, 2, 3, 4 };
+            s.request_begin(0);
+            int64_t t = 0;
+            for (int r = 0; r < 200; ++r) {
+                const int32_t id_last = (int32_t) (rng() % 26);
+                const int32_t pos0    = (int32_t) ctx.size();
+                s.close_round(0, t);
+                s.tconf_begin(0, ctx.data(), ctx.size(), id_last, pos0);
+                std::vector<int32_t> full = ctx;
+                full.push_back(id_last);
+                const std::vector<int32_t> known = full; // the trigram table: the context and id_last, not the draft
+                std::vector<double> rx; // reference rows of the drafted positions
+                int k = 0;
+                if (s.begin_round(0, 3)) {
+                    for (;;) {
+                        // ten candidates, top one first; the target token is one of them or none
+                        int32_t ids[10];
+                        float   p[10];
+                        float   rest = 1.0f;
+                        for (int i = 0; i < 10; ++i) {
+                            ids[i] = (int32_t) ((rng() % 26 + i * 3) % 26);
+                            p[i]   = i < 9 ? rest * (0.3f + 0.6f * (float) (rng() % 100) / 100.0f) : rest;
+                            rest  -= i < 9 ? p[i] : 0.0f;
+                        }
+                        std::sort(p, p + 10, [](float a, float b) { return a > b; });
+                        double q = -1.0;
+                        const int32_t i_c = s.tconf_pick(0, ids, p, variant == 0 ? 1 : 10, -1, &q);
+                        CHECK(i_c == 0);
+                        int32_t cnt, N;
+                        ref_counts(known, full[full.size() - 2], full.back(), ids[0], cnt, N);
+                        const bool mid = s.tconf_mid(std::vector<int32_t>(full.end() - std::min<size_t>(6, full.size()), full.end()));
+                        double x[common_spec_tconf::DIM];
+                        ref.x_of(p[0], cnt, N, mid, wf[ids[0]] != 0, x);
+                        CHECK(std::fabs(ref.q(x) - q) < 1e-12);
+                        rx.insert(rx.end(), x, x + common_spec_tconf::DIM);
+                        qs[variant].push_back(q);
+                        full.push_back(ids[0]);
+                        s.add_draft_step(2000.0);
+                        const int32_t n = s.after_step(0, p[0], q);
+                        if (n >= 0) {
+                            k = n;
+                            break;
+                        }
+                    }
+                }
+                s.drafted(0, k, t);
+                const int a = k > 0 ? (int) (rng() % (k + 1)) : 0;
+                if (k > 0) {
+                    s.accepted(0, a);
+                    for (int j = 0; j <= std::min(a, k - 1); ++j) {
+                        ref.learn(rx.data() + (size_t) j * common_spec_tconf::DIM, j < a ? 1.0 : 0.0);
+                    }
+                }
+                for (int d = 0; d < common_spec_tconf::DIM; ++d) {
+                    CHECK(std::fabs(ref.b[d] - s.tconf_model.b[d]) < 1e-12); // learnt at once, no pending position
+                }
+                CHECK(!s.seqs[0].tc_pend_valid);
+                // the context grows by id_last and the accepted tokens; the target token follows them
+                ctx.push_back(id_last);
+                for (int j = 0; j < a; ++j) {
+                    ctx.push_back(full[ctx.size()]);
+                }
+                t += 40000;
+            }
+            updates[variant] = s.tc_updates;
+            std::copy(s.tconf_model.b, s.tconf_model.b + common_spec_tconf::DIM, b_end[variant]);
+            CHECK(s.tc_invert == 0);
+            CHECK(s.request_summary(0).find("trigram confidence k 1") != std::string::npos);
+        }
+        CHECK(updates[0] == updates[1] && updates[0] > 50);
+        CHECK(qs[0] == qs[1]);
+        for (int d = 0; d < common_spec_tconf::DIM; ++d) {
+            CHECK(b_end[0][d] == b_end[1][d]);
+        }
+    }
+
+    // 5. k = 3: the candidate the trigram counts back is drafted; the rejected position is learnt at the next draft
+    //    with its target token, and dropped when the next draft does not continue right after it
+    {
+        common_spec_smart_config c = base_cfg(3);
+        c.tconf   = true;
+        c.tconf_k = 3;
+        common_spec_smart s(c, 1);
+        s.tconf_vocab(tail, wf);
+        set_identity(s, 0.6);
+        set_costs(s, { 30, 31, 32, 33 }, 0.5);
+        // the context repeats (7, 8) -> 9 ten times
+        std::vector<int32_t> ctx;
+        for (int i = 0; i < 10; ++i) {
+            ctx.insert(ctx.end(), { 7, 8, 9 });
+        }
+        ctx.push_back(7);
+        s.request_begin(0);
+        s.close_round(0, 0);
+        s.tconf_begin(0, ctx.data(), ctx.size(), 8, (int32_t) ctx.size());
+        CHECK(s.begin_round(0, 3));
+        const int32_t ids[3] = { 1, 2, 9 };
+        const float   p[3]   = { 0.45f, 0.30f, 0.25f };
+        double q = -1.0;
+        CHECK(s.tconf_pick(0, ids, p, 3, -1, &q) == 2); // 9 after (7, 8): every time
+        CHECK(q > 0.6 && s.tc_invert == 1 && s.seqs[0].tc_pos[0].N == 10);
+        CHECK(s.seqs[0].tc_ctx.back() == 9);
+        // a fixed (sampled) token stays
+        double q2 = -1.0;
+        CHECK(s.tconf_pick(0, ids, p, 3, 0, &q2) == 0);
+        s.after_step(0, p[2], q);
+        s.drafted(0, 1, 1000);
+        s.accepted(0, 0); // rejected: its labels wait for the target token
+        CHECK(s.tc_updates == 0 && s.seqs[0].tc_pend_valid && s.seqs[0].tc_pend_at == (int32_t) ctx.size() + 1);
+        double b0[common_spec_tconf::DIM];
+        std::copy(s.tconf_model.b, s.tconf_model.b + common_spec_tconf::DIM, b0);
+        // the next draft continues right after the rejected position: the target token was candidate 1 (2)
+        std::vector<int32_t> ctx2 = ctx;
+        ctx2.push_back(8);
+        s.close_round(0, 40000);
+        s.tconf_begin(0, ctx2.data(), ctx2.size(), 2, (int32_t) ctx2.size());
+        CHECK(s.tc_updates == 1 && !s.seqs[0].tc_pend_valid);
+        {
+            // the same step by hand: three rows, labels 0 1 0, gradient / sqrt(3)
+            common_spec_tconf m;
+            m.reset(3);
+            const auto & ps = s.seqs[0].tc_pos; // cleared by tconf_begin
+            CHECK(ps.empty());
+            constexpr int D = common_spec_tconf::DIM;
+            double X[3 * D];
+            tc_features(p[0], 0, 0, 0, 10, false, wf[1] != 0, X);
+            tc_features(p[1], 0, 0, 0, 10, false, wf[2] != 0, X + D);
+            tc_features(p[2], 0, 0, 10, 10, false, wf[9] != 0, X + 2 * D);
+            const double lab[3] = { 0, 1, 0 };
+            m.update(X, lab, 3);
+            for (int d = 0; d < D; ++d) {
+                // the columns that are 0 in every row (RA, the profile, mid, sw) keep their value
+                const bool moved = d < 2 || d == 4 || d == 5;
+                CHECK(std::fabs(m.b[d] - s.tconf_model.b[d]) < 1e-12 && (moved ? m.b[d] != b0[d] : m.b[d] == b0[d]));
+            }
+        }
+        // a rejected position whose next draft starts elsewhere (a new request, a reused draft) is not learnt
+        CHECK(s.begin_round(0, 3));
+        s.tconf_pick(0, ids, p, 3, -1, &q);
+        s.after_step(0, p[2], q);
+        s.drafted(0, 1, 50000);
+        s.accepted(0, 0);
+        CHECK(s.seqs[0].tc_pend_valid);
+        s.close_round(0, 90000);
+        s.tconf_begin(0, ctx2.data(), ctx2.size(), 2, (int32_t) ctx2.size() + 5);
+        CHECK(s.tc_updates == 1 && !s.seqs[0].tc_pend_valid);
+    }
+
+    // 6. off: the hooks do nothing and the decision reads the calibration cells
+    {
+        common_spec_smart_config c = base_cfg(3);
+        CHECK(!c.tconf && c.tconf_k == 1);
+        common_spec_smart s(c, 1);
+        const int32_t ctx[4] = { 1, 2, 3, 4 };
+        s.tconf_begin(0, ctx, 4, 5, 4);
+        CHECK(s.seqs[0].tri.size() == 0 && s.request_summary(0).empty());
+    }
+
+    // 7. host cost: a 100k-token prompt inserted once, then one draft step (k = 1, 3, 10 candidates)
+    {
+        common_spec_smart_config c = base_cfg(3);
+        c.tconf = true;
+        std::mt19937 rng(3);
+        std::vector<int32_t> ctx(100000);
+        for (auto & x : ctx) {
+            x = (int32_t) (rng() % 2000); // a small vocabulary: long lists after every context
+        }
+        for (int k : { 1, 3, 10 }) {
+            c.tconf_k = k;
+            common_spec_smart s(c, 1);
+            s.tconf_vocab(std::vector<uint32_t>(2000, (1u << 24) | 'a'), std::vector<uint8_t>(2000, 0));
+            const int64_t t0 = ggml_time_us();
+            s.tconf_begin(0, ctx.data(), ctx.size(), 7, (int32_t) ctx.size());
+            const int64_t t1 = ggml_time_us();
+            int32_t ids[10];
+            float   p[10];
+            for (int i = 0; i < 10; ++i) {
+                ids[i] = (int32_t) (rng() % 2000);
+                p[i]   = 0.1f;
+            }
+            const int n_it = 20000;
+            double acc = 0.0;
+            for (int it = 0; it < n_it; ++it) {
+                double q;
+                s.seqs[0].tc_ctx.resize(8); // the same context every time
+                s.seqs[0].tc_pos.clear();
+                acc += s.tconf_pick(0, ids, p, 10, -1, &q) + q;
+            }
+            const int64_t t2 = ggml_time_us();
+            fprintf(stderr, "tconf k %2d: insert 100k tokens %.1f ms, one step %.2f us (%g)\n", k, (t1 - t0) / 1000.0,
+                    (double) (t2 - t1) / n_it, acc);
+        }
+    }
+    return 0;
+}
+
 int main() {
     ggml_time_init(); // common_time_meas in the speculative hooks
 
@@ -2585,6 +2987,7 @@ int main() {
     if (test_cost_decomp())     { return 1; }
     if (test_off())             { return 1; }
     if (test_resolve())         { return 1; }
+    if (test_tconf())           { return 1; }
     fprintf(stderr, "test-spec-smart: OK\n");
     return 0;
 }
