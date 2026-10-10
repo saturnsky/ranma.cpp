@@ -64,14 +64,19 @@ expert_validation validate_expert_params(const common_params & params) {
                     t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK ||
                     t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP;
             });
-    // An MTP head kept out of the cache (--expert-cache-draft off) with every layer on the GPU and no
-    // tensor overrides reads no host or file expert, so the finite tier and the prefill swap never
-    // see its work: it is checked as well (the pre-joint-cache placement, measured on DS4F).
+    // An MTP head or a DSpark block drafter kept out of the cache (--expert-cache-draft off) with every
+    // layer on the GPU and no tensor overrides reads no host or file expert, so the finite tier and the
+    // prefill swap never see its work: it is checked as well (the pre-joint-cache placement, measured on
+    // DS4F with MTP). DSpark needs it while the joint cache requires the target's expert count (V4.1: a
+    // 128-expert drafter for a 384-expert target).
     const bool resident_mtp = params.speculative.has_dft() && !params.speculative.has_synth() &&
         !expert_draft_joins(params) && params.speculative.draft.tensor_buft_overrides.empty() &&
         (params.speculative.draft.n_gpu_layers <= -2 || params.speculative.draft.n_gpu_layers >= 999) &&
         std::all_of(params.speculative.types.begin(), params.speculative.types.end(),
-            [](common_speculative_type t) { return t == COMMON_SPECULATIVE_TYPE_NONE || t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP; });
+            [](common_speculative_type t) {
+                return t == COMMON_SPECULATIVE_TYPE_NONE || t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP ||
+                    t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
+            });
     // An MTP context on the target's own weights (draft-mtp without -md): its NextN block is one more
     // routed layer of the target's own cache (blk.<n_layer>), not a second model.
     const bool own_mtp = !params.speculative.has_dft() && !params.speculative.has_synth() &&
