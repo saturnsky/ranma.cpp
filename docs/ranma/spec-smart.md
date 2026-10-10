@@ -236,7 +236,8 @@ without it. `LLAMA_SPEC_TRIGRAM_TOPK=k` (1 to 10, default 1) sets how many draft
   takes 0.1 (k = 1) to 0.3 us (k = 10) on the host. The token pieces of the vocabulary are read once at startup.
 - The round log adds per verified draft step `tc_i` (the drafter rank of the drafted token, 0 = its top), `tc_n` (the
   trigram observations of its context in the request, both roles) and `tc_src` (per source RA, RU, PM, PX, PU the
-  count of the drafted token and the observations of the context, 10 numbers); the request summary adds k, the
+  count of the drafted token and the observations of the context, 10 numbers) and `tc_ms` (`mid` + 2 `sw` of the
+  drafted token), enough to fit the model again offline from the log; the request summary adds k, the
   updates, the steps that drafted another candidate than the top one and the coefficients.
 
 ## Trigram profile

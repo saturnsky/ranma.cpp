@@ -749,6 +749,13 @@ void common_spec_smart::log_round(int32_t seq, const char * end, double verify_u
             l += ']';
         }
         l += ']';
+        // per verified draft step: mid (1) and sw (2) of the drafted token
+        std::vector<int32_t> ms;
+        for (const auto & ps : st.tc_pos) {
+            ms.push_back(ps.ms);
+        }
+        l += ",\"tc_ms\":";
+        smart_json_arr(l, ms, "%g");
     }
     l += ",\"q\":";
     smart_json_arr(l, dg.q);
@@ -1353,6 +1360,7 @@ int32_t common_spec_smart::tconf_pick(int32_t seq, const int32_t * ids, const fl
         ps.src[2 * s]     = (float) cn[best][s];
         ps.src[2 * s + 1] = (float) cN[s];
     }
+    ps.ms = (uint8_t) ((mid ? 1 : 0) | (ids[best] >= 0 && (size_t) ids[best] < tc_wf.size() && tc_wf[ids[best]] ? 2 : 0));
     if (best != 0) {
         tc_invert++;
     }
