@@ -51,15 +51,17 @@ static void set_costs(common_spec_smart & s, const std::vector<double> & ms, dou
 }
 
 // the tests from before the lookahead mix use the lookahead of the position mean alone (lookahead_mix 0), which must
-// decide as before. They were written for the half-life 1000 of the previous default (now 250) and keep it, so that
-// their expectations stay those of the previous values
+// decide as before. They were written for the half-life 1000 of the previous default (now 250) and the extension
+// interval 64 (now 16) and keep them, so that their expectations stay those of the previous values
 static const double OLD_HALF_LIFE = 1000.0;
+static const int32_t OLD_REPROBE_EVERY = 64;
 
 static common_spec_smart_config base_cfg(int n_max) {
     common_spec_smart_config c;
     c.n_max = n_max;
     c.half_life = OLD_HALF_LIFE;
     c.lookahead_mix = 0.0;
+    c.reprobe_every = OLD_REPROBE_EVERY;
     return c;
 }
 
@@ -1428,6 +1430,7 @@ static int test_level_wide() {
             common_spec_smart_config c;
             c.n_max = 15;
             c.half_life = hl;
+            c.reprobe_every = OLD_REPROBE_EVERY; // written for the interval of before
             common_spec_smart s(c, 1);
             std::mt19937 rng(303);
             int64_t t = 0;
@@ -2247,11 +2250,116 @@ static int test_round_log() {
 // the decode pool counts in the round log: the draft part (round start -> drafted) and the verification part (drafted ->
 // close) of every closed round, the rounds since the last lend, nothing when a count is missing, and no effect on the
 // decisions or the cells
+// the cost decomposition: the graph builds and captures of the target and the draft context are taken out of the
+// verification time, those of a draft step out of the step time, and the rounds of a decode pool lend (the lend round
+// and the next lend_skip - 1) are not observed; their acceptance is. Without counts, or with both switched off, the
+// observations are the measured times
+static int test_cost_decomp() {
+    struct result {
+        std::vector<double> level, draft;
+        int64_t n_obs = 0;
+        double  acc_lend = 0.0; // acceptance observations made in the lend rounds
+    };
+    auto run = [](bool on, bool counts, result & res) {
+        common_spec_smart_config c;
+        c.n_max = 2;
+        c.reprobe_every = 0;
+        if (!on) {
+            c.cost_graph = false;
+            c.lend_skip  = 0;
+        }
+        common_spec_smart s(c, 1);
+        set_identity(s, 0.95);
+        set_costs(s, { 40.0, 40.0, 40.0 }, 3.0); // every width costs the same: the decision drafts 2
+        common_spec_smart_pool P;
+        P.valid = true;
+        common_spec_smart_graphs G;
+        G.tgt.valid = G.dft.valid = true;
+        int64_t t = 0;
+        s.request_begin(0);
+        double n_acc0 = 0.0;
+        for (int r = 0; r < 40; ++r) {
+            s.close_round(0, t, counts ? &P : nullptr, counts ? &G : nullptr);
+            res.level.push_back(s.level());
+            if (r == 20) {
+                n_acc0 = s.conf(s.qbar_cells[0]);
+            }
+            if (r == 25) {
+                res.acc_lend = s.conf(s.qbar_cells[0]) - n_acc0;
+            }
+            if (s.begin_round(0, 2)) {
+                for (int step = 0;; ++step) {
+                    const int32_t k = s.after_step(0, 0.95f);
+                    // a draft step of 3 ms; the first one of round 7 builds a graph of the draft context for 2 ms
+                    const double g_step = r == 7 && step == 0 ? 2000.0 : 0.0;
+                    s.add_draft_step(3000.0 + g_step, counts ? g_step : 0.0);
+                    t += (int64_t) (3000.0 + g_step);
+                    if (k >= 0) {
+                        break;
+                    }
+                }
+            }
+            res.draft.push_back(s.draft_step());
+            if (r == 20) {
+                P.lends++; // a lend in the draft steps of round 20
+            }
+            s.drafted(0, (int32_t) s.seqs[0].p.size(), t, counts ? &P : nullptr, counts ? &G : nullptr);
+            if (s.seqs[0].k > 0) {
+                s.accepted(0, 1);
+            }
+            // a verification of 40 ms; in rounds 10 and 30 a build (8 ms) and a capture (15 ms) of the target add 23 ms,
+            // in the lend round and the next four the fills add 30 ms
+            double v = 40000.0;
+            if (r == 10 || r == 30) {
+                G.tgt.builds++;
+                G.tgt.build_us   += 8000;
+                G.tgt.captures++;
+                G.tgt.capture_us += 15000;
+                v += 23000.0;
+            }
+            if (r >= 20 && r < 25) {
+                v += 30000.0;
+            }
+            t += (int64_t) v;
+        }
+        s.close_round(0, t, counts ? &P : nullptr, counts ? &G : nullptr);
+        res.level.push_back(s.level());
+        for (const auto x : s.cost_n_run) {
+            res.n_obs += x;
+        }
+    };
+    result on, raw, nc;
+    run(true,  true,  on);
+    run(false, true,  raw);
+    run(true,  false, nc);
+    // with the decomposition every observed verification is 40 ms: the level stays there
+    for (const double x : on.level) {
+        CHECK(std::fabs(x - 40000.0) < 1e-6);
+    }
+    // the five lend rounds are not observed, their acceptance is
+    CHECK(on.n_obs == raw.n_obs - 5);
+    CHECK(on.acc_lend > 3.0);
+    // the step that built a graph counts 3 ms with the decomposition, 5 ms without it
+    CHECK(std::fabs(on.draft.back() - 3000.0) < 1e-6);
+    CHECK(raw.draft.back() > 3000.0 + 1.0);
+    // the measured times move the level (the builds and the lends)
+    double max_dev = 0.0;
+    for (const double x : raw.level) {
+        max_dev = std::max(max_dev, std::fabs(x - 40000.0));
+    }
+    CHECK(max_dev > 1000.0);
+    // without counts the switches change nothing: the same as switched off
+    CHECK(nc.level == raw.level && nc.draft == raw.draft && nc.n_obs == raw.n_obs);
+    return 0;
+}
+
 static int test_round_log_pool() {
     const std::string path = (std::filesystem::temp_directory_path() / "test-spec-smart-pool.jsonl").string();
     std::filesystem::remove(path);
     common_spec_smart_config c;
     c.n_max = 2;
+    c.cost_graph = false; // the counts only feed the log here (the cost decomposition is test_cost_decomp)
+    c.lend_skip  = 0;
     common_spec_smart_config cl = c;
     cl.log_path = path;
     {
@@ -2331,7 +2439,8 @@ static int test_off() {
     CHECK(p.speculative.draft.n_max == 3); // the single-argument default is unchanged
     {
         common_spec_smart_config c;
-        CHECK(c.half_life == 250.0 && c.reprobe_n == 4.0 && c.reprobe_every == 64);
+        CHECK(c.half_life == 250.0 && c.reprobe_n == 4.0 && c.reprobe_every == 16);
+        CHECK(c.cost_graph && c.lend_skip == 5);
         CHECK(c.level_half_life == 64.0 && c.level_cap_load == 2.0 && c.cap_load == 32.0 && c.conf_cap == 16.0);
         CHECK(c.lookahead_mix == 0.5);
     }
@@ -2473,6 +2582,7 @@ int main() {
     if (test_conf_cap_noise())  { return 1; }
     if (test_round_log())       { return 1; }
     if (test_round_log_pool())  { return 1; }
+    if (test_cost_decomp())     { return 1; }
     if (test_off())             { return 1; }
     if (test_resolve())         { return 1; }
     fprintf(stderr, "test-spec-smart: OK\n");

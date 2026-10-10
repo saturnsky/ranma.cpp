@@ -34,7 +34,13 @@ struct common_spec_smart_config {
     int32_t save_every  = 256;    // closed rounds between periodic saves
     double  reprobe_n     = 4.0;  // a width whose shape confidence is below this waits for an extension: when the
                                   // decision stops at k and width k + 1 waits, the round verifies k + 1 ...
-    int32_t reprobe_every = 64;   // ... at most once per this many closed rounds (0: never)
+    int32_t reprobe_every = 16;   // ... at most once per this many closed rounds (0: never)
+    // the cost of a round without what the graph runtime and the expert cache add to it now and then (the counts
+    // come from the caller, close_round / drafted / add_draft_step; without them nothing changes):
+    bool    cost_graph  = true;   // the host time of graph builds and captures is taken out of the verification time
+                                  // and of the draft step time
+    int32_t lend_skip   = 5;      // the verification time of the round in which the decode pool was lent and of the
+                                  // next lend_skip - 1 rounds is not observed (0: every round is)
     std::string log_path;         // round log (JSON lines, appended); empty: none. The decisions do not depend on it
 };
 
@@ -143,7 +149,7 @@ struct common_spec_smart {
     void    drafted(int32_t seq, int32_t k, int64_t t_us, const common_spec_smart_pool * pool = nullptr,
                     const common_spec_smart_graphs * graphs = nullptr);
     void    accepted(int32_t seq, int32_t n_accepted);
-    void    add_draft_step(double us);
+    void    add_draft_step(double us, double graph_us = 0.0); // graph_us: graph builds and captures inside the step
 
     // one line per request: mean k, share per width, predicted / observed cost per width, acceptance
     std::string request_summary(int32_t seq) const;
@@ -175,7 +181,9 @@ struct common_spec_smart {
 
     // round log: write the buffered lines to the file (at the end of a request); no effect without --spec-smart-log
     void log_flush() const;
-    bool logging() const { return log != nullptr; } // the round log is on: the caller reads the pool counts
+    bool logging() const { return log != nullptr; } // the round log is on
+    // the caller reads the pool and graph counts for close_round / drafted / add_draft_step
+    bool wants_counts() const { return log != nullptr || cfg.cost_graph || cfg.lend_skip > 0; }
 
     bool save(const std::string & path) const;
     bool load(const std::string & path, std::string * why = nullptr);
@@ -207,8 +215,8 @@ struct common_spec_smart {
     double  wr_n_before  = 0.0;   // ... the confidence of the mean before it and after the cut (before the observation)
     double  wr_n_after   = 0.0;
     int64_t last_extend  = 0; // n_closed at the last one
-    uint64_t pool_lends  = 0;  // round log: the lend count at the last close_round
-    int64_t pool_since_lend = -1; // round log: closed rounds since the last lend (0: a lend in this round), -1: none seen
+    uint64_t pool_lends  = 0;  // the lend count at the last close_round
+    int64_t pool_since_lend = -1; // closed rounds since the last lend (0: a lend in this round), -1: none seen
     int64_t n_closed_saved = 0;
     bool    save_failed  = false;
 
@@ -234,6 +242,8 @@ struct common_spec_smart {
         int32_t log_steps = 0;     // draft steps of the round, dropped ones included
         int32_t log_acc   = -1;    // accepted tokens of the round, -1: not verified
         int32_t log_steps_timed = 0;
+        double  log_obs_us = -1.0;  // the verification time observed for the round, -1: not observed
+        const char * log_skip = nullptr; // why the round's time was not observed, nullptr: it was
         double  log_draft_us = 0.0; // time of the draft steps of the round
         std::vector<float>  log_p;       // top probability of every draft step
         std::vector<double> log_la_next; // before draft step i: the predicted acceptance of position i

@@ -116,11 +116,11 @@ static const ggml_expert_iface * spec_expert_iface() {
     return iface;
 }
 
-// the counts now; invalid without a round log, a cache, or a decode pool. Never waits for the device: it is read
+// the counts now; invalid when the controller does not use them, without a cache, or without a decode pool. Never waits for the device: it is read
 // right after the host has the results of the draft steps or of the verification
 static common_spec_smart_pool spec_smart_pool(const common_spec_smart * smart) {
     common_spec_smart_pool out;
-    const ggml_expert_iface * iface = smart != nullptr && smart->logging() ? spec_expert_iface() : nullptr;
+    const ggml_expert_iface * iface = smart != nullptr && smart->wants_counts() ? spec_expert_iface() : nullptr;
     ggml_expert_pool_counts c{};
     if (iface != nullptr && iface->pool_counts(&c)) {
         out.valid      = true;
@@ -153,11 +153,11 @@ static common_spec_smart_graph spec_smart_graph(const llama_context * ctx) {
     return g;
 }
 
-// the graph counts of the target and the draft context; invalid without a round log
+// the graph counts of the target and the draft context; invalid when the controller does not use them
 static common_spec_smart_graphs spec_smart_graphs(const common_spec_smart * smart, const llama_context * ctx_tgt,
                                                   const llama_context * ctx_dft) {
     common_spec_smart_graphs out;
-    if (smart != nullptr && smart->logging()) {
+    if (smart != nullptr && smart->wants_counts()) {
         out.tgt = spec_smart_graph(ctx_tgt);
         out.dft = spec_smart_graph(ctx_dft);
     }
@@ -2037,6 +2037,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         while (n_drafting > 0) {
             const int64_t t_step_us = smart ? ggml_time_us() : 0;
+            // the graph builds and captures of the step (the draft context), taken out of its time
+            const common_spec_smart_graph g_step0 = smart && smart->wants_counts() ? spec_smart_graph(ctx_dft) : common_spec_smart_graph();
 
             // each step decodes under a different head, i.e. a different decoder layer, and
             // KV is per layer. process() filled this layer's KV only for positions < pos0
@@ -2167,7 +2169,15 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
 
             if (smart) {
-                smart->add_draft_step((double) (ggml_time_us() - t_step_us));
+                const int64_t t_step_end = ggml_time_us();
+                double graph_us = 0.0;
+                if (g_step0.valid) {
+                    const common_spec_smart_graph g_step1 = spec_smart_graph(ctx_dft);
+                    if (g_step1.valid) {
+                        graph_us = (double) ((g_step1.build_us - g_step0.build_us) + (g_step1.capture_us - g_step0.capture_us));
+                    }
+                }
+                smart->add_draft_step((double) (t_step_end - t_step_us), graph_us);
             }
 
             if (batch.size() == 0) {

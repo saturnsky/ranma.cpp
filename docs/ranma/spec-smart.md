@@ -37,8 +37,9 @@ Before this controller, the draft length of `draft-mtp` came from fixed threshol
 ### Fixed constants
 
 The controller has a few more constants. They are fixed, not options (the values below are those of every measurement
-so far): the half-life of the level 64 rounds, the extension threshold 4 observations and its interval 64 rounds, the
-cap of the wait confidence 16 observations and the lookahead mix 0.5. The text below calls them by these values.
+so far): the half-life of the level 64 rounds, the extension threshold 4 observations and its interval 16 rounds (64
+before 2026-10-10), the cap of the wait confidence 16 observations and the lookahead mix 0.5. The text below calls them
+by these values.
 
 ## How a round is chosen
 
@@ -85,7 +86,7 @@ round forced to a width the decision did not reach.
   verifies all k + 1. The observation of width k + 1 then goes in as in any round. Otherwise the round verifies k.
   Only width k + 1 is looked at; a waiting width two or more widths beyond the decision is not extended in that
   round, and a round is extended by one width at most. A decision that drafts nothing (k = 0) extends to width 1.
-- **Interval.** At most one extended round every 64 closed rounds, counted from the start of the process; only widths
+- **Interval.** At most one extended round every 16 closed rounds, counted from the start of the process; only widths
   up to the bound (`--spec-draft-n-max`, else 7) and the limit of the request.
 - **Frontier.** A decision does not draft beyond the widest width w for which every width 1..w was verified by this
   process or has a shape (stored or observed). The width after it is reached only by an extension of a round that
@@ -123,7 +124,8 @@ computed when a cell is read or updated, not every round.
 - **Verification time per width.** The time from the end of a draft to the next draft of the same sequence: the target
   batch, the draft catch-up, sampling, a checkpoint replay if one happened, and the per-token server work. A round
   whose request ended is not timed (the gap to the next request is not verification), nor the first verification of
-  a width in the process (graph builds).
+  a width in the process (graph builds). What the graph runtime and the expert cache add now and then is taken out
+  (see "Cost decomposition").
 - **Level x shape.** The predicted time of width k is `L * S_k`. The level L is one number for all widths; the shape
   S_k is the ratio of width k. A change of task changes the experts in use, and often makes every width slower or
   faster by about the same factor (a change of level), while the ratios of the widths change less. So the level
@@ -152,6 +154,27 @@ computed when a cell is read or updated, not every round.
 - **Draft step time**, one decayed mean, measured anew by every process.
 
 There is no regression over the traffic or position of a batch: each width has its own ratio.
+
+## Cost decomposition
+
+A round's measured time also carries costs that are not the width's: a llama graph built and allocated anew, a
+HIP graph captured again (the KV length is part of a graph's shape, so every width is rebuilt now and then, a rare
+width almost every time it comes back), and the first rounds after the expert cache's decode pool was lent, which
+fill its positions. A rare width that is observed only with such a cost learns a ratio that is too high and is chosen
+even more rarely; on a roleplay run the mean width fell to 0.045 that way. An offline replay of the round logs and a
+closed-loop simulation reproduced that fall from the measured costs alone (21 of 40 seeds) and none with the rules
+below.
+
+- **Graph builds and captures.** The host time of the builds (with their allocation) and of the capture calls of the
+  target and the draft context between the end of the draft and the next draft is taken out of the verification
+  time, and that of the draft context inside a draft step out of the step time. The round stays an observation.
+  The first run of a captured graph is not taken out (it is the work itself). The counts come from
+  `llama_get_graph_counts` (llama-ext.h), read from host state after the host has the results; no synchronize.
+- **Decode pool lends.** The round in which the decode pool was lent and the next four are not observed (their
+  acceptance is). Taking the fills out was measured as not enough: the lend round stays 20-30 ms slow and the next four
+  4-9 ms; from the fifth round on the times are those of the steady state. About five rounds of a few hundred per
+  request.
+- Without the counts (another backend, the pool off) the times are taken as measured, as before.
 
 ## The store
 
@@ -224,6 +247,7 @@ exit, and whenever 1 MiB is buffered.
 | `cost_table` | the predicted verification time of every width 0..n-max (us) |
 | `draft_us` | the measured time of the draft steps of the round (us) |
 | `verify_us` | the measured time from the end of the draft to the next draft (the verification time, see above); null when the round ended with the request or was not verified |
+| `obs_us`, `obs_skip` | closed rounds: the time the cost model took for the round (`verify_us` without graph builds and captures, see "Cost decomposition"), null when it took none, and why: `untimed` (first verification of the width) or `lend` (a decode pool lend round or one of the next four) |
 | `accepted` | draft tokens accepted (0 when k = 0); null when the draft was not verified |
 | `pool` | only with the expert cache's decode pool and its counts read at the round's start, end of draft and end of verification: `draft` and `verify`, the pool's work in the draft steps (round start to the end of the draft) and in the verification (end of the draft to the next draft), each with `fills` (positions copied by the step of a launch) and `fill_mib`, `hits`, `lends` and `reclaims`; `since_lend`, the closed rounds since the last lend (0: a lend in this round, -1: none seen); `lend`, the lends so far. The counts are read from host memory the pool's kernels write, without a synchronize, right after the host has the results of the draft or of the verification; work still running then counts in the next part |
 | `graph` | the graphs of the target (`tgt`) and the draft context (`dft`) in the draft steps (`draft`) and in the verification (`verify`): `calls` (ubatch graphs computed), `builds` (of them built and allocated anew, not reused or resumed), `build_ms` (host time of the builds and allocations), `nt` (rows of the last graph built, null without a build), `extent_mib` and `pos` (the last graph computed in the part: how far it reached into the compute buffer of the expert backend, and the highest position of its ubatch; only when a graph was computed), and with a GPU backend that counts its graph calls `captures` / `capture_ms` (calls that captured a HIP graph, host time of those calls) and `direct` / `direct_ms` (calls run without a graph, e.g. a warmup call). A context whose counts could not be read is null. Read from host state, without a synchronize, like `pool` |
@@ -246,9 +270,9 @@ observation of the round moves the estimates after it is logged.
   ratio there stays until a decision takes that width. A change of level reaches it without a verification.
 - A width no decision reaches is predicted from its neighbours only (the line through them, and never cheaper than
   the nearest narrower width measured by the process).
-- A cold start drafts nothing for the first 64 rounds and widens one width per 64 rounds at most: width 7 (the default
-  bound) is found after about 450 rounds when every decision goes that far, later when decisions stop short of the frontier.
-- The extended rounds cost throughput when the width after the one in use is truly slow: at most one round in 64,
+- A cold start drafts nothing for the first 16 rounds and widens one width per 16 rounds at most: width 7 (the default
+  bound) is found after about 120 rounds when every decision goes that far, later when decisions stop short of the frontier.
+- The extended rounds cost throughput when the width after the one in use is truly slow: at most one round in 16,
   and one width more than the decision wanted.
 - Off (`--no-spec-smart`, a threshold given, or another speculative type), the draft loop and the server loop run
   the single-argument code: every new hook returns at once.
