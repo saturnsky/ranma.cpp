@@ -2,6 +2,7 @@
 #include "models.h"
 
 #include "llama-kv-cache-dsv4.h"
+#include "llama-prefetch.h"
 
 #include <algorithm>
 #include <cinttypes>
@@ -298,7 +299,9 @@ class llm_graph_input_engram : public llm_graph_input_i {
 public:
     llm_graph_input_engram(const llama_model_deepseek41 & pmodel,
                            const llama_kv_cache_dsv4_raw_context * mctx,
-                           int eg) : pmodel(pmodel), mctx(mctx), eg(eg) {}
+                           int eg,
+                           const ggml_tensor * table,
+                           enum llama_ple_prefetch prefetch) : pmodel(pmodel), mctx(mctx), eg(eg), table(table), prefetch(prefetch) {}
     virtual ~llm_graph_input_engram() = default;
 
     void set_input(const llama_ubatch * ubatch) override;
@@ -318,6 +321,10 @@ public:
 
     // which engram layer this is, so the right multipliers and buckets are used
     const int eg;
+
+    // this layer's lazily mapped table and the --ple-prefetch mode: the rows are handed to the OS before the gather
+    const ggml_tensor * table;
+    const enum llama_ple_prefetch prefetch;
 
     // scratch, reused across set_input() calls
     std::vector<llama_token> prev;
@@ -382,6 +389,10 @@ void llm_graph_input_engram::set_input(const llama_ubatch * ubatch) {
         }
     }
 
+    if (pmodel.can_prefetch.count(table)) {
+        llama_prefetch_table_rows(table, idx, prefetch);
+    }
+
     ggml_backend_tensor_set(rows, idx.data(), 0, idx.size()*ggml_element_size(rows));
 }
 
@@ -395,7 +406,8 @@ ggml_tensor * llama_model_deepseek41::graph::build_inp_engram(
 
     const auto * mctx_cur = static_cast<const llama_kv_cache_dsv4_context *>(mctx);
 
-    auto inp = std::make_unique<llm_graph_input_engram>(pmodel, mctx_cur->get_raw(), pmodel.engram_index(il));
+    auto inp = std::make_unique<llm_graph_input_engram>(pmodel, mctx_cur->get_raw(), pmodel.engram_index(il),
+                                                        model.layers[il].engram_embd, cparams.ple_prefetch);
 
     inp->rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_cols * n_tokens);
     ggml_set_input(inp->rows);
@@ -403,6 +415,7 @@ ggml_tensor * llama_model_deepseek41::graph::build_inp_engram(
     res->add_input(std::move(inp));
 
     // gather then flatten, laying the buckets out slowest, as the reference does
+    // (the table is MXFP8 rows read in place from the mapping; the gather dequantizes to F32 on the CPU)
     ggml_tensor * emb = ggml_get_rows(ctx0, model.layers[il].engram_embd, rows);
     emb = ggml_reshape_2d(ctx0, emb, key_len * n_cols, n_tokens);
     cb(emb, "engram_embd", il);
