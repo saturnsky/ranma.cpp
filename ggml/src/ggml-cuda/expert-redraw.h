@@ -124,7 +124,7 @@ inline std::vector<int> redraw_capacities(const geometry & geo, const uint64_t *
     std::vector<int> caps(classes, 0), lo(classes, 0), hi(classes, 0);
     size_t reserved = 0;
     for (size_t c = 0; c < classes; ++c) {
-        hi[c] = std::max(0, std::min(ceiling[c], geo.class_layers[c]*geo.n_experts));
+        hi[c] = std::max(0, std::min(ceiling[c], geo.class_slices(int(c))));
         lo[c] = std::max(0, std::min(floor[c], hi[c]));
         caps[c] = lo[c];
         reserved += size_t(lo[c])*geo.class_vram_bytes(int(c));
@@ -226,7 +226,7 @@ inline redraw_estimate redraw_estimate_of(const geometry & geo, const uint64_t *
         if (c < 0) { continue; }
         const size_t bytes = geo.class_vram_bytes(c);
         auto has = [](const std::vector<int32_t> & v, int e) { return std::binary_search(v.begin(), v.end(), e); };
-        for (int e = 0; e < geo.n_experts; ++e) {
+        for (int e = 0; e < geo.experts(l); ++e) {
             const bool a = has(now[l], e), b = has(next[l], e);
             if (a == b) { continue; }
             const double rate = out.tokens > 0.0 && counts != nullptr ? double(counts[size_t(l)*geo.n_experts + e])/out.tokens : 0.0;
