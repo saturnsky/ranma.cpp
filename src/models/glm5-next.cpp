@@ -349,6 +349,17 @@ static ggml_tensor * dsv4_view_1d(ggml_context * ctx, ggml_tensor * t, int64_t n
     return ggml_view_1d(ctx, t, ne0, dsv4_elem_offset(t, i0));
 }
 
+// RANMA_EXPERT_PREFETCH (with RANMA_EXPERT_UB_POOL): the decode graphs end every layer with a prediction of the
+// next routed layer's experts for the expert cache's prefetch (ggml-cuda expert-ub-pool.cuh).
+static bool glm5_next_expert_prefetch() {
+    static const bool on = [] {
+        const char * p = getenv("RANMA_EXPERT_PREFETCH");
+        const char * u = getenv("RANMA_EXPERT_UB_POOL");
+        return p != nullptr && atoi(p) != 0 && u != nullptr && atoi(u) != 0;
+    }();
+    return on;
+}
+
 ggml_tensor * llama_model_glm5_next::graph::build_hc_mean(ggml_tensor * x) const {
     const int64_t hc = x->ne[1];
 
@@ -786,6 +797,31 @@ llama_model_glm5_next::graph::graph(const llama_model & model, const llm_graph_p
         inpL = build_hc_post(cur, residual, post, comb, il);
         inpL = build_cvec(inpL, il);
         cb(inpL, "l_out", il);
+
+        // the prediction of layer il+1's experts from this output: the mHC pre-mix of il+1's FFN block and its
+        // ffn_norm applied to l_out (only the attention of il+1 is skipped), then il+1's router selection score;
+        // the expert cache's prefetch reads the descending order of the scores ("ffn_moe_pred-<il+1>")
+        if (glm5_next_expert_prefetch() && n_tokens <= 8 && il + 1 < n_layer &&
+                (uint32_t) (il + 1) >= hparams.n_layer_dense_lead &&
+                hparams.expert_gating_func == LLAMA_EXPERT_GATING_FUNC_TYPE_SIGMOID) {
+            const auto & nl = model.layers[il + 1];
+            if (nl.hc_ffn_fn != nullptr && nl.ffn_gate_inp != nullptr) {
+                ggml_tensor * flat  = ggml_reshape_2d(ctx0, inpL, hc*n_embd, n_tokens);
+                ggml_tensor * mixes = ggml_mul_mat(ctx0, nl.hc_ffn_fn, ggml_rms_norm(ctx0, flat, norm_rms_eps));
+                ggml_tensor * pre   = dsv4_view_2d(ctx0, mixes, hc, n_tokens, 0);
+                pre = dsv4_hc_affine(ctx0, pre, dsv4_view_1d(ctx0, nl.hc_ffn_scale, 1, 0), dsv4_view_1d(ctx0, nl.hc_ffn_base, hc, 0));
+                pre = ggml_scale_bias(ctx0, ggml_sigmoid(ctx0, pre), 1.0f, hparams.dsv4_hc_eps);
+                ggml_tensor * x = build_hc_pre(inpL, pre, -1);
+                x = build_norm(x, nl.ffn_norm, nullptr, LLM_NORM_RMS, -1);
+                ggml_tensor * score = ggml_sigmoid(ctx0, ggml_mul_mat(ctx0, nl.ffn_gate_inp, x));
+                if (nl.ffn_exp_probs_b != nullptr) {
+                    score = ggml_add(ctx0, score, nl.ffn_exp_probs_b);
+                }
+                ggml_tensor * order = ggml_argsort(ctx0, score, GGML_SORT_ORDER_DESC);
+                ggml_format_name(order, "ffn_moe_pred-%d", il + 1);
+                ggml_build_forward_expand(gf, order);
+            }
+        }
     }
 
     // narrow to the output tokens, then collapse the streams
