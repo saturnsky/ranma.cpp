@@ -86,6 +86,31 @@ struct llama_memory_range {
 
 using llama_memory_ranges = std::vector<llama_memory_range>;
 
+// host memory reserved as address space whose pages can be given back to the system and taken again, for buffers
+// sized for the worst case of which a smaller part is in use (the graph metadata of llm_graph_result)
+// the interface is the part of std::vector<uint8_t> that such a buffer needs, the contents are not initialized
+struct llama_vmem {
+    llama_vmem() = default;
+    llama_vmem(const llama_vmem &) = delete;
+    llama_vmem & operator=(const llama_vmem &) = delete;
+    ~llama_vmem();
+
+    // make all `size` bytes usable; the contents are kept only when the size does not change
+    void resize(size_t size);
+
+    // give back the pages past the first `keep` bytes; they must not be accessed until the next resize()
+    void release_tail(size_t keep);
+
+    uint8_t * data() const { return ptr; }
+    size_t    size() const { return n; }
+
+private:
+    uint8_t * ptr = nullptr;
+    size_t    n   = 0;
+    size_t    n_committed = 0; // the first n_committed bytes are usable
+    bool      paged = false;   // false: a plain heap allocation, release_tail() does nothing
+};
+
 // Prefetch the host pages covering these memory ranges.
 void llama_prefetch(llama_memory_ranges mr);
 

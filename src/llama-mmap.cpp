@@ -10,6 +10,7 @@
 #include <stdexcept>
 #include <cerrno>
 #include <algorithm>
+#include <new>
 
 #ifdef __has_include
     #if __has_include(<unistd.h>)
@@ -915,4 +916,110 @@ void llama_prefetch(llama_memory_ranges mr) {
 
 size_t llama_path_max() {
     return PATH_MAX;
+}
+
+// llama_vmem
+
+static size_t llama_vmem_page_size() {
+#if defined(_WIN32)
+    SYSTEM_INFO si;
+    GetSystemInfo(&si);
+    return si.dwPageSize;
+#elif defined(_POSIX_MAPPED_FILES)
+    return (size_t) sysconf(_SC_PAGESIZE);
+#else
+    return 4096;
+#endif
+}
+
+static void llama_vmem_unmap(uint8_t * ptr, size_t n, bool paged) {
+    if (ptr == nullptr) {
+        return;
+    }
+    if (!paged) {
+        free(ptr);
+        return;
+    }
+#if defined(_WIN32)
+    GGML_UNUSED(n);
+    VirtualFree(ptr, 0, MEM_RELEASE);
+#elif defined(_POSIX_MAPPED_FILES)
+    munmap(ptr, n);
+#else
+    GGML_UNUSED(n);
+#endif
+}
+
+llama_vmem::~llama_vmem() {
+    llama_vmem_unmap(ptr, n, paged);
+}
+
+void llama_vmem::resize(size_t size) {
+    if (size != n) {
+        llama_vmem_unmap(ptr, n, paged);
+        ptr         = nullptr;
+        n           = 0;
+        n_committed = 0;
+        paged       = false;
+
+        if (size == 0) {
+            return;
+        }
+
+        void * addr = nullptr;
+#if defined(_WIN32)
+        addr = VirtualAlloc(nullptr, size, MEM_RESERVE, PAGE_READWRITE);
+#elif defined(_POSIX_MAPPED_FILES)
+        int flags = MAP_PRIVATE | MAP_ANONYMOUS;
+#ifdef MAP_NORESERVE
+        flags |= MAP_NORESERVE;
+#endif
+        addr = mmap(nullptr, size, PROT_READ | PROT_WRITE, flags, -1, 0);
+        if (addr == MAP_FAILED) {
+            addr = nullptr;
+        }
+#endif
+        paged = addr != nullptr;
+        if (addr == nullptr) {
+            addr = malloc(size);
+            if (addr == nullptr) {
+                throw std::bad_alloc();
+            }
+        }
+        ptr = (uint8_t *) addr;
+        n   = size;
+#if defined(_WIN32)
+        n_committed = paged ? 0 : n;
+#else
+        n_committed = n;
+#endif
+    }
+
+    if (n_committed < n) {
+#if defined(_WIN32)
+        if (VirtualAlloc(ptr + n_committed, n - n_committed, MEM_COMMIT, PAGE_READWRITE) == nullptr) {
+            throw std::bad_alloc();
+        }
+#endif
+        n_committed = n;
+    }
+}
+
+void llama_vmem::release_tail(size_t keep) {
+    if (!paged) {
+        return;
+    }
+
+    static const size_t page = llama_vmem_page_size();
+
+    keep = std::min(n, (keep + page - 1) / page * page);
+    if (keep >= n_committed) {
+        return;
+    }
+#if defined(_WIN32)
+    VirtualFree(ptr + keep, n_committed - keep, MEM_DECOMMIT);
+#elif defined(_POSIX_MAPPED_FILES)
+    madvise(ptr + keep, n_committed - keep, MADV_DONTNEED);
+#endif
+    n_committed = keep;
 }

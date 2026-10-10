@@ -914,6 +914,7 @@ void llama_context::graph_reuse_invalidate() {
     for (auto & slot : gf_res_shapes) {
         if (slot.res) {
             slot.res->reset();
+            slot.res->trim();
         }
         slot.allocated = false;
     }
@@ -1679,6 +1680,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             ret = GGML_STATUS_FAILED;
             return nullptr;
         }
+
+        res->trim();
 
         // ranma expert cache: a graph of few rows is planned on its own, so it leaves the rest of the compute buffer
         // unused (RANMA_EXPERT_UB_POOL)
@@ -2842,6 +2845,8 @@ ggml_cgraph * llama_context::graph_reserve(
     res->reset();
 
     auto * gf = model.build_graph(gparams);
+
+    res->trim();
 
     this->n_input_tensors = llama_graph_n_input_tensors(gf);
     this->n_outputs = save_n_outputs;
