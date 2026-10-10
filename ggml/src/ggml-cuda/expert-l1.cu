@@ -191,12 +191,12 @@ bool l1_arena::assign_exclusive(const std::vector<std::vector<int32_t>> & select
         }
         std::vector<bool> wanted(geo_.n_experts, false);
         for (int expert : selected[layer]) {
-            if (expert < 0 || expert >= geo_.n_experts || wanted[expert]) {
+            if (expert < 0 || expert >= geo_.experts(layer) || wanted[expert]) {
                 return false;
             }
             wanted[expert] = true;
         }
-        for (int expert = 0; expert < geo_.n_experts; ++expert) {
+        for (int expert = 0; expert < geo_.experts(layer); ++expert) {
             if (wanted[expert]) {
                 if (next_gpu[cls] >= capacities_[cls]) {
                     return false;
@@ -287,7 +287,8 @@ bool l1_arena::logical_io(int layer, int kind, void * data, size_t offset, size_
         return false;
     }
     const size_t stride = geo_.class_bytes[cls][kind];
-    if (stride == 0 || offset > stride*size_t(geo_.n_experts) || size > stride*size_t(geo_.n_experts) - offset) {
+    const size_t experts = size_t(geo_.experts(layer));
+    if (stride == 0 || offset > stride*experts || size > stride*experts - offset) {
         return false;
     }
     ggml_cuda_set_device(device_);
@@ -331,7 +332,7 @@ bool l1_arena::read_slice(int layer, int kind, int slot, void * dst) const {
 bool l1_arena::verify_current_assignment(std::string & reason) const {
     if (host_) {
         return verify_assignment(host_slots_, homes_, geo_.layer_class, layout_, gpu_spares_, geo_.n_experts,
-            {host_master_, spare_slots_}, bool(addresses_), reason);
+            {host_master_, spare_slots_}, bool(addresses_), reason, geo_.layer_experts);
     }
     // The unlimited inclusive path keeps its master in each original host tensor.
     const auto tx = stage(selected_, true);
@@ -651,12 +652,12 @@ l1_transaction l1_arena::stage(const expert_slot_table & selected, bool retain) 
         for (int l = 0; l < geo_.n_layers; ++l) {
             const int c = geo_.layer_class[l];
             if (c < 0) { continue; }
-            for (int e = 0; e < geo_.n_experts; ++e) { homes[l][e] = {expert_storage::host, layout.host[c]++}; }
+            for (int e = 0; e < geo_.experts(l); ++e) { homes[l][e] = {expert_storage::host, layout.host[c]++}; }
         }
     }
     for (int l = 0; l < geo_.n_layers; ++l) {
         if (geo_.layer_class[l] < 0) { continue; }
-        for (int e = 0; e < geo_.n_experts; ++e) {
+        for (int e = 0; e < geo_.experts(l); ++e) {
             if (host_master_ || std::find(selected[l].begin(), selected[l].end(), e) == selected[l].end()) { hs[l].push_back(e); }
         }
     }
@@ -777,7 +778,7 @@ bool l1_arena::install(const expert_slot_table & selected, bool retain, l1_insta
 }
 
 bool l1_arena::verify_slice(int layer, int kind, int expert) const {
-    if (!allocated() || layer < 0 || layer >= geo_.n_layers || expert < 0 || expert >= geo_.n_experts) {
+    if (!allocated() || layer < 0 || layer >= geo_.n_layers || expert < 0 || expert >= geo_.experts(layer)) {
         return false;
     }
     const int cls  = geo_.layer_class[layer];
