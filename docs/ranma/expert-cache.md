@@ -148,6 +148,7 @@ with `--expert-freeze` it leaves the placement unchanged and only records the pr
 |---|---|---|
 | `RANMA_EXPERT_TRACE=<mask>` | 0 | Bit mask of log lines: 1 install, 2 profile, 4 prompt processing, 8 host tier and per-commit round lines. |
 | `RANMA_EXPERT_L1_REDRAW_BENEFIT`, `RANMA_EXPERT_L1_REDRAW_MOVE` | not set | Setting either turns on the redraw of the VRAM size-class split at plan installs (`expert-cache-l1-redraw.md`). |
+| `RANMA_EXPERT_UB_POOL=0` | pool on | Turns off the decode pool, which lends the part of the compute buffer the decode graphs leave unused to extra LRU positions of host-resident experts (`expert-cache-ub-pool.md`). |
 | `RANMA_EXPERT_VERIFY=1` | off | After every install, read every resident slice back and compare it with its source. Slow; for correctness checks, not for serving. |
 
 Both are read once at startup.
