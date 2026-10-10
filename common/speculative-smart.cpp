@@ -430,11 +430,25 @@ void common_spec_smart::request_begin(int32_t seq) {
     shrink_calibration(cfg.cap_request);
 }
 
-void common_spec_smart::close_round(int32_t seq, int64_t t_us) {
+void common_spec_smart::close_round(int32_t seq, int64_t t_us, const common_spec_smart_pool * pool) {
     if (seq < 0 || seq >= (int32_t) seqs.size()) {
         return;
     }
     auto & st = seqs[seq];
+    // round log: the counts here end the verification of the pending round and start the draft of the next one
+    const common_spec_smart_pool now = pool != nullptr ? *pool : common_spec_smart_pool();
+    st.pool_start = st.pool_next;
+    st.pool_end   = now;
+    st.pool_end.valid = now.valid && st.pool_start.valid && st.pool_drafted.valid;
+    st.pool_next  = now;
+    if (now.valid) {
+        if (now.lends != pool_lends) {
+            pool_since_lend = 0;
+        } else if (pool_since_lend >= 0 && st.active) {
+            pool_since_lend++;
+        }
+        pool_lends = now.lends;
+    }
     if (!st.active) {
         return;
     }
@@ -577,8 +591,9 @@ int32_t common_spec_smart::after_step(int32_t seq, float p_top) {
     return r;
 }
 
-void common_spec_smart::drafted(int32_t seq, int32_t k, int64_t t_us) {
+void common_spec_smart::drafted(int32_t seq, int32_t k, int64_t t_us, const common_spec_smart_pool * pool) {
     auto & st = seqs[seq];
+    st.pool_drafted = pool != nullptr ? *pool : common_spec_smart_pool();
     k = std::clamp<int32_t>(k, 0, std::min<int32_t>(cfg.n_max, (int32_t) st.p.size()));
     st.drafting  = false;
     st.active    = true;
@@ -688,6 +703,23 @@ void common_spec_smart::log_round(int32_t seq, const char * end, double verify_u
         l += std::to_string(st.log_acc);
     } else {
         l += "null";
+    }
+    // the decode pool in the draft steps (round start -> drafted) and in the verification (drafted -> close)
+    if (std::string(end) == "closed" && st.pool_end.valid) {
+        const auto & a = st.pool_start;
+        const auto & b = st.pool_drafted;
+        const auto & c = st.pool_end;
+        auto part = [&](const common_spec_smart_pool & x, const common_spec_smart_pool & y) {
+            l += "{\"fills\":" + std::to_string(y.fills - x.fills) + ",\"fill_mib\":";
+            smart_json_num(l, (double) (y.fill_bytes - x.fill_bytes) / 1048576.0, "%.1f");
+            l += ",\"hits\":" + std::to_string(y.hits - x.hits) + ",\"lends\":" + std::to_string(y.lends - x.lends) +
+                 ",\"reclaims\":" + std::to_string(y.reclaims - x.reclaims) + "}";
+        };
+        l += ",\"pool\":{\"draft\":";
+        part(a, b);
+        l += ",\"verify\":";
+        part(b, c);
+        l += ",\"since_lend\":" + std::to_string(pool_since_lend) + ",\"lend\":" + std::to_string(c.lends) + "}";
     }
     l += ",\"wait_reset\":";
     const bool wr = std::string(end) == "closed" && wr_last;

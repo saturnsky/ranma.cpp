@@ -2244,6 +2244,70 @@ static int test_round_log() {
     return 0;
 }
 
+// the decode pool counts in the round log: the draft part (round start -> drafted) and the verification part (drafted ->
+// close) of every closed round, the rounds since the last lend, nothing when a count is missing, and no effect on the
+// decisions or the cells
+static int test_round_log_pool() {
+    const std::string path = (std::filesystem::temp_directory_path() / "test-spec-smart-pool.jsonl").string();
+    std::filesystem::remove(path);
+    common_spec_smart_config c;
+    c.n_max = 2;
+    common_spec_smart_config cl = c;
+    cl.log_path = path;
+    {
+        common_spec_smart a(c, 1);
+        common_spec_smart b(cl, 1);
+        common_spec_smart_pool P;
+        P.valid = true;
+        int64_t t = 0;
+        a.request_begin(0);
+        b.request_begin(0);
+        for (int r = 0; r < 5; ++r) {
+            a.close_round(0, t);
+            b.close_round(0, t, &P);
+            CHECK(a.begin_round(0, 2) == b.begin_round(0, 2));
+            t += 1000;
+            if (r == 0) {
+                P.lends = 1; // a lend in the draft steps, and its first fills
+                P.fills = 2; P.fill_bytes = 2 << 20;
+            }
+            a.drafted(0, 0, t);
+            b.drafted(0, 0, t, r == 2 ? nullptr : &P); // round 2: the count at drafted is missing
+            const int64_t v = 40000 + 1000 * r;
+            if (r == 0) {
+                P.fills += 7; P.fill_bytes += 7 << 20; P.hits += 3;
+            } else {
+                P.fills += 1; P.fill_bytes += 1 << 20; P.hits += 10;
+            }
+            t += v;
+        }
+        a.close_round(0, t);
+        b.close_round(0, t, &P);
+        CHECK(a.cost_table() == b.cost_table() && a.level() == b.level() && a.n_closed == b.n_closed);
+    }
+    std::vector<std::string> lines;
+    {
+        std::istringstream in(read_file(path));
+        for (std::string l; std::getline(in, l);) {
+            if (l.find("\"ev\":\"round\"") != std::string::npos && l.find("\"end\":\"closed\"") != std::string::npos) {
+                lines.push_back(l);
+            }
+        }
+    }
+    CHECK(lines.size() == 5);
+    CHECK(lines[0].find("\"pool\":{\"draft\":{\"fills\":2,\"fill_mib\":2.0,\"hits\":0,\"lends\":1,\"reclaims\":0},"
+                        "\"verify\":{\"fills\":7,\"fill_mib\":7.0,\"hits\":3,\"lends\":0,\"reclaims\":0},"
+                        "\"since_lend\":0,\"lend\":1}") != std::string::npos);
+    CHECK(lines[1].find("\"verify\":{\"fills\":1,\"fill_mib\":1.0,\"hits\":10,") != std::string::npos);
+    CHECK(lines[1].find("\"since_lend\":1,") != std::string::npos);
+    CHECK(lines[2].find("\"pool\"") == std::string::npos); // the count at drafted was missing
+    CHECK(lines[3].find("\"draft\":{\"fills\":0,") != std::string::npos);
+    CHECK(lines[3].find("\"since_lend\":3,") != std::string::npos);
+    CHECK(lines[4].find("\"since_lend\":4,") != std::string::npos);
+    std::filesystem::remove(path);
+    return 0;
+}
+
 static int test_off() {
     // the defaults; an instance without draft-mtp never gets a controller, and every hook is a no-op
     common_params p;
@@ -2393,6 +2457,7 @@ int main() {
     if (test_conf_cap_ext_rate()) { return 1; }
     if (test_conf_cap_noise())  { return 1; }
     if (test_round_log())       { return 1; }
+    if (test_round_log_pool())  { return 1; }
     if (test_off())             { return 1; }
     if (test_resolve())         { return 1; }
     fprintf(stderr, "test-spec-smart: OK\n");
