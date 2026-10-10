@@ -1461,6 +1461,7 @@ struct llama_model_deepseek41 : public llama_model_deepseek4 {
                 llm_graph_input_dsv4 * inp_dsv4,
                 ggml_tensor * cur,
                 ggml_tensor * inp_pos,
+                ggml_tensor * & top_k_carry,
                 int il) const;
     };
 
