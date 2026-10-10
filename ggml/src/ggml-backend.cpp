@@ -1053,6 +1053,8 @@ struct ggml_backend_sched {
     uint64_t gstate_clock;
     uint64_t alloc_generation;                        // incremented whenever the compute buffers are planned for a
                                                       // reserve or change size, which invalidates the stored slots
+    size_t hash_size_full;                            // the hash set size for graph_size; a stored slot keeps the
+                                                      // smaller tables of its graph [ggml_backend_sched_slot_fit]
     // with graph slots on, the views of the graph copy live in their own context, sized when they are created
     struct ggml_context * ctx_views;
     char * views_buffer;
@@ -1094,6 +1096,16 @@ struct ggml_backend_sched_graph_state {
 #define tensor_backend_id(tensor) sched->hv_tensor_backend_ids[hash_id(tensor)]
 #define tensor_id_copy(id, backend_id, copy_id) sched->hv_tensor_copies[(id) * sched->n_backends * sched->n_copies + (backend_id) * sched->n_copies + (copy_id)]
 #define tensor_copy(tensor, backend_id, copy_id) tensor_id_copy(hash_id(tensor), backend_id, copy_id)
+
+// LLAMA_GRAPH_META_TRIM=0 keeps the worst-case hash tables and context buffer in every graph slot
+static bool ggml_backend_sched_slot_trim_enabled(void) {
+    static const bool enabled = []() {
+        const char * env = getenv("LLAMA_GRAPH_META_TRIM");
+        return env ? atoi(env) != 0 : true;
+    }();
+
+    return enabled;
+}
 
 static void ggml_backend_sched_split_inputs_grow(struct ggml_backend_sched_split * split) {
     int new_cap = GGML_SCHED_MAX_SPLIT_INPUTS;
@@ -1367,7 +1379,9 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
             }
         }
         const size_t need = (n_src*sched->n_copies + 16)*(ggml_tensor_overhead() + GGML_MEM_ALIGN);
-        if (sched->context_buffer_size < need) {
+        // slot 0 adopts the worst-case buffer of the scheduler, which is given back here as well
+        if (sched->context_buffer_size < need ||
+                (ggml_backend_sched_slot_trim_enabled() && sched->context_buffer_size/4 > need)) {
             free(sched->context_buffer);
             sched->context_buffer_size = need + need/4;
             sched->context_buffer = (char *) malloc(sched->context_buffer_size);
@@ -2418,6 +2432,7 @@ ggml_backend_sched_t ggml_backend_sched_new(
     sched->context_buffer_size = ggml_sched_max_splits*GGML_SCHED_MAX_SPLIT_INPUTS*2*sizeof(struct ggml_tensor) + ggml_graph_overhead_custom(graph_size, false);
     sched->context_buffer = (char *) malloc(sched->context_buffer_size);
     sched->context_buffer_size_full = sched->context_buffer_size;
+    sched->hash_size_full = sched->hash_set.size;
 
     const int initial_splits_capacity = 16;
     sched->splits = (ggml_backend_sched_split *) calloc(initial_splits_capacity, sizeof(sched->splits[0]));
@@ -2547,10 +2562,65 @@ static void ggml_backend_sched_gstate_load(ggml_backend_sched_t sched, const str
     memcpy(sched->alloc_extent, st->alloc_extent, sizeof(sched->alloc_extent));
 }
 
+// replace the hash set of the current working set and its tables by ones of at least `size` entries; with `keep` the
+// entries are moved over, else the tables are left for ggml_backend_sched_clear
+static void ggml_backend_sched_hash_resize(ggml_backend_sched_t sched, size_t size, bool keep) {
+    const size_t n_cp = (size_t) sched->n_backends * sched->n_copies;
+
+    struct ggml_hash_set hash_set = ggml_hash_set_new(size);
+    int                 * ids     = (int *) malloc(hash_set.size * sizeof(ids[0]));
+    struct ggml_tensor ** copies  = (ggml_tensor **) malloc(hash_set.size * n_cp * sizeof(copies[0]));
+    GGML_ASSERT(ids != NULL && copies != NULL);
+
+    if (keep) {
+        memset(ids,   -1, hash_set.size * sizeof(ids[0]));
+        memset(copies, 0, hash_set.size * n_cp * sizeof(copies[0]));
+        for (size_t i = 0; i < sched->hash_set.size; i++) {
+            if (!ggml_bitset_get(sched->hash_set.used, i)) {
+                continue;
+            }
+            const size_t j = ggml_hash_insert(&hash_set, sched->hash_set.keys[i]);
+            GGML_ASSERT(j != GGML_HASHSET_ALREADY_EXISTS);
+            ids[j] = sched->hv_tensor_backend_ids[i];
+            memcpy(&copies[j*n_cp], &sched->hv_tensor_copies[i*n_cp], n_cp*sizeof(copies[0]));
+        }
+    }
+
+    ggml_hash_set_free(&sched->hash_set);
+    free(sched->hv_tensor_backend_ids);
+    free(sched->hv_tensor_copies);
+
+    sched->hash_set              = hash_set;
+    sched->hv_tensor_backend_ids = ids;
+    sched->hv_tensor_copies      = copies;
+}
+
+// a slot whose graph is split and allocated keeps hash tables of the size of that graph instead of the worst case of
+// the scheduler (n_nodes + n_leafs of the graph and twice the used entries); the full tables come back when the next
+// graph is built in the slot (ggml_backend_sched_clear) [LLAMA_GRAPH_META_TRIM]
+static void ggml_backend_sched_slot_fit(ggml_backend_sched_t sched, const struct ggml_cgraph * graph) {
+    if (!ggml_backend_sched_slot_trim_enabled()) {
+        return;
+    }
+
+    size_t n_used = 0;
+    const size_t n_words = ggml_bitset_size(sched->hash_set.size);
+    for (size_t w = 0; w < n_words; w++) {
+        for (ggml_bitset_t v = sched->hash_set.used[w]; v != 0; v &= v - 1) {
+            n_used++;
+        }
+    }
+
+    const size_t want = std::max<size_t>(2*n_used, (size_t) graph->n_nodes + graph->n_leafs) + 64;
+    if (2*ggml_hash_size(want) <= sched->hash_set.size) {
+        ggml_backend_sched_hash_resize(sched, want, true);
+    }
+}
+
 // a new, empty working set; the context buffers are sized when the slot is split
 static void ggml_backend_sched_gstate_init(ggml_backend_sched_t sched, struct ggml_backend_sched_graph_state * st) {
     memset(st, 0, sizeof(*st));
-    st->hash_set              = ggml_hash_set_new(sched->hash_set.size);
+    st->hash_set              = ggml_hash_set_new(sched->hash_size_full);
     st->hv_tensor_backend_ids = (int *) malloc(st->hash_set.size * sizeof(st->hv_tensor_backend_ids[0]));
     st->hv_tensor_copies      = (ggml_tensor **) malloc(st->hash_set.size * sched->n_backends * sched->n_copies * sizeof(struct ggml_tensor *));
     GGML_ASSERT(st->hv_tensor_backend_ids != NULL && st->hv_tensor_copies != NULL);
@@ -2585,6 +2655,10 @@ static void ggml_backend_sched_gstate_free(struct ggml_backend_sched_graph_state
 
 // clear the hash set and the copies of the current working set
 static void ggml_backend_sched_clear(ggml_backend_sched_t sched) {
+    if (sched->hash_set.size < sched->hash_size_full) {
+        // the slot kept the tables of its previous graph [ggml_backend_sched_slot_fit]
+        ggml_backend_sched_hash_resize(sched, sched->hash_size_full, false);
+    }
     ggml_hash_set_reset(&sched->hash_set);
     memset(sched->hv_tensor_backend_ids, -1, sched->hash_set.size * sizeof(sched->hv_tensor_backend_ids[0]));
     memset(sched->hv_tensor_copies,       0, sched->hash_set.size * sched->n_backends * sched->n_copies * sizeof(struct ggml_tensor *));
@@ -2671,7 +2745,10 @@ bool ggml_backend_sched_set_graph_slots(ggml_backend_sched_t sched, int n_slots)
         sched->n_gstates  = 0;
         sched->gstate_cur = 0;
 
-        // without slots the context must hold the worst case again
+        // without slots the hash tables and the context must hold the worst case again
+        if (sched->hash_set.size < sched->hash_size_full) {
+            ggml_backend_sched_hash_resize(sched, sched->hash_size_full, true);
+        }
         if (sched->context_buffer_size < sched->context_buffer_size_full) {
             ggml_free(sched->ctx);
             sched->ctx = NULL;
@@ -2803,6 +2880,9 @@ void ggml_backend_sched_reserve_size(ggml_backend_sched_t sched, struct ggml_cgr
 
 bool ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph) {
     GGML_ASSERT(sched);
+    if (sched->hash_set.size < sched->hash_size_full) {
+        ggml_backend_sched_hash_resize(sched, sched->hash_size_full, true);
+    }
     GGML_ASSERT((int)sched->hash_set.size >= measure_graph->n_nodes + measure_graph->n_leafs);
 
     ggml_backend_sched_synchronize(sched);
@@ -2823,6 +2903,9 @@ bool ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph *
 
 bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
     GGML_ASSERT(sched);
+    if (sched->hash_set.size < sched->hash_size_full) {
+        ggml_backend_sched_hash_resize(sched, sched->hash_size_full, true);
+    }
     GGML_ASSERT((int)sched->hash_set.size >= graph->n_nodes + graph->n_leafs);
     GGML_ASSERT(!sched->is_alloc);
 
@@ -2869,6 +2952,8 @@ bool ggml_backend_sched_alloc_graph(ggml_backend_sched_t sched, struct ggml_cgra
         st.generation = sched->alloc_generation;
         st.last_use   = ++sched->gstate_clock;
         memcpy(st.alloc_extent, sched->alloc_extent, sizeof(st.alloc_extent));
+
+        ggml_backend_sched_slot_fit(sched, graph);
     }
 
     sched->is_alloc = true;
