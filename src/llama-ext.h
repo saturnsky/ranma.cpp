@@ -17,6 +17,25 @@ LLAMA_API struct ggml_cgraph * llama_graph_reserve(
         uint32_t n_seqs,
         uint32_t n_outputs);
 
+// ranma: what the graphs of this context cost so far (diagnostics; the --spec-smart round log reads it). calls: ubatch
+// graphs computed; builds: of them, built and allocated anew (not reused or resumed), with the host time of the build
+// and allocation and the rows of the last one. With a GPU backend that counts its graph calls (ggml-cuda): the calls
+// that captured a HIP/CUDA graph and those run directly (no graph, or a warmup call), with their host time; replays of
+// a captured graph are not counted. Cumulative, read from host state only.
+struct llama_graph_counts {
+    int64_t calls;
+    int64_t builds;
+    int64_t build_us;
+    int32_t last_nt;
+    bool    has_backend;
+    int64_t captures;
+    int64_t capture_us;
+    int64_t direct;
+    int64_t direct_us;
+};
+
+LLAMA_API bool llama_get_graph_counts(const struct llama_context * ctx, struct llama_graph_counts * out);
+
 // Get the default ggml_type for a given ftype.
 LLAMA_API ggml_type llama_ftype_get_default_type(llama_ftype ftype);
 

@@ -2259,12 +2259,15 @@ static int test_round_log_pool() {
         common_spec_smart b(cl, 1);
         common_spec_smart_pool P;
         P.valid = true;
+        common_spec_smart_graphs G; // the target builds a graph of 2 rows in the verification of round 1, captured
+        G.tgt.valid = G.dft.valid = true;
+        G.tgt.backend = true;
         int64_t t = 0;
         a.request_begin(0);
         b.request_begin(0);
         for (int r = 0; r < 5; ++r) {
             a.close_round(0, t);
-            b.close_round(0, t, &P);
+            b.close_round(0, t, &P, &G);
             CHECK(a.begin_round(0, 2) == b.begin_round(0, 2));
             t += 1000;
             if (r == 0) {
@@ -2272,7 +2275,12 @@ static int test_round_log_pool() {
                 P.fills = 2; P.fill_bytes = 2 << 20;
             }
             a.drafted(0, 0, t);
-            b.drafted(0, 0, t, r == 2 ? nullptr : &P); // round 2: the count at drafted is missing
+            b.drafted(0, 0, t, r == 2 ? nullptr : &P, &G); // round 2: the pool count at drafted is missing
+            G.dft.calls++;
+            G.tgt.calls++;
+            if (r == 1) {
+                G.tgt.builds++; G.tgt.build_us += 1500; G.tgt.last_nt = 2; G.tgt.captures++; G.tgt.capture_us += 2500;
+            }
             const int64_t v = 40000 + 1000 * r;
             if (r == 0) {
                 P.fills += 7; P.fill_bytes += 7 << 20; P.hits += 3;
@@ -2282,7 +2290,7 @@ static int test_round_log_pool() {
             t += v;
         }
         a.close_round(0, t);
-        b.close_round(0, t, &P);
+        b.close_round(0, t, &P, &G);
         CHECK(a.cost_table() == b.cost_table() && a.level() == b.level() && a.n_closed == b.n_closed);
     }
     std::vector<std::string> lines;
@@ -2304,6 +2312,13 @@ static int test_round_log_pool() {
     CHECK(lines[3].find("\"draft\":{\"fills\":0,") != std::string::npos);
     CHECK(lines[3].find("\"since_lend\":3,") != std::string::npos);
     CHECK(lines[4].find("\"since_lend\":4,") != std::string::npos);
+    // graphs: the draft part saw none, the verification of round 1 a build of 2 rows and a capture
+    CHECK(lines[0].find("\"graph\":{\"draft\":{\"tgt\":{\"calls\":0,\"builds\":0,\"build_ms\":0.000,\"nt\":null,"
+                        "\"captures\":0,\"capture_ms\":0.000,\"direct\":0,\"direct_ms\":0.000},\"dft\":{\"calls\":0,"
+                        "\"builds\":0,\"build_ms\":0.000,\"nt\":null}},\"verify\":{\"tgt\":{\"calls\":1,") != std::string::npos);
+    CHECK(lines[1].find("\"verify\":{\"tgt\":{\"calls\":1,\"builds\":1,\"build_ms\":1.500,\"nt\":2,\"captures\":1,"
+                        "\"capture_ms\":2.500,") != std::string::npos);
+    CHECK(lines[2].find("\"graph\"") != std::string::npos); // the graph counts do not depend on the pool counts
     std::filesystem::remove(path);
     return 0;
 }

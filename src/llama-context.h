@@ -297,6 +297,9 @@ public:
 
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
 
+    // ranma: the graph counts of llama_get_graph_counts (llama-ext.h)
+    void graph_counts(struct llama_graph_counts & out) const;
+
 private:
     llm_graph_result * get_gf_res_prev();
 
@@ -483,6 +486,13 @@ private:
     int64_t n_graph_resumed = 0;
     int64_t n_graph_stale   = 0; // a stored graph matched, but its allocation was gone
     int64_t n_graph_evicted = 0;
+
+    // every graph a ubatch built (with or without shape slots), the host time of the build and its allocation, and the
+    // rows of the last one (llama_get_graph_counts)
+    int64_t n_graph_builds    = 0;
+    int64_t t_graph_build_us  = 0;
+    int64_t n_graph_calls     = 0;
+    int32_t graph_build_last_nt = 0;
 
     // drop every stored graph (they are rebuilt on their next use)
     void graph_reuse_invalidate();

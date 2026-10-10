@@ -6106,6 +6106,51 @@ static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, co
 }
 #endif // USE_CUDA_GRAPH
 
+// ranma: what the graph calls of a context did, for diagnostics (ggml_backend_cuda_graph_counts, read by the
+// --spec-smart round log): calls that captured a graph, calls run directly (no graph, or the warmup of one), and the
+// host time of both. Calls that replayed a captured graph are not counted. A few contexts per process; the table is
+// searched by context and its entries are never removed (a context that goes away leaves 64 bytes).
+struct ggml_cuda_graph_call_counts {
+    const void * ctx = nullptr;
+    int64_t captures = 0, capture_us = 0, direct = 0, direct_us = 0;
+};
+static std::mutex ggml_cuda_graph_call_mutex;
+static std::vector<ggml_cuda_graph_call_counts> ggml_cuda_graph_call_table;
+
+static void ggml_cuda_graph_call_add(const void * ctx, bool captured, int64_t us) {
+    std::lock_guard<std::mutex> lock(ggml_cuda_graph_call_mutex);
+    for (auto & e : ggml_cuda_graph_call_table) {
+        if (e.ctx == ctx) {
+            (captured ? e.captures : e.direct)++;
+            (captured ? e.capture_us : e.direct_us) += us;
+            return;
+        }
+    }
+    ggml_cuda_graph_call_counts e;
+    e.ctx = ctx;
+    (captured ? e.captures : e.direct)++;
+    (captured ? e.capture_us : e.direct_us) += us;
+    ggml_cuda_graph_call_table.push_back(e);
+}
+
+// out[4]: captures, their host time (us), direct calls, their host time (us); cumulative for the backend
+static bool ggml_backend_cuda_graph_counts(ggml_backend_t backend, int64_t * out) {
+    if (backend == nullptr || out == nullptr || !ggml_backend_is_cuda(backend)) {
+        return false;
+    }
+    out[0] = out[1] = out[2] = out[3] = 0;
+    std::lock_guard<std::mutex> lock(ggml_cuda_graph_call_mutex);
+    for (const auto & e : ggml_cuda_graph_call_table) {
+        if (e.ctx == backend->context) {
+            out[0] = e.captures;
+            out[1] = e.capture_us;
+            out[2] = e.direct;
+            out[3] = e.direct_us;
+        }
+    }
+    return true;
+}
+
 static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
@@ -6199,6 +6244,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     }
 #endif // USE_CUDA_GRAPH
 
+    const int64_t t_call_us = ggml_time_us();
     if (use_cuda_graph && cuda_graph_update_required) {
         // Start CUDA graph capture
         {
@@ -6210,6 +6256,9 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     }
 
     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
+    if (!use_cuda_graph || cuda_graph_update_required) {
+        ggml_cuda_graph_call_add(cuda_ctx, use_cuda_graph, ggml_time_us() - t_call_us);
+    }
 
 #ifdef USE_CUDA_GRAPH
     if (use_cuda_graph && cuda_graph_update_required) {
@@ -7655,6 +7704,10 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
         return (void *)ggml_backend_cuda_expert_host_direct;
     }
 #endif
+    if (strcmp(name, "ggml_backend_cuda_graph_counts") == 0) {
+        // ranma: diagnostics of the graph calls (captures and direct calls), see ggml_backend_cuda_graph_counts
+        return (void *)ggml_backend_cuda_graph_counts;
+    }
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_cuda_get_features;
     }

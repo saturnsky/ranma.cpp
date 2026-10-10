@@ -1703,6 +1703,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
 
+    n_graph_calls++;
+
     if (graph_reuse_shapes > 0 && shape_reused) {
         // can_reuse() of the chosen graph has already bound it to the memory context of this ubatch
         n_reused++;
@@ -1718,6 +1720,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         n_reused++;
     } else {
+        const int64_t t_build_us = ggml_time_us();
         gf_res_prev_active = nullptr;
         res->reset();
 
@@ -1762,6 +1765,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
 
         gf_res_prev_active = res;
+
+        n_graph_builds++;
+        t_graph_build_us += ggml_time_us() - t_build_us;
+        graph_build_last_nt = (int32_t) ubatch.n_tokens;
     }
 
     // set the input data for the input tensors
@@ -4606,6 +4613,39 @@ bool llama_expert_plan_install(llama_context * ctx, ggml_expert_plan_id plan) {
 void llama_expert_set_profiled_seq(llama_context * ctx, llama_seq_id seq_id, ggml_expert_bank_id bank) {
     ctx->expert_profiled_seq  = seq_id;
     ctx->expert_profiled_bank = bank;
+}
+
+bool llama_get_graph_counts(const llama_context * ctx, llama_graph_counts * out) {
+    if (ctx == nullptr || out == nullptr) {
+        return false;
+    }
+    ctx->graph_counts(*out);
+    return true;
+}
+
+void llama_context::graph_counts(llama_graph_counts & out) const {
+    out = {};
+    out.calls    = n_graph_calls;
+    out.builds   = n_graph_builds;
+    out.build_us = t_graph_build_us;
+    out.last_nt  = graph_build_last_nt;
+    // the GPU backends that count their graph calls (ggml-cuda: captures and direct calls)
+    for (const auto & backend : backends) {
+        ggml_backend_dev_t dev = ggml_backend_get_device(backend.get());
+        if (dev == nullptr) {
+            continue;
+        }
+        auto * fn = (bool (*)(ggml_backend_t, int64_t *)) ggml_backend_reg_get_proc_address(
+                ggml_backend_dev_backend_reg(dev), "ggml_backend_cuda_graph_counts");
+        int64_t v[4] = { 0, 0, 0, 0 };
+        if (fn != nullptr && fn(backend.get(), v)) {
+            out.has_backend  = true;
+            out.captures    += v[0];
+            out.capture_us  += v[1];
+            out.direct      += v[2];
+            out.direct_us   += v[3];
+        }
+    }
 }
 
 void llama_expert_route_hint(llama_context * ctx, const llama_token * tokens, int32_t n_tokens) {

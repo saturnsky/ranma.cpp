@@ -133,6 +133,35 @@ static common_spec_smart_pool spec_smart_pool(const common_spec_smart * smart) {
     return out;
 }
 
+static common_spec_smart_graph spec_smart_graph(const llama_context * ctx) {
+    common_spec_smart_graph g;
+    llama_graph_counts c{};
+    if (ctx != nullptr && llama_get_graph_counts(ctx, &c)) {
+        g.valid      = true;
+        g.calls      = c.calls;
+        g.builds     = c.builds;
+        g.build_us   = c.build_us;
+        g.last_nt    = c.last_nt;
+        g.backend    = c.has_backend;
+        g.captures   = c.captures;
+        g.capture_us = c.capture_us;
+        g.direct     = c.direct;
+        g.direct_us  = c.direct_us;
+    }
+    return g;
+}
+
+// the graph counts of the target and the draft context; invalid without a round log
+static common_spec_smart_graphs spec_smart_graphs(const common_spec_smart * smart, const llama_context * ctx_tgt,
+                                                  const llama_context * ctx_dft) {
+    common_spec_smart_graphs out;
+    if (smart != nullptr && smart->logging()) {
+        out.tgt = spec_smart_graph(ctx_tgt);
+        out.dft = spec_smart_graph(ctx_dft);
+    }
+    return out;
+}
+
 static std::string spec_threshold_list_str(const std::vector<float> & thresholds) {
     if (thresholds.empty()) {
         return "off";
@@ -1960,8 +1989,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             if (smart) {
                 // the previous round of this sequence ends here: its verification time is known now
                 const int64_t t_close = ggml_time_us();
-                const common_spec_smart_pool pool = spec_smart_pool(smart);
-                smart->close_round(seq_id, t_close, &pool);
+                const common_spec_smart_pool   pool   = spec_smart_pool(smart);
+                const common_spec_smart_graphs graphs = spec_smart_graphs(smart, params.ctx_tgt, params.ctx_dft);
+                smart->close_round(seq_id, t_close, &pool, &graphs);
 
                 const int32_t n_max_seq = dp.n_max > 0 ? std::min(params.n_max, dp.n_max) : params.n_max;
                 if (!smart->begin_round(seq_id, n_max_seq)) {
@@ -2161,8 +2191,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
             if (smart) {
                 const int64_t t_drafted = ggml_time_us();
-                const common_spec_smart_pool pool = spec_smart_pool(smart);
-                smart->drafted(seq_id, (int32_t) dp.result->size(), t_drafted, &pool);
+                const common_spec_smart_pool   pool   = spec_smart_pool(smart);
+                const common_spec_smart_graphs graphs = spec_smart_graphs(smart, params.ctx_tgt, params.ctx_dft);
+                smart->drafted(seq_id, (int32_t) dp.result->size(), t_drafted, &pool, &graphs);
             }
         }
     }
