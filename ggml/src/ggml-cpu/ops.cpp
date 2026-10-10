@@ -5409,6 +5409,7 @@ void ggml_compute_forward_get_rows(
         case GGML_TYPE_EXL3R_M6:
         case GGML_TYPE_EXL3R_M7:
         case GGML_TYPE_EXL3R_M8:
+        case GGML_TYPE_MXFP8:
             {
                 ggml_compute_forward_get_rows_q(params, dst);
             } break;
@@ -6210,6 +6211,7 @@ void ggml_compute_forward_clamp(
         case GGML_TYPE_EXL3R_M6:
         case GGML_TYPE_EXL3R_M7:
         case GGML_TYPE_EXL3R_M8:
+        case GGML_TYPE_MXFP8:
         case GGML_TYPE_COUNT:
             {
                 GGML_ABORT("fatal error");
