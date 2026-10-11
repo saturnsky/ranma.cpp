@@ -58,6 +58,15 @@ struct common_spec_smart_config {
     double      tprof_half_life = 131072.0; // generated tokens (LLAMA_SPEC_TRIGRAM_PROFILE_HALF_LIFE)
     std::string tprof_coef_key;             // the target and draft model files: the coefficients of the trigram
                                             // confidence kept in the profile for another pair (or k) are not used
+    // block drafter (draft-dspark, see "DSpark" in docs/ranma/spec-smart.md): one forward drafts the whole block and the
+    // decision picks how many of its tokens to verify (begin_block, block_drafted); the acceptance input p of a position
+    // is the drafter's confidence head (the acceptance given that the positions before it were accepted)
+    bool        block         = false;
+    int32_t     n_groups      = 3;     // calibration cells per position group 0 .. n_groups - 1 (the last for all beyond)
+    bool        tconf_per_pos = false; // trigram confidence: one coefficient set per position group (block drafter,
+                                       // LLAMA_SPEC_DSPARK_TCONF_POS=per); false: one set for all positions
+    int32_t     blk_keep      = 32;    // block drafter: drafted blocks kept per sequence for the decision to draft
+    int32_t     skip_probe    = 16;    // block drafter: a sequence drafts again after this many skipped rounds
 };
 
 // what a decision saw (round log only): filled by decide() when asked, never read by the controller
@@ -184,7 +193,7 @@ struct common_spec_tconf {
     double G[DIM] = {};
     double lr = 0.15;
 
-    void   reset(int32_t k);  // the static coefficients of k
+    void   reset(int32_t k, bool block = false); // the static coefficients of k (block: of the block drafter)
     double q(const double * x) const;
     void   update(const double * X, const double * lab, int32_t n); // n rows of DIM
     // n[s], N[s]: the count of the candidate and the observations of the context per source
@@ -197,6 +206,7 @@ struct common_spec_tconf_pos {
     int32_t chosen = 0;  // index of the drafted one among the drafter candidates (may be >= n for a fixed one)
     int32_t id     = -1; // the drafted token
     int32_t N      = 0;  // trigram observations of the context in the request (both roles)
+    int32_t m      = 0;  // the coefficient set that scored it (common_spec_smart::tc_model)
     float   src[2 * common_spec_tconf::N_SRC] = {}; // round log: n_s, N_s of the drafted candidate per source
     uint8_t ms     = 0;  // round log: mid (1) and sw (2) of the drafted candidate
     std::vector<int32_t> ids; // the n candidates scored
@@ -204,7 +214,8 @@ struct common_spec_tconf_pos {
 };
 
 struct common_spec_smart {
-    static constexpr int32_t N_GROUPS = 3;  // draft positions 0, 1 and 2+ share calibration cells
+    static constexpr int32_t N_GROUPS = 3;  // draft-mtp: draft positions 0, 1 and 2+ share calibration cells (the
+                                            // default of cfg.n_groups; n_groups is the one in use)
     static constexpr int32_t N_QBAR_MAX = 16; // mean acceptance per position 0..n_max, the last cell for all beyond
     using tconf_pos = common_spec_tconf_pos;
 
@@ -227,6 +238,21 @@ struct common_spec_smart {
     void    close_round(int32_t seq, int64_t t_us, const common_spec_smart_pool * pool = nullptr,
                         const common_spec_smart_graphs * graphs = nullptr);
     bool    begin_round(int32_t seq, int32_t n_max_seq);
+    // block drafter (cfg.block) instead of begin_round / after_step:
+    //   begin_block   before the forward: false skips it (the round decodes one token, drafted(seq, 0)). It drafts
+    //                 when the recent drafted blocks of the sequence, decided again with the costs of now, give more
+    //                 tokens per time with the draft step than one token per cost(0) does, or after skip_probe skipped
+    //                 rounds, or while nothing is known
+    //   block_drafted after the forward, with the acceptance inputs p[0..n) (the confidence head) and with the trigram
+    //                 confidence qd[0..n) (of the drafted tokens) and qd_last (per position: the best of the scored
+    //                 candidates, used for the position when it is the last verified one; null: qd). Returns the
+    //                 tokens to verify, 0..n; the draft step is spent and not counted (sunk). add_draft_step takes the
+    //                 time of the forward, drafted() the final width
+    //   block_last    the last verified position j drafts another candidate (its acceptance input and q)
+    bool    begin_block(int32_t seq, int32_t n_max_seq);
+    int32_t block_drafted(int32_t seq, const float * p, int32_t n, const double * qd = nullptr,
+                          const double * qd_last = nullptr);
+    void    block_last(int32_t seq, int32_t j, float p, double qd);
     int32_t after_step(int32_t seq, float p_top, double q_direct = -1.0); // q_direct >= 0: the trigram confidence
     void    drafted(int32_t seq, int32_t k, int64_t t_us, const common_spec_smart_pool * pool = nullptr,
                     const common_spec_smart_graphs * graphs = nullptr);
@@ -254,7 +280,11 @@ struct common_spec_smart {
     void    tconf_end(int32_t seq, const int32_t * gen, size_t n);
     bool    tprof_on() const { return tprof != nullptr; }
     void    tconf_begin(int32_t seq, const int32_t * toks, size_t n, int32_t id_last, int32_t pos0);
-    int32_t tconf_pick(int32_t seq, const int32_t * ids, const float * p, int32_t n, int32_t fixed, double * q);
+    int32_t tconf_pick(int32_t seq, const int32_t * ids, const float * p, int32_t n, int32_t fixed, double * q,
+                       double * q_all = nullptr); // q_all: the acceptance of each scored candidate (min(k, n) values)
+    //   tconf_repick  block drafter: scores draft position j (< the positions picked) again with the free choice of
+    //                 tconf_pick (the steps after it are dropped); its context is that of the first pick
+    int32_t tconf_repick(int32_t seq, int32_t j, const int32_t * ids, const float * p, int32_t n, double * q);
     bool    tconf_mid(const std::vector<int32_t> & ctx) const; // the context ends inside an unfinished UTF-8 sequence
 
     // one line per request: mean k, share per width, predicted / observed cost per width, acceptance
@@ -266,6 +296,15 @@ struct common_spec_smart {
     // qd (trigram confidence): the acceptance of every drafted position, used instead of q(i, p)
     int32_t decide(const float * p, int32_t n_drafted, int32_t n_max_seq, common_spec_smart_diag * diag = nullptr,
                    const double * qd = nullptr) const;
+    // block drafter: the width k = 0..min(n, n_lim) with the highest (expected accepted + 1) / (D + C[k]), D the draft
+    // time still to pay (0 after the forward: sunk). The last verified position k - 1 counts with qd_last (when given),
+    // the others with qd (or q(j, p)). exp_acc (may be null): the expected accepted tokens of the result
+    int32_t decide_block(const float * p, int32_t n, int32_t n_lim, double D, const std::vector<double> & C,
+                         common_spec_smart_diag * diag = nullptr, const double * qd = nullptr,
+                         const double * qd_last = nullptr, double * exp_acc = nullptr) const;
+    // block drafter: the expected tokens per us of drafting every round, from the recent drafted blocks of seq decided
+    // again with the costs of now (each block decided as after its forward, the draft step added); -1: none kept
+    double  block_value(int32_t seq, int32_t n_lim) const;
 
     std::vector<double> cost_table() const; // predicted verification time per width 0..n_max: level x shape
     double cost(int32_t k) const { return cost_table()[k]; }
@@ -308,7 +347,8 @@ struct common_spec_smart {
     std::vector<common_spec_smart_cell> shape_cells; // [n_max + 1], time / level per width; n 0: no value
     std::vector<double>                 shape_over;  // [n_max + 1], confidence of the shape above the wait confidence
                                                      // at the round of the cell (wait = n - over, decays alike)
-    std::vector<common_spec_smart_cell> cal_cells;  // [N_GROUPS * n_bins], acceptance per position group and bin
+    int32_t                             n_groups;   // position groups of the calibration (cfg.n_groups)
+    std::vector<common_spec_smart_cell> cal_cells;  // [n_groups * n_bins], acceptance per position group and bin
     std::vector<common_spec_smart_cell> qbar_cells; // [min(n_max + 1, N_QBAR_MAX)], acceptance per position
     common_spec_smart_cell              draft_cell; // time of one draft step; never stored
 
@@ -352,6 +392,28 @@ struct common_spec_smart {
         bool                    tc_pend_valid = false;
         int32_t                 tc_pend_at = -1; // ... the position of that token (the next round's pos0)
         int32_t                 tc_pos0 = -1;    // pos0 of the current round
+        size_t                  tc_ctx0 = 0;     // the length of tc_ctx before the first draft step
+
+        // block drafter: the acceptance inputs of the recent drafted blocks (ring of cfg.blk_keep), the rounds skipped
+        // since the last draft, and the decision to draft of this round (round log)
+        struct blk_entry {
+            static constexpr int32_t N = 16;
+            int32_t n = 0;
+            float   p[N]  = {};
+            double  qd[N] = {};
+            double  ql[N] = {};
+            bool    has_qd = false;
+            bool    has_ql = false;
+        };
+        std::vector<blk_entry>  blk;
+        size_t                  blk_next    = 0;
+        int32_t                 blk_skips   = 0;
+        bool                    blk_draft   = false;
+        bool                    blk_probe   = false;
+        double                  blk_v_draft = -1.0; // tokens / us, -1: not known
+        double                  blk_v_skip  = -1.0;
+        int64_t                 blk_n_skip  = 0;    // request statistics: rounds that skipped the forward, probes
+        int64_t                 blk_n_probe = 0;
         size_t                  tc_n_prompt = SIZE_MAX; // prompt tokens of the request (the generated ones follow)
         bool                    tc_open = false;        // a request began and was not counted into the profile yet
         std::vector<int32_t>    tc_prompt;              // its prompt (with a profile)
@@ -387,12 +449,20 @@ struct common_spec_smart {
     std::vector<seq_state> seqs;
 
     // trigram confidence
-    common_spec_tconf     tconf_model;
+    common_spec_tconf     tconf_model;         // the coefficients (with cfg.tconf_per_pos: of position group 0)
+    std::vector<common_spec_tconf> tconf_more; // cfg.tconf_per_pos: of the position groups 1 .. n_groups - 1
+    int32_t tc_n_models() const { return 1 + (int32_t) tconf_more.size(); }
+    common_spec_tconf & tc_model(int32_t m) { return m <= 0 ? tconf_model : tconf_more[m - 1]; }
+    const common_spec_tconf & tc_model(int32_t m) const { return m <= 0 ? tconf_model : tconf_more[m - 1]; }
+    int32_t tc_model_of(int32_t j) const { return std::clamp<int32_t>(j, 0, tc_n_models() - 1); } // of draft position j
+    std::vector<int64_t>  tc_kept_m;           // per coefficient set: AdaGrad steps before this process (profile)
+    std::vector<int64_t>  tc_upd_m;            // per coefficient set: AdaGrad steps of the process
     std::vector<uint32_t> tc_tail;
     std::vector<uint8_t>  tc_wf;
     common_spec_roles     tc_roles;
     std::unique_ptr<common_spec_tprof> tprof; // the trigram profile, nullptr: none (or off)
-    std::string           tprof_coef_key;     // the coefficient block of this process: model pair, k, layout
+    std::string           tprof_coef_key;     // the coefficient block of this process: model pair, k, layout (with
+                                              // cfg.tconf_per_pos one block per set: " pos=<m>" appended)
     int64_t               tc_updates_kept = 0; // AdaGrad steps of the coefficients before this process (from the profile)
     void tprof_put_coef();
     int64_t               tc_updates = 0; // AdaGrad steps of the process
