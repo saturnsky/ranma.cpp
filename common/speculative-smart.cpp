@@ -98,7 +98,7 @@ common_spec_smart::common_spec_smart(const common_spec_smart_config & cfg_in, in
     cost_n_run.assign(cfg.n_max + 1, 0);
     used_run.assign(cfg.n_max + 1, 0);
     cfg.tconf_k = std::clamp<int32_t>(cfg.tconf_k, 1, common_spec_tconf::K_MAX);
-    tconf_model.reset(cfg.tconf_k, cfg.block);
+    tconf_model.reset(cfg.tconf_k);
     if (cfg.tconf_per_pos && n_groups > 1) {
         tconf_more.assign(n_groups - 1, tconf_model); // every position group starts at the same static coefficients
     }
@@ -1260,16 +1260,20 @@ void common_spec_trigram::lookup(int32_t a, int32_t b, const int32_t * toks, int
     }
 }
 
-// static coefficients per k (layout of common_spec_tconf::features, the profile columns 0): IRLS (ridge 0.1) on the
-// top-k drafter candidates of every logged chain position of the GLM-5.3-Flash EXL3 3.05bpw MTP top-k log main-v3
-// (2026-10-10; 170 requests at fixed width 3, temperature 0), trigram source = the request's own prompt and generated
-// tokens split by the role of the next token (after <|assistant|> and the generated tokens: RA, else RU), presets
-// rp-ja, rp-en, rp-zh and code (rp-ko left out, so that the roleplay-ko measurements are not fit on). On the rp-ko
-// questions >= 10: log-loss of the top-1 positions 0.4960 (k = 1) against 0.4962 without the role split, 0.5085 for the
-// calibration cells and 0.591 for the raw probability. The profile columns start at 0 (no profile in the logs): an
-// empty profile leaves the acceptance as without it, and the coefficients are learnt online.
+// static coefficients per k (layout of common_spec_tconf::features, the profile columns 0); they are only the start of
+// the online fit, which reaches the per-pair fit within about one request.
+// k = 1, every drafter (draft-mtp and the draft-dspark block drafter): one set for every model and drafter, IRLS
+// (ridge 0.1) on the pooled logs of five pairs with equal weight (GLM-5.3-Flash + MTP, DS4F + DSpark, DS4F + MTP,
+// Qwen3.8-Flash-Next + MTP, Gemma4-31B + MTP; 2026-10-11). A fixed set does not carry over to a pair it was not fit on
+// (leave-one-pair-out log-loss +0.007..+0.11), but started from the set of the other four pairs the online fit ends
+// 0.0006 nats per row above the per-pair fit: per-pair sets are not needed.
+// k >= 2 (draft-mtp): IRLS (ridge 0.1) on the top-k drafter candidates of every logged chain position of the
+// GLM-5.3-Flash EXL3 3.05bpw MTP top-k log main-v3 (2026-10-10; 170 requests at fixed width 3, temperature 0), trigram
+// source = the request's own prompt and generated tokens split by the role of the next token (after <|assistant|> and
+// the generated tokens: RA, else RU), presets rp-ja, rp-en, rp-zh and code (rp-ko left out). Only GLM has top-k
+// candidate logs, so these are not checked on other pairs.
 static const double TCONF_B[common_spec_tconf::K_MAX][common_spec_tconf::DIM] = {
-    { -0.861109, 0.718653, 0.464978, 0.222404, 0.612030, 1.118706, 0, 0, 0, 0, 0, 0, 1.117296, -0.092387 }, // k = 1, 43120 rows
+    { -0.533980, 0.479004, 0.870644, 0.235297, 1.338502, 2.562494, 0, 0, 0, 0, 0, 0, 0.668234, 0.177469 }, // k = 1, five pairs
     { -0.784430, 0.645351, 0.535515, 0.538600, 0.721376, 1.154944, 0, 0, 0, 0, 0, 0, 0.714918, -0.025989 }, // k = 2, 86240 rows
     { -0.823403, 0.651749, 0.593044, 0.652753, 0.675563, 1.116444, 0, 0, 0, 0, 0, 0, 0.578160, 0.013571 }, // k = 3, 129360 rows
     { -0.847199, 0.660359, 0.591215, 0.685364, 0.683916, 1.091001, 0, 0, 0, 0, 0, 0, 0.507744, 0.024719 }, // k = 4, 172480 rows
@@ -1286,20 +1290,10 @@ static double tconf_lg(double x) {
     return std::log(x / (1.0 - x));
 }
 
-// static coefficients of the block drafter (draft-dspark), the same for every k: IRLS (ridge 0.1) on the drafted token of
-// every position whose prefix was accepted in the DS4F + DSpark Q8_0 round log ds4f-fullr-coll (2026-10-11; 30 requests of
-// roleplay ko / en and code, width 4, 7074 rows), p = the confidence head, trigram source = the request's own tokens (the
-// prompt RU, the generated tokens RA), the profile columns 0. Request-split log-loss 0.4474 / 0.4620 against 0.4540 /
-// 0.4629 of the raw confidence and 0.560 / 0.571 of the draft-mtp coefficients of k = 1 (fit on the drafter probability
-// of GLM MTP, too low for a calibrated confidence)
-static const double TCONF_B_BLOCK[common_spec_tconf::DIM] = {
-    0.246370, 1.014855, 0.947002, 0.731891, 1.160671, 0.526061, 0, 0, 0, 0, 0, 0, 0.210823, -0.212246
-};
-
-void common_spec_tconf::reset(int32_t k, bool block) {
+void common_spec_tconf::reset(int32_t k) {
     k = std::clamp<int32_t>(k, 1, K_MAX);
     for (int32_t d = 0; d < DIM; ++d) {
-        b[d] = block ? TCONF_B_BLOCK[d] : TCONF_B[k - 1][d];
+        b[d] = TCONF_B[k - 1][d];
         G[d] = 1e-3;
     }
 }
