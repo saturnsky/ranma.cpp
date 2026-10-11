@@ -1,4 +1,4 @@
-# Smart draft length for draft-mtp (`--spec-smart`)
+# Smart draft length for draft-mtp and draft-dspark (`--spec-smart`)
 
 ## What it is
 
@@ -21,7 +21,8 @@ the single-argument rule and is unchanged). The bound also sizes the target batc
 the expert cache rows, so a model that gains from longer drafts gets a higher `--spec-draft-n-max`; it never turns the
 controller off.
 
-It applies to `draft-mtp` only. With another speculative type it is off (an explicit `--spec-smart` logs a warning).
+It applies to `draft-mtp` and `draft-dspark` (see "DSpark"), on by default for both. With another speculative
+type it is off (an explicit `--spec-smart` logs a warning).
 
 ### The single-argument rule
 
@@ -380,6 +381,70 @@ exit, and whenever 1 MiB is buffered.
 In an extended round `la`, `draft_pred` and `cost_table` are those of the decision that stopped at `k_nat`;
 `cost_pred` is `cost_table[k]`. The predicted values of a decision are those before the round is observed: the
 observation of the round moves the estimates after it is logged.
+
+## DSpark (`draft-dspark`)
+
+A DSpark drafter drafts its whole block (4 tokens for the DeepSeek-V4-Flash DSpark) in one forward, and its confidence
+head gives for every position the probability that the target accepts the token when all positions before it were
+accepted (measured on DS4F: the conditional acceptance, calibrated almost as it is, better than the drafter's top
+probability). So there is no "one more step": the controller decides twice per round.
+
+- **Before the forward: draft or not.** The last 32 drafted blocks of the sequence are decided again with the costs and
+  calibration of now (each as after its forward, below). Their expected tokens over their time, the draft step
+  included, are the tokens per time of drafting every round; when it is not above 1 / cost(0) of a decode without a
+  draft, the forward is skipped and the round decodes one token (as a width-0 round of `draft-mtp`). After 16 skipped
+  rounds the sequence drafts once (a probe), so that the kept blocks follow a change of the text. While nothing is kept
+  or cost(0) is not known it drafts. The widths of the request count here, not the frontier: a width not measured
+  yet is predicted from the narrower ones (never cheaper), so a cold start drafts and finds the widths through the
+  extensions of the drafted rounds.
+- **After the forward: how many tokens to verify.** k = 0..4 with the highest (expected accepted + 1) / cost(k); the
+  draft step is spent and not counted. The expected accepted tokens are the sum of the products of the acceptances
+  of the prefix, as for `draft-mtp`. k = 0 returns no draft: the round decodes one token. Frontier, extension (a
+  stopped round verifies one width more when that width waits, its token is drafted already), first use, cost
+  decomposition and the level x shape of the verification times are those of `draft-mtp`.
+- **Acceptance per position.** The confidence of position j takes the place of the drafter probability: calibration
+  cells per position group and 0.05 bin, with four groups (positions 0, 1, 2, 3; `draft-mtp` keeps 0, 1, 2+). Only
+  verified positions whose prefix was accepted are observed (the label: accepted or not); the positions after the
+  first rejected one and those beyond k are not.
+- **Draft step time.** The time of the forward with the reading of the block (one per round), a decayed mean; with
+  the joint expert cache it has a long tail (DS4F: mean 29.8 ms, median 12.4 ms), and the decision uses the mean.
+- **Trigram confidence** (always on). The trigram context is the real token stream: the
+  prompt, the generated tokens and the drafted prefix of the block. The input p of the model is the confidence of the
+  position; a candidate below the top one gets the confidence scaled by its drafter probability relative to the top
+  one. The coefficients start at a fit on DSpark logs (DS4F, roleplay ko / en and code: request-split log-loss 0.447 /
+  0.462 against 0.454 / 0.463 of the raw confidence; the `draft-mtp` start would give 0.56).
+  One coefficient set is shared by all positions (an offline comparison found no gain from one set per position
+  group: A shared 0.4474 / 0.4614, B per position 0.4479 / 0.4624).
+- **Another candidate** (not used by the server, which scores one candidate): only at the last verified position k - 1. The Markov head of
+  DSpark chains every position on the drafted token before it inside the graph, so a token changed before the last
+  verified one would make the later ones invalid. The width decision already counts the best q of the scored
+  candidates for the position that would be the last one.
+- **Store and profile.** The store key and the key of the trigram coefficients in the profile name the drafter
+  (`drafter=dspark`, with `per`: one block per position group, ` pos=<m>`), and the store keeps the four groups, so a
+  store or coefficients of `draft-mtp` are never read for DSpark (another key: cold start).
+- **Options.** On by default, as for `draft-mtp` (`--no-spec-smart`: the fixed block). Without
+  `--spec-draft-n-max` the bound is the block of the draft model (read from its GGUF). A `--spec-draft-p-min` or
+  `--spec-draft-p-continue` given turns it off as for `draft-mtp` (so do not pass `--spec-draft-p-min 0`).
+- **Logs.** The startup line `spec-smart: block drafter: verifies 0..4 tokens of every drafted block, ...`; the request
+  summary adds `block: forward skipped S of R rounds, probes P`; the round log (`--spec-smart-log`) adds per round
+  `blk` (`draft`, `probe`, `v_draft` and `v_skip` in tokens / s, `skips`, `kept`), `steps` is the drafted block
+  positions (0 when the forward was skipped) and `p` their confidence. `LLAMA_SPEC_DSPARK_LOG` adds with
+  `--spec-smart` `skip`, `k`, `q_cal` (q(position, conf) of the cells), `q_tc` (trigram q of the drafted token),
+  `q_best` (best q of the scored candidates) and `tc_c` (the candidate drafted at the last verified position, 0 = the
+  top one) to every round, and writes also the rounds that verified nothing (at the next draft); without
+  `--spec-smart` its lines are as before.
+
+Example (DS4F + DSpark Q8_0):
+
+    llama-server -m <target> -md <dspark.gguf> --spec-type draft-dspark --spec-smart \
+        --spec-smart-store <path> --spec-smart-log <path>.jsonl
+    # optional: LLAMA_SPEC_DSPARK_LOG=<path>
+
+Offline replay of the DS4F round log ds4f-fullr-coll (30 requests, the raw confidence as q): with the joint expert
+cache costs (draft 29.8 ms, verification 45.4 / 73.3 / 97.1 / 116.6 / 141.3 ms for widths 0..4) no draft gives 22.03
+tokens / s, drafting every round and choosing k 19.45, this rule 21.82 (it drafts in 6 % of the rounds, the probes);
+with the draft resident in VRAM (4.9 ms, 45.0 / 76.2 / 100.6 / 120.7 / 146.3 ms) 22.22, 24.70 and 24.59. The rule is
+not measured in the server yet.
 
 ## Limits
 

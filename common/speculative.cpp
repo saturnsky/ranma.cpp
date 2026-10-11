@@ -15,6 +15,7 @@
 #include "../src/llama-ext.h" // staging API: llama_set_embeddings_nextn / llama_get_embeddings_nextn_ith (used by MTP)
 
 #include <algorithm>
+#include <array>
 #include <cassert>
 #include <cmath>
 #include <cstring>
@@ -1133,11 +1134,22 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         std::vector<float>       conf;
         std::vector<llama_token> cand; // 3 per position
         std::vector<float>       cand_p;
+        // --spec-smart only
+        bool                     skipped = false; // the forward was skipped
+        int32_t                  k       = -1;    // the width chosen
+        int32_t                  tc_c    = -1;    // the candidate drafted at the last verified position
+        std::vector<double>      q_cal;           // per drafted position: q(position, conf) of the calibration cells
+        std::vector<double>      q_tc;            // ... the trigram confidence of the drafted token
+        std::vector<double>      q_best;          // ... the best of the scored candidates
     };
     FILE *                    dspark_log = nullptr;
     bool                      dspark_has_conf = false;
     int64_t                   dspark_n_round = 0;
     std::vector<dspark_round> dspark_rounds;
+
+    // --spec-smart (draft-dspark): chooses per round whether to draft and how many tokens of the block to verify
+    // (owned by common_speculative, nullptr when off)
+    common_spec_smart * smart = nullptr;
 
     common_speculative_impl_draft_dflash(const common_params_speculative & params, uint32_t n_seq,
             common_speculative_type type = COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH)
@@ -1408,6 +1420,35 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 continue;
             }
 
+            if (smart) {
+                // --spec-smart: the previous round of this sequence ends here (its verification time is known now);
+                // a round that verified nothing gets no accept(), its DSpark round log line is written here
+                if (dspark_log) {
+                    dspark_log_round(seq_id, 0, (double) (ggml_time_us() - dspark_rounds[seq_id].t_drafted_us), true);
+                }
+                const int64_t t_close = ggml_time_us();
+                const common_spec_smart_pool   pool   = spec_smart_pool(smart);
+                const common_spec_smart_graphs graphs = spec_smart_graphs(smart, params.ctx_tgt, params.ctx_dft);
+                smart->close_round(seq_id, t_close, &pool, &graphs);
+                if (smart->tconf_on() && dp.prompt != nullptr) {
+                    smart->tconf_begin(seq_id, dp.prompt->data(), dp.prompt->size(), dp.id_last, dp.pos0);
+                }
+                const int32_t n_max_seq = dp.n_max > 0 ? std::min(params.n_max, dp.n_max) : params.n_max;
+                if (!smart->begin_block(seq_id, n_max_seq)) {
+                    // no forward: the round decodes one token without a draft (the result stays empty)
+                    if (dspark_log) {
+                        auto & rl = dspark_rounds[seq_id];
+                        rl = dspark_round();
+                        rl.pending      = true;
+                        rl.skipped      = true;
+                        rl.id_last      = dp.id_last;
+                        rl.pos0         = dp.pos0;
+                        rl.t_drafted_us = ggml_time_us();
+                    }
+                    continue;
+                }
+            }
+
             common_sampler_reset(smpls[seq_id].get());
 
             const int32_t n = (int32_t) dp.pos0;
@@ -1423,13 +1464,19 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         }
 
         if (batch.size() == 0) {
+            smart_finish(dparams);
             return;
         }
+
+        // --spec-smart: the time of the forward (with the reading of the block), its graph builds and captures taken out
+        const int64_t t_fwd_us = smart ? ggml_time_us() : 0;
+        const common_spec_smart_graph g_fwd0 = smart && smart->wants_counts() ? spec_smart_graph(ctx_dft) : common_spec_smart_graph();
 
         // decode all sequence's noise block in a single batch
         int ret = llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, batch.get());
         if (ret != 0) {
             LOG_WRN("%s: llama_process returned %d\n", __func__, ret);
+            smart_finish(dparams);
             return;
         }
 
@@ -1478,21 +1525,35 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
             if (is_dspark) {
                 // DSpark: read from the first draft slot, truncate below the confidence threshold
-                const float * conf = params.p_min_enabled() || (dspark_log && dspark_has_conf) ?
+                const float * conf = params.p_min_enabled() || ((dspark_log || smart) && dspark_has_conf) ?
                         llama_get_embeddings_nextn(ctx_dft) : nullptr;
                 dspark_round * rl = dspark_log ? &dspark_rounds[seq_id] : nullptr;
                 if (rl) {
                     rl->pending = false;
+                    rl->skipped = false;
                     rl->ids.clear(); rl->conf.clear(); rl->cand.clear(); rl->cand_p.clear();
+                    rl->q_cal.clear(); rl->q_tc.clear(); rl->q_best.clear();
+                    rl->k = -1; rl->tc_c = -1;
                     rl->id_last = dp.id_last;
                     rl->pos0    = dp.pos0;
                 }
+                // --spec-smart: per drafted position the acceptance input (the confidence head, or the drafter's top
+                // probability without one), and with the trigram confidence the q of the drafted token, the best q of
+                // the scored candidates and the candidates (with their inputs scaled from the confidence)
+                const bool tc  = smart && smart->tconf_on();
+                const bool inv = tc && smart->cfg.tconf_k >= 2;
+                std::vector<float>   s_p;
+                std::vector<double>  s_qd, s_ql;
+                std::vector<int32_t> s_cb;
+                std::vector<std::array<int32_t, 10>> s_ids;
+                std::vector<std::array<float, 10>>   s_pc;
+                std::vector<int32_t> s_nc;
                 // bonus-anchor drafts read the mask positions only, like DFlash
                 const int32_t i_draft_beg = sample_from_anchor ? 0 : 1;
                 for (int32_t i = i_draft_beg; i < n_block_tokens; ++i) {
                     const int32_t idx = beg + i;
 
-                    if (conf && params.p_min_enabled() && conf[(size_t) idx * n_embd_dec] < params.p_min_at(i - i_draft_beg)) {
+                    if (!smart && conf && params.p_min_enabled() && conf[(size_t) idx * n_embd_dec] < params.p_min_at(i - i_draft_beg)) {
                         break;
                     }
                     if (rl) {
@@ -1519,13 +1580,80 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                         }
                     }
 
+                    if (smart) {
+                        const float pc0 = cur_p->size > 0 ? cur_p->data[0].p : 0.0f;
+                        const float pin = conf ? conf[(size_t) idx * n_embd_dec] : pc0;
+                        s_p.push_back(std::clamp(pin, 0.0f, 1.0f));
+                        if (tc) {
+                            // candidate c: the confidence scaled by its drafter probability relative to the top one
+                            std::array<int32_t, 10> ids_c{};
+                            std::array<float, 10>   p_c{};
+                            const int32_t n_c = (int32_t) std::min<size_t>(cur_p->size, 10);
+                            for (int32_t c = 0; c < n_c; ++c) {
+                                ids_c[c] = cur_p->data[c].id;
+                                p_c[c]   = c == 0 ? s_p.back() :
+                                           std::clamp(s_p.back() * cur_p->data[c].p / std::max(pc0, 1e-6f), 0.0f, 1.0f);
+                            }
+                            double q_top = -1.0;
+                            double q_all[10];
+                            if (n_c > 0) {
+                                // the drafted (top) token: the Markov head chains the block on it
+                                smart->tconf_pick(seq_id, ids_c.data(), p_c.data(), n_c, 0, &q_top, q_all);
+                            }
+                            int32_t cb = 0;
+                            double  qb = q_top;
+                            for (int32_t c = 1; inv && c < std::min(n_c, smart->cfg.tconf_k); ++c) {
+                                if (q_all[c] > qb) {
+                                    qb = q_all[c];
+                                    cb = c;
+                                }
+                            }
+                            s_qd.push_back(q_top);
+                            s_ql.push_back(qb);
+                            s_cb.push_back(cb);
+                            s_ids.push_back(ids_c);
+                            s_pc.push_back(p_c);
+                            s_nc.push_back(n_c);
+                        }
+                    }
+
                     common_sampler_accept(smpl, id, true);
 
                     result.push_back(id);
                 }
 
+                if (smart) {
+                    // --spec-smart: the tokens of the block to verify; the candidate with the highest q may replace the
+                    // drafted token at the last verified position only (the Markov head chained the later positions
+                    // on the drafted one)
+                    const int32_t n_pos = (int32_t) s_p.size();
+                    int32_t k = smart->block_drafted(seq_id, s_p.data(), n_pos, tc ? s_qd.data() : nullptr,
+                                                     inv ? s_ql.data() : nullptr);
+                    k = std::clamp<int32_t>(k, 0, (int32_t) result.size());
+                    int32_t c_last = 0;
+                    if (inv && k > 0 && s_cb[k - 1] != 0) {
+                        double q_new = -1.0;
+                        c_last = smart->tconf_repick(seq_id, k - 1, s_ids[k - 1].data(), s_pc[k - 1].data(),
+                                                     s_nc[k - 1], &q_new);
+                        if (c_last > 0) {
+                            result[k - 1] = s_ids[k - 1][c_last];
+                            smart->block_last(seq_id, k - 1, s_pc[k - 1][c_last], q_new);
+                        }
+                    }
+                    result.resize(k);
+                    if (rl) {
+                        rl->k    = k;
+                        rl->tc_c = c_last;
+                        for (int32_t j = 0; j < n_pos; ++j) {
+                            rl->q_cal.push_back(smart->q(j, s_p[j]));
+                        }
+                        rl->q_tc   = s_qd;
+                        rl->q_best = s_ql;
+                    }
+                }
+
                 if (rl) {
-                    rl->n_drafted = (int32_t) result.size();
+                    rl->n_drafted = (int32_t) (smart ? rl->conf.size() : result.size());
                     rl->ids.assign(result.begin(), result.end());
                 }
             } else {
@@ -1558,6 +1686,18 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             }
         }
 
+        if (smart) {
+            const int64_t t_fwd_end = ggml_time_us();
+            double graph_us = 0.0;
+            if (g_fwd0.valid) {
+                const common_spec_smart_graph g_fwd1 = spec_smart_graph(ctx_dft);
+                if (g_fwd1.valid) {
+                    graph_us = (double) ((g_fwd1.build_us - g_fwd0.build_us) + (g_fwd1.capture_us - g_fwd0.capture_us));
+                }
+            }
+            smart->add_draft_step((double) (t_fwd_end - t_fwd_us), graph_us);
+        }
+
         if (dspark_log) {
             const int64_t t_end = ggml_time_us();
             for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
@@ -1566,24 +1706,41 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 }
                 auto & rl = dspark_rounds[seq_id];
                 rl.ids.assign(dparams[seq_id].result->begin(), dparams[seq_id].result->end());
-                rl.pending      = !rl.ids.empty();
+                rl.pending      = !rl.ids.empty() || smart != nullptr; // with --spec-smart also a round of width 0
                 rl.t_drafted_us = t_end;
                 rl.draft_us     = (double) (t_end - t_draft_beg);
             }
             dspark_n_round++;
         }
+
+        smart_finish(dparams);
     }
 
-    void accept(llama_seq_id seq_id, uint16_t n_accepted, bool /*is_other*/) override {
-        if (!dspark_log || seq_id < 0 || seq_id >= (llama_seq_id) dspark_rounds.size()) {
+    // --spec-smart: the end of the draft of every sequence that began a round (also one that skipped the forward)
+    void smart_finish(common_speculative_draft_params_vec & dparams) {
+        if (!smart) {
             return;
         }
+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+            auto & dp = dparams[seq_id];
+            if (!dp.drafting) {
+                continue;
+            }
+            const int64_t t_drafted = ggml_time_us();
+            const common_spec_smart_pool   pool   = spec_smart_pool(smart);
+            const common_spec_smart_graphs graphs = spec_smart_graphs(smart, params.ctx_tgt, params.ctx_dft);
+            smart->drafted(seq_id, (int32_t) dp.result->size(), t_drafted, &pool, &graphs);
+        }
+    }
+
+    // one line of the DSpark round log for the pending round of seq_id. at_draft: written at the next draft (a round
+    // that verified nothing; --spec-smart only)
+    void dspark_log_round(llama_seq_id seq_id, int32_t n_accepted, double verify_us, bool at_draft = false) {
         auto & rl = dspark_rounds[seq_id];
-        if (!rl.pending) {
+        if (!rl.pending || (at_draft && !rl.ids.empty())) {
             return;
         }
         rl.pending = false;
-        const double verify_us = (double) (ggml_time_us() - rl.t_drafted_us);
         fprintf(dspark_log, "{\"ev\":\"round\",\"seq\":%d,\"pos0\":%d,\"id_last\":%d,\"n_drafted\":%d,\"width\":%d,"
                 "\"n_acc\":%d,\"draft_us\":%.0f,\"verify_us\":%.0f,\"ids\":[",
                 (int) seq_id, (int) rl.pos0, (int) rl.id_last, rl.n_drafted, (int) rl.ids.size(), (int) n_accepted,
@@ -1603,8 +1760,38 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         for (size_t i = 0; i < rl.cand_p.size(); ++i) {
             fprintf(dspark_log, i ? ",%.4f" : "%.4f", rl.cand_p[i]);
         }
-        fprintf(dspark_log, "]}\n");
+        fprintf(dspark_log, "]");
+        if (smart) {
+            // --spec-smart: whether the forward was skipped, the width chosen, the calibrated acceptance q(position,
+            // conf) of every drafted position, with the trigram confidence its q (drafted token) and the best q of the
+            // scored candidates, and the candidate drafted at the last verified position (0: the top one)
+            fprintf(dspark_log, ",\"skip\":%s,\"k\":%d,\"q_cal\":[", rl.skipped ? "true" : "false", rl.skipped ? 0 : rl.k);
+            for (size_t i = 0; i < rl.q_cal.size(); ++i) {
+                fprintf(dspark_log, i ? ",%.4f" : "%.4f", rl.q_cal[i]);
+            }
+            fprintf(dspark_log, "],\"q_tc\":[");
+            for (size_t i = 0; i < rl.q_tc.size(); ++i) {
+                fprintf(dspark_log, i ? ",%.4f" : "%.4f", rl.q_tc[i]);
+            }
+            fprintf(dspark_log, "],\"q_best\":[");
+            for (size_t i = 0; i < rl.q_best.size(); ++i) {
+                fprintf(dspark_log, i ? ",%.4f" : "%.4f", rl.q_best[i]);
+            }
+            fprintf(dspark_log, "],\"tc_c\":%d", rl.tc_c);
+        }
+        fprintf(dspark_log, "}\n");
         fflush(dspark_log);
+    }
+
+    void accept(llama_seq_id seq_id, uint16_t n_accepted, bool /*is_other*/) override {
+        if (!dspark_log || seq_id < 0 || seq_id >= (llama_seq_id) dspark_rounds.size()) {
+            return;
+        }
+        auto & rl = dspark_rounds[seq_id];
+        if (!rl.pending || rl.ids.empty()) {
+            return;
+        }
+        dspark_log_round(seq_id, (int32_t) n_accepted, (double) (ggml_time_us() - rl.t_drafted_us));
     }
 };
 
@@ -2829,7 +3016,7 @@ struct common_speculative {
 
     std::vector<double> synth_probs;
 
-    // --spec-smart (draft-mtp only), nullptr when off
+    // --spec-smart (draft-mtp, or draft-dspark when given), nullptr when off
     std::unique_ptr<common_spec_smart> smart;
 };
 
@@ -2973,6 +3160,39 @@ static uint32_t common_get_enabled_speculative_configs(const std::vector<common_
     return result;
 }
 
+// draft-dspark: the draft tokens of one block (dflash.block_size, one less without sample_from_anchor), read from the
+// draft GGUF; -1 when it cannot be read
+static int32_t spec_dspark_block_tokens(const std::string & path) {
+    if (path.empty()) {
+        return -1;
+    }
+    struct gguf_init_params gp = {
+        /* .no_alloc = */ true,
+        /* .ctx      = */ nullptr,
+    };
+    gguf_context_ptr g(gguf_init_from_file(path.c_str(), gp));
+    if (!g) {
+        return -1;
+    }
+    const int64_t kb = gguf_find_key(g.get(), "dflash.block_size");
+    if (kb < 0) {
+        return -1;
+    }
+    int32_t block = -1;
+    switch (gguf_get_kv_type(g.get(), kb)) {
+        case GGUF_TYPE_UINT32: block = (int32_t) gguf_get_val_u32(g.get(), kb); break;
+        case GGUF_TYPE_INT32:  block = gguf_get_val_i32(g.get(), kb); break;
+        case GGUF_TYPE_STRING: block = atoi(gguf_get_val_str(g.get(), kb)); break;
+        default: return -1;
+    }
+    bool anchor = true;
+    const int64_t ka = gguf_find_key(g.get(), "dflash.sample_from_anchor");
+    if (ka >= 0 && gguf_get_kv_type(g.get(), ka) == GGUF_TYPE_BOOL) {
+        anchor = gguf_get_val_bool(g.get(), ka);
+    }
+    return block > 0 ? block - (anchor ? 0 : 1) : -1;
+}
+
 void common_speculative_smart_resolve(common_params_speculative & params) {
     auto & dft = params.draft;
 
@@ -2983,9 +3203,12 @@ void common_speculative_smart_resolve(common_params_speculative & params) {
 
     const bool has_mtp = std::find(params.types.begin(), params.types.end(),
                                    COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params.types.end();
-    if (!has_mtp) {
+    // draft-dspark: on by default as well (the block size of the draft model is the bound)
+    const bool has_dspark = std::find(params.types.begin(), params.types.end(),
+                                      COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK) != params.types.end();
+    if (!has_mtp && !has_dspark) {
         if (dft.smart_explicit) {
-            SPC_WRN("%s", "--spec-smart applies to draft-mtp only and is ignored\n");
+            SPC_WRN("%s", "--spec-smart applies to draft-mtp and draft-dspark only and is ignored\n");
         }
         return;
     }
@@ -2999,9 +3222,11 @@ void common_speculative_smart_resolve(common_params_speculative & params) {
         return;
     }
 
-    // --spec-draft-n-max stays the upper bound when it was given; else the bound of the controller
+    // --spec-draft-n-max stays the upper bound when it was given; else the bound of the controller (draft-dspark: the
+    // block of the draft model)
     if (!dft.n_max_explicit) {
-        dft.n_max = dft.smart_n_max;
+        const int32_t nb = has_mtp ? -1 : spec_dspark_block_tokens(dft.mparams.path);
+        dft.n_max = nb > 0 ? nb : dft.smart_n_max;
     }
     dft.smart_on = true;
 }
@@ -3421,23 +3646,45 @@ common_speculative * common_speculative_init(common_params_speculative & params,
 
     if (params.draft.smart_on) {
         common_speculative_impl_draft_mtp * mtp = nullptr;
+        common_speculative_impl_draft_dflash * dspark = nullptr; // draft-dspark (the block drafter), when no draft-mtp
         for (auto & impl : result->impls) {
             if (impl->type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP) {
                 mtp = static_cast<common_speculative_impl_draft_mtp *>(impl.get());
             }
+            if (impl->type == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK) {
+                dspark = static_cast<common_speculative_impl_draft_dflash *>(impl.get());
+            }
         }
-        if (mtp == nullptr) {
-            SPC_WRN("%s", "--spec-smart applies to draft-mtp only and is ignored\n");
+        if (mtp != nullptr) {
+            dspark = nullptr;
+        }
+        if (mtp == nullptr && dspark == nullptr) {
+            SPC_WRN("%s", "--spec-smart applies to draft-mtp and draft-dspark only and is ignored\n");
         } else {
-            SPC_INF("--spec-smart: the draft length is chosen per step, up to %d (--spec-draft-n-max%s)\n",
-                    mtp->params.n_max, params.draft.n_max_explicit ? "" : " not given");
+            if (mtp != nullptr) {
+                SPC_INF("--spec-smart: the draft length is chosen per step, up to %d (--spec-draft-n-max%s)\n",
+                        mtp->params.n_max, params.draft.n_max_explicit ? "" : " not given");
+            } else {
+                SPC_INF("--spec-smart: draft-dspark chooses per round whether to draft and how many of the %d tokens of "
+                        "the block to verify (--spec-draft-n-max%s)\n",
+                        dspark->params.n_max, params.draft.n_max_explicit ? "" : " not given: the block of the draft model");
+            }
+            llama_context * smart_ctx_dft = mtp != nullptr ? mtp->params.ctx_dft : dspark->params.ctx_dft;
 
             common_spec_smart_config cfg;
-            cfg.n_max      = mtp->params.n_max;
+            cfg.n_max      = mtp != nullptr ? mtp->params.n_max : dspark->params.n_max;
             cfg.store_path = params.draft.smart_store;
             cfg.store_key  = params.draft.smart_key;
             cfg.half_life  = params.draft.smart_half_life;
             cfg.log_path   = params.draft.smart_log;
+            if (dspark != nullptr) {
+                // the block drafter: four calibration position groups (0, 1, 2, 3); a store or trigram coefficients of
+                // draft-mtp are not mixed with it (the key names the drafter)
+                cfg.block      = true;
+                cfg.n_groups   = 4;
+                cfg.store_key += " drafter=dspark";
+                // the trigram coefficients are shared by all positions (cfg.tconf_per_pos keeps one set per group)
+            }
             // the acceptance of a draft token from its drafter probability and the request's trigram counts, one
             // drafter candidate scored per step (cfg.tconf_k = 1)
             cfg.tconf = true;
@@ -3445,18 +3692,22 @@ common_speculative * common_speculative_init(common_params_speculative & params,
                 // --spec-trigram-profile; LLAMA_SPEC_TRIGRAM_PROFILE_HALF_LIFE: its half-life in generated tokens
                 cfg.tprof_path     = common_spec_tprof_path(params.draft.smart_store, params.draft.tprof);
                 cfg.tprof_mib      = params.draft.tprof_mib;
-                cfg.tprof_coef_key = params.draft.tprof_key;
+                cfg.tprof_coef_key = params.draft.tprof_key + (dspark != nullptr ? " drafter=dspark" : "");
                 if (const char * h = getenv("LLAMA_SPEC_TRIGRAM_PROFILE_HALF_LIFE"); h != nullptr && atof(h) >= 1.0) {
                     cfg.tprof_half_life = atof(h);
                 }
             }
 
             result->smart = std::make_unique<common_spec_smart>(cfg, (int32_t) n_seq);
-            mtp->smart    = result->smart.get();
+            if (mtp != nullptr) {
+                mtp->smart = result->smart.get();
+            } else {
+                dspark->smart = result->smart.get();
+            }
 
             if (cfg.tconf) {
                 // per token: its last bytes (the UTF-8 state of a context) and whether it starts a word
-                const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(mtp->params.ctx_dft));
+                const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(smart_ctx_dft));
                 const int32_t n_vocab = llama_vocab_n_tokens(vocab);
                 std::vector<uint32_t> tail(n_vocab, 0);
                 std::vector<uint8_t>  wf(n_vocab, 0);
