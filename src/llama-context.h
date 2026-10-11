@@ -430,6 +430,18 @@ private:
     std::vector<ggml_backend_buffer_type_t> backend_buft;
     std::vector<size_t>                     backend_buf_exp_size; // expected buffer sizes
 
+    // env LLAMA_DRAFT_SHARE_COMPUTE=1 (alias LLAMA_MTP_SHARE_COMPUTE): a drafting context (an MTP context or a draft
+    // model's context) computes in the compute buffers of the context it drafts for (ctx_other).
+    // sched_buft is what the scheduler allocates from: backend_buft, with the GPU entries replaced by
+    // shared buffer types (ggml_backend_shared_buft_new) that both contexts hold. Before a graph computes, the
+    // backends of every context in share_peers are synchronized, so the two never use the buffers at once.
+    std::vector<ggml_backend_buffer_type_t> sched_buft;
+    std::vector<std::pair<ggml_backend_buffer_type_t, ggml_backend_buffer_type_t>> share_buft; // (base, shared) held
+    std::vector<llama_context *> share_peers;
+    void share_compute_init(const llama_context_params & params);
+    void share_compute_release();
+    void share_compute_wait();
+
     // Separate arenas give batches with and without outputs distinct CUDA graph cache keys.
     std::array<llm_graph_result_ptr, 2> gf_res_prev;
     llm_graph_result_ptr gf_res_reserve;

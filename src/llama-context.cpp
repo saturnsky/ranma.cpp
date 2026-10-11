@@ -14,6 +14,7 @@
 #include "llama-sampler.h"
 #include "llama.h"
 
+#include <algorithm>
 #include <cinttypes>
 #include <cmath>
 #include <cstdlib>
@@ -536,6 +537,8 @@ llama_context::llama_context(
             moe_cache = std::make_unique<llama_moe_cache>(model, backend_ptrs, backend_buft, cparams.moe_cache_size);
         }
 
+        share_compute_init(params);
+
         sched_reserve();
 
         if (!cparams.flash_attn) {
@@ -566,6 +569,8 @@ llama_context::~llama_context() {
                 (long long) n_graph_built, (long long) n_graph_resumed, (long long) n_graph_stale,
                 (long long) n_graph_evicted, gf_res_shapes.size());
     }
+
+    share_compute_release();
 
     // ranma expert cache: this context's compute backend is freed below
     if (expert_iface && expert_backend && expert_iface->attach_backend) {
@@ -719,6 +724,7 @@ void llama_context::sched_reserve() {
     LLAMA_LOG_INFO("%s: reserving ...\n", __func__);
 
     synchronize();
+    share_compute_wait();
 
     const int64_t t_start_us = ggml_time_us();
 
@@ -737,7 +743,7 @@ void llama_context::sched_reserve() {
     gf_res_reserve.reset(new llm_graph_result(max_nodes));
     gf_res_prev_active = nullptr;
 
-    sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
+    sched.reset(ggml_backend_sched_new(backend_ptrs.data(), sched_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
     ggml_backend_sched_set_copy_callback(sched.get(), sched_copy_experts, this);
 
     llama_memory_context_ptr mctx;
@@ -777,7 +783,7 @@ void llama_context::sched_reserve() {
             if (cparams.pipeline_parallel) {
                 LLAMA_LOG_WARN("%s: compute buffer allocation failed, retrying without pipeline parallelism\n", __func__);
                 cparams.pipeline_parallel = false;
-                sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
+                sched.reset(ggml_backend_sched_new(backend_ptrs.data(), sched_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
                 ggml_backend_sched_set_copy_callback(sched.get(), sched_copy_experts, this);
                 gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get());
             }
@@ -2892,6 +2898,8 @@ ggml_status llama_context::graph_compute(
 
     copy_experts.reset();
 
+    share_compute_wait();
+
     auto status = ggml_backend_sched_graph_compute_async(sched.get(), gf);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: ggml_backend_sched_graph_compute_async failed with error %d\n", __func__, status);
@@ -2900,6 +2908,105 @@ ggml_status llama_context::graph_compute(
     // fprintf(stderr, "splits: %d\n", ggml_backend_sched_get_n_splits(sched));
 
     return status;
+}
+
+void llama_context::share_compute_init(const llama_context_params & params) {
+    sched_buft = backend_buft;
+
+    // LLAMA_DRAFT_SHARE_COMPUTE=1: a drafting context (an MTP context or a draft model's context, both with ctx_other)
+    // computes in the compute buffers of its target; the target makes the shared buffer types. LLAMA_MTP_SHARE_COMPUTE
+    // is an alias; the canonical name wins when both are set.
+    const char * canon = getenv("LLAMA_DRAFT_SHARE_COMPUTE");
+    const char * alias = getenv("LLAMA_MTP_SHARE_COMPUTE");
+    const bool has_canon = canon != nullptr && *canon != '\0';
+    const bool has_alias = alias != nullptr && *alias != '\0';
+    const bool share = has_canon ? atoi(canon) != 0 : has_alias && atoi(alias) != 0;
+    {
+        static bool logged = false;   // once per process, not per context
+        if (!logged && has_canon && has_alias && (atoi(canon) != 0) != (atoi(alias) != 0)) {
+            LLAMA_LOG_WARN("%s: LLAMA_DRAFT_SHARE_COMPUTE=%s and its alias LLAMA_MTP_SHARE_COMPUTE=%s differ; "
+                    "LLAMA_DRAFT_SHARE_COMPUTE applies\n", __func__, canon, alias);
+            logged = true;
+        } else if (!logged && !has_canon && share) {
+            LLAMA_LOG_INFO("%s: LLAMA_MTP_SHARE_COMPUTE is an alias of LLAMA_DRAFT_SHARE_COMPUTE\n", __func__);
+            logged = true;
+        }
+    }
+    if (!share || cparams.pipeline_parallel) {
+        return;
+    }
+
+    const bool is_mtp   = params.ctx_type == LLAMA_CONTEXT_TYPE_MTP;
+    const bool is_draft = !is_mtp && params.ctx_other != nullptr;
+    llama_context * peer = is_mtp || is_draft ? params.ctx_other : nullptr;
+    if (is_mtp && peer == nullptr) {
+        return;
+    }
+    if (is_draft && peer->expert_iface != nullptr && expert_iface == nullptr) {
+        // ranma expert cache: a draft outside the target's cache would not take back what the cache lends from the
+        // shared buffer (RANMA_EXPERT_UB_POOL); not supported
+        LLAMA_LOG_WARN("%s: LLAMA_DRAFT_SHARE_COMPUTE: the target has an expert cache and the draft is not in it; "
+                "the draft keeps its own compute buffers\n", __func__);
+        return;
+    }
+
+    for (size_t i = 0; i < backend_ptrs.size(); ++i) {
+        const auto type = ggml_backend_dev_type(ggml_backend_get_device(backend_ptrs[i]));
+        if (type != GGML_BACKEND_DEVICE_TYPE_GPU && type != GGML_BACKEND_DEVICE_TYPE_IGPU) {
+            continue;
+        }
+        ggml_backend_buffer_type_t base   = backend_buft[i];
+        ggml_backend_buffer_type_t shared = nullptr;
+        if (peer != nullptr) {
+            // the drafting context shares the buffer type its target made for the same base
+            for (const auto & entry : peer->share_buft) {
+                if (entry.first == base) {
+                    shared = entry.second;
+                }
+            }
+            if (shared == nullptr) {
+                continue;
+            }
+            ggml_backend_shared_buft_retain(shared);
+        } else {
+            shared = ggml_backend_shared_buft_new(base);
+        }
+        share_buft.emplace_back(base, shared);
+        sched_buft[i] = shared;
+    }
+
+    if (peer != nullptr && !share_buft.empty()) {
+        share_peers.push_back(peer);
+        peer->share_peers.push_back(this);
+        if (is_mtp) {
+            LLAMA_LOG_INFO("%s: the MTP context computes in the compute buffers of its target context (LLAMA_DRAFT_SHARE_COMPUTE)\n", __func__);
+        } else {
+            LLAMA_LOG_INFO("%s: the draft context computes in the compute buffers of its target context (LLAMA_DRAFT_SHARE_COMPUTE)\n", __func__);
+        }
+    }
+}
+
+void llama_context::share_compute_release() {
+    for (llama_context * peer : share_peers) {
+        auto & back = peer->share_peers;
+        back.erase(std::remove(back.begin(), back.end(), this), back.end());
+    }
+    share_peers.clear();
+    // the scheduler frees its buffers after this; a shared allocation lives until its last view is freed
+    for (const auto & entry : share_buft) {
+        ggml_backend_shared_buft_release(entry.second);
+    }
+    share_buft.clear();
+}
+
+void llama_context::share_compute_wait() {
+    for (llama_context * peer : share_peers) {
+        for (size_t i = 0; i < peer->backend_ptrs.size(); ++i) {
+            if (peer->sched_buft[i] != peer->backend_buft[i]) {
+                ggml_backend_synchronize(peer->backend_ptrs[i]);
+            }
+        }
+    }
 }
 
 bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor * src, ggml_tensor * dst, ggml_cgraph * graph, void * user_data) {
