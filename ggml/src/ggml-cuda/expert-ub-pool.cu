@@ -29,6 +29,7 @@ ub_pool_config ub_pool_config_from_env() {
     c.r_cap     = std::min(std::max(ub_env_int("RANMA_EXPERT_UB_POOL_RCAP", c.r_cap), 1), ub_pool_max_rcap);
     c.rows      = std::max(ub_env_int("RANMA_EXPERT_UB_POOL_ROWS", 0), 0);
     c.log       = ub_env_int("RANMA_EXPERT_UB_POOL_LOG", 0) != 0;
+    c.ring      = ub_env_int("RANMA_EXPERT_UB_POOL_RING", 0) != 0;
     if (const char * f = getenv("RANMA_EXPERT_UB_POOL_FILTER"); f != nullptr && *f != '\0') {
         const std::string s = f;
         const int k = s.rfind("ghost:", 0) == 0 ? atoi(s.c_str() + 6) : -1;
@@ -65,7 +66,27 @@ struct ub_step_args {
     uint64_t pos_bytes;
     ub_pf_dev pf;            // prefetch staging (pf_on)
     int pf_on;
+    int32_t * ringpos;       // [P] ring admission (enable_ring), else null
+    uint32_t * ringbits;     // [L][words] device copy
+    uint32_t * ringbits_host;   // [L][words] mapped host memory (device address)
+    int words;
 };
+
+// ring admission: the layer's bitmap of positions admitted from the ring, into both copies (after the layer's
+// positions changed; every thread of the block calls it, after a barrier)
+static __device__ void ub_ring_bits(const ub_step_args & a, const int16_t * pos_of, const int off, const int r) {
+    for (int w = threadIdx.x; w < a.words; w += blockDim.x) {
+        uint32_t m = 0;
+        for (int b = 0; b < 32; ++b) {
+            const int e = w*32 + b;
+            const int p = e < a.n_experts ? pos_of[e] : -1;
+            m |= (p >= 0 && p < r && a.ringpos[off + p] != 0) ? 1u << b : 0u;
+        }
+        a.ringbits[size_t(a.layer)*a.words + w] = m;
+        a.ringbits_host[size_t(a.layer)*a.words + w] = m;
+    }
+    __threadfence_system();
+}
 
 // The admission rule of the step kernel, for an expert not in a position: not an L1
 // resident, not one the SSD worker serves, and with a host home.
@@ -79,6 +100,20 @@ static __device__ __forceinline__ bool ub_admissible(const ub_pool_layer & L, co
     if (L.kind[0].host_slots != nullptr && L.kind[0].addresses != nullptr && L.kind[0].addresses[id] == 0 &&
             L.kind[0].host_slots[id] < 0) {
         return false;   // no host home
+    }
+    return true;
+}
+
+// Ring admission: a miss the SSD worker serves whose three table entries name a ring slot (not 0). An L1 resident
+// or a file resident (entries 0) is not admitted.
+static __device__ __forceinline__ bool ub_ring_admissible(const ub_pool_layer & L, const int id) {
+    if (L.slots[id] >= 0 || L.serve == nullptr || (L.serve[id/32] & (1u << (id%32))) == 0) {
+        return false;
+    }
+    for (int k = 0; k < 3; ++k) {
+        if (L.kind[k].addresses == nullptr || L.kind[k].addresses[id] == 0) {
+            return false;
+        }
     }
     return true;
 }
@@ -206,6 +241,9 @@ static __global__ void __launch_bounds__(ub_pool_threads) ub_step_kernel(const u
     __shared__ int32_t s_pf_owner[ub_pf_max_slots];
     __shared__ uint32_t s_pf_expect, s_pf_arrived, s_pf_taken;
     __shared__ int s_pf_set;
+    __shared__ int s_ring_on;                            // ring admission in this lend
+    __shared__ uint8_t s_viaring[ub_pool_max_experts];  // ring admission: the miss is a ring occupant
+    __shared__ unsigned int s_ring_fills;
 
     const int tid = threadIdx.x;
     const int E   = a.n_experts;
@@ -223,6 +261,8 @@ static __global__ void __launch_bounds__(ub_pool_threads) ub_step_kernel(const u
         s_n_miss = 0;
         s_n_victims = 0;
         s_hits = s_over = s_fills = s_evict = s_rejected = 0;
+        s_ring_fills = 0;
+        s_ring_on = a.ringpos != nullptr && m.ring != 0 && s_r > 0;
         s_pf_arrived = s_pf_taken = 0;
         s_pf_set = 0;
         s_pf_expect = 0;
@@ -268,7 +308,9 @@ static __global__ void __launch_bounds__(ub_pool_threads) ub_step_kernel(const u
         s_key[e] = -1;
         s_missed[e] = 0;
         s_pfidx[e] = -1;
+        s_viaring[e] = 0;
     }
+    const bool ring_on = s_ring_on != 0;
     __syncthreads();
     const bool pf_on = a.pf_on && !a.pf.inplace && s_pf_arrived != 0;
     if (pf_on) {
@@ -299,9 +341,13 @@ static __global__ void __launch_bounds__(ub_pool_threads) ub_step_kernel(const u
         if (L.slots[id] >= 0) {
             continue;   // static: not a miss
         }
+        bool via_ring = false;
         if (!a.admit || !ub_admissible(L, id)) {
-            if (ghost) { s_missed[id] = 1; }
-            continue;
+            if (!(ring_on && a.admit && ub_ring_admissible(L, id))) {
+                if (ghost) { s_missed[id] = 1; }
+                continue;
+            }
+            via_ring = true;
         }
         // a staged expert is admitted ahead of the other misses and without the admission filter
         const bool staged = pf_on && s_pfidx[id] >= 0;
@@ -312,6 +358,9 @@ static __global__ void __launch_bounds__(ub_pool_threads) ub_step_kernel(const u
                 continue;
             }
             s_missed[id] = 1;
+        }
+        if (via_ring) {
+            s_viaring[id] = 1;   // every selection of the expert in this launch agrees
         }
         // later rows first, then the first router slot of that row
         atomicMax(&s_key[id], (staged ? 0x40000000 : 0) + row*a.n_used + (a.n_used - 1 - k));
@@ -351,7 +400,7 @@ static __global__ void __launch_bounds__(ub_pool_threads) ub_step_kernel(const u
         }
         __syncthreads();
         const int n_fill = min(n_miss, s_n_victims);
-        unsigned int fills = 0, over = 0, evict = 0;
+        unsigned int fills = 0, over = 0, evict = 0, ring_fills = 0;
         for (int j = tid; j < n_miss; j += blockDim.x) {
             const int key = s_miss_key[j];
             int rank = 0;
@@ -367,10 +416,12 @@ static __global__ void __launch_bounds__(ub_pool_threads) ub_step_kernel(const u
             const int e = s_miss[j];
             const int old = a.owner[q];
             if (old >= 0) {
-                // the old owner is not used by this launch, and the previous launch is complete
+                // the old owner is not used by this launch, and the previous launch is complete; an owner from the
+                // ring gets 0 (its saved slot may hold another expert by now), and the worker publishes it again
+                const bool old_ring = ring_on && a.ringpos[q] != 0;
                 for (int kind = 0; kind < 3; ++kind) {
                     if (L.kind[kind].addresses != nullptr) {
-                        L.kind[kind].addresses[old] = a.home[size_t(q)*3 + kind];
+                        L.kind[kind].addresses[old] = old_ring ? 0 : a.home[size_t(q)*3 + kind];
                     }
                 }
                 pos_of[old] = -1;
@@ -389,6 +440,10 @@ static __global__ void __launch_bounds__(ub_pool_threads) ub_step_kernel(const u
             if (a.pf_on && a.pf.inplace) {
                 a.pf.pdown[q] = 0;
             }
+            if (ring_on) {
+                a.ringpos[q] = s_viaring[e];
+                ring_fills += s_viaring[e];
+            }
             const int pj = pf_on ? (int) s_pfidx[e] : -1;
             a.copy[off + rank] = { e, q, pj >= 0 ? s_pf_set*a.pf.slots + pj : -1 };
             if (pj >= 0) {
@@ -402,10 +457,15 @@ static __global__ void __launch_bounds__(ub_pool_threads) ub_step_kernel(const u
         if (fills) { atomicAdd(&s_fills, fills); }
         if (over)  { atomicAdd(&s_over, over); }
         if (evict) { atomicAdd(&s_evict, evict); }
+        if (ring_fills) { atomicAdd(&s_ring_fills, ring_fills); }
     }
     // the tables may be mapped host memory, which the next kernels read
     __threadfence_system();
     __syncthreads();
+    if (ring_on && s_fills != 0) {
+        // the positions changed: the tier's publish kernel (next on the stream) and the worker see the new set
+        ub_ring_bits(a, pos_of, off, r);
+    }
     if (ghost) {
         // the misses of this step, stamped after its decisions, so that a miss never admits itself
         for (int e = tid; e < E; e += blockDim.x) {
@@ -457,6 +517,7 @@ static __global__ void __launch_bounds__(ub_pool_threads) ub_step_kernel(const u
         if (s_over)  { atomicAdd(&a.counters[ub_pool_over], (unsigned long long) s_over); }
         if (s_evict) { atomicAdd(&a.counters[ub_pool_evictions], (unsigned long long) s_evict); }
         if (s_rejected) { atomicAdd(&a.counters[ub_pool_rejected], (unsigned long long) s_rejected); }
+        if (s_ring_fills) { atomicAdd(&a.counters[ub_pool_ring_fills], (unsigned long long) s_ring_fills); }
         if ((s_hits || s_fills) && a.live != nullptr) {
             // the layer's own totals: only this layer's launches write them, in stream order
             ub_pool_meta & m = a.meta[a.layer];
@@ -537,6 +598,7 @@ static __global__ void __launch_bounds__(ub_pool_threads) ub_publish_inplace_ker
     __shared__ int32_t s_pick[ub_pf_max_slots];
     __shared__ unsigned long long s_best;
     __shared__ int s_r, s_off, s_n, s_b;
+    __shared__ int s_ring_changed;   // ring admission: a reservation evicted an owner from the ring
     __shared__ uint32_t s_t;
     const int tid = threadIdx.x;
     const int E = a.n_experts;
@@ -551,6 +613,7 @@ static __global__ void __launch_bounds__(ub_pool_threads) ub_publish_inplace_ker
         s_off = m.offset;
         s_t = m.step;
         s_n = 0;
+        s_ring_changed = 0;
         const int bucket = rows <= 1 ? 0 : rows <= 3 ? 1 : 2;
         int b = __hip_atomic_load(&pf.budget[a.layer*3 + bucket], __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
         s_b = s_r > 0 ? max(0, min(b, pf.slots)) : 0;
@@ -654,14 +717,20 @@ static __global__ void __launch_bounds__(ub_pool_threads) ub_publish_inplace_ker
         for (int j = 0; j < nn; ++j) {
             const int q = off + s_victim[j];
             const int old = a.owner[q];
+            const bool old_ring = a.ringpos != nullptr && old >= 0 && a.ringpos[q] != 0;
             if (old >= 0) {
-                // the old owner is not used before this layer's step, and its last launch is complete
+                // the old owner is not used before this layer's step, and its last launch is complete (one from the
+                // ring gets 0, see the step kernel)
                 for (int kind = 0; kind < 3; ++kind) {
                     if (L.kind[kind].addresses != nullptr) {
-                        L.kind[kind].addresses[old] = a.home[size_t(q)*3 + kind];
+                        L.kind[kind].addresses[old] = old_ring ? 0 : a.home[size_t(q)*3 + kind];
                     }
                 }
                 pos_of[old] = -1;
+            }
+            if (a.ringpos != nullptr) {
+                s_ring_changed |= old_ring ? 1 : 0;
+                a.ringpos[q] = 0;
             }
             a.owner[q] = ub_pending;
             pf.pend_e[q] = s_pick[j];
@@ -679,6 +748,12 @@ static __global__ void __launch_bounds__(ub_pool_threads) ub_publish_inplace_ker
         m.t_pub  = (uint64_t) wall_clock64();
         __threadfence_system();
         __hip_atomic_store(&m.gen, gen, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+    }
+    if (a.ringpos != nullptr) {
+        __syncthreads();
+        if (s_ring_changed) {
+            ub_ring_bits(a, pos_of, off, r);
+        }
     }
 }
 
@@ -719,6 +794,8 @@ struct ub_lend_args {
     const size_t * strides;   // [L][3]
     const size_t * tails;     // [L][3]
     int r;
+    int ring;                 // ring admission in this lend
+    int32_t * ringpos;        // [P] or null
 };
 
 // lend: the r positions of every enabled layer, empty, their tails zeroed. The step count is kept.
@@ -741,6 +818,9 @@ static __global__ void __launch_bounds__(ub_pool_threads) ub_lend_kernel(const u
         if (tid == 0) {
             a.owner[q] = -1;
             a.stamp[q] = 0;
+            if (a.ringpos != nullptr) {
+                a.ringpos[q] = 0;
+            }
         }
         for (int k = 0; k < 3; ++k) {
             char * tail = (char *) (uintptr_t) a.addr[size_t(q)*3 + k] + a.strides[size_t(layer)*3 + k];
@@ -753,6 +833,7 @@ static __global__ void __launch_bounds__(ub_pool_threads) ub_lend_kernel(const u
     if (tid == 0) {
         a.count[layer] = 0;
         m.r = r;
+        m.ring = a.ring;
     }
     // the tables may be mapped host memory, which the next kernels read
     __threadfence_system();
@@ -760,7 +841,8 @@ static __global__ void __launch_bounds__(ub_pool_threads) ub_lend_kernel(const u
 
 // reclaim: the entries of every owner back to their homes, then r = 0
 static __global__ void ub_reclaim_kernel(const ub_pool_layer * layers, ub_pool_meta * meta, const uint64_t * home,
-        int32_t * owner, int16_t * pos_of, int n_experts, uint32_t * pdown) {
+        int32_t * owner, int16_t * pos_of, int n_experts, uint32_t * pdown, int32_t * ringpos, uint32_t * ringbits,
+        uint32_t * ringbits_host, int words) {
     const int layer = blockIdx.x;
     ub_pool_meta & m = meta[layer];
     const int r = m.r;
@@ -771,17 +853,28 @@ static __global__ void ub_reclaim_kernel(const ub_pool_layer * layers, ub_pool_m
         if (pdown != nullptr) {
             pdown[q] = 0;
         }
+        // ring admission: an owner from the ring gets 0, not its saved slot (see the step kernel)
+        const bool from_ring = ringpos != nullptr && ringpos[q] != 0;
+        if (ringpos != nullptr) {
+            ringpos[q] = 0;
+        }
         if (e < 0) {
             owner[q] = -1;   // empty, or a pending prefetch (its copy finished before the reclaim)
             continue;
         }
         for (int k = 0; k < 3; ++k) {
             if (L.kind[k].addresses != nullptr) {
-                L.kind[k].addresses[e] = home[size_t(q)*3 + k];
+                L.kind[k].addresses[e] = from_ring ? 0 : home[size_t(q)*3 + k];
             }
         }
         pos_of[size_t(layer)*n_experts + e] = -1;
         owner[q] = -1;
+    }
+    if (ringbits != nullptr) {
+        for (int w = threadIdx.x; w < words; w += blockDim.x) {
+            ringbits[size_t(layer)*words + w] = 0;
+            ringbits_host[size_t(layer)*words + w] = 0;
+        }
     }
     __threadfence_system();
     __syncthreads();
@@ -808,6 +901,9 @@ ub_pool::~ub_pool() {
     if (h_pf_mail_ != nullptr) { (void) hipHostFree(h_pf_mail_); }
     if (h_pf_budget_ != nullptr) { (void) hipHostFree(h_pf_budget_); }
     if (pf_in_alloc_ != nullptr) { (void) cudaFree(pf_in_alloc_); }
+    if (d_ringpos_ != nullptr) { (void) cudaFree(d_ringpos_); }
+    if (d_ringbits_ != nullptr) { (void) cudaFree(d_ringbits_); }
+    if (h_ringbits_ != nullptr) { (void) hipHostFree(h_ringbits_); }
 }
 
 bool ub_pool::allocate(int device, const std::vector<ub_pool_layer> & layers,
@@ -948,6 +1044,8 @@ int ub_pool::lend(void * base, size_t bytes, cudaStream_t stream) {
     a.strides    = d_sizes_;
     a.tails      = d_sizes_ + size_t(n_layers_)*3;
     a.r          = r;
+    a.ring       = ring_ ? 1 : 0;
+    a.ringpos    = d_ringpos_;
     {
         const ggml_cuda_kernel_launch_params launch(dim3(n_layers_), dim3(ub_pool_threads), 0, stream);
         ggml_cuda_kernel_launch(ub_lend_kernel, launch, a);
@@ -967,7 +1065,8 @@ void ub_pool::reclaim(cudaStream_t stream) {
     ggml_cuda_set_device(device_);
     const ggml_cuda_kernel_launch_params launch(dim3(n_layers_), dim3(256), 0, stream);
     ggml_cuda_kernel_launch(ub_reclaim_kernel, launch, (const ub_pool_layer *) d_layers_, d_meta_, (const uint64_t *) d_home_,
-        d_owner_, d_pos_of_, n_experts_, pf_.inplace ? pf_.pdown : (uint32_t *) nullptr);
+        d_owner_, d_pos_of_, n_experts_, pf_.inplace ? pf_.pdown : (uint32_t *) nullptr, d_ringpos_, d_ringbits_,
+        d_ringbits_host_, (int) ring_words());
     r_ = 0;
     base_ = nullptr;
     lent_bytes_ = 0;
@@ -999,8 +1098,42 @@ void ub_pool::launch_step(int layer, const int32_t * ids, int n_rows, int row_st
     a.pos_bytes  = pos_bytes_[(size_t) layer];
     a.pf         = pf_;
     a.pf_on      = pf_.staging != nullptr ? 1 : 0;
+    a.ringpos       = d_ringpos_;
+    a.ringbits      = d_ringbits_;
+    a.ringbits_host = d_ringbits_host_;
+    a.words         = (int) ring_words();
     const ggml_cuda_kernel_launch_params launch(dim3(1), dim3(ub_pool_threads), 0, stream);
     ggml_cuda_kernel_launch(ub_step_kernel, launch, a);
+}
+
+bool ub_pool::enable_ring() {
+    if (blob_ == nullptr || ring_enabled()) {
+        return false;
+    }
+    const size_t P = size_t(n_layers_)*size_t(r_cap_), B = size_t(n_layers_)*ring_words()*sizeof(uint32_t);
+    ggml_cuda_set_device(device_);
+    int32_t * pos = nullptr;
+    uint32_t * bits = nullptr, * host = nullptr, * host_dev = nullptr;
+    bool ok = cudaMalloc((void **) &pos, P*sizeof(int32_t)) == cudaSuccess && cudaMalloc((void **) &bits, B) == cudaSuccess &&
+        hipHostMalloc((void **) &host, B, hipHostMallocMapped | hipHostMallocCoherent) == hipSuccess &&
+        hipHostGetDevicePointer((void **) &host_dev, host, 0) == hipSuccess;
+    if (!ok) {
+        (void) hipGetLastError();
+        if (pos != nullptr) { (void) cudaFree(pos); }
+        if (bits != nullptr) { (void) cudaFree(bits); }
+        if (host != nullptr) { (void) hipHostFree(host); }
+        return false;
+    }
+    CUDA_CHECK(cudaMemset(pos, 0, P*sizeof(int32_t)));
+    CUDA_CHECK(cudaMemset(bits, 0, B));
+    memset(host, 0, B);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    d_ringpos_       = pos;
+    d_ringbits_      = bits;
+    h_ringbits_      = host;
+    d_ringbits_host_ = host_dev;
+    ring_            = true;
+    return true;
 }
 
 void ub_pool::launch_copy(int layer, cudaStream_t stream) {
@@ -1122,6 +1255,10 @@ void ub_pool::launch_publish(int layer, const int32_t * ids, int n_rows, int row
     a.pos_of     = d_pos_of_;
     a.pf         = pf_;
     a.pf_on      = 1;
+    a.ringpos       = d_ringpos_;
+    a.ringbits      = d_ringbits_;
+    a.ringbits_host = d_ringbits_host_;
+    a.words         = (int) ring_words();
     const ggml_cuda_kernel_launch_params launch(dim3(1), dim3(ub_pool_threads), 0, stream);
     ggml_cuda_kernel_launch(ub_publish_inplace_kernel, launch, a, k);
 }
@@ -1196,6 +1333,10 @@ long ub_pool::verify(std::string & reason) const {
     CUDA_CHECK(cudaMemcpy(addr.data(), d_addr_, P*3*sizeof(uint64_t), cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaMemcpy(home.data(), d_home_, P*3*sizeof(uint64_t), cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaMemcpy(pos_of.data(), d_pos_of_, L*E*sizeof(int16_t), cudaMemcpyDeviceToHost));
+    std::vector<int32_t> ringpos(P, 0);
+    if (d_ringpos_ != nullptr) {
+        CUDA_CHECK(cudaMemcpy(ringpos.data(), d_ringpos_, P*sizeof(int32_t), cudaMemcpyDeviceToHost));
+    }
     long checked = 0;
     std::vector<char> a, b;
     for (size_t l = 0; l < L; ++l) {
@@ -1222,6 +1363,9 @@ long ub_pool::verify(std::string & reason) const {
                             ": the address table does not point at its position";
                         return -1;
                     }
+                }
+                if (ringpos[q] != 0) {
+                    continue;   // admitted from the ring: the slot it was copied from may hold another expert by now
                 }
                 const char * src = nullptr;
                 if (home[q*3 + k] != 0) {

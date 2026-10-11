@@ -1067,6 +1067,11 @@ public:
             if (ub_ && ub_->lent() && ub_owner_ == key) {
                 ub_reclaim_sync_locked("context freed");
             }
+            if (ub_last_cctx_ == key) {
+                ub_last_cctx_   = nullptr;
+                ub_last_stream_ = nullptr;
+            }
+            ub_ring_judged_.erase(std::remove(ub_ring_judged_.begin(), ub_ring_judged_.end(), key), ub_ring_judged_.end());
             return true;
         }
         if (state_ == state_t::unconfigured) {
@@ -1247,6 +1252,9 @@ public:
         }
         ggml_cuda_set_device(device_);
         cudaStream_t stream = cctx->stream();
+        if (ub_->ring()) {
+            ub_ring_order_locked(cctx, stream, base);
+        }
         if (ub_->lent()) {
             // an unknown buffer (null base) may be the lent one
             const bool same = base == nullptr || base == ub_lent_base_;
@@ -1267,25 +1275,35 @@ public:
             return true;
         }
         // Only the largest compute buffer lends: the target's, not the smaller one of a draft context that computes on
-        // its own (contexts that share one buffer, LLAMA_MTP_SHARE_COMPUTE, see views of different sizes at one base).
+        // its own (contexts that share one buffer, LLAMA_DRAFT_SHARE_COMPUTE, see views of different sizes at one base).
         // The decode high-water mark is kept per buffer.
         ub_max_size_ = std::max(ub_max_size_, size);
         ub_buf_base_ = base;
+        if (size >= ub_max_size_ && member_of(cctx) == ub_member_) {
+            ub_member_base_ = base;   // the buffer the pool lends from (ring admission: a joint member is judged against it)
+        }
         size_t & hwm = ub_hwm_of_[base];
         if (ub_hwm_of_.size() > 16) {
             ub_hwm_of_.clear();   // buffers come and go with the contexts; a forgotten mark is measured again
         }
-        if (n_tokens <= 0 || n_tokens > ub_rows_ || member_of(cctx) != ub_member_) {
+        if (n_tokens <= 0 || n_tokens > ub_rows_) {
             return true;
         }
+        // A small graph of any context counts for its buffer's mark: with shared compute buffers
+        // (LLAMA_DRAFT_SHARE_COMPUTE) a draft's decode graphs run in the target's buffer, and a
+        // lend above them is not taken back by every draft forward. Only the cached model's own contexts lend.
+        const bool lends = member_of(cctx) == ub_member_;
         ub_hwm_ = hwm;
         if (ub_cfg_.log && (ub_calls_ < 16 || extent > ub_hwm_)) {
-            GGML_LOG_INFO("expert cache: decode pool: a %d-row graph reaches %.1f MiB of the %.1f MiB compute buffer\n",
-                n_tokens, extent/1048576.0, size/1048576.0);
+            GGML_LOG_INFO("expert cache: decode pool: a %d-row graph%s reaches %.1f MiB of the %.1f MiB compute buffer\n",
+                n_tokens, lends ? "" : " of a draft", extent/1048576.0, size/1048576.0);
         }
         ++ub_calls_;
         ub_hwm_ = std::max(ub_hwm_, extent);
         ub_hwm_of_[base] = ub_hwm_;
+        if (!lends) {
+            return true;
+        }
         const size_t align = size_t(2) << 20;
         const size_t begin = (ub_hwm_ + std::max(ub_cfg_.margin, ub_hwm_/4) + align - 1)/align*align;
         if (size < ub_max_size_ || begin >= size || size - begin < ub_cfg_.min_bytes) {
@@ -1307,6 +1325,47 @@ public:
             }
         }
         return true;
+    }
+
+    // Ring admission (RANMA_EXPERT_UB_POOL_RING): a step copies from a ring slot that only the stream order protects
+    // (the worker serves only while that stream waits at a readiness). Each llama context computes on its own
+    // stream, and nothing orders the graphs of two contexts on the device, so before a graph of another context the
+    // previous context's stream is drained (normally already idle: its outputs were read).
+    // A context of a joint cache member (a draft model in the cache) is judged at its first graph with a known buffer:
+    // a graph at the base of the cached model's compute buffer runs in a view of it, which exists only with the shared
+    // buffer types (LLAMA_DRAFT_SHARE_COMPUTE), and those synchronize the other context's backend before every graph
+    // (llama_context::share_compute_wait), so the ring admission stays on. A graph elsewhere (no sharing) turns it off
+    // for good: the positions from the ring go back before that graph, and the next lends admit host residents only.
+    void ub_ring_order_locked(ggml_backend_cuda_context * cctx, cudaStream_t stream, const void * base) {
+        const int member = member_of(cctx);
+        // before the cached model computed, nothing is lent and there is nothing to judge against: the next graph is judged
+        if (member >= 0 && member != ub_member_ && base != nullptr && ub_member_base_ != nullptr &&
+                std::find(ub_ring_judged_.begin(), ub_ring_judged_.end(), (const void *) cctx) == ub_ring_judged_.end()) {
+            if (base == ub_member_base_) {
+                ub_ring_judged_.push_back(cctx);
+                GGML_LOG_INFO("expert cache: decode pool: RANMA_EXPERT_UB_POOL_RING stays on: the draft model's context "
+                              "computes in the target's compute buffer (shared, one context at a time)\n");
+            } else {
+                GGML_LOG_WARN("expert cache: decode pool: RANMA_EXPERT_UB_POOL_RING is off from now on: the draft model's "
+                              "context computes in its own compute buffer (set LLAMA_DRAFT_SHARE_COMPUTE=1 to share it)\n");
+                if (ub_->lent()) {
+                    if ((const void *) cctx != ub_owner_) {
+                        CUDA_CHECK(cudaStreamSynchronize(ub_stream_));
+                    }
+                    xp_pause_locked(stream);
+                    ub_reclaim_locked(stream, "ring admission off");
+                }
+                ub_->set_ring(false);
+                ub_last_cctx_   = nullptr;
+                ub_last_stream_ = nullptr;
+                return;
+            }
+        }
+        if (ub_last_cctx_ != nullptr && ub_last_cctx_ != (const void *) cctx && ub_last_stream_ != nullptr) {
+            CUDA_CHECK(cudaStreamSynchronize(ub_last_stream_));
+        }
+        ub_last_cctx_   = cctx;
+        ub_last_stream_ = stream;
     }
 
     int32_t compact_rows() const {
@@ -1372,13 +1431,17 @@ public:
         if (!ub_->read_counters(c)) {
             return;
         }
+        char ring_text[48] = "";
+        if (ub_->ring_enabled()) {
+            snprintf(ring_text, sizeof(ring_text), " ring_fills=%llu", (unsigned long long) c[ub_pool_ring_fills]);
+        }
         GGML_LOG_INFO("expert cache: decode pool counters (%s): lends=%llu reclaims=%llu steps=%llu hits=%llu fills=%llu "
-                      "(%.1f MiB) over=%llu evictions=%llu rejected=%llu prefetch_fills=%llu prefetch_arrived=%llu\n", why,
+                      "(%.1f MiB) over=%llu evictions=%llu rejected=%llu prefetch_fills=%llu prefetch_arrived=%llu%s\n", why,
             (unsigned long long) ub_lends_,
             (unsigned long long) ub_reclaims_, (unsigned long long) c[ub_pool_steps], (unsigned long long) c[ub_pool_hits],
             (unsigned long long) c[ub_pool_fills], c[ub_pool_fill_bytes]/1048576.0, (unsigned long long) c[ub_pool_over],
             (unsigned long long) c[ub_pool_evictions], (unsigned long long) c[ub_pool_rejected],
-            (unsigned long long) c[ub_pool_pf_fills], (unsigned long long) c[ub_pool_pf_arrived]);
+            (unsigned long long) c[ub_pool_pf_fills], (unsigned long long) c[ub_pool_pf_arrived], ring_text);
     }
 
     void allocate_ub_pool_locked() {
@@ -1472,6 +1535,23 @@ public:
         if (tier_) {
             tier_->set_served_only();
         }
+        if (ub_cfg_.ring) {
+            // ring admission (expert-ub-pool.cuh): only where the stream order alone protects the ring slot it copies
+            const char * why = nullptr;
+            if (!tier_) {
+                why = "there is no SSD tier";
+            } else if (hash_mode_.ssd) {
+                why = "RANMA_EXPERT_HASH_EARLY reads from the SSD while the graphs run";
+            } else if (!ub_->enable_ring()) {
+                why = "its state could not be allocated";
+            } else if (!tier_->set_pool_bits(ub_->ring_bits_host(), ub_->ring_bits_device(), ub_->ring_words())) {
+                ub_->set_ring(false);
+                why = "the tier's bitmap layout differs";
+            }
+            if (why != nullptr) {
+                GGML_LOG_WARN("expert cache: decode pool: RANMA_EXPERT_UB_POOL_RING=1 is off: %s\n", why);
+            }
+        }
         ub_member_ = 0;
         ub_rows_   = ub_cfg_.rows > 0 ? ub_cfg_.rows : (int) std::max<uint64_t>(cfg_.l2_decode_rows, 1);
         ub_on_.store(true, std::memory_order_release);
@@ -1483,7 +1563,8 @@ public:
         }
         GGML_LOG_INFO("expert cache: decode pool on: %d layers, up to %d positions each, launches of up to %d rows, "
                       "%zu KiB of state, admission filter %s%s%s\n", ub_n_layers_, ub_cfg_.r_cap, ub_rows_,
-            ub_->device_bytes()/1024, filter_text, own_tables ? ", own address tables" : "", "");
+            ub_->device_bytes()/1024, filter_text, own_tables ? ", own address tables" : "",
+            ub_->ring() ? ", ring occupants admitted" : "");
         xp_start_locked();
     }
 
@@ -2071,6 +2152,9 @@ public:
     void free_ub_pool_locked() {
         xp_stop_locked();
         ub_on_.store(false, std::memory_order_release);
+        if (tier_ && ub_ && ub_->ring_enabled()) {
+            tier_->set_pool_bits(nullptr, nullptr, ub_->ring_words());   // the worker must not read the freed bitmap
+        }
         ub_.reset();
         if (ub_tables_ != nullptr) {
             (void) cudaFree(ub_tables_);
@@ -4532,6 +4616,10 @@ private:
     uint64_t * ub_tables_ = nullptr;        // the pool's own address tables [layer][kind][expert], or null
     const void * ub_owner_ = nullptr;       // the compute context that lent its buffer
     cudaStream_t ub_stream_ = nullptr;      // its stream
+    const void * ub_last_cctx_ = nullptr;   // ring admission: the context of the last graph, and its stream
+    cudaStream_t ub_last_stream_ = nullptr;
+    const void * ub_member_base_ = nullptr;          // base of the cached model's largest compute buffer
+    std::vector<const void *> ub_ring_judged_;       // joint member contexts found computing in that buffer
     void * ub_buf_base_ = nullptr;          // the buffer of the last graph
     void * ub_lent_base_ = nullptr;         // the buffer the pool is lent from
     size_t ub_hwm_ = 0, ub_begin_ = 0;      // largest decode extent seen, start of the lent region (offsets)

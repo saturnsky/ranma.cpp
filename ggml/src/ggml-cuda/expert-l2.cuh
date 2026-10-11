@@ -214,6 +214,20 @@ public:
     // The decode pool (expert-ub-pool.cuh) owns the entries of the host residents it holds: from now on
     // the worker rewrites only the entries of the experts it serves, and the verification skips the rest.
     void set_served_only() { served_only_ = true; }
+    // The decode pool's ring admission (RANMA_EXPERT_UB_POOL_RING): a bitmap of the served experts a pool position
+    // holds, [layer*words + word], written by the GPU (mapped host memory `host`, its device copy `device`). While a
+    // bit is set the publish kernel leaves the expert out of the demand, and the worker neither publishes nor
+    // invalidates its entries; the pool writes 0 into them when it lets the expert go. False when `words` does not
+    // match. Without a call (the default) every path is the one without the pool's ring admission.
+    bool set_pool_bits(const uint32_t * host, const uint32_t * device, size_t words) {
+        if (words != bitmap_words()) {
+            return false;
+        }
+        std::lock_guard<std::mutex> lock(io_mutex_);
+        pool_bits_host_ = host;
+        pool_bits_dev_  = device;
+        return true;
+    }
     void publish_and_wait(int layer, const ggml_tensor * ids, cudaStream_t stream);
     // Staged service only: orders the kernel that reads `kind` of `layer` after that kind's reads.
     // A no-op for the first kind, which the route waits for, and for a layer routed unstaged.
@@ -366,6 +380,15 @@ private:
     bool verify_     = false;
     bool any_ssd_    = false;
     bool served_only_ = false;
+    const uint32_t * pool_bits_host_ = nullptr;   // set_pool_bits; null = no ring admission
+    const uint32_t * pool_bits_dev_  = nullptr;
+    bool pool_owned(int layer, int expert) const {
+        if (pool_bits_host_ == nullptr) {
+            return false;
+        }
+        const volatile uint32_t * w = pool_bits_host_ + (size_t) layer*bitmap_words() + size_t(expert/32);
+        return (*w & (1u << (expert%32))) != 0;
+    }
 
     l2_counters counters_;
     int clock_khz_ = 0, steady_khz_ = 0, first_layer_ = -1;

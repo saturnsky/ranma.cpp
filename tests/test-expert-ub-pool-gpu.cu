@@ -50,6 +50,7 @@ struct fixture {
     std::vector<uint64_t *> tables;        // [layer*3 + kind] address table (device pointer)
     std::vector<uint64_t *> tables_host;   // coherent host pointer (tier) or null
     std::vector<uint32_t *> serve_dev;     // [layer]
+    std::vector<uint32_t *> serve_host;    // [layer] (tier)
     std::vector<int32_t *> slots;          // [layer]
     std::vector<std::vector<uint64_t>> initial; // [layer*3 + kind]
     std::vector<uint32_t> ref;             // [kind][e] checksum of the home
@@ -103,6 +104,7 @@ static int build(fixture & f, bool tier, std::vector<ub_pool_layer> & layers, st
             sh[0] = 0; sh[1] = 0;
             for (int e = 36; e < 40; ++e) { sh[e/32] |= 1u << (e%32); }
             CUDA_CHECK(hipHostGetDevicePointer((void **) &serve, sh, 0));
+            f.serve_host.push_back(sh);
         }
         f.serve_dev.push_back(serve);
         layers[l].slots   = ds;
@@ -372,12 +374,124 @@ static int run_ghost(bool tier) {
     return 0;
 }
 
+// Ring admission (RANMA_EXPERT_UB_POOL_RING): experts 30..35 are ring occupants (served, their entries name ring slots
+// that hold their bytes), 36..39 file residents (served, entries 0).
+static int run_ring() {
+    fixture f;
+    std::vector<ub_pool_layer> layers;
+    std::vector<std::array<size_t, 3>> bytes, tails;
+    if (build(f, true, layers, bytes, tails)) { return 1; }
+    constexpr int R0 = 30, R1 = 36;
+    std::vector<char *> ring(3), ring_dev(3);
+    for (int k = 0; k < 3; ++k) {
+        CUDA_CHECK(hipHostMalloc((void **) &ring[k], (R1 - R0)*KIND_BYTES[k], hipHostMallocMapped));
+        CUDA_CHECK(hipHostGetDevicePointer((void **) &ring_dev[k], ring[k], 0));
+        for (int e = R0; e < R1; ++e) { memcpy(ring[k] + (e - R0)*KIND_BYTES[k], f.host[k] + e*KIND_BYTES[k], KIND_BYTES[k]); }
+    }
+    auto ring_addr = [&](int k, int e) { return (uint64_t) (uintptr_t) (ring_dev[k] + (e - R0)*KIND_BYTES[k]); };
+    auto publish_ring = [&](int l, int e) {   // what the worker publishes for a ring occupant
+        for (int k = 0; k < 3; ++k) { f.tables_host[l*3 + k][e] = ring_addr(k, e); }
+    };
+    for (int l = 0; l < L; ++l) {
+        for (int e = R0; e < R1; ++e) {
+            f.serve_host[l][e/32] |= 1u << (e%32);
+            publish_ring(l, e);
+        }
+    }
+    ub_pool pool(L, E, 8);
+    CHECK(pool.allocate(0, layers, bytes, tails));
+    CHECK(pool.enable_ring() && pool.ring() && pool.ring_words() == 2);
+    if (alloc_region(f)) { return 1; }
+    CHECK(pool.lend(f.region, f.region_bytes, 0) == 2);
+    auto bit = [&](int l, int e) {
+        CUDA_CHECK(hipDeviceSynchronize());
+        uint32_t dev[2];
+        CUDA_CHECK(hipMemcpy(dev, pool.ring_bits_device() + l*2, sizeof(dev), hipMemcpyDeviceToHost));
+        const bool h = (pool.ring_bits_host()[l*2 + e/32] & (1u << (e%32))) != 0;
+        const bool d = (dev[e/32] & (1u << (e%32))) != 0;
+        return h == d ? (h ? 1 : 0) : -1;   // -1: the two copies disagree
+    };
+    auto entries = [&](int l, int e, bool zero) {   // all three kinds 0, or all at the ring slot
+        for (int k = 0; k < 3; ++k) {
+            std::vector<uint64_t> t;
+            table_read(f, l, k, t);
+            if (t[e] != (zero ? 0 : ring_addr(k, e))) { return false; }
+        }
+        return true;
+    };
+    // ring occupants are admitted (their copy reads the ring slot), a file resident is not
+    if (launch(f, pool, 0, {{30, 31, 36, 1}})) { return 1; }
+    CHECK(counter(pool, ub_pool_fills) == 2 && counter(pool, ub_pool_ring_fills) == 2);
+    CHECK(pooled(f, pool, 0, 30) && pooled(f, pool, 0, 31) && !pooled(f, pool, 0, 36));
+    CHECK(bit(0, 30) == 1 && bit(0, 31) == 1 && bit(0, 36) == 0 && bit(2, 30) == 0);
+    // the ring reuses the slot of 30 meanwhile: the pooled copy is unaffected
+    for (int k = 0; k < 3; ++k) { memset(ring[k] + (30 - R0)*KIND_BYTES[k], 0x77, KIND_BYTES[k]); }
+    if (launch(f, pool, 0, {{30, 1, 2, 3}})) { return 1; }
+    CHECK(counter(pool, ub_pool_hits) == 1);
+    // evicted ring owners get 0 (not the saved slot), and leave the bitmap
+    if (launch(f, pool, 0, {{32, 33, 1, 2}})) { return 1; }
+    CHECK(entries(0, 30, true) && entries(0, 31, true) && pooled(f, pool, 0, 32) && pooled(f, pool, 0, 33));
+    CHECK(bit(0, 30) == 0 && bit(0, 31) == 0 && bit(0, 32) == 1 && bit(0, 33) == 1);
+    CHECK(counter(pool, ub_pool_ring_fills) == 4);
+    // host residents take the positions: the marks go, their eviction restores the home
+    if (launch(f, pool, 0, {{10, 11, 1, 2}})) { return 1; }
+    CHECK(entries(0, 32, true) && entries(0, 33, true) && bit(0, 32) == 0 && bit(0, 33) == 0);
+    CHECK(counter(pool, ub_pool_ring_fills) == 4);
+    if (launch(f, pool, 0, {{34, 10, 1, 2}})) { return 1; }
+    CHECK(pooled(f, pool, 0, 34) && pooled(f, pool, 0, 10) && !pooled(f, pool, 0, 11) && bit(0, 34) == 1);
+    CHECK(counter(pool, ub_pool_ring_fills) == 5);
+    {
+        std::vector<uint64_t> t;
+        table_read(f, 0, 1, t);
+        CHECK(t[11] == f.initial[0*3 + 1][11]);
+    }
+    std::string why;
+    const long checked = pool.verify(why);
+    if (checked < 0) { fprintf(stderr, "verify: %s\n", why.c_str()); }
+    CHECK(checked == 2);
+    // reclaim: the ring owner gets 0, the host resident its home, the bitmap is empty
+    pool.reclaim(0);
+    CUDA_CHECK(hipDeviceSynchronize());
+    CHECK(entries(0, 34, true) && bit(0, 34) == 0);
+    {
+        std::vector<uint64_t> t;
+        table_read(f, 0, 0, t);
+        CHECK(t[10] == f.initial[0*3 + 0][10]);
+    }
+    // the worker published 34 again; with the ring admission off a lend admits host residents only (the old rule)
+    publish_ring(0, 34);
+    pool.set_ring(false);
+    CHECK(pool.lend(f.region, f.region_bytes, 0) == 2);
+    const uint64_t fills = counter(pool, ub_pool_fills);
+    if (launch(f, pool, 0, {{34, 35, 12, 1}})) { return 1; }
+    CHECK(!pooled(f, pool, 0, 34) && !pooled(f, pool, 0, 35) && pooled(f, pool, 0, 12));
+    CHECK(counter(pool, ub_pool_fills) == fills + 1 && counter(pool, ub_pool_ring_fills) == 5 && bit(0, 34) == 0);
+    CHECK(entries(0, 34, false));
+    pool.reclaim(0);
+    CUDA_CHECK(hipDeviceSynchronize());
+    // on again: a ring occupant whose entries are 0 (the ring dropped it) is not admitted
+    pool.set_ring(true);
+    CHECK(pool.lend(f.region, f.region_bytes, 0) == 2);
+    for (int k = 0; k < 3; ++k) { f.tables_host[0*3 + k][35] = 0; }
+    if (launch(f, pool, 0, {{35, 34, 1, 2}})) { return 1; }
+    CHECK(!pooled(f, pool, 0, 35) && pooled(f, pool, 0, 34) && counter(pool, ub_pool_ring_fills) == 6);
+    CHECK(live_matches(pool));
+    pool.reclaim(0);
+    CUDA_CHECK(hipDeviceSynchronize());
+    CHECK(entries(0, 34, true) && bit(0, 34) == 0);
+    for (int k = 0; k < 3; ++k) { CUDA_CHECK(hipHostFree(ring[k])); }
+    printf("PASS: decode pool ring admission: ring occupants admitted and copied from the ring, file residents not, "
+           "the bitmap follows fills, evictions and the reclaim, ring owners go back as 0, off = host residents only\n");
+    return 0;
+}
+
 int main() {
     CUDA_CHECK(hipSetDevice(0));
     if (run(false)) { return 1; }
     if (run(true)) { return 1; }
     if (run_ghost(false)) { return 1; }
     if (run_ghost(true)) { return 1; }
+    if (run_ring()) { return 1; }
     printf("ALL PASS\n");
     return 0;
 }
