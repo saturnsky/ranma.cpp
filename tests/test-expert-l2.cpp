@@ -1,7 +1,7 @@
 // ranma: the staging ring ledger of the expert cache SSD tier (expert-l2-ledger.h), and for the
 // class layout the storage classes (expert-storage.h), the per-class slot ledger
-// (expert-l2-class-ledger.h), the host cut's per-layer file cap (expert-plan.h) and the relabel
-// install transaction (expert-l2-relabel.h).
+// (expert-l2-class-ledger.h) with its unified policy, the host cut's per-layer file cap (expert-plan.h)
+// and the relabel install transaction (expert-l2-relabel.h).
 //
 // Everything the ring decides is here: which expert gets which slot, when a slot may be reused,
 // how repeated demands retain slots and what a ring resize does. A mock read queue stands in
@@ -1075,6 +1075,323 @@ static int early_tests() {
     return 0;
 }
 
+// The unified policy of the class ledger (l2_unified_policy): the probation split, the insertion points,
+// the ghost, the prompt rule, dissolve, sink and adopt, against a slow reference that keeps each class
+// list as a plain vector.
+struct reference_unified {
+    struct slot_state {
+        int layer = -1, expert = -1;
+        uint32_t seq = 0;
+        bool unhit = false;
+    };
+    double q = 0.1;
+    uint32_t ghost = 32;
+    bool prompt_lru = false;
+    int experts = 0;
+    std::vector<int> layer_storage;
+    std::vector<std::vector<int>> order;          // [class] LRU end first
+    std::vector<std::vector<slot_state>> slots;   // [class][slot]
+    std::vector<uint32_t> done, step, last;
+    l2_unified_stats stats;
+
+    reference_unified(const std::vector<int> & storage, const std::vector<int> & n, int experts, double q, uint32_t ghost,
+            bool prompt_lru) : q(q), ghost(ghost), prompt_lru(prompt_lru), experts(experts), layer_storage(storage) {
+        order.resize(n.size());
+        slots.resize(n.size());
+        for (size_t s = 0; s < n.size(); ++s) {
+            slots[s].assign((size_t) n[s], {});
+            for (int i = 0; i < n[s]; ++i) { order[s].push_back(i); }
+        }
+        done.assign(storage.size(), 0u);
+        step.assign(storage.size(), 0u);
+        last.assign(storage.size()*(size_t) experts, 0u);
+    }
+    int slot_of(int layer, int expert) const {
+        const auto & row = slots[(size_t) layer_storage[(size_t) layer]];
+        for (size_t i = 0; i < row.size(); ++i) {
+            if (row[i].layer == layer && row[i].expert == expert) { return int(i); }
+        }
+        return -1;
+    }
+    bool reusable(const slot_state & st) const { return st.layer < 0 || int32_t(done[(size_t) st.layer] - st.seq) >= 0; }
+    void move(int s, int slot, l2_place where) {
+        auto & o = order[(size_t) s];
+        o.erase(std::find(o.begin(), o.end(), slot));
+        if (where == l2_place::lru) {
+            o.insert(o.begin(), slot);
+        } else if (where == l2_place::mru) {
+            o.push_back(slot);
+        } else {
+            const int n = (int) slots[(size_t) s].size();
+            const size_t p = (size_t) std::min(n, int(q*double(n) + 1e-9));
+            o.insert(o.begin() + (std::ptrdiff_t) std::min(p, o.size()), slot);
+        }
+    }
+    bool service(int layer, const std::vector<int> & wanted, uint32_t seq, bool prompt) {
+        const int s = layer_storage[(size_t) layer];
+        const bool ring_rule = prompt && !prompt_lru;
+        const uint32_t now = ring_rule ? step[(size_t) layer] : ++step[(size_t) layer];
+        std::set<int> pinned;
+        for (int e : wanted) {
+            const int slot = slot_of(layer, e);
+            if (slot >= 0) { pinned.insert(slot); }
+        }
+        for (int e : wanted) {
+            int slot = slot_of(layer, e);
+            auto & row = slots[(size_t) s];
+            if (slot >= 0) {
+                row[(size_t) slot].seq = seq;
+                ++stats.hits;
+                if (row[(size_t) slot].unhit && !ring_rule) { ++stats.probation_hits; row[(size_t) slot].unhit = false; }
+                if (!ring_rule) { move(s, slot, l2_place::mru); }
+                continue;
+            }
+            slot = -1;
+            for (int cand : order[(size_t) s]) {
+                if (!pinned.count(cand) && reusable(row[(size_t) cand])) { slot = cand; break; }
+            }
+            if (slot < 0) { return false; }
+            slot_state & st = row[(size_t) slot];
+            if (st.layer >= 0) {
+                ++stats.evictions;
+                stats.probation_evicted_unhit += st.unhit ? 1 : 0;
+            }
+            const uint32_t prev = last[(size_t) layer*(size_t) experts + (size_t) e];
+            const bool pass = !ring_rule && prev != 0 && int32_t(now - prev) > 0 && uint32_t(now - prev) <= ghost;
+            const l2_place where = ring_rule ? l2_place::lru : pass ? l2_place::mru : l2_place::probation;
+            st = {layer, e, seq, where == l2_place::probation};
+            ++stats.fills;
+            ++(where == l2_place::lru ? stats.prompt_fills : where == l2_place::mru ? stats.mru_fills : stats.probation_fills);
+            move(s, slot, where);
+            pinned.insert(slot);
+        }
+        if (!ring_rule) {
+            for (int e : wanted) { last[(size_t) layer*(size_t) experts + (size_t) e] = now; }
+        }
+        return true;
+    }
+    void sink(int s, int slot) {
+        slots[(size_t) s][(size_t) slot] = {};
+        move(s, slot, l2_place::lru);
+        ++stats.sunk;
+    }
+    void discard() {
+        for (size_t s = 0; s < slots.size(); ++s) {
+            for (auto & st : slots[s]) { st = {}; }
+            order[s].clear();
+            for (int i = 0; i < (int) slots[s].size(); ++i) { order[s].push_back(i); }
+        }
+    }
+};
+
+static bool same_stats(const l2_unified_stats & a, const l2_unified_stats & b) {
+    return a.hits == b.hits && a.fills == b.fills && a.mru_fills == b.mru_fills && a.probation_fills == b.probation_fills &&
+        a.prompt_fills == b.prompt_fills && a.probation_hits == b.probation_hits &&
+        a.probation_evicted_unhit == b.probation_evicted_unhit && a.evictions == b.evictions && a.sunk == b.sunk;
+}
+
+static int unified_tests() {
+    auto none = [](int, int) { return false; };
+    std::string why;
+    auto all_ring = [](int layers, int experts, const std::vector<int> & storage, const std::vector<int> & n) {
+        l2_class_ledger ledger;
+        ledger.reset(layers, experts, storage, n, 3);
+        for (size_t s = 0; s < n.size(); ++s) {
+            for (int i = 0; i < n[s]; ++i) { ledger.make_ring(int(s), i); }
+        }
+        return ledger;
+    };
+    l2_unified_policy policy;
+    policy.on = true; policy.probation = 0.10; policy.ghost = 4;
+    // ---- insertion points, ghost, hits ---------------------------------------------------------------
+    {
+        l2_class_ledger ledger = all_ring(2, 32, {0, 0}, {20});
+        ledger.set_unified(policy);
+        CHECK(ledger.unified() && ledger.probation_count(0) == 2 && ledger.check(why));
+        uint32_t g = 0;
+        auto serve = [&](std::vector<int> ids) {
+            ++g;
+            ledger.set_done(0, g - 1);
+            return ledger.service(0, ids, g, none);
+        };
+        // a first miss never passes its own ghost: it lands with exactly the probation share below it
+        auto first = serve({7});
+        const int s7 = ledger.slot_of(0, 7);
+        CHECK(first.ok && first.misses == 1 && s7 == 0 && ledger.order(0)[2] == s7 && ledger.check(why));
+        CHECK(ledger.unified_stats().probation_fills == 1 && ledger.unified_stats().mru_fills == 0);
+        // a hit goes to the most recently used end and counts as a probation hit once
+        CHECK(serve({7}).hits == 1 && ledger.order(0).back() == s7 && ledger.unified_stats().probation_hits == 1);
+        CHECK(serve({7}).hits == 1 && ledger.unified_stats().probation_hits == 1);
+        // a miss within K decode generations of the layer's last miss passes the ghost
+        CHECK(serve({9}).ok);
+        const int s9 = ledger.slot_of(0, 9);
+        CHECK(ledger.order(0)[2] == s9 && !ledger.sink(0, s9));   // leased until the layer is done
+        ledger.set_done(0, g);
+        CHECK(ledger.sink(0, s9) && ledger.order(0)[0] == s9 && ledger.slot_of(0, 9) < 0);
+        CHECK(serve({9}).misses == 1 && ledger.order(0).back() == ledger.slot_of(0, 9));
+        CHECK(ledger.unified_stats().mru_fills == 1 && ledger.check(why));
+        // ... and one older than K does not
+        ledger.set_done(0, g);
+        CHECK(ledger.sink(0, ledger.slot_of(0, 9)));
+        for (int i = 0; i < 5; ++i) { CHECK(serve({7}).ok); }
+        CHECK(serve({9}).misses == 1 && ledger.order(0)[2] == ledger.slot_of(0, 9) && ledger.check(why));
+        printf("PASS: unified policy: misses at the probation point, ghost passes at the MRU end, hits move up\n");
+    }
+    // ---- prompt rule ---------------------------------------------------------------------------------
+    for (bool prompt_lru : {false, true}) {
+        l2_unified_policy p = policy;
+        p.prompt_lru = prompt_lru;
+        l2_class_ledger ledger = all_ring(2, 32, {0, 0}, {20});
+        ledger.set_unified(p);
+        uint32_t g = 0;
+        auto serve = [&](std::vector<int> ids) {
+            ++g;
+            ledger.set_done(0, g - 1);
+            return ledger.service(0, ids, g, none);
+        };
+        CHECK(serve({3}).ok);
+        const std::vector<int> before = ledger.order(0);
+        ledger.set_prompt(true);
+        CHECK(serve({3, 11}).ok);
+        const int s11 = ledger.slot_of(0, 11);
+        if (!prompt_lru) {
+            // the hit stays where it was, the miss is the next to go, and no ghost step was taken
+            std::vector<int> expect = before;
+            expect.erase(std::find(expect.begin(), expect.end(), s11));
+            expect.insert(expect.begin(), s11);
+            CHECK(ledger.order(0) == expect && ledger.unified_stats().prompt_fills == 1);
+            ledger.set_prompt(false);
+            ledger.set_done(0, g);
+            CHECK(ledger.sink(0, s11) && serve({11}).misses == 1 && ledger.order(0)[2] == ledger.slot_of(0, 11));
+        } else {
+            CHECK(ledger.order(0).back() == ledger.slot_of(0, 3) && ledger.order(0)[2] == s11);
+            CHECK(ledger.unified_stats().prompt_fills == 0 && ledger.unified_stats().probation_fills == 2);
+        }
+        CHECK(ledger.check(why));
+    }
+    printf("PASS: unified policy: a prompt generation fills at the LRU end and moves no hit (or follows decode)\n");
+    // ---- dissolve, sink, adopt -----------------------------------------------------------------------
+    {
+        l2_class_ledger ledger;
+        ledger.reset(2, 16, {0, 0}, {8}, 3);
+        for (int e = 0; e < 4; ++e) { CHECK(ledger.set_resident(0, e, 0, e)); }
+        CHECK(ledger.set_resident(0, 4, -1, -1));
+        for (int slot = 5; slot < 8; ++slot) { CHECK(ledger.make_ring(0, slot)); }
+        l2_unified_policy p = policy;
+        p.probation = 0.25;
+        ledger.set_unified(p);
+        CHECK(ledger.probation_count(0) == 0 && ledger.check(why));
+        CHECK(ledger.dissolve([](int, int e) { return 10.0 - e; }) == 5);
+        CHECK((ledger.order(0) == std::vector<int>{4, 5, 6, 7, 3, 2, 1, 0}) && ledger.ring_count(0) == 8);
+        CHECK(ledger.probation_count(0) == 2 && ledger.slot_of(0, 0) == 0 && ledger.check(why));
+        CHECK(ledger.sink(0, 0) && ledger.order(0)[0] == 0 && ledger.slot_of(0, 0) < 0);
+        CHECK(ledger.adopt(0, 0, 0, 9, l2_place::probation) && ledger.order(0)[2] == 0 && ledger.slot_of(0, 9) == 0);
+        CHECK(!ledger.adopt(0, 0, 0, 10, l2_place::mru) && !ledger.adopt(0, 4, 0, 9, l2_place::mru) &&
+              !ledger.adopt(0, 4, 2, 1, l2_place::mru));
+        CHECK(ledger.adopt(0, 4, 1, 5, l2_place::mru) && ledger.order(0).back() == 4 && ledger.check(why));
+        // a leased slot is not sunk
+        CHECK(ledger.service(1, {5}, 1, none).hits == 1 && !ledger.sink(0, 4));
+        ledger.set_done(1, 1);
+        CHECK(ledger.sink(0, 4) && ledger.check(why));
+        // after a dissolve with the policy off, the same order and no split
+        l2_class_ledger off;
+        off.reset(2, 16, {0, 0}, {8}, 3);
+        for (int e = 0; e < 4; ++e) { CHECK(off.set_resident(0, e, 0, e)); }
+        CHECK(off.set_resident(0, 4, -1, -1));
+        for (int slot = 5; slot < 8; ++slot) { CHECK(off.make_ring(0, slot)); }
+        CHECK(off.dissolve([](int, int e) { return 10.0 - e; }) == 5);
+        CHECK((off.order(0) == std::vector<int>{4, 5, 6, 7, 3, 2, 1, 0}) && off.probation_count(0) == 0 && off.check(why));
+        printf("PASS: unified policy: residents dissolve into the rings in score order, sink and adopt\n");
+    }
+    // ---- the policy off is the plain ring, also after it was on --------------------------------------
+    {
+        const std::vector<int> storage = {0, 1, 0, 1};
+        l2_class_ledger plain = all_ring(4, 16, storage, {6, 7});
+        l2_class_ledger toggled = all_ring(4, 16, storage, {6, 7});
+        toggled.set_unified(policy);
+        toggled.set_unified(l2_unified_policy());
+        uint32_t rng = 4242u;
+        auto next = [&]() { rng = rng*1664525u + 1013904223u; return rng >> 8; };
+        std::vector<uint32_t> seq(4, 0u);
+        for (int step = 0; step < 2000; ++step) {
+            const int layer = int(next()%4);
+            for (int l = 0; l < 4; ++l) {
+                if (next()%2 == 0) { plain.set_done(l, seq[(size_t) l]); toggled.set_done(l, seq[(size_t) l]); }
+            }
+            std::vector<int> ids;
+            for (int i = 0, n = 1 + int(next()%4); i < n; ++i) { ids.push_back(int(next()%9)); }
+            const uint32_t g = ++seq[(size_t) layer];
+            const auto a = plain.service(layer, ids, g, none);
+            const auto b = toggled.service(layer, ids, g, none);
+            CHECK(a.ok == b.ok && a.hits == b.hits && a.misses == b.misses && a.reads.size() == b.reads.size());
+            for (size_t i = 0; i < a.reads.size(); ++i) { CHECK(a.reads[i].slot == b.reads[i].slot); }
+            if (!a.ok) { plain.discard(); toggled.discard(); }
+            CHECK(plain.order(0) == toggled.order(0) && plain.order(1) == toggled.order(1));
+        }
+        CHECK(!toggled.unified() && toggled.check(why));
+        printf("PASS: unified policy off: the ledger serves exactly as the plain ring\n");
+    }
+    // ---- random demands against the slow reference ---------------------------------------------------
+    {
+        const std::vector<int> storage = {0, 1, 0, 1};
+        const int experts = 24;
+        int runs = 0;
+        for (double q : {0.0, 0.1, 0.25}) for (uint32_t k : {1u, 4u, 32u}) for (bool prompt_lru : {false, true}) {
+            const std::vector<int> n = {10, 23};
+            l2_class_ledger ledger = all_ring(4, experts, storage, n);
+            l2_unified_policy p;
+            p.on = true; p.probation = q; p.ghost = k; p.prompt_lru = prompt_lru;
+            ledger.set_unified(p);
+            reference_unified ref(storage, n, experts, q, k, prompt_lru);
+            uint32_t rng = 99u + 7u*(uint32_t) runs;
+            auto next = [&]() { rng = rng*1664525u + 1013904223u; return rng >> 8; };
+            std::vector<uint32_t> seq(4, 0u);
+            int served = 0;
+            for (int step = 0; step < 3000; ++step) {
+                const int layer = int(next()%4);
+                const int s = storage[(size_t) layer];
+                for (int l = 0; l < 4; ++l) {
+                    if (next()%3 != 0) { ledger.set_done(l, seq[(size_t) l]); ref.done[(size_t) l] = seq[(size_t) l]; }
+                }
+                if (next()%17 == 0) {
+                    const int slot = int(next()%(uint32_t) n[(size_t) s]);
+                    const bool can = ref.reusable(ref.slots[(size_t) s][(size_t) slot]);
+                    CHECK(ledger.sink(s, slot) == can);
+                    if (can) { ref.sink(s, slot); }
+                }
+                const bool prompt = next()%5 == 0;
+                std::vector<int> ids, wanted;
+                std::vector<bool> seen((size_t) experts, false);
+                for (int i = 0, m = 1 + int(next()%(prompt ? 6u : 3u)); i < m; ++i) {
+                    const int e = next()%3 == 0 ? int(next()%experts) : int(next()%8);
+                    ids.push_back(e);
+                    if (!seen[(size_t) e]) { seen[(size_t) e] = true; wanted.push_back(e); }
+                }
+                const uint32_t g = ++seq[(size_t) layer];
+                ledger.set_prompt(prompt);
+                const bool ref_ok = ref.service(layer, wanted, g, prompt);
+                const auto got = ledger.service(layer, ids, g, none);
+                CHECK(got.ok == ref_ok);
+                if (!ref_ok) {
+                    ledger.discard();
+                    ref.discard();
+                } else {
+                    ++served;
+                }
+                CHECK(ledger.order(0) == ref.order[0] && ledger.order(1) == ref.order[1]);
+                for (int e : wanted) { CHECK(ledger.slot_of(layer, e) == (ref_ok ? ref.slot_of(layer, e) : -1)); }
+                if (step%97 == 0) { CHECK(ledger.check(why)); }
+            }
+            CHECK(served > 2000 && ledger.check(why) && same_stats(ledger.unified_stats(), ref.stats));
+            CHECK(ledger.unified_stats().probation_fills + ledger.unified_stats().mru_fills + ledger.unified_stats().prompt_fills ==
+                  ledger.unified_stats().fills);
+            ++runs;
+        }
+        printf("PASS: unified policy: %d random runs (probation share, ghost K, prompt rule) match the slow reference\n", runs);
+    }
+    return 0;
+}
+
 int main() {
     constexpr size_t mib = 1024*1024, stride = 4*mib;
     auto plan = plan_l2_ring(512, 8, 512, 1, stride, 0, 0, true);
@@ -1245,6 +1562,7 @@ int main() {
     CHECK(class_ledger_tests() == 0);
     CHECK(relabel_install_tests() == 0);
     CHECK(early_tests() == 0);
+    CHECK(unified_tests() == 0);
     printf("OK\n");
     return 0;
 }
