@@ -193,7 +193,7 @@ struct common_spec_tconf {
     double G[DIM] = {};
     double lr = 0.15;
 
-    void   reset(int32_t k, bool block = false); // the static coefficients of k (block: of the block drafter)
+    void   reset(int32_t k);  // the static coefficients of k
     double q(const double * x) const;
     void   update(const double * X, const double * lab, int32_t n); // n rows of DIM
     // n[s], N[s]: the count of the candidate and the observations of the context per source

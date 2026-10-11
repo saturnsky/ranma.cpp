@@ -218,9 +218,13 @@ sees what the request itself has written so far. It scores one drafter candidate
   drafter's top one. The candidates are already on the host (the draft sampler's top 10), so no transfer is added.
   With probabilistic drafting (`--spec-draft-sampling probabilistic`) the sampled token is kept and only its q is
   computed (provisional: whether to draw from the calibrated candidates instead is open).
-- **Learning.** The coefficients start at a static fit for k (constants in the source: GLM-5.3-Flash MTP logs of
-  roleplay in Japanese, English and Chinese and of code at temperature 0, the request's tokens split by role; the k
-  candidates of every verified position; the profile columns 0) and follow every verified position by AdaGrad
+- **Learning.** The coefficients start at a static fit for k (constants in the source; the profile columns 0). For
+  k = 1 it is one set for every model and drafter, fit on the pooled logs of five pairs (GLM-5.3-Flash, DS4F,
+  Qwen3.8-Flash-Next and Gemma4-31B with MTP, DS4F with DSpark). A fixed set does not carry over to a pair it was not
+  fit on, but the online fit started from the set of the other pairs ends within 0.001 nats per position of the
+  per-pair fit after about one request, so no per-pair start is kept. For k >= 2 the start is a fit on the top-k
+  candidates of GLM-5.3-Flash MTP logs (roleplay ja / en / zh and code at temperature 0, the request's tokens split by
+  role). The coefficients follow every verified position by AdaGrad
   (learning rate 0.15), with the labels of the same k candidates: 1 for the target's token, 0 for the others. The sum
   of squared gradients of AdaGrad halves every 4096 updates, so that the step stays near 0.15 / 77 instead of going to
   0, and coefficients kept for a long time still follow a change of task. An accepted position is learnt when the
@@ -411,8 +415,7 @@ probability). So there is no "one more step": the controller decides twice per r
 - **Trigram confidence** (always on). The trigram context is the real token stream: the
   prompt, the generated tokens and the drafted prefix of the block. The input p of the model is the confidence of the
   position; a candidate below the top one gets the confidence scaled by its drafter probability relative to the top
-  one. The coefficients start at a fit on DSpark logs (DS4F, roleplay ko / en and code: request-split log-loss 0.447 /
-  0.462 against 0.454 / 0.463 of the raw confidence; the `draft-mtp` start would give 0.56).
+  one. The coefficients start at the same static set as `draft-mtp` (see "Learning" above) and are learnt online.
   One coefficient set is shared by all positions (an offline comparison found no gain from one set per position
   group: A shared 0.4474 / 0.4614, B per position 0.4479 / 0.4624).
 - **Another candidate** (not used by the server, which scores one candidate): only at the last verified position k - 1. The Markov head of
