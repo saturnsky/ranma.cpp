@@ -4475,7 +4475,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "draft-mtp: choose the draft length at every step from the measured verification time per width and the "
         "calibrated acceptance of the draft probabilities, up to --spec-draft-n-max (default without it: 7); "
         "--no-spec-smart, or giving --spec-draft-p-min or --spec-draft-p-continue, uses the fixed thresholds instead "
-        "(default: enabled)",
+        "(default: enabled); draft-dspark (default: enabled): choose per round whether to draft and how many tokens of "
+        "the block to verify, from the confidence head",
         [](common_params & params, bool value) {
             params.speculative.draft.smart = value;
             params.speculative.draft.smart_explicit = true;
