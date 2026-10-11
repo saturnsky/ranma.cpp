@@ -3566,6 +3566,277 @@ static int test_tprof() {
     return 0;
 }
 
+//
+// block drafter (draft-dspark): the width of a drafted block, the decision to draft before the forward, the position
+// groups of the calibration, the store, the trigram confidence per position and the option rules
+//
+
+static common_spec_smart_config block_cfg() {
+    common_spec_smart_config c;
+    c.n_max    = 4;
+    c.block    = true;
+    c.n_groups = 4;
+    return c;
+}
+
+// q = p exactly in all four position groups
+static void set_identity_groups(common_spec_smart & s) {
+    for (int g = 0; g < s.n_groups; ++g) {
+        for (int b = 0; b < s.cfg.n_bins; ++b) {
+            s.cal_cells[(size_t) g * s.cfg.n_bins + b] = { (b + 0.5) / s.cfg.n_bins, 1e9 };
+        }
+    }
+}
+
+// the best width by enumeration: (expected accepted + 1) / (D + C[k]), the last verified position with ql
+static int ref_block_k(const std::vector<double> & q, const std::vector<double> & ql, int n_lim, double D,
+                       const std::vector<double> & C) {
+    int best_k = 0;
+    double best = -1.0;
+    for (int k = 0; k <= std::min<int>((int) q.size(), n_lim); ++k) {
+        double A = 0.0;
+        for (int m = 1; m <= k; ++m) {
+            double P = 1.0;
+            for (int j = 0; j < m; ++j) {
+                P *= (j == k - 1) ? ql[j] : q[j];
+            }
+            A += P;
+        }
+        const double T = (A + 1.0) / std::max(D + C[k], 1.0);
+        if (T > best) {
+            best = T;
+            best_k = k;
+        }
+    }
+    return best_k;
+}
+
+static int test_block() {
+    // 1. the width of a drafted block against the enumeration, with and without the last-position q
+    {
+        common_spec_smart s(block_cfg(), 1);
+        CHECK(s.n_groups == 4 && s.cal_cells.size() == (size_t) 4 * s.cfg.n_bins);
+        set_identity_groups(s);
+        std::mt19937 rng(7);
+        std::uniform_real_distribution<double> U(0.02, 0.98);
+        for (int it = 0; it < 2000; ++it) {
+            std::vector<double> C(5);
+            C[0] = 30000.0 + 30000.0 * U(rng);
+            for (int k = 1; k <= 4; ++k) {
+                C[k] = C[k - 1] + 40000.0 * U(rng);
+            }
+            const double D = (it % 2) ? 0.0 : 30000.0 * U(rng);
+            std::vector<double> qd(4), ql(4);
+            for (int j = 0; j < 4; ++j) {
+                qd[j] = U(rng);
+                ql[j] = std::max(qd[j], U(rng));
+            }
+            const int n_lim = it % 5;
+            CHECK(s.decide_block(nullptr, 4, n_lim, D, C, nullptr, qd.data(), nullptr) == ref_block_k(qd, qd, n_lim, D, C));
+            CHECK(s.decide_block(nullptr, 4, n_lim, D, C, nullptr, qd.data(), ql.data()) == ref_block_k(qd, ql, n_lim, D, C));
+            // without the trigram confidence: q(j, p) of the cells (identity: the bin centre)
+            float p[4];
+            std::vector<double> qc(4);
+            for (int j = 0; j < 4; ++j) {
+                p[j]  = (float) qd[j];
+                qc[j] = s.q(j, p[j]);
+            }
+            CHECK(s.decide_block(p, 4, n_lim, D, C) == ref_block_k(qc, qc, n_lim, D, C));
+        }
+        // the measured DS4F costs (ms) and a confident block: the sunk draft makes the widest width pay
+        std::vector<double> C = { 45400, 73300, 97100, 116600, 141300 };
+        const double q4[4] = { 0.95, 0.95, 0.95, 0.95 };
+        CHECK(s.decide_block(nullptr, 4, 4, 0.0, C, nullptr, q4) == 4);
+        const double q0[4] = { 0.3, 0.9, 0.9, 0.9 };
+        CHECK(s.decide_block(nullptr, 4, 4, 0.0, C, nullptr, q0) == 0);
+    }
+
+    // 2. the decision to draft before the forward: weak blocks skip it, a probe after skip_probe skipped rounds, strong
+    //    blocks draft every round
+    {
+        auto cfg = block_cfg();
+        cfg.skip_probe = 4;
+        cfg.blk_keep = 8;
+        common_spec_smart s(cfg, 1);
+        set_identity_groups(s);
+        // costs: verification 45 / 73 / 97 / 117 / 141 ms, draft step 30 ms (the joint expert cache)
+        for (int k = 0; k <= 4; ++k) {
+            const double ms[] = { 45.4, 73.3, 97.1, 116.6, 141.3 };
+            s.observe_cost(k, ms[k] * 1000.0);
+            s.used_run[k] = 1;
+            s.cost_n_run[k] = 1;
+        }
+        s.add_draft_step(29800.0);
+        int64_t t = 0;
+        int32_t k_last = 0;
+        auto round = [&](const float * p, bool & drew) {
+            // the verification of the last round takes the time of its width (the costs stay as set)
+            const double ms[] = { 45.4, 73.3, 97.1, 116.6, 141.3 };
+            s.close_round(0, t += (int64_t) (ms[k_last] * 1000.0));
+            drew = s.begin_block(0, 4);
+            int32_t k = 0;
+            if (drew) {
+                k = s.block_drafted(0, p, 4);
+                s.add_draft_step(29800.0);
+            }
+            k_last = k;
+            s.drafted(0, k, t += 1000);
+            if (k > 0) {
+                s.accepted(0, 0);
+            }
+            return k;
+        };
+        const float weak[4] = { 0.5f, 0.5f, 0.5f, 0.5f };
+        bool drew = false;
+        round(weak, drew);
+        CHECK(drew); // nothing kept yet: draft
+        int n_skip = 0;
+        for (int r = 0; r < 4; ++r) {
+            round(weak, drew);
+            n_skip += !drew;
+        }
+        CHECK(n_skip == 4);
+        round(weak, drew);
+        CHECK(drew && s.seqs[0].blk_probe); // the probe after 4 skipped rounds
+        // strong blocks: the probe keeps them, and once they fill the kept blocks every round drafts
+        const float strong[4] = { 0.99f, 0.99f, 0.99f, 0.99f };
+        int n_draw = 0;
+        for (int r = 0; r < 60; ++r) {
+            round(strong, drew);
+            n_draw += drew;
+        }
+        CHECK(n_draw >= 40);
+        for (int r = 0; r < 10; ++r) {
+            round(strong, drew);
+            CHECK(drew && !s.seqs[0].blk_probe);
+        }
+        // with a cheap draft step (the draft resident in VRAM) the medium blocks draft
+        common_spec_smart s2(cfg, 1);
+        set_identity_groups(s2);
+        for (int k = 0; k <= 4; ++k) {
+            const double ms[] = { 45.0, 76.2, 100.6, 120.7, 146.3 };
+            s2.observe_cost(k, ms[k] * 1000.0);
+            s2.used_run[k] = 1;
+            s2.cost_n_run[k] = 1;
+        }
+        s2.add_draft_step(4900.0);
+        const float mid[4] = { 0.85f, 0.8f, 0.8f, 0.8f };
+        s2.close_round(0, 1);
+        CHECK(s2.begin_block(0, 4));
+        CHECK(s2.block_drafted(0, mid, 4) >= 1);
+        s2.drafted(0, 1, 2);
+        s2.close_round(0, 50000);
+        CHECK(s2.begin_block(0, 4));
+        CHECK(s2.block_value(0, 4) > 1.0 / s2.cost(0));
+    }
+
+    // 3. the calibration of the four position groups takes the verified positions with the prefix accepted only
+    {
+        common_spec_smart s(block_cfg(), 1);
+        s.close_round(0, 1);
+        CHECK(s.begin_block(0, 4)); // nothing known: draft
+        const float p[4] = { 0.92f, 0.92f, 0.92f, 0.92f };
+        const int32_t k = s.block_drafted(0, p, 4);
+        CHECK(k == 0); // cold: frontier 0 (the extension needs reprobe_every closed rounds)
+        s.drafted(0, 3, 10); // the caller verifies 3 (as an extension would)
+        s.accepted(0, 1);
+        const int b = s.bin(0.92f);
+        auto cell = [&](int g) { return s.cal_cells[(size_t) g * s.cfg.n_bins + b]; };
+        CHECK(cell(0).n == 1.0 && cell(0).mean == 1.0); // accepted
+        CHECK(cell(1).n == 1.0 && cell(1).mean == 0.0); // the first rejected one
+        CHECK(cell(2).n == 0.0 && cell(3).n == 0.0);    // after a rejection, and not verified: not observed
+        s.close_round(0, 20);
+        CHECK(s.begin_block(0, 4) || true);
+        s.block_drafted(0, p, 4);
+        s.drafted(0, 4, 30);
+        s.accepted(0, 4);
+        CHECK(cell(3).n == 1.0 && cell(3).mean == 1.0); // position 3 has its own group
+    }
+
+    // 4. the store keeps the four groups; a store of draft-mtp (three groups) is not read
+    {
+        const std::string path = (std::filesystem::temp_directory_path() / "test-spec-smart-block.store").string();
+        auto cfg = block_cfg();
+        cfg.store_path = path;
+        cfg.store_key  = "k drafter=dspark";
+        {
+            common_spec_smart s(cfg, 1);
+            s.cal_cells[(size_t) 3 * s.cfg.n_bins + 5] = { 0.42, 7.0 };
+            s.observe_cost(0, 45000.0);
+            CHECK(s.save(path));
+        }
+        {
+            common_spec_smart s(cfg, 1);
+            CHECK(s.store_loaded);
+            CHECK(s.cal_cells[(size_t) 3 * s.cfg.n_bins + 5].mean == 0.42);
+        }
+        {
+            common_spec_smart_config m;
+            m.n_max = 4;
+            m.store_key = cfg.store_key;
+            common_spec_smart s(m, 1);
+            std::string why;
+            CHECK(!s.load(path, &why) && why == "another calibration layout");
+        }
+        std::filesystem::remove(path);
+    }
+
+    // 5. the trigram confidence: the last verified position takes the candidate with the highest q; one coefficient
+    //    set per position group with LLAMA_SPEC_DSPARK_TCONF_POS=per; the block drafter starts at its own fit
+    {
+        auto cfg = block_cfg();
+        cfg.tconf = true;
+        cfg.tconf_k = 2;
+        cfg.tconf_per_pos = true;
+        common_spec_smart s(cfg, 1);
+        CHECK(s.tc_n_models() == 4);
+        CHECK(std::fabs(s.tconf_model.b[1] - 1.014855) < 1e-9 && std::fabs(s.tc_model(3).b[1] - 1.014855) < 1e-9);
+        const std::vector<int32_t> toks = { 1, 2, 3, 4, 5 };
+        s.request_begin(0);
+        s.tconf_request(0, toks.data(), toks.size());
+        s.close_round(0, 1);
+        s.tconf_begin(0, toks.data(), toks.size(), 6, 5);
+        CHECK(s.begin_block(0, 4));
+        const int32_t ids0[2] = { 10, 11 }, ids1[2] = { 20, 21 };
+        const float   p0[2] = { 0.9f, 0.05f }, p1[2] = { 0.3f, 0.6f };
+        double q = 0.0, qa[2];
+        CHECK(s.tconf_pick(0, ids0, p0, 2, 0, &q, qa) == 0);
+        CHECK(s.tconf_pick(0, ids1, p1, 2, 0, &q, qa) == 0 && qa[1] > qa[0]); // the drafted (top) token
+        CHECK(s.seqs[0].tc_pos.size() == 2 && s.seqs[0].tc_pos[1].m == 1 && s.tc_invert == 0);
+        CHECK(s.tconf_repick(0, 1, ids1, p1, 2, &q) == 1 && std::fabs(q - qa[1]) < 1e-12);
+        CHECK(s.seqs[0].tc_pos.size() == 2 && s.seqs[0].tc_pos[1].chosen == 1 && s.tc_invert == 1);
+        CHECK(s.seqs[0].tc_ctx.back() == 21 && s.seqs[0].tc_ctx.size() == s.seqs[0].tc_ctx0 + 2);
+        const float pb[2] = { 0.9f, 0.3f };
+        const double qdb[2] = { 0.8, 0.4 };
+        s.block_drafted(0, pb, 2, qdb);
+        s.block_last(0, 1, 0.6f, qa[1]);
+        CHECK(s.seqs[0].p[1] == 0.6f && std::fabs(s.seqs[0].qd[1] - std::clamp(qa[1], 0.01, 0.99)) < 1e-12);
+        // learning goes to the set of the position: position 1 was rejected with the other candidate drafted
+        const double b0 = s.tc_model(0).b[0], b1 = s.tc_model(1).b[0];
+        s.drafted(0, 2, 10);
+        s.accepted(0, 1);
+        CHECK(s.tc_model(0).b[0] != b0 && s.tc_model(1).b[0] == b1); // position 0 learnt now, 1 waits for its target
+        s.tconf_begin(0, toks.data(), toks.size(), 20, 7);
+        CHECK(s.tc_model(1).b[0] != b1);
+    }
+
+    // 6. the option rules: draft-dspark only with --spec-smart given; a threshold turns it off
+    {
+        common_params p;
+        CHECK(parse_resolve({ "--spec-type", "draft-dspark" }, p));
+        CHECK(!p.speculative.draft.smart_on && p.speculative.draft.n_max == 3);
+        CHECK(parse_resolve({ "--spec-type", "draft-dspark", "--spec-smart" }, p));
+        CHECK(p.speculative.draft.smart_on && p.speculative.draft.n_max == 7); // no draft GGUF to read the block from
+        CHECK(parse_resolve({ "--spec-type", "draft-dspark", "--spec-smart", "--spec-draft-n-max", "4" }, p));
+        CHECK(p.speculative.draft.smart_on && p.speculative.draft.n_max == 4);
+        CHECK(parse_resolve({ "--spec-type", "draft-dspark", "--spec-smart", "--spec-draft-p-min", "0" }, p));
+        CHECK(!p.speculative.draft.smart_on);
+        CHECK(parse_resolve({ "--spec-type", "draft-dflash", "--spec-smart" }, p));
+        CHECK(!p.speculative.draft.smart_on);
+    }
+    return 0;
+}
+
 int main() {
     ggml_time_init(); // common_time_meas in the speculative hooks
 
@@ -3599,6 +3870,7 @@ int main() {
     if (test_resolve())         { return 1; }
     if (test_tconf())           { return 1; }
     if (test_tprof())           { return 1; }
+    if (test_block())           { return 1; }
     fprintf(stderr, "test-spec-smart: OK\n");
     return 0;
 }
