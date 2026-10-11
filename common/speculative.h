@@ -105,8 +105,9 @@ void common_speculative_draft(common_speculative * spec);
 void common_speculative_accept(common_speculative * spec, llama_seq_id, uint16_t n_accepted);
 
 // --spec-smart: decide whether the controller runs (sets params.draft.smart_on) before the contexts are sized. It runs
-// for draft-mtp unless --no-spec-smart was given; a --spec-draft-p-min or --spec-draft-p-continue given by the user
-// turns it off with a warning. Without --spec-draft-n-max the draft length bound becomes params.draft.smart_n_max.
+// for draft-mtp unless --no-spec-smart was given, and for draft-dspark when --spec-smart was given; a --spec-draft-p-min
+// or --spec-draft-p-continue given by the user turns it off with a warning. Without --spec-draft-n-max the draft length
+// bound becomes params.draft.smart_n_max (draft-dspark: the block of the draft model, read from its GGUF).
 void common_speculative_smart_resolve(common_params_speculative & params);
 
 // --spec-smart: the number of draft tokens the target accepted in the round it verified (after a checkpoint

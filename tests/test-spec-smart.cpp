@@ -3820,10 +3820,12 @@ static int test_block() {
         CHECK(s.tc_model(1).b[0] != b1);
     }
 
-    // 6. the option rules: draft-dspark only with --spec-smart given; a threshold turns it off
+    // 6. the option rules: draft-dspark on by default as for draft-mtp; --no-spec-smart or a threshold turns it off
     {
         common_params p;
         CHECK(parse_resolve({ "--spec-type", "draft-dspark" }, p));
+        CHECK(p.speculative.draft.smart_on && p.speculative.draft.n_max == 7); // no draft GGUF to read the block from
+        CHECK(parse_resolve({ "--spec-type", "draft-dspark", "--no-spec-smart" }, p));
         CHECK(!p.speculative.draft.smart_on && p.speculative.draft.n_max == 3);
         CHECK(parse_resolve({ "--spec-type", "draft-dspark", "--spec-smart" }, p));
         CHECK(p.speculative.draft.smart_on && p.speculative.draft.n_max == 7); // no draft GGUF to read the block from
