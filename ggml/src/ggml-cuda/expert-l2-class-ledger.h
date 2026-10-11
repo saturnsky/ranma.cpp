@@ -13,17 +13,49 @@
 // occupant of the same expert in place (the ring grows, nothing is read), and a ring slot can become
 // a resident (the ring shrinks; if the slot does not already hold that expert, the caller reads it).
 // A ring never shrinks below its floor.
+//
+// The unified policy (set_unified, off by default): every slot of a class is a ring slot once the
+// residents of the seed plan are dissolved into the rings (dissolve), and each class list is split
+// into a probation part at the least recently used end, a fixed share of the class's ring slots
+// (empty slots included), and a main part above it. A hit moves its slot to the most recently used
+// end. A miss of an expert that also missed in its layer within the last K decode generations (the
+// ghost) is filled at the most recently used end, any other miss at the bottom of the main part, so
+// that exactly the probation share of the list lies below it; a prompt generation fills at the least
+// recently used end and moves no hit, unless the policy says prompts follow the decode rules. Each
+// operation keeps the split with O(1) moves. Off, none of this state exists and every path is the
+// one above.
 
 #include "expert-l2-ledger.h"
 
 #include <algorithm>
 #include <cstdint>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace ggml_cuda_expert {
 
 enum class slot_role : uint8_t { free, resident, ring };
+
+// Where a slot goes in its class list: the most recently used end, the probation point (the bottom of
+// the main part) or the least recently used end.
+enum class l2_place : uint8_t { mru, probation, lru };
+
+// The unified host policy.
+struct l2_unified_policy {
+    bool     on         = false;
+    double   probation  = 0.10;   // share of each class list below the probation point, 0..0.5
+    uint32_t ghost      = 32;     // a miss within this many decode generations of its layer passes the ghost
+    bool     prompt_lru = false;  // prompt generations follow the decode rules; false: misses at the LRU end, hits stay
+};
+
+// Counts of the unified policy. Probation fills that were evicted before any hit are the immediate
+// evictions; probation hits are the probation fills that hit before their eviction.
+struct l2_unified_stats {
+    uint64_t hits = 0, fills = 0, mru_fills = 0, probation_fills = 0, prompt_fills = 0;
+    uint64_t probation_hits = 0, probation_evicted_unhit = 0, evictions = 0;
+    uint64_t sunk = 0, adopted = 0, dissolved = 0;
+};
 
 struct l2_relabel {
     bool ok   = false;
@@ -58,6 +90,105 @@ public:
         }
         done_.assign((size_t) std::max(layers, 0), 0u);
         map_.assign((size_t) std::max(layers, 0), std::vector<int32_t>((size_t) std::max(experts, 0), -1));
+        if (uni_.on) { unified_init(); }
+    }
+
+    // ---- the unified policy ----------------------------------------------------------------------
+    // Turns the policy on (or off) for the lists as they are: every listed slot starts in the main part,
+    // then each class's probation share is taken from its least recently used end.
+    void set_unified(const l2_unified_policy & policy) {
+        uni_ = policy;
+        uni_.probation = std::min(std::max(uni_.probation, 0.0), 0.5);
+        if (!uni_.on) {
+            in_p_.clear(); unhit_.clear(); pcount_.clear(); bnd_.clear(); last_miss_.clear(); step_.clear();
+            return;
+        }
+        unified_init();
+    }
+    bool unified() const { return uni_.on; }
+    const l2_unified_policy & unified_policy() const { return uni_; }
+    const l2_unified_stats & unified_stats() const { return ustats_; }
+    // The phase of the generations served from now on (unified policy only).
+    void set_prompt(bool prompt) { prompt_ = prompt; }
+    // Slots in the probation part of a class (unified policy only).
+    int probation_count(int s) const { return uni_.on ? pcount_[(size_t) s] : 0; }
+
+    // Every resident slot joins the ring of its class in place, with its expert if it has one, and
+    // each class list is laid out again: empty slots at the least recently used end, then the
+    // occupants from the lowest to the highest `score(layer, expert)`, ties in slot order. Only while
+    // nothing computes (every occupant is reusable at once). Returns the residents that joined.
+    template <typename Score>
+    int dissolve(Score score) {
+        int joined = 0;
+        for (int s = 0; s < storages(); ++s) {
+            std::vector<owner> & row = owners_[(size_t) s];
+            for (size_t slot = 0; slot < row.size(); ++slot) {
+                owner & o = row[slot];
+                if (o.role != slot_role::resident) { continue; }
+                o.role = slot_role::ring;
+                ++ring_count_[(size_t) s];
+                ++joined;
+                if (o.layer >= 0) {
+                    const int other = map_[(size_t) o.layer][(size_t) o.expert];
+                    if (other >= 0 && other != int(slot)) { empty(s, other); }
+                    map_[(size_t) o.layer][(size_t) o.expert] = int(slot);
+                }
+            }
+            std::vector<int> empties;
+            std::vector<std::pair<double, int>> held;
+            for (size_t slot = 0; slot < row.size(); ++slot) {
+                owner & o = row[slot];
+                if (o.role != slot_role::ring) { continue; }
+                if (o.layer < 0) {
+                    empties.push_back(int(slot));
+                } else {
+                    o.seq = done_[(size_t) o.layer];   // nothing computes
+                    held.push_back({double(score(o.layer, o.expert)), int(slot)});
+                }
+            }
+            std::stable_sort(held.begin(), held.end(),
+                [](const std::pair<double, int> & a, const std::pair<double, int> & b) { return a.first < b.first; });
+            head_[(size_t) s] = tail_[(size_t) s] = -1;
+            for (size_t slot = 0; slot < row.size(); ++slot) { prev_[(size_t) s][slot] = next_[(size_t) s][slot] = -1; }
+            if (uni_.on) { unified_clear_lists(s); }
+            for (int slot : empties) { link_tail(s, slot); }
+            for (const auto & item : held) { link_tail(s, item.second); }
+            if (uni_.on) { rebalance(s); }
+        }
+        ustats_.dissolved += (uint64_t) joined;
+        return joined;
+    }
+
+    // A ring slot that loses its occupant (e.g. promoted to VRAM by an install) goes to the least
+    // recently used end. Refused for a slot a pending generation still reads.
+    bool sink(int s, int slot) {
+        if (!valid_slot(s, slot) || owners_[(size_t) s][(size_t) slot].role != slot_role::ring ||
+                !reusable(owners_[(size_t) s][(size_t) slot])) {
+            return false;
+        }
+        empty(s, slot);
+        unlink(s, slot);
+        link_head(s, slot);
+        if (uni_.on) { rebalance(s); }
+        ++ustats_.sunk;
+        return true;
+    }
+
+    // An empty ring slot (e.g. from take_free) takes (layer, expert), whose bytes the caller put there
+    // without a read (a demotion from VRAM), at `where` in its class list. Refused when the slot is not an
+    // empty ring slot of the layer's class or the expert already has a ring slot.
+    bool adopt(int s, int slot, int layer, int expert, l2_place where) {
+        if (!valid_slot(s, slot) || layer < 0 || layer >= layers_ || storage_of(layer) != s || expert < 0 ||
+                expert >= experts_ || map_[(size_t) layer][(size_t) expert] >= 0) {
+            return false;
+        }
+        owner & o = owners_[(size_t) s][(size_t) slot];
+        if (o.role != slot_role::ring || o.layer >= 0) { return false; }
+        o.layer = layer; o.expert = expert; o.seq = done_[(size_t) layer];
+        map_[(size_t) layer][(size_t) expert] = slot;
+        place(s, slot, where);
+        ++ustats_.adopted;
+        return true;
     }
 
     int storages() const { return (int) owners_.size(); }
@@ -105,6 +236,7 @@ public:
         owners_[(size_t) s][(size_t) slot].role = slot_role::ring;
         link_tail(s, slot);
         ++ring_count_[(size_t) s];
+        if (uni_.on) { rebalance(s); }
         return true;
     }
 
@@ -146,6 +278,7 @@ public:
         }
         if (cold) { link_head(s, slot); } else { link_tail(s, slot); }
         ++ring_count_[(size_t) s];
+        if (uni_.on) { rebalance(s); }
         return true;
     }
 
@@ -186,6 +319,7 @@ public:
         }
         unlink(s, slot);
         --ring_count_[(size_t) s];
+        if (uni_.on) { unhit_[(size_t) s][(size_t) slot] = 0; rebalance(s); }
         o = owner();
         o.role = slot_role::resident;
         o.layer = layer; o.expert = expert;
@@ -218,6 +352,7 @@ public:
         }
         unlink(s, slot);
         --ring_count_[(size_t) s];
+        if (uni_.on) { unhit_[(size_t) s][(size_t) slot] = 0; rebalance(s); }
         o = owner();
         o.role = slot_role::resident;
         out.ok = true;
@@ -238,6 +373,7 @@ public:
                 o.layer = -1; o.expert = -1; o.seq = 0;
             }
             touch(s, slot);
+            if (uni_.on) { unhit_[(size_t) s][(size_t) slot] = 0; rebalance(s); }
             return slot;
         }
         return -1;
@@ -255,6 +391,7 @@ public:
                 unlink(s, empty_slots[i]);
                 link_head(s, empty_slots[i]);
             }
+            if (uni_.on) { rebalance(s); }
         }
     }
 
@@ -274,6 +411,7 @@ public:
         }
         for (size_t s = 0; s < owners_.size(); ++s) {
             head_[s] = tail_[s] = -1;
+            if (uni_.on) { unified_clear_lists(int(s)); }
             for (size_t slot = 0; slot < owners_[s].size(); ++slot) {
                 prev_[s][slot] = next_[s][slot] = -1;
                 owner & o = owners_[s][slot];
@@ -282,6 +420,7 @@ public:
                 o.role = slot_role::ring;
                 link_tail(int(s), int(slot));
             }
+            if (uni_.on) { rebalance(int(s)); }
         }
     }
 
@@ -313,6 +452,12 @@ public:
                 wanted.push_back(expert);
             }
         }
+        // The unified policy: a prompt generation under the ring rule moves no hit and fills at the least
+        // recently used end; a decode generation (not an early service) is one ghost step of its layer.
+        const bool uni = uni_.on;
+        const bool ring_rule = uni && prompt_ && !uni_.prompt_lru;
+        const bool ghost_step = uni && !ring_rule && !early;
+        const uint32_t step = ghost_step ? ++step_[(size_t) layer] : (uni ? step_[(size_t) layer] : 0u);
         // Everything already in the ring is pinned before any slot is handed out, or a demand
         // larger than the free part of the ring would evict its own earlier experts.
         std::vector<bool> pinned((size_t) slots(s), false);
@@ -330,11 +475,19 @@ public:
                 if (!early) {
                     owners_[(size_t) s][(size_t) slot].seq = seq;   // extend the lease to this generation
                 }
-                touch(s, slot);
+                if (uni) {
+                    ++ustats_.hits;
+                    uint8_t & unhit = unhit_[(size_t) s][(size_t) slot];
+                    if (unhit && !ring_rule) { ++ustats_.probation_hits; unhit = 0; }
+                    if (!ring_rule) { touch(s, slot); }
+                } else {
+                    touch(s, slot);
+                }
                 continue;
             }
             slot = acquire(s, pinned);
             if (slot < 0) {
+                if (uni) { rebalance(s); }
                 out.ok = false;
                 out.reason = "no reusable ring slot in storage class " + std::to_string(s) + " for layer " +
                     std::to_string(layer) + " expert " + std::to_string(expert);
@@ -344,15 +497,36 @@ public:
             if (o.layer >= 0) {
                 out.evicted.push_back({o.layer, o.expert, slot});
                 map_[(size_t) o.layer][(size_t) o.expert] = -1;
+                if (uni) {
+                    ++ustats_.evictions;
+                    ustats_.probation_evicted_unhit += unhit_[(size_t) s][(size_t) slot];
+                }
             }
             o.layer = layer; o.expert = expert; o.seq = seq;
             map_[(size_t) layer][(size_t) expert] = slot;
-            touch(s, slot);
+            if (uni) {
+                const l2_place where = ring_rule ? l2_place::lru : ghost_ok(layer, expert, step) ? l2_place::mru : l2_place::probation;
+                ++ustats_.fills;
+                ++(where == l2_place::lru ? ustats_.prompt_fills : where == l2_place::mru ? ustats_.mru_fills : ustats_.probation_fills);
+                place(s, slot, where);
+                unhit_[(size_t) s][(size_t) slot] = where == l2_place::probation ? 1 : 0;
+            } else {
+                touch(s, slot);
+            }
             pinned[(size_t) slot] = true;
             ++out.misses;
             for (int kind = 0; kind < kinds_; ++kind) {
                 out.reads.push_back({layer, kind, expert, slot});
             }
+        }
+        if (uni) {
+            // stamped after every decision of the step, so that a miss never passes its own ghost
+            if (ghost_step) {
+                for (int expert : wanted) {
+                    if (!homed(layer, expert)) { last_miss_[(size_t) layer*(size_t) experts_ + (size_t) expert] = step; }
+                }
+            }
+            rebalance(s);
         }
         return out;
     }
@@ -380,6 +554,27 @@ public:
                 last = slot;
             }
             if (last != tail_[s] || listed != ring || ring != ring_count_[s]) { reason = "the ring count or the list end is wrong"; return false; }
+            if (uni_.on) {
+                // the probation part is the least recently used end of the list, of the policy's share
+                int in_p = 0, first_main = -1;
+                bool main_seen = false;
+                for (int slot = head_[s]; slot >= 0; slot = next_[s][(size_t) slot]) {
+                    if (in_p_[s][(size_t) slot]) {
+                        if (main_seen) { reason = "a probation slot above the main part"; return false; }
+                        ++in_p;
+                    } else if (!main_seen) {
+                        main_seen = true;
+                        first_main = slot;
+                    }
+                }
+                for (size_t slot = 0; slot < owners_[s].size(); ++slot) {
+                    if (owners_[s][slot].role != slot_role::ring && in_p_[s][slot]) { reason = "a probation mark off the ring"; return false; }
+                    if (owners_[s][slot].layer < 0 && unhit_[s][slot]) { reason = "an empty slot marked as a probation fill"; return false; }
+                }
+                if (in_p != pcount_[s] || first_main != bnd_[s] || in_p != probation_target(int(s))) {
+                    reason = "the probation part does not match its share"; return false;
+                }
+            }
         }
         for (int l = 0; l < layers_; ++l) {
             for (int e = 0; e < experts_; ++e) {
@@ -391,6 +586,88 @@ public:
     }
 
 private:
+    // ---- the unified policy --------------------------------------------------------------------------
+    int probation_target(int s) const {
+        const int n = ring_count_[(size_t) s];
+        return std::min(n, int(uni_.probation*double(n) + 1e-9));
+    }
+
+    bool ghost_ok(int layer, int expert, uint32_t step) const {
+        const uint32_t last = last_miss_[(size_t) layer*(size_t) experts_ + (size_t) expert];
+        const int32_t age = int32_t(step - last);
+        return last != 0 && age > 0 && uint32_t(age) <= uni_.ghost;
+    }
+
+    void unified_clear_lists(int s) {
+        std::fill(in_p_[(size_t) s].begin(), in_p_[(size_t) s].end(), uint8_t(0));
+        std::fill(unhit_[(size_t) s].begin(), unhit_[(size_t) s].end(), uint8_t(0));
+        pcount_[(size_t) s] = 0;
+        bnd_[(size_t) s] = -1;
+    }
+
+    // Sizes the policy state for the current lists and splits each of them.
+    void unified_init() {
+        const size_t n = owners_.size();
+        in_p_.assign(n, {});
+        unhit_.assign(n, {});
+        pcount_.assign(n, 0);
+        bnd_.assign(n, -1);
+        for (size_t s = 0; s < n; ++s) {
+            in_p_[s].assign(owners_[s].size(), 0);
+            unhit_[s].assign(owners_[s].size(), 0);
+            bnd_[s] = head_[s];
+            rebalance(int(s));
+        }
+        last_miss_.assign((size_t) std::max(layers_, 0)*(size_t) std::max(experts_, 0), 0u);
+        step_.assign((size_t) std::max(layers_, 0), 0u);
+    }
+
+    // Restores the probation share of a class: the bottom of the main part moves down, or the top of
+    // the probation part moves up, one slot at a time (an operation changes the share by at most two).
+    void rebalance(int s) {
+        const int target = probation_target(s);
+        int & count = pcount_[(size_t) s];
+        int & bnd   = bnd_[(size_t) s];
+        while (count < target && bnd >= 0) {
+            in_p_[(size_t) s][(size_t) bnd] = 1;
+            ++count;
+            bnd = next_[(size_t) s][(size_t) bnd];
+        }
+        while (count > target) {
+            const int last = bnd >= 0 ? prev_[(size_t) s][(size_t) bnd] : tail_[(size_t) s];
+            in_p_[(size_t) s][(size_t) last] = 0;
+            --count;
+            bnd = last;
+        }
+    }
+
+    // Moves a listed slot to `where`. Off, the probation point is the most recently used end.
+    void place(int s, int slot, l2_place where) {
+        unlink(s, slot);
+        if (where == l2_place::lru) {
+            link_head(s, slot);
+        } else if (where == l2_place::probation && uni_.on) {
+            rebalance(s);   // exactly the probation share lies below the slot
+            const int bnd = bnd_[(size_t) s];
+            if (bnd < 0) {
+                link_tail(s, slot);
+            } else {
+                auto & prev = prev_[(size_t) s];
+                auto & next = next_[(size_t) s];
+                const int p = prev[(size_t) bnd];
+                prev[(size_t) slot] = p;
+                next[(size_t) slot] = bnd;
+                prev[(size_t) bnd] = slot;
+                if (p >= 0) { next[(size_t) p] = slot; } else { head_[(size_t) s] = slot; }
+                in_p_[(size_t) s][(size_t) slot] = 0;
+                bnd_[(size_t) s] = slot;
+            }
+        } else {
+            link_tail(s, slot);
+        }
+        if (uni_.on) { rebalance(s); }
+    }
+
     struct owner {
         int       layer  = -1;
         int       expert = -1;
@@ -423,12 +700,21 @@ private:
             map_[(size_t) o.layer][(size_t) o.expert] = -1;
         }
         o.layer = -1; o.expert = -1; o.seq = 0;
+        if (uni_.on) { unhit_[(size_t) s][(size_t) slot] = 0; }
     }
 
     void unlink(int s, int slot) {
         auto & prev = prev_[(size_t) s];
         auto & next = next_[(size_t) s];
         const int p = prev[(size_t) slot], n = next[(size_t) slot];
+        if (uni_.on) {
+            if (in_p_[(size_t) s][(size_t) slot]) {
+                in_p_[(size_t) s][(size_t) slot] = 0;
+                --pcount_[(size_t) s];
+            } else if (bnd_[(size_t) s] == slot) {
+                bnd_[(size_t) s] = n;
+            }
+        }
         if (p >= 0) { next[(size_t) p] = n; } else { head_[(size_t) s] = n; }
         if (n >= 0) { prev[(size_t) n] = p; } else { tail_[(size_t) s] = p; }
         prev[(size_t) slot] = next[(size_t) slot] = -1;
@@ -442,6 +728,10 @@ private:
         next[(size_t) slot] = -1;
         if (t >= 0) { next[(size_t) t] = slot; } else { head_[(size_t) s] = slot; }
         tail_[(size_t) s] = slot;
+        if (uni_.on) {
+            in_p_[(size_t) s][(size_t) slot] = 0;   // the most recently used end is in the main part
+            if (bnd_[(size_t) s] < 0) { bnd_[(size_t) s] = slot; }
+        }
     }
 
     void link_head(int s, int slot) {
@@ -452,6 +742,10 @@ private:
         next[(size_t) slot] = h;
         if (h >= 0) { prev[(size_t) h] = slot; } else { tail_[(size_t) s] = slot; }
         head_[(size_t) s] = slot;
+        if (uni_.on) {
+            in_p_[(size_t) s][(size_t) slot] = 1;   // the least recently used end is in the probation part
+            ++pcount_[(size_t) s];
+        }
     }
 
     // Moves a ring slot to the most recently used end.
@@ -472,6 +766,15 @@ private:
     std::vector<int> ring_count_, floor_;
     std::vector<uint32_t> done_;
     std::vector<std::vector<int32_t>> map_;    // [layer][expert] ring slot or -1
+    // the unified policy (empty while it is off)
+    l2_unified_policy uni_;
+    l2_unified_stats  ustats_;
+    bool prompt_ = false;
+    std::vector<std::vector<uint8_t>> in_p_;    // [storage class][slot] in the probation part
+    std::vector<std::vector<uint8_t>> unhit_;   // [storage class][slot] a probation fill not hit yet
+    std::vector<int> pcount_, bnd_;             // probation slots; the least recently used slot of the main part or -1
+    std::vector<uint32_t> last_miss_;           // [layer*experts + expert] ghost step of the last miss, 0 = none
+    std::vector<uint32_t> step_;                // [layer] decode generations served
 };
 
 } // namespace ggml_cuda_expert
