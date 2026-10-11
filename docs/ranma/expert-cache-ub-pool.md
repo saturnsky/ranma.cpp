@@ -24,7 +24,7 @@ The kernels already take a 64-bit address table before the host slot table
 (`ggml_cuda_expert_cache_select`): a pooled expert's entry is the address of its position. The
 previous value (its home address, or 0) is kept and written back when the position is evicted or
 the pool is taken back. No matmul kernel changes. With the SSD tier the table is the tier's, and only
-host residents are admitted (the experts the SSD worker serves are left to it); without a table from
+host residents are admitted (the experts the SSD worker serves are left to it, except "Ring admission" below); without a table from
 the tier or a host arena the pool brings its own, zero by default.
 
 For every launch of up to `rows` rows (the decode rows: `n_parallel x (draft_max + 1)`), a step kernel
@@ -44,14 +44,30 @@ is lent (r = 0 makes them return at once), so a captured graph stays valid eithe
   graphs per buffer; the region starts at that mark plus a margin (`max(64 MiB, mark / 4)`, 2 MiB
   aligned) and must be at least 256 MiB.
 - Only the largest compute buffer lends: the target's, not the smaller one of a draft context. With
-  `LLAMA_MTP_SHARE_COMPUTE=1` an MTP context computes in views of the target's buffers, and each context
-  waits for the other before its graphs.
+  `LLAMA_DRAFT_SHARE_COMPUTE=1` (default off) a drafting context, an MTP context or a draft model's context
+  (`-md`: DSpark, DFlash, EAGLE3 and the plain draft model), computes in views of the target's buffers, and
+  each context waits for the other before its graphs. On DS4.1F with DSpark at ubatch 2048 the draft's own
+  compute buffer is 2220 MiB, which sharing should save (not measured yet). A draft outside the target's
+  expert cache is not supported while the target has one (it would not take back what the pool lends): it
+  keeps its own buffers, with one warning line. Following up with that case would mean letting such a draft
+  call the target's cache hooks.
+- Every allocation from a shared buffer type logs one line: `a new shared block of N MiB`, or `a N MiB buffer
+  is a view of the shared M MiB block`. The scheduler's `compute buffer size` line prints the size the context
+  asked for in either case, so only these lines tell whether a draft's buffer took VRAM of its own.
+- `LLAMA_MTP_SHARE_COMPUTE` is an alias of `LLAMA_DRAFT_SHARE_COMPUTE` (one info line when it turned sharing on);
+  when both are set the canonical name applies, with one warning line if their values differ.
+- The decode high-water mark of a buffer counts the small graphs (at most `rows` rows) of every context
+  that computes in it, so with a shared buffer the region starts above the draft's decode graphs as well
+  (a DSpark block forward and the injection of the accepted tokens), and a draft forward does not take
+  the region back. Only the cached model's own contexts lend. A larger draft graph (the injection of a
+  prompt) reaches into the region and takes it back, like the target's prompt ubatch at the same request
+  boundary; the next small graph of the target lends again.
 - An install, a member join or a scheduler reserve takes the region back synchronously.
 
 ## Measured
 
 GLM-5.3 3.05 bpw, server with smart MTP, code preset of 12 requests, ub 2048, L1 16896, L2 86016, pool and
-`LLAMA_MTP_SHARE_COMPUTE` on; one run per row, each after a GPU rest:
+`LLAMA_DRAFT_SHARE_COMPUTE` on (then set through its alias); one run per row, each after a GPU rest:
 
 | row | filter | decode t/s | from request 4 | pool hits | fills |
 |---|---|---|---|---|---|
@@ -73,6 +89,45 @@ Steps count only the launches that step a lent pool, and the stamps survive a re
 spans lends. On by default with K = 8 (`off` turns it off): in the table above it cut the fills by
 54 % and lifted decode by 5 % (h against e).
 
+## Ring admission (experimental)
+
+`RANMA_EXPERT_UB_POOL_RING=1` (default 0) also admits the experts that the SSD worker serves from its host
+ring (ring occupants), under the same admission filter. A CPU replay of DS4F traces put the gain at r = 9 (the
+positions a 2048-row ubatch leaves on DS4.1F) at 1.5 to 2.6 ms per token over host residents only with a 24 GiB
+host tier, and 0.04 to 1.0 ms with 40.8 GiB; it is not measured on the model yet. File residents (in neither
+ring nor host memory) are still not admitted.
+
+- **Which.** A miss the worker serves is a ring occupant when its three table entries are not 0: the worker
+  zeroes an entry before it reuses the slot, and an expert in the file has entry 0.
+- **Copy.** The copy kernel reads the ring slot as it reads any home, on the compute stream, before the tier's
+  publish of the same layer. Nothing else protects the slot: the worker serves only while the stream waits at a
+  layer's readiness, so no read can land in that slot during the copy. Because of this the ring admission stays
+  off with `RANMA_EXPERT_HASH_EARLY=ssd|both` (early reads run while the graphs run). Every context computes
+  on its own stream: before a graph of another context than the last one, the controller waits for the last
+  one's stream (normally idle already, since its outputs were read). A joint cache's draft model is judged
+  at the first graph of its context with a known buffer: at the base of the target's compute buffer it
+  computes in a view of it, which exists only with `LLAMA_DRAFT_SHARE_COMPUTE=1`, whose contexts synchronize
+  each other's backend before every graph, and the ring admission stays on; anywhere else (no sharing) it
+  turns off for good, after the ring positions went back. Either outcome is logged in one line.
+- **While pooled.** The pool marks the expert in a bitmap per layer, written by the kernel that changed the
+  layer's positions into device memory and into mapped host memory. The tier's publish kernel leaves a marked
+  expert out of the demand, so a pool hit never reaches the worker. The worker neither publishes nor
+  invalidates a marked expert's entries. The expert is invisible to the ring meanwhile: no lease, no least
+  recently used bump, so the ring ages it and may reuse its slot (the CPU replay modelled it the same way).
+  After a staged service the worker skips its final repeat of the layer's publish (every kind was published
+  before its readiness), since the GPU may be past the layer by then.
+- **Leaving.** An eviction, a prefetch reservation or a reclaim writes 0 into a ring owner's entries instead of
+  the saved slot address, which may hold another expert by now, and clears its mark. The next demand of the
+  expert reaches the worker again: a ring hit republishes the slot, otherwise it is read from the file.
+- **Diagnostics.** The counter line adds `ring_fills` (fills of ring occupants, part of `fills`), and the
+  pool's on line says `ring occupants admitted`. `RANMA_EXPERT_VERIFY` checks a ring owner's table entries but
+  not its bytes, whose source slot may be gone. `RANMA_EXPERT_L2_VERIFY` accepts a 0 entry of a served expert
+  in the layers other than the one just served (an entry the pool let go, published again at the layer's next
+  service); the layer just served and every layer after an install are still checked exactly.
+
+With the switch at 0 nothing is allocated, the step kernel's ring branch is never taken, the publish kernel
+gets a null bitmap, and the worker's checks see no bitmap.
+
 ## Switches
 
 | Environment switch | Default | Effect |
@@ -83,6 +138,7 @@ spans lends. On by default with K = 8 (`off` turns it off): in the table above i
 | `RANMA_EXPERT_UB_POOL_MARGIN_MIB` | 64 | Least headroom above the decode graphs' largest extent. |
 | `RANMA_EXPERT_UB_POOL_RCAP` | 64 | Positions per layer allocated (the most a lend can use). |
 | `RANMA_EXPERT_UB_POOL_ROWS` | decode rows | Launches of at most this many rows step the pool and are planned compactly. |
+| `RANMA_EXPERT_UB_POOL_RING` | 0 | 1: also admit ring occupants of the SSD tier (experimental, above). |
 | `RANMA_EXPERT_UB_POOL_LOG` | 0 | 1: lends, reclaims and counters. |
 
 All are read once at startup. `RANMA_EXPERT_VERIFY` compares every position with its home before every
@@ -105,6 +161,7 @@ The `--spec-smart-log` round log uses it to record each round's pool work (`docs
 
 ## Not done
 
-- Experts the SSD worker serves are not admitted.
+- Experts the SSD worker serves are not admitted (ring occupants are with `RANMA_EXPERT_UB_POOL_RING=1`; file
+  residents never).
 - Early-route (hash) layers and the layers of a joint cache's draft member get no positions.
 - A compute buffer of more than one chunk reports no extent, so the pool never lends from it.

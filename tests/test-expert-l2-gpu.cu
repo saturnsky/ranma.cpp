@@ -29,6 +29,13 @@ static __global__ void readback(const uint64_t * table, int expert, char * out, 
     for (size_t i = blockIdx.x*blockDim.x + threadIdx.x; i < n; i += blockDim.x*gridDim.x) { out[i] = src[i]; }
 }
 
+// what the decode pool writes when it lets a ring occupant go (ring admission)
+static __global__ void zero_entries(uint64_t * a, uint64_t * b, uint64_t * c, int expert) {
+    uint64_t * t = threadIdx.x == 0 ? a : threadIdx.x == 1 ? b : c;
+    t[expert] = 0;
+    __threadfence_system();
+}
+
 static int bitmap_test() {
     constexpr int experts = 73, words = (experts + 31)/32, used = 8, stride = 11;
     l2_mailbox * host = nullptr, * device = nullptr;
@@ -56,7 +63,7 @@ static int bitmap_test() {
             }
         }
         CUDA_CHECK(hipMemcpy(ids, input.data(), input.size()*sizeof(int32_t), hipMemcpyHostToDevice));
-        l2_publish_kernel<<<1, 128, words*sizeof(uint32_t)>>>(device, device_bits, device_serve, ids, rows, used, stride, experts);
+        l2_publish_kernel<<<1, 128, words*sizeof(uint32_t)>>>(device, device_bits, device_serve, ids, rows, used, stride, experts, nullptr);
         CUDA_CHECK(hipDeviceSynchronize());
         CHECK(host->published == uint32_t(pattern + 1));
         CHECK(bool(host->invalid) == (pattern == 3));
@@ -87,26 +94,45 @@ static int serve_test() {
     const int routed = input[0], absent = experts - 1;   // rows*used = 32 < absent
     CUDA_CHECK(hipMemcpy(ids, input.data(), input.size()*sizeof(int32_t), hipMemcpyHostToDevice));
 
-    l2_publish_kernel<<<1, 128, words*sizeof(uint32_t)>>>(device, device_bits, device_serve, ids, rows, used, stride, experts);
+    l2_publish_kernel<<<1, 128, words*sizeof(uint32_t)>>>(device, device_bits, device_serve, ids, rows, used, stride, experts, nullptr);
     CUDA_CHECK(hipDeviceSynchronize());
     CHECK(host->published == 1 && host->need == 0 && host->ready == host->generation);
 
     serve[routed/32] |= 1u << (routed%32);
-    l2_publish_kernel<<<1, 128, words*sizeof(uint32_t)>>>(device, device_bits, device_serve, ids, rows, used, stride, experts);
+    l2_publish_kernel<<<1, 128, words*sizeof(uint32_t)>>>(device, device_bits, device_serve, ids, rows, used, stride, experts, nullptr);
     CUDA_CHECK(hipDeviceSynchronize());
     CHECK(host->published == 2 && host->need == 1 && host->ready == 0);
 
     serve[routed/32] &= ~(1u << (routed%32));
     serve[absent/32] |= 1u << (absent%32);
-    l2_publish_kernel<<<1, 128, words*sizeof(uint32_t)>>>(device, device_bits, device_serve, ids, rows, used, stride, experts);
+    l2_publish_kernel<<<1, 128, words*sizeof(uint32_t)>>>(device, device_bits, device_serve, ids, rows, used, stride, experts, nullptr);
     CUDA_CHECK(hipDeviceSynchronize());
     CHECK(host->published == 3 && host->need == 0 && host->ready == host->generation);
+
+    // the decode pool's ring admission: a served expert the pool holds is neither demanded nor a reason to call the worker
+    uint32_t * pooled = nullptr, * device_pooled = nullptr;
+    CHECK(coherent_alloc((void **) &pooled, (void **) &device_pooled, words*sizeof(uint32_t)));
+    memset(pooled, 0, words*sizeof(uint32_t));
+    serve[absent/32] &= ~(1u << (absent%32));
+    serve[routed/32] |= 1u << (routed%32);
+    pooled[routed/32] |= 1u << (routed%32);
+    l2_publish_kernel<<<1, 128, words*sizeof(uint32_t)>>>(device, device_bits, device_serve, ids, rows, used, stride, experts, device_pooled);
+    CUDA_CHECK(hipDeviceSynchronize());
+    CHECK(host->published == 4 && host->need == 0 && host->ready == host->generation);
+    CHECK((bits[routed/32] & (1u << (routed%32))) == 0);
+    CHECK((bits[input[1]/32] & (1u << (input[1]%32))) != 0);
+    pooled[routed/32] = 0;
+    l2_publish_kernel<<<1, 128, words*sizeof(uint32_t)>>>(device, device_bits, device_serve, ids, rows, used, stride, experts, device_pooled);
+    CUDA_CHECK(hipDeviceSynchronize());
+    CHECK(host->published == 5 && host->need == 1 && host->ready == 0);
+    CHECK((bits[routed/32] & (1u << (routed%32))) != 0);
+    CUDA_CHECK(hipHostFree(pooled));
 
     CUDA_CHECK(hipFree(ids));
     CUDA_CHECK(hipHostFree(serve));
     CUDA_CHECK(hipHostFree(bits));
     CUDA_CHECK(hipHostFree(host));
-    printf("PASS: a resident plan answers its own wait; one served expert still calls the worker\n");
+    printf("PASS: a resident plan answers its own wait; one served expert still calls the worker; a pooled one does not\n");
     return 0;
 }
 
@@ -1368,6 +1394,42 @@ int main(int argc, char ** argv) {
     CHECK(tier.counters().ssd_reads == 6 && tier.counters().ring_hits == 2);
     printf("PASS: batched install uses shifted ring data, exact H2D and zero tails; demand refills after scratch use\n");
     printf("PASS: 14-row demand reads 1 of 17 experts, skips next layer, replays exact payload and zero MMQ padding\n");
+    {
+        // The decode pool's ring admission lets a ring occupant go with 0 in its entries. The verification of another
+        // layer's service accepts that; the next demand of the layer publishes the ring slot again (a ring hit).
+        uint32_t * pool_bits = nullptr, * pool_bits_dev = nullptr;
+        CHECK(coherent_alloc((void **) &pool_bits, (void **) &pool_bits_dev, 2*sizeof(uint32_t)));
+        pool_bits[0] = pool_bits[1] = 0;
+        CHECK(tier.set_pool_bits(pool_bits, pool_bits_dev, 1));
+        tier.start_worker();
+        tier.publish_and_wait(0, &ids, stream);   // layer 0 holds `selected` in the ring
+        tier.wait_kind(0, 1, stream); tier.wait_kind(0, 2, stream);
+        tier.mark_done(0, stream);
+        CUDA_CHECK(hipStreamSynchronize(stream));
+        zero_entries<<<1, 3, 0, stream>>>(const_cast<uint64_t *>(tier.addresses(0, 0)), const_cast<uint64_t *>(tier.addresses(0, 1)),
+            const_cast<uint64_t *>(tier.addresses(0, 2)), selected);
+        CUDA_CHECK(hipStreamSynchronize(stream));
+        const l2_counters c0 = tier.counters_snapshot();
+        tier.publish_and_wait(1, &ids, stream);   // its service verifies layer 0 as well
+        tier.wait_kind(1, 1, stream); tier.wait_kind(1, 2, stream);
+        tier.mark_done(1, stream);
+        CUDA_CHECK(hipStreamSynchronize(stream));
+        tier.publish_and_wait(0, &ids, stream);
+        tier.wait_kind(0, 1, stream); tier.wait_kind(0, 2, stream);
+        readback<<<32, 128, 0, stream>>>(tier.addresses(0, 2), selected, copy, slice + tail);
+        CUDA_CHECK(hipMemcpyAsync(before.data(), copy, before.size(), hipMemcpyDeviceToHost, stream));
+        tier.mark_done(0, stream);
+        CUDA_CHECK(hipStreamSynchronize(stream));
+        tier.stop_worker();
+        const l2_counters c1 = tier.counters();
+        CHECK(c1.verify_bad == 0);
+        CHECK(c1.ring_hits == c0.ring_hits + 1);   // layer 0 still owned `selected` while its entries were 0
+        CHECK(memcmp(before.data(), file.data() + shift + selected*slice, slice) == 0);
+        CHECK(tier.set_pool_bits(nullptr, nullptr, 1));
+        CUDA_CHECK(hipHostFree(pool_bits));
+        printf("PASS: ring admission: an entry the pool let go (0) passes another layer's verification and is published "
+               "again by the next demand of its layer\n");
+    }
     // A plan that keeps every routed expert out of the file must not reach the worker at all.
     std::vector<std::vector<int32_t>> vram(2, std::vector<int32_t>(experts, -1));
     for (int l = 0; l < 2; ++l) { vram[l][selected] = 0; }

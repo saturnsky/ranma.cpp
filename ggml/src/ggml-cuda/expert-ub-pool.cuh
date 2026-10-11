@@ -13,7 +13,8 @@
 // table (ggml_cuda_expert_cache_select): a pooled expert's entry is the address of its slot; its
 // previous value (the home address, or 0) is kept and written back when the slot is evicted or the
 // pool is reclaimed. No matmul kernel changes. With the SSD tier the table is the tier's, and only
-// host residents (serve bit clear) are admitted, so the worker never writes an entry the pool owns.
+// host residents (serve bit clear) are admitted, so the worker never writes an entry the pool owns
+// (the ring admission below adds ring occupants, whose entries the worker then leaves alone).
 //
 // Per routed layer, r positions (the same r for every layer, at most r_cap), least recently used.
 // For every launch of up to `rows` rows, on the compute stream right after the router, the step
@@ -29,6 +30,17 @@
 // expert also missed in this layer within the last K steps of the layer; the misses of a step are
 // stamped after its decisions, so a miss never admits itself. Steps count only the launches that step
 // a lent pool, and the stamps survive reclaims, so the window spans lends.
+//
+// Ring admission (RANMA_EXPERT_UB_POOL_RING=1, off by default; enable_ring): a miss the SSD worker serves is also
+// admissible when it is a ring occupant, i.e. its three table entries are not 0 (the worker zeroes an entry before
+// it reuses the slot, and it serves only while the stream waits at a layer's readiness, so a nonzero entry seen by
+// the step names a slot that holds the expert until this layer's own publish). The copy reads that ring slot like any
+// home. Such a position is marked (`ringpos`), and the layer's bitmap of marked experts is written to device memory
+// (read by the tier's publish kernel, which then leaves the expert out of the demand) and to mapped host memory
+// (read by the worker, which then neither publishes nor invalidates its entries). Its saved home is not written back:
+// the ring may have reused the slot meanwhile, so an eviction or a reclaim writes 0, and the next demand of the expert
+// reaches the worker again, which publishes its address. While pooled the expert is not seen by the ring: no lease,
+// no least recently used bump. With every ring position the bitmap is rewritten by the kernel that changed it.
 
 #include "common.cuh"
 
@@ -47,10 +59,11 @@ struct ub_pool_config {
     int    rows      = 0;                 // launches of at most this many rows step the pool; 0 = the decode rows
     bool   log       = false;
     int    ghost     = 8;                 // admission filter ghost:K; 0 = admit every admissible miss
+    bool   ring      = false;             // also admit the SSD tier's ring occupants (see "Ring admission" below)
 };
 
 // RANMA_EXPERT_UB_POOL=0|1, _MIN_MIB, _MARGIN_MIB, _RCAP, _ROWS, _LOG,
-// _FILTER=ghost:K|off (default ghost:8). Read once.
+// _FILTER=ghost:K|off (default ghost:8), _RING=0|1 (default 0). Read once.
 ub_pool_config ub_pool_config_from_env();
 
 static constexpr int ub_pool_max_experts = 1024;
@@ -69,6 +82,7 @@ enum ub_pool_counter : int {
     ub_pool_rejected,      // admissible misses the admission filter turned away
     ub_pool_pf_fills,      // fills whose copy read a prefetch staging slot
     ub_pool_pf_arrived,    // staging slots whose generation matched at the step
+    ub_pool_ring_fills,    // fills of ring occupants (ring admission), part of ub_pool_fills
     ub_pool_n_counters,
 };
 
@@ -92,7 +106,7 @@ struct ub_pool_meta {
     int32_t  offset; // first position of the layer
     int32_t  r;      // active positions, 0 = the pool is not lent
     uint32_t step;   // launches that stepped a lent pool; kept across lends (stamps, ghost window)
-    int32_t  pad;
+    int32_t  ring;   // ring admission for this lend (set by the lend kernel); 0 = off
     unsigned long long n_hits, n_fills; // of the layer, cumulative: the values the step kernel writes to ub_pool_live
 };
 
@@ -250,6 +264,17 @@ public:
     // The publish of layer `layer`'s prediction (ids: n_rows rows of k, row_stride apart), on the compute stream.
     void launch_publish(int layer, const int32_t * ids, int n_rows, int row_stride, int k, cudaStream_t stream);
     const ub_pf_dev & prefetch() const { return pf_; }
+
+    // Ring admission (above): once, after allocate and before any graph capture; the bitmaps have ring_words()
+    // 32-bit words per layer. False (and no ring admission) when it cannot allocate.
+    bool enable_ring();
+    bool ring_enabled() const { return d_ringpos_ != nullptr; }
+    // Whether the next lend admits ring occupants (the controller turns it off, then reclaims, when it is no longer safe).
+    void set_ring(bool on) { ring_ = on && ring_enabled(); }
+    bool ring() const { return ring_; }
+    size_t ring_words() const { return size_t((n_experts_ + 31)/32); }
+    const uint32_t * ring_bits_host() const { return h_ringbits_; }
+    const uint32_t * ring_bits_device() const { return d_ringbits_; }
     ub_pf_mail * pf_mail_host() const { return h_pf_mail_; }
     ub_pf_stat * pf_stat_host() const { return h_pf_stat_; }
     int32_t * pf_budget_host() const { return h_pf_budget_; }
@@ -312,6 +337,13 @@ private:
     ub_pf_mail *    h_pf_mail_ = nullptr;
     int32_t *       h_pf_budget_ = nullptr;
     void *          pf_in_alloc_ = nullptr;   // inplace: pend_e, pend_gen, done, res_q, res_e, res_n
+
+    // ring admission (enable_ring); all null without it
+    bool       ring_ = false;
+    int32_t *  d_ringpos_  = nullptr;   // [P] 1 = the position's owner was admitted from the ring
+    uint32_t * d_ringbits_ = nullptr;   // [L][words] device copy of the pooled ring occupants
+    uint32_t * h_ringbits_ = nullptr;   // [L][words] mapped host memory, read by the worker
+    uint32_t * d_ringbits_host_ = nullptr;   // its device address
 };
 
 } // namespace ggml_cuda_expert
