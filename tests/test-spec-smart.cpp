@@ -2620,13 +2620,14 @@ static void tc_features(double p, int cA, int NA, int cU, int NU, bool mid, bool
 }
 
 static int test_tconf() {
-    // 1. the features and the static coefficients against the offline fit (tconf_fit2.py reference points, k = 1)
+    // 1. the features and the static coefficients against the offline fit (the five-pair set of k = 1, reference points
+    //    from an independent Python copy of the features)
     {
         struct pt { double p; int cA, NA, cU, NU, mid, sw; double q; };
         const pt R[] = {
-            { 0.4, 4, 10, 0, 0, 0, 1, 0.2305283658606285 },  { 0.3, 0, 0, 9, 10, 0, 1, 0.5416871315347813 },
-            { 0.9, 1, 5, 0, 20, 1, 0, 0.6573225453247713 },  { 0.05, 0, 0, 0, 0, 0, 0, 0.04846946976832208 },
-            { 0.99, 3, 3, 2, 2, 1, 1, 0.992394076381946 },
+            { 0.4, 4, 10, 0, 0, 0, 1, 0.3506899998300212 },  { 0.3, 0, 0, 9, 10, 0, 1, 0.9572736538341446 },
+            { 0.9, 1, 5, 0, 20, 1, 0, 0.20455832081279748 }, { 0.05, 0, 0, 0, 0, 0, 0, 0.12516766976776844 },
+            { 0.99, 3, 3, 2, 2, 1, 1, 0.9953408013957517 },
         };
         for (const auto & r : R) {
             common_spec_tconf m;
@@ -3782,7 +3783,7 @@ static int test_block() {
     }
 
     // 5. the trigram confidence: the last verified position takes the candidate with the highest q; one coefficient
-    //    set per position group with LLAMA_SPEC_DSPARK_TCONF_POS=per; the block drafter starts at its own fit
+    //    set per position group with tconf_per_pos; every set starts at the static set of k
     {
         auto cfg = block_cfg();
         cfg.tconf = true;
@@ -3790,7 +3791,7 @@ static int test_block() {
         cfg.tconf_per_pos = true;
         common_spec_smart s(cfg, 1);
         CHECK(s.tc_n_models() == 4);
-        CHECK(std::fabs(s.tconf_model.b[1] - 1.014855) < 1e-9 && std::fabs(s.tc_model(3).b[1] - 1.014855) < 1e-9);
+        CHECK(std::fabs(s.tconf_model.b[1] - 0.645351) < 1e-9 && std::fabs(s.tc_model(3).b[1] - 0.645351) < 1e-9);
         const std::vector<int32_t> toks = { 1, 2, 3, 4, 5 };
         s.request_begin(0);
         s.tconf_request(0, toks.data(), toks.size());
