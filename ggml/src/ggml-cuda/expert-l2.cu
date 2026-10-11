@@ -35,7 +35,7 @@ static_assert(sizeof(l2_mailbox) == 64, "the mailbox layout is part of the host 
 // The bitmap and the flags are built in shared memory and then stored: PCIe has no atomic OR, and on
 // some hosts an atomicOr on the mapped mailbox is lost.
 static __global__ void l2_publish_kernel(l2_mailbox * m, uint32_t * demand, const uint32_t * serve,
-        const int32_t * ids, int rows, int used, int stride, int experts) {
+        const int32_t * ids, int rows, int used, int stride, int experts, const uint32_t * pooled) {
     extern __shared__ uint32_t demand_shared[];
     __shared__ uint32_t need, invalid;
     const int words = (experts + 31)/32;
@@ -50,6 +50,8 @@ static __global__ void l2_publish_kernel(l2_mailbox * m, uint32_t * demand, cons
     for (int64_t i = threadIdx.x; i < int64_t(rows)*used; i += blockDim.x) {
         const int e = ids[(i/used)*stride + i%used];
         if ((unsigned) e < (unsigned) experts) {
+            // a served expert the decode pool holds (its ring admission) is read from its position: not demanded
+            if (pooled != nullptr && (pooled[e/32] & (1u << (e%32))) != 0) { continue; }
             atomicOr(demand_shared + e/32, 1u << (e%32));
             if (serve[e/32] & (1u << (e%32))) { need = 1; }
         } else {
@@ -995,7 +997,8 @@ void l2_tier::service_layer(int layer, uint32_t seq, const std::vector<int> & id
         GGML_ABORT("expert cache: the SSD tier cannot serve layer %d: %s", layer, service.reason.c_str());
     }
     for (const l2_eviction & old : service.evicted) {
-        for (int kind = 0; kind < geometry::n_kinds; ++kind) {
+        // an entry the decode pool owns points at its position; the pool writes 0 when it lets the expert go
+        for (int kind = 0; kind < geometry::n_kinds && !pool_owned(old.layer, old.expert); ++kind) {
             maps_host_[((size_t) old.layer*geometry::n_kinds + kind)*geo_.n_experts + old.expert] = 0;
         }
         early_evicted(old.layer, old.expert);
@@ -1016,13 +1019,18 @@ void l2_tier::service_layer(int layer, uint32_t seq, const std::vector<int> & id
         early_list_[(size_t) layer].clear();
     }
     std::string reason;
-    if (staged() && item.rows >= uint64_t(cfg_.staged_min_rows)) {
+    const bool staged_service = staged() && item.rows >= uint64_t(cfg_.staged_min_rows);
+    if (staged_service) {
         serve_staged(layer, seq, service.reads);
     } else if (!run_reads(service.reads, reason)) {
         GGML_ABORT("expert cache: the SSD tier failed to read layer %d: %s", layer, reason.c_str());
     }
     item.ssd_bytes = counters_.ssd_bytes - before_bytes;
-    publish_layer(layer);
+    // The staged service published every kind before its readiness, so the GPU may already be past this layer;
+    // with the decode pool's ring admission a later step of the layer may own an entry this repeat would overwrite.
+    if (!(staged_service && pool_bits_host_ != nullptr)) {
+        publish_layer(layer);
+    }
     if (verify_) { verify_addresses(layer, ids); }
     std::atomic_thread_fence(std::memory_order_release);
     counters_.service_ms += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
@@ -1077,6 +1085,9 @@ void l2_tier::publish_layer(int layer) {
         if (served_only_ && !(serve_host_[(size_t) layer*words + size_t(expert/32)] & (1u << (expert%32)))) {
             continue;
         }
+        if (pool_owned(layer, expert)) {
+            continue;   // the decode pool owns the entry (ring admission)
+        }
         for (int kind = 0; kind < geometry::n_kinds; ++kind) {
             maps_host_[((size_t) layer*geometry::n_kinds + kind)*geo_.n_experts + expert] =
                 address_of(layer, kind, expert);
@@ -1091,6 +1102,9 @@ void l2_tier::publish_layer_kind(int layer, int kind) {
         if (served_only_ && !(serve_host_[(size_t) layer*words + size_t(expert/32)] & (1u << (expert%32)))) {
             continue;
         }
+        if (pool_owned(layer, expert)) {
+            continue;   // the decode pool owns the entry (ring admission)
+        }
         maps_host_[((size_t) layer*geometry::n_kinds + kind)*geo_.n_experts + expert] = address_of(layer, kind, expert);
     }
     std::atomic_thread_fence(std::memory_order_release);
@@ -1102,9 +1116,22 @@ void l2_tier::verify_addresses(int demanded_layer, const std::vector<int> & ids)
             if (served_only_ && !(serve_host_[(size_t) layer*bitmap_words() + size_t(expert/32)] & (1u << (expert%32)))) {
                 continue;   // the decode pool may own this entry
             }
+            if (pool_owned(layer, expert)) {
+                continue;   // the decode pool owns it (ring admission)
+            }
             for (int kind = 0; kind < geometry::n_kinds; ++kind) {
                 const uint64_t actual = maps_host_[((size_t) layer*geometry::n_kinds + kind)*geo_.n_experts + expert];
                 const uint64_t expected = address_of(layer, kind, expert);
+                if (actual != expected && pool_bits_host_ != nullptr && demanded_layer >= 0 && layer != demanded_layer &&
+                        (actual == 0 || pool_owned(layer, expert))) {
+                    // The decode pool's ring admission: an entry the pool let go is 0 until the next service of its
+                    // layer publishes it again (a 0 entry of a served expert is never read before that service, which
+                    // its demand calls). The demanded layer was just published and stays checked exactly, and so does
+                    // every layer after an install (the pool gave everything back before it). An entry the pool took
+                    // meanwhile (its bit set after the first look) is the pool's.
+                    ++counters_.owner_checks;
+                    continue;
+                }
                 if (actual != expected) {
                     ++counters_.verify_bad;
                     GGML_ABORT("expert cache: address ownership mismatch at layer %d expert %d kind %d: "
@@ -1320,7 +1347,7 @@ void l2_tier::serve_early(std::vector<l2_early_layer> job) {
             continue;
         }
         for (const l2_eviction & old : service.evicted) {
-            for (int kind = 0; kind < geometry::n_kinds; ++kind) {
+            for (int kind = 0; kind < geometry::n_kinds && !pool_owned(old.layer, old.expert); ++kind) {
                 maps_host_[((size_t) old.layer*geometry::n_kinds + kind)*geo_.n_experts + old.expert] = 0;
             }
             early_evicted(old.layer, old.expert);
@@ -1399,7 +1426,8 @@ void l2_tier::publish_and_wait(int layer, const ggml_tensor * ids, cudaStream_t 
         static_cast<l2_mailbox *>(mail_device_) + layer,
         demand_device_ + size_t(layer)*bitmap_words(), serve_device_ + size_t(layer)*bitmap_words(),
         (const int32_t *) ids->data, (int) ids->ne[1], (int) ids->ne[0],
-        (int) (ids->nb[1]/sizeof(int32_t)), geo_.n_experts);
+        (int) (ids->nb[1]/sizeof(int32_t)), geo_.n_experts,
+        pool_bits_dev_ != nullptr ? pool_bits_dev_ + size_t(layer)*bitmap_words() : (const uint32_t *) nullptr);
     if (staged()) {
         // The worker decides from the same row count. A mismatch would still be safe: every kind
         // wait also passes on the whole generation, and the worker publishes that last either way.
