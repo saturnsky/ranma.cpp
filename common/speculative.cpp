@@ -1125,6 +1125,26 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     const int32_t * target_layer_ids   = nullptr; // model_dft's extract layer indices
     uint32_t        target_layer_ids_n = 0;
 
+    // DSpark round log (LLAMA_SPEC_DSPARK_LOG=<path>, jsonl): per round the drafted tokens with their confidence and
+    // top-3 draft candidates, the accepted count, the draft time and the host time from the end of the draft to
+    // accept() (the verification).
+    struct dspark_round {
+        bool                     pending = false;
+        int64_t                  t_drafted_us = 0;
+        double                   draft_us = 0.0;
+        int32_t                  n_drafted = 0;  // before the width cut
+        llama_token              id_last = -1;
+        llama_pos                pos0 = 0;
+        std::vector<llama_token> ids;
+        std::vector<float>       conf;
+        std::vector<llama_token> cand; // 3 per position
+        std::vector<float>       cand_p;
+    };
+    FILE *                    dspark_log = nullptr;
+    bool                      dspark_has_conf = false;
+    int64_t                   dspark_n_round = 0;
+    std::vector<dspark_round> dspark_rounds;
+
     common_speculative_impl_draft_dflash(const common_params_speculative & params, uint32_t n_seq,
             common_speculative_type type = COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH)
         : common_speculative_impl(type, n_seq, params.draft.n_max)
@@ -1175,14 +1195,23 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         }
         mask_token_id = llama_vocab_mask(llama_model_get_vocab(model_dft));
 
-        if (is_dspark && this->params.p_min_enabled()) {
+        if (is_dspark) {
             char buf[16] = {};
-            const bool has_conf =
+            dspark_has_conf =
                 llama_model_meta_val_str(model_dft, "dflash.has_confidence_head", buf, sizeof(buf)) < 0 ||
                 std::strcmp(buf, "true") == 0;
-            if (!has_conf) {
+            if (!dspark_has_conf && this->params.p_min_enabled()) {
                 throw std::runtime_error("DSpark draft has no confidence head: please set --spec-draft-p-min 0");
             }
+            if (const char * path = getenv("LLAMA_SPEC_DSPARK_LOG"); path != nullptr && *path != '\0') {
+                dspark_log = fopen(path, "ab");
+                if (dspark_log == nullptr) {
+                    LOG_WRN("%s: cannot open LLAMA_SPEC_DSPARK_LOG '%s'\n", __func__, path);
+                }
+            }
+            dspark_rounds.resize(n_seq);
+            LOG_INF("%s: DSpark confidence head=%d, round log=%s\n", __func__, dspark_has_conf,
+                    dspark_log ? "on" : "off");
         }
 
         LOG_INF("%s: adding speculative implementation '%s'\n", __func__, common_speculative_type_to_str(type).c_str());
@@ -1258,11 +1287,25 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             llama_sampler_free(backend_chains[seq_id]);
         }
         backend_chains.clear();
+        if (dspark_log) {
+            fclose(dspark_log);
+        }
     }
 
     void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
         if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
             return;
+        }
+
+        if (dspark_log) {
+            // the request's prompt, for the trigram counts of the offline analysis
+            dspark_rounds[seq_id].pending = false;
+            fprintf(dspark_log, "{\"ev\":\"begin\",\"seq\":%d,\"prompt\":[", (int) seq_id);
+            for (size_t i = 0; i < prompt.size(); ++i) {
+                fprintf(dspark_log, i ? ",%d" : "%d", (int) prompt[i]);
+            }
+            fprintf(dspark_log, "]}\n");
+            fflush(dspark_log);
         }
 
         const int32_t N = (int32_t) prompt.size();
@@ -1384,6 +1427,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     void draft(common_speculative_draft_params_vec & dparams) override {
         auto & ctx_dft = params.ctx_dft;
 
+        const int64_t t_draft_beg = dspark_log ? ggml_time_us() : 0;
+
         batch.clear();
 
         // build one batch holding every drafting sequence's noise block into a single decode)
@@ -1474,14 +1519,25 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
             if (is_dspark) {
                 // DSpark: read from the first draft slot, truncate below the confidence threshold
-                const float * conf = params.p_min_enabled() ? llama_get_embeddings_nextn(ctx_dft) : nullptr;
+                const float * conf = params.p_min_enabled() || (dspark_log && dspark_has_conf) ?
+                        llama_get_embeddings_nextn(ctx_dft) : nullptr;
+                dspark_round * rl = dspark_log ? &dspark_rounds[seq_id] : nullptr;
+                if (rl) {
+                    rl->pending = false;
+                    rl->ids.clear(); rl->conf.clear(); rl->cand.clear(); rl->cand_p.clear();
+                    rl->id_last = dp.id_last;
+                    rl->pos0    = dp.pos0;
+                }
                 // bonus-anchor drafts read the mask positions only, like DFlash
                 const int32_t i_draft_beg = sample_from_anchor ? 0 : 1;
                 for (int32_t i = i_draft_beg; i < n_block_tokens; ++i) {
                     const int32_t idx = beg + i;
 
-                    if (conf && conf[(size_t) idx * n_embd_dec] < params.p_min_at(i - i_draft_beg)) {
+                    if (conf && params.p_min_enabled() && conf[(size_t) idx * n_embd_dec] < params.p_min_at(i - i_draft_beg)) {
                         break;
+                    }
+                    if (rl) {
+                        rl->conf.push_back(conf ? conf[(size_t) idx * n_embd_dec] : -1.0f);
                     }
 
                     common_sampler_sample(smpl, ctx_dft, idx, true);
@@ -1496,9 +1552,22 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
                     const llama_token id = cur_p->data[0].id;
 
+                    if (rl) {
+                        for (int k = 0; k < 3; ++k) {
+                            const bool has = k < (int) cur_p->size;
+                            rl->cand.push_back(has ? cur_p->data[k].id : -1);
+                            rl->cand_p.push_back(has ? cur_p->data[k].p : 0.0f);
+                        }
+                    }
+
                     common_sampler_accept(smpl, id, true);
 
                     result.push_back(id);
+                }
+
+                if (rl) {
+                    rl->n_drafted = (int32_t) result.size();
+                    rl->ids.assign(result.begin(), result.end());
                 }
             } else {
                 // greedily read the predicted block at this sequence's noise positions 1..n_block_tokens-1
@@ -1529,10 +1598,54 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 result.clear();
             }
         }
+
+        if (dspark_log) {
+            const int64_t t_end = ggml_time_us();
+            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+                if (i_block_beg[seq_id] < 0) {
+                    continue;
+                }
+                auto & rl = dspark_rounds[seq_id];
+                rl.ids.assign(dparams[seq_id].result->begin(), dparams[seq_id].result->end());
+                rl.pending      = !rl.ids.empty();
+                rl.t_drafted_us = t_end;
+                rl.draft_us     = (double) (t_end - t_draft_beg);
+            }
+            dspark_n_round++;
+        }
     }
 
-    void accept(llama_seq_id /*seq_id*/, uint16_t /*n_accepted*/, bool /*is_other*/) override {
-        // noop
+    void accept(llama_seq_id seq_id, uint16_t n_accepted, bool /*is_other*/) override {
+        if (!dspark_log || seq_id < 0 || seq_id >= (llama_seq_id) dspark_rounds.size()) {
+            return;
+        }
+        auto & rl = dspark_rounds[seq_id];
+        if (!rl.pending) {
+            return;
+        }
+        rl.pending = false;
+        const double verify_us = (double) (ggml_time_us() - rl.t_drafted_us);
+        fprintf(dspark_log, "{\"ev\":\"round\",\"seq\":%d,\"pos0\":%d,\"id_last\":%d,\"n_drafted\":%d,\"width\":%d,"
+                "\"n_acc\":%d,\"draft_us\":%.0f,\"verify_us\":%.0f,\"ids\":[",
+                (int) seq_id, (int) rl.pos0, (int) rl.id_last, rl.n_drafted, (int) rl.ids.size(), (int) n_accepted,
+                rl.draft_us, verify_us);
+        for (size_t i = 0; i < rl.ids.size(); ++i) {
+            fprintf(dspark_log, i ? ",%d" : "%d", (int) rl.ids[i]);
+        }
+        fprintf(dspark_log, "],\"conf\":[");
+        for (size_t i = 0; i < rl.conf.size(); ++i) {
+            fprintf(dspark_log, i ? ",%.4f" : "%.4f", rl.conf[i]);
+        }
+        fprintf(dspark_log, "],\"cand\":[");
+        for (size_t i = 0; i < rl.cand.size(); ++i) {
+            fprintf(dspark_log, i ? ",%d" : "%d", (int) rl.cand[i]);
+        }
+        fprintf(dspark_log, "],\"cand_p\":[");
+        for (size_t i = 0; i < rl.cand_p.size(); ++i) {
+            fprintf(dspark_log, i ? ",%.4f" : "%.4f", rl.cand_p[i]);
+        }
+        fprintf(dspark_log, "]}\n");
+        fflush(dspark_log);
     }
 };
 
