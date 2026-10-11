@@ -61,6 +61,9 @@ struct l2_config {
     l2_unified_policy unified;
     int     unified_probation_min = -1;   // probation slots per storage class at least; -1 = its ring slots of the layout
     int     unified_reseed        = 1;    // per install: 0 = the rings stay, 1 = laid out in score order (default), 2 = also read the best experts
+    // The model of every layer (a joint cache; empty = one model). The unified policy needs every storage
+    // class to hold the layers of one model, since a model that binds later joins it separately.
+    std::vector<int> layer_owner;
 };
 
 // Whether the staged service is on when RANMA_EXPERT_L2_STAGED is not set. On, it covers the
@@ -209,12 +212,26 @@ public:
     // demotions from VRAM join the rings at the probation point, and the ring copies of VRAM residents are
     // emptied; the caller publishes every non-VRAM expert as a file resident (set_homes(..., true)).
     bool unified() const { return class_layout() && cfg_.unified.on; }
+    // The storage class that holds the layers of several models (set_storage then turned the policy off), or -1.
+    int  unified_shared_storage() const { return uni_shared_; }
+    // Per storage class: whether the policy applies to it. All of them at first; a joint cache whose later model
+    // has not bound yet clears its classes until unify_storages (their residents and rings stay as they are).
+    bool unified_storage(int s) const { return unified() && (uni_active_.empty() || uni_active_[(size_t) s] != 0); }
+    void set_unified_active(const std::vector<uint8_t> & active) { uni_active_ = active; }
+    const std::vector<uint8_t> * unified_active() const { return uni_active_.empty() ? nullptr : &uni_active_; }
+    // A storage class joins the policy while the others run (a late model bound and loaded): its residents
+    // dissolve into the ring in place, then the best experts of `counts` fill the empty slots and the list
+    // is laid out in score order (reseed_unified restricted to `scope`). Nothing may compute meanwhile:
+    // the worker is stopped and the device idle. The caller publishes the homes (set_homes(..., true)).
+    bool unify_storages(const std::vector<uint8_t> & scope, const std::vector<uint64_t> & counts,
+                        const std::vector<std::vector<int32_t>> & vram, l2_install_stats & stats, std::string & reason);
     int  unified_reseed() const { return cfg_.unified_reseed; }
     // Brings every class ring to the best experts of `counts` (a profile, [layer*experts + expert]; empty =
     // no profile: nothing is read and the order stays) that are not VRAM residents of `vram`, reading what it
     // lacks when `fill`, and lays the rings out in score order. The worker must be stopped and the device idle.
+    // `scope` (per storage class, null = the classes the policy applies to) limits it to those classes.
     bool reseed_unified(const std::vector<uint64_t> & counts, const std::vector<std::vector<int32_t>> & vram, bool fill,
-                        l2_install_stats & stats, std::string & reason);
+                        l2_install_stats & stats, std::string & reason, const std::vector<uint8_t> * scope = nullptr);
     // The least ring slots a storage class has under the unified policy (every slot of its arena).
     int  class_slots(int s) const { return cledger_.ring_count(s); }
     // Runs the moves of `tx` (host locations `before` -> tx.host) by relabeling slots: reads only the
@@ -354,6 +371,8 @@ private:
 
     const geometry & geo_;
     l2_config cfg_;
+    std::vector<uint8_t> uni_active_;   // per storage class, see unified_storage
+    int uni_shared_ = -1;
     int    device_ = -1;
     bool   sized_  = false;
     bool   mapped_ = false;

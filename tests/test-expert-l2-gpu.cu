@@ -1395,6 +1395,185 @@ static int unified_test(const std::filesystem::path & dir) {
     return 0;
 }
 
+// A joint cache whose second model binds late (the DS4.1F target and its drafter): layer 0 belongs to model A
+// (storage class 0), layer 1 to model B (storage class 1, another slice size). The start dissolves class 0 only;
+// B's residents stay residents (the loader of B writes them later) and its layer is not touched. Then B binds
+// (its residents are written, its file opens) and class 1 joins on its own: its residents dissolve into its ring in
+// place, its profile fills the empty slots, and generations of both layers read the files' bytes. A cache that
+// puts the layers of two models into one storage class turns the policy off instead.
+static int unified_late_test(const std::filesystem::path & dir) {
+    constexpr int K = 256, M0 = 64, M1 = 128, experts = 9;
+    constexpr size_t slice0 = size_t(K/32)*24*M0, slice1 = size_t(K/32)*24*M1, shift = 512;
+    const auto path_a = dir / "late-a.bin", path_b = dir / "late-b.bin";
+    std::vector<char> file_a(shift + experts*slice0 + 4096), file_b(shift + experts*slice1 + 4096);
+    for (size_t i = 0; i < file_a.size(); ++i) { file_a[i] = char((i*157 + i/1013) & 0xff); }
+    for (size_t i = 0; i < file_b.size(); ++i) { file_b[i] = char((i*131 + i/977 + 5) & 0xff); }
+    { std::ofstream out(path_a, std::ios::binary); out.write(file_a.data(), file_a.size()); CHECK(bool(out)); }
+    { std::ofstream out(path_b, std::ios::binary); out.write(file_b.data(), file_b.size()); CHECK(bool(out)); }
+    geometry geo;
+    geo.n_layers = 2; geo.n_experts = experts;
+    geo.layer_class = {0, 1}; geo.class_layers = {1, 1};
+    geo.class_bytes = {{slice0, slice0, slice0}, {slice1, slice1, slice1}};
+    ggml_tensor w0 = {}, w1 = {};
+    w0.type = GGML_TYPE_Q5_1; w0.ne[0] = K; w0.ne[1] = M0; w0.ne[2] = experts; w0.ne[3] = 1;
+    w1.type = GGML_TYPE_Q5_1; w1.ne[0] = K; w1.ne[1] = M1; w1.ne[2] = experts; w1.ne[3] = 1;
+    geo.tensors = {{{&w0, &w0, &w0}}, {{&w1, &w1, &w1}}};
+    std::vector<std::array<size_t, 3>> tails = {
+        {arena_tail_bytes(geo, 0, 0), arena_tail_bytes(geo, 0, 1), arena_tail_bytes(geo, 0, 2)},
+        {arena_tail_bytes(geo, 1, 0), arena_tail_bytes(geo, 1, 1), arena_tail_bytes(geo, 1, 2)}};
+    class_storage st = plan_storage_classes(geo, tails, expert_os::io_alignment, 8, /*merge =*/ false);   // layers of one or two layers would merge
+    CHECK(st.valid() && st.storages() == 2 && st.place({4, 4}, {4, 4}));
+    st.floor = {2, 2};
+    l2_config cfg; cfg.verify = true; cfg.class_layout = true; cfg.decode_rows = 1; cfg.prefill_rows = 8;
+    cfg.unified.on = true; cfg.unified.ghost = 4; cfg.unified_probation_min = 1;
+    cfg.layer_owner = {0, 1};
+    l2_tier tier(geo, cfg);
+    tier.set_storage(st);
+    CHECK(tier.sized() && tier.unified() && tier.unified_shared_storage() < 0);
+    host_arena host(geo);
+    CHECK(host.allocate({4, 4}, 0, 0, &tier.storage()));
+    CHECK(tier.allocate(0));
+    auto expect = [&](int layer, int expert) {
+        return layer == 0 ? file_a.data() + shift + expert*slice0 : file_b.data() + shift + expert*slice1;
+    };
+    const size_t slice[2] = {slice0, slice1};
+    // the loader of A: layer 0 experts 0..3 are its host residents
+    for (int i = 0; i < 4; ++i) for (int k = 0; k < 3; ++k) { memcpy(static_cast<char *>(host.slice(0, k, i)) + shift, expect(0, i), slice0); }
+    CHECK(host.map());
+    l2_host_geometry host_geo;
+    host_geo.device_base.assign(2, {nullptr, nullptr, nullptr});
+    host_geo.host_base.assign(2, {nullptr, nullptr, nullptr});
+    for (int sc = 0; sc < 2; ++sc) for (int k = 0; k < 3; ++k) {
+        host_geo.device_base[sc][k] = host.storage_base(sc, k, true); host_geo.host_base[sc][k] = host.storage_base(sc, k, false);
+    }
+    const std::vector<std::vector<int32_t>> vram(2, std::vector<int32_t>(experts, -1));
+    std::vector<std::vector<int32_t>> resident(2, std::vector<int32_t>(experts, -1));
+    for (int i = 0; i < 4; ++i) { resident[0][i] = i; resident[1][i] = i; }
+    const expert_locations homes = host_locations(resident), file_homes = host_locations(vram);
+    expert_locations start_homes = file_homes;   // A in the file, B still at its resident homes
+    start_homes[1] = homes[1];
+    tier.set_homes(vram, homes, host_geo);
+    const std::string name_a = path_a.string(), name_b = path_b.string();
+    for (int k = 0; k < 3; ++k) { tier.set_backing(0, k, 0, name_a.c_str(), shift); }
+    std::string reason;
+    const std::vector<uint8_t> only_a = {1, 0}, only_b = {0, 1};
+    CHECK(tier.open_files(reason, &only_a));
+    CHECK(tier.map());
+    l1_arena gpu(geo);
+    CHECK(gpu.allocate({1, 1}, 0, 0));
+    // the start: class 0 dissolves and is filled from A's profile; class 1 waits for its model
+    tier.set_unified_active(only_a);
+    CHECK(tier.unified_storage(0) && !tier.unified_storage(1));
+    install_transaction tx;
+    tx.valid = true; tx.gpu_slots = vram; tx.host = start_homes;
+    l2_install_stats stats;
+    CHECK(tier.install_relabel(tx, homes, gpu, stats, reason));
+    CHECK(stats.demoted == 4);
+    std::vector<uint64_t> counts((size_t) 2*experts, 0);
+    for (int e = 4; e < 8; ++e) { counts[(size_t) e] = 50 - e; }               // layer 0 experts 4..7
+    for (int e = 4; e < 8; ++e) { counts[(size_t) (experts + e)] = 40 - e; }   // layer 1 experts 4..7
+    CHECK(tier.reseed_unified(counts, vram, true, stats, reason));
+    CHECK(stats.reseed_slices == 4);   // class 0 only: the profile's four best of layer 0
+    tier.set_homes(vram, start_homes, host_geo, true);
+    const l2_class_ledger & led = tier.class_ledger();
+    CHECK(led.ring_count(0) == 8 && led.ring_count(1) == 4);
+    for (int e = 0; e < 8; ++e) { CHECK(led.slot_of(0, e) >= 0); }
+    {
+        int residents = 0;   // class 1 is untouched: four residents holding layer 1's experts 0..3, no ring occupant
+        for (int slot = 0; slot < led.slots(1); ++slot) {
+            int l = -1, e = -1;
+            if (led.role_of(1, slot) == slot_role::resident && led.occupant(1, slot, l, e) && l == 1 && e < 4) { ++residents; }
+            CHECK(!(led.role_of(1, slot) == slot_role::ring && led.occupant(1, slot, l, e)));
+        }
+        CHECK(residents == 4);
+    }
+    int32_t * dev_ids = nullptr; char * copy = nullptr;
+    CUDA_CHECK(hipMalloc(&dev_ids, sizeof(int32_t)));
+    CUDA_CHECK(hipMalloc(&copy, slice1));
+    hipStream_t stream; CUDA_CHECK(hipStreamCreate(&stream));
+    ggml_tensor ids = {}; ids.type = GGML_TYPE_I32; ids.data = dev_ids;
+    ids.ne[0] = 1; ids.ne[1] = 1; ids.ne[2] = ids.ne[3] = 1; ids.nb[0] = ids.nb[1] = 4;
+    std::vector<char> back(slice1);
+    auto generation = [&](int layer, int expert) {
+        CUDA_CHECK(hipMemcpyAsync(dev_ids, &expert, sizeof(int32_t), hipMemcpyHostToDevice, stream));
+        CUDA_CHECK(hipStreamSynchronize(stream));
+        tier.publish_and_wait(layer, &ids, stream);
+        readback<<<32, 128, 0, stream>>>(tier.addresses(layer, 2), expert, copy, slice[layer]);
+        tier.mark_done(layer, stream);
+        CUDA_CHECK(hipMemcpyAsync(back.data(), copy, slice[layer], hipMemcpyDeviceToHost, stream));
+        CUDA_CHECK(hipStreamSynchronize(stream));
+        return memcmp(back.data(), expect(layer, expert), slice[layer]) == 0;
+    };
+    // model A runs before B has bound
+    tier.start_worker();
+    for (int round = 0; round < 2; ++round) { for (int e = 0; e < experts; ++e) { CHECK(generation(0, e)); } }
+    tier.stop_worker();
+    CHECK(led.ring_count(1) == 4);
+    // B binds: the loader writes its residents, its file opens, the addresses are recomputed
+    for (int i = 0; i < 4; ++i) for (int k = 0; k < 3; ++k) { memcpy(static_cast<char *>(host.slice(1, k, i)) + shift, expect(1, i), slice1); }
+    for (int k = 0; k < 3; ++k) { tier.set_backing(1, k, 0, name_b.c_str(), shift); }
+    CHECK(tier.open_files(reason, &only_b));
+    tier.refresh_addresses();
+    CHECK(tier.counters().verify_bad == 0);
+    // class 1 joins on its own: four residents dissolve, B's profile reads its four best into the empty slots
+    auto class0_state = [&]() {
+        std::vector<int> out = led.order(0);
+        for (int slot = 0; slot < led.slots(0); ++slot) {
+            int l = -1, e = -1;
+            out.push_back(led.occupant(0, slot, l, e) ? l*experts + e : -1);
+        }
+        return out;
+    };
+    const std::vector<int> class0_before = class0_state();
+    l2_install_stats joined;
+    const uint64_t reads_before = tier.counters().ssd_reads;
+    CHECK(tier.unify_storages(only_b, counts, vram, joined, reason));
+    CHECK(joined.demoted == 4 && joined.reseed_slices == 4);
+    tier.set_homes(vram, file_homes, host_geo, true);
+    CHECK(tier.unified_storage(0) && tier.unified_storage(1));
+    CHECK(led.ring_count(1) == 8 && led.ring_count(0) == 8);
+    for (int e = 0; e < 8; ++e) { CHECK(led.slot_of(1, e) >= 0 && led.role_of(1, led.slot_of(1, e)) == slot_role::ring); }
+    CHECK(class0_state() == class0_before);   // class 0 kept its contents and its order
+    CHECK(tier.counters().ssd_reads == reads_before);
+    // both models run: the held experts of both layers are ring hits, then every expert twice
+    tier.start_worker();
+    const uint64_t hits0 = tier.counters().ring_hits;
+    for (int e = 0; e < 8; ++e) { CHECK(generation(1, e)); }
+    CHECK(wait_until([&] { return tier.counters().ring_hits == hits0 + 8; }));
+    CHECK(tier.counters().ssd_reads == reads_before);
+    for (int round = 0; round < 2; ++round) {
+        for (int l = 0; l < 2; ++l) for (int e = 0; e < experts; ++e) { CHECK(generation(l, e)); }
+    }
+    tier.stop_worker();
+    CHECK(tier.counters().verify_bad == 0);
+    printf("PASS: unified late bind: class 0 dissolved at the start, class 1 joined after its model bound (%zu slices read), %llu hits, "
+           "%llu demand reads\n", joined.reseed_slices, (unsigned long long) tier.counters().ring_hits,
+        (unsigned long long) tier.counters().ssd_reads);
+    CUDA_CHECK(hipStreamDestroy(stream)); CUDA_CHECK(hipFree(copy)); CUDA_CHECK(hipFree(dev_ids));
+    // two models in one storage class: the policy is off
+    {
+        geometry shared = geo;
+        shared.layer_class = {0, 0}; shared.class_layers = {2};
+        shared.class_bytes = {{slice0, slice0, slice0}};
+        shared.tensors = {{{&w0, &w0, &w0}}, {{&w0, &w0, &w0}}};
+        std::vector<std::array<size_t, 3>> t1 = {{arena_tail_bytes(shared, 0, 0), arena_tail_bytes(shared, 0, 1), arena_tail_bytes(shared, 0, 2)}};
+        class_storage one = plan_storage_classes(shared, t1, expert_os::io_alignment, 8);
+        CHECK(one.valid() && one.place({4}, {4}));
+        one.floor = {2};
+        l2_config c2 = cfg;
+        c2.layer_owner = {0, 1};
+        l2_tier mixed(shared, c2);
+        mixed.set_storage(one);
+        CHECK(mixed.sized() && !mixed.unified() && mixed.unified_shared_storage() == 0);
+        c2.layer_owner = {0, 0};
+        l2_tier same(shared, c2);
+        same.set_storage(one);
+        CHECK(same.sized() && same.unified() && same.unified_shared_storage() < 0);
+    }
+    printf("PASS: unified late bind: a storage class with the layers of two models turns the policy off\n");
+    return 0;
+}
+
 int main(int argc, char ** argv) {
     if (argc != 2) { return 2; }
     setvbuf(stdout, nullptr, _IONBF, 0);
@@ -1413,6 +1592,7 @@ int main(int argc, char ** argv) {
     CHECK(host_chunk_cost_test() == 0);
     CHECK(early_ssd_test(argv[1]) == 0);
     CHECK(unified_test(argv[1]) == 0);
+    CHECK(unified_late_test(argv[1]) == 0);
     constexpr int K = 640, M = 2560, N = 14, J = 16, experts = 17, selected = 4;
     constexpr size_t slice = size_t(K/32)*24*M, shift = 4064, tail = 288;
     const auto path = std::filesystem::path(argv[1]) / "ring-weights.bin";
