@@ -90,14 +90,22 @@ common_spec_smart::common_spec_smart(const common_spec_smart_config & cfg_in, in
 
     shape_cells.assign(cfg.n_max + 1, {});
     shape_over.assign(cfg.n_max + 1, 0.0);
-    cal_cells.assign((size_t) N_GROUPS * cfg.n_bins, {});
+    n_groups = std::max<int32_t>(1, cfg.n_groups);
+    cal_cells.assign((size_t) n_groups * cfg.n_bins, {});
     qbar_cells.assign(std::min<int32_t>(cfg.n_max + 1, N_QBAR_MAX), {});
     cfg.lookahead_mix = std::clamp(cfg.lookahead_mix, 0.0, 1.0);
     cfg.conf_cap = cfg.conf_cap > 0.0 ? std::max(cfg.conf_cap, 1.0) : 0.0;
     cost_n_run.assign(cfg.n_max + 1, 0);
     used_run.assign(cfg.n_max + 1, 0);
     cfg.tconf_k = std::clamp<int32_t>(cfg.tconf_k, 1, common_spec_tconf::K_MAX);
-    tconf_model.reset(cfg.tconf_k);
+    tconf_model.reset(cfg.tconf_k, cfg.block);
+    if (cfg.tconf_per_pos && n_groups > 1) {
+        tconf_more.assign(n_groups - 1, tconf_model); // every position group starts at the same static coefficients
+    }
+    tc_kept_m.assign(tc_n_models(), 0);
+    tc_upd_m.assign(tc_n_models(), 0);
+    cfg.blk_keep   = std::max<int32_t>(1, cfg.blk_keep);
+    cfg.skip_probe = std::max<int32_t>(1, cfg.skip_probe);
 
     seqs.resize(std::max<int32_t>(1, n_seq));
     for (auto & st : seqs) {
@@ -136,6 +144,12 @@ common_spec_smart::common_spec_smart(const common_spec_smart_config & cfg_in, in
             smart_json_num(l, cfg.lookahead_mix);
             l += ",\"tconf\":";
             l += cfg.tconf ? std::to_string(cfg.tconf_k) : "0";
+            if (cfg.block) {
+                // block drafter only (the line of draft-mtp is as before)
+                l += ",\"block\":true,\"n_groups\":" + std::to_string(n_groups) + ",\"tconf_pos\":\"" +
+                     (cfg.tconf_per_pos ? "per" : "shared") + "\",\"blk_keep\":" + std::to_string(cfg.blk_keep) +
+                     ",\"skip_probe\":" + std::to_string(cfg.skip_probe);
+            }
             l += "}";
             log->put(l);
             log->flush();
@@ -152,7 +166,14 @@ common_spec_smart::common_spec_smart(const common_spec_smart_config & cfg_in, in
     if (cfg.tconf) {
         SMT_INF("trigram confidence: the acceptance of a draft token from its drafter probability and the request's "
                 "trigram counts, %d candidate%s per step%s\n", cfg.tconf_k, cfg.tconf_k > 1 ? "s" : "",
-                cfg.tconf_k > 1 ? " (the most likely accepted one is drafted)" : "");
+                cfg.tconf_k > 1 ? (cfg.block ? " (the most likely accepted one is drafted at the last verified position)"
+                                             : " (the most likely accepted one is drafted)") : "");
+    }
+    if (cfg.block) {
+        SMT_INF("block drafter: verifies 0..%d tokens of every drafted block, calibration cells of %d position groups, "
+                "trigram coefficients %s; the forward is skipped while the last %d drafted blocks give fewer tokens per "
+                "time than a decode without a draft (a draft again after %d skipped rounds)\n", cfg.n_max, n_groups,
+                cfg.tconf_per_pos ? "per position group" : "shared by all positions", cfg.blk_keep, cfg.skip_probe);
     }
 }
 
@@ -180,7 +201,7 @@ int32_t common_spec_smart::bin(float p) const {
 }
 
 double common_spec_smart::q(int32_t i, float p) const {
-    const int32_t g = std::min<int32_t>(std::max<int32_t>(i, 0), N_GROUPS - 1);
+    const int32_t g = std::min<int32_t>(std::max<int32_t>(i, 0), n_groups - 1);
     const int32_t b = bin(p);
     const auto &  c = cal_cells[(size_t) g * cfg.n_bins + b];
     const double mid = (b + 0.5) / cfg.n_bins;
@@ -328,6 +349,190 @@ int32_t common_spec_smart::decide(const float * p, int32_t n_drafted, int32_t n_
     return res;
 }
 
+//
+// block drafter (draft-dspark): one forward drafts the whole block, the decision picks the verified prefix
+//
+
+int32_t common_spec_smart::decide_block(const float * p, int32_t n, int32_t n_lim, double D, const std::vector<double> & C,
+                                        common_spec_smart_diag * diag, const double * qd, const double * qd_last,
+                                        double * exp_acc) const {
+    const int32_t kmax = std::max<int32_t>(0, std::min({ n, n_lim, cfg.n_max, (int32_t) C.size() - 1 }));
+
+    double  best   = -1.0;
+    int32_t best_k = 0;
+    double  best_A = 0.0;
+    double  Ssum   = 0.0; // expected accepted tokens of positions 0..k-2 (their prefixes all accepted)
+    double  P      = 1.0; // probability that positions 0..k-2 are all accepted
+    for (int32_t k = 0; k <= kmax; ++k) {
+        double A = 0.0;
+        if (k > 0) {
+            const double qk = qd != nullptr ? qd[k - 1] : q(k - 1, p[k - 1]);
+            const double ql = qd_last != nullptr ? qd_last[k - 1] : qk; // the last verified position
+            A = Ssum + P * ql;
+            P    *= qk;
+            Ssum += P;
+        }
+        const double T = (A + 1.0) / std::max(D + C[k], 1.0);
+        if (T > best) {
+            best   = T;
+            best_k = k;
+            best_A = A;
+        }
+    }
+    if (exp_acc) {
+        *exp_acc = best_A;
+    }
+    if (diag) {
+        diag->q.clear();
+        diag->la.clear();
+        for (int32_t j = 0; j < n; ++j) {
+            diag->q.push_back(qd != nullptr ? qd[j] : q(j, p[j]));
+        }
+        diag->valid      = true;
+        diag->k          = best_k;
+        diag->exp_acc    = best_A;
+        diag->t_stop     = best;
+        diag->t_cont     = -1.0;
+        diag->draft_pred = draft_step();
+        diag->cost       = C;
+    }
+    return best_k;
+}
+
+double common_spec_smart::block_value(int32_t seq, int32_t n_lim) const {
+    const auto & st = seqs[seq];
+    if (st.blk.empty()) {
+        return -1.0;
+    }
+    // every kept block decided again as after its forward (the draft step sunk), with the costs and calibration of now;
+    // tokens per time of drafting every round = the sum of (expected accepted + 1) over the sum of (draft step + cost)
+    const std::vector<double> C = cost_table();
+    const double d = draft_step();
+    double num = 0.0;
+    double den = 0.0;
+    for (const auto & e : st.blk) {
+        double a = 0.0;
+        const int32_t k = decide_block(e.p, e.n, n_lim, 0.0, C, nullptr, e.has_qd ? e.qd : nullptr,
+                                       e.has_ql ? e.ql : nullptr, &a);
+        num += a + 1.0;
+        den += d + C[k];
+    }
+    return den > 0.0 ? num / den : -1.0;
+}
+
+bool common_spec_smart::begin_block(int32_t seq, int32_t n_max_seq) {
+    auto & st = seqs[seq];
+    st.drafting  = true;
+    st.active    = false;
+    st.has_acc   = false;
+    st.p.clear();
+    st.qd.clear();
+    st.n_max_seq = std::max<int32_t>(0, std::min(n_max_seq, cfg.n_max));
+    st.forced    = -1;
+    st.timed     = true;
+    st.k_nat     = -1;
+    st.ext_step  = false;
+    if (log) {
+        st.log_forced      = 0;
+        st.log_steps       = 0;
+        st.log_acc         = -1;
+        st.log_steps_timed = 0;
+        st.log_draft_us    = 0.0;
+        st.log_p.clear();
+        st.log_la_next.clear();
+        st.log_diag = {};
+    }
+    st.n_lim       = std::min(st.n_max_seq, frontier());
+    st.blk_draft   = false;
+    st.blk_probe   = false;
+    st.blk_v_draft = -1.0;
+    st.blk_v_skip  = -1.0;
+    if (st.n_max_seq == 0) {
+        return false;
+    }
+
+    // draft when the recent blocks, decided again now, give more tokens per time than a decode without a draft. The
+    // widths are those of the request, not the frontier: a width not measured yet is predicted from the narrower ones
+    // (never cheaper), so that a cold start drafts and finds the widths through the extensions of the drafted rounds
+    const std::vector<double> C = cost_table();
+    st.blk_v_skip  = C[0] > 0.0 ? 1.0 / C[0] : -1.0;
+    st.blk_v_draft = block_value(seq, st.n_max_seq);
+    bool draft = false;
+    if (st.blk_v_draft < 0.0 || st.blk_v_skip < 0.0) {
+        draft = true; // nothing known yet
+    } else if (st.blk_v_draft > st.blk_v_skip) {
+        draft = true;
+    } else if (st.blk_skips >= cfg.skip_probe) {
+        draft        = true; // probe: the kept blocks are refreshed, so that a change of the text is seen
+        st.blk_probe = true;
+    }
+    st.blk_draft = draft;
+    st.blk_skips = draft ? 0 : st.blk_skips + 1;
+    st.blk_n_skip  += draft ? 0 : 1;
+    st.blk_n_probe += st.blk_probe ? 1 : 0;
+    return draft;
+}
+
+int32_t common_spec_smart::block_drafted(int32_t seq, const float * p, int32_t n, const double * qd,
+                                         const double * qd_last) {
+    using blk_entry = seq_state::blk_entry;
+    auto & st = seqs[seq];
+    n = std::clamp<int32_t>(n, 0, blk_entry::N);
+    st.p.assign(p, p + n);
+    st.qd.clear();
+    if (qd != nullptr) {
+        for (int32_t j = 0; j < n; ++j) {
+            st.qd.push_back(std::clamp(qd[j], 0.01, 0.99));
+        }
+    }
+    double ql[blk_entry::N];
+    if (qd_last != nullptr) {
+        for (int32_t j = 0; j < n; ++j) {
+            ql[j] = std::clamp(qd_last[j], 0.01, 0.99);
+        }
+    }
+
+    // kept for the decision to draft of the next rounds
+    blk_entry e;
+    e.n = n;
+    std::copy(p, p + n, e.p);
+    e.has_qd = qd != nullptr;
+    e.has_ql = qd_last != nullptr;
+    for (int32_t j = 0; j < n; ++j) {
+        e.qd[j] = e.has_qd ? st.qd[j] : 0.0;
+        e.ql[j] = e.has_ql ? ql[j] : 0.0;
+    }
+    if ((int32_t) st.blk.size() < cfg.blk_keep) {
+        st.blk.push_back(e);
+    } else {
+        st.blk[st.blk_next] = e;
+        st.blk_next = (st.blk_next + 1) % (size_t) cfg.blk_keep;
+    }
+
+    if (st.n_max_seq == 0 || n == 0) {
+        return 0;
+    }
+    // the draft step is spent: only the verification time of the width counts
+    const int32_t r = decide_block(st.p.data(), n, st.n_lim, 0.0, cost_table(), log ? &st.log_diag : nullptr,
+                                   st.qd.empty() ? nullptr : st.qd.data(), qd_last != nullptr ? ql : nullptr);
+    if (r < n && can_extend(r + 1, st.n_max_seq)) {
+        // the decision stops at r and width r + 1 waits: verify r + 1 (its token is drafted already)
+        start_extend(seq, r, false);
+        return r + 1;
+    }
+    return r;
+}
+
+void common_spec_smart::block_last(int32_t seq, int32_t j, float p, double qd) {
+    auto & st = seqs[seq];
+    if (j >= 0 && j < (int32_t) st.p.size()) {
+        st.p[j] = p;
+    }
+    if (j >= 0 && j < (int32_t) st.qd.size()) {
+        st.qd[j] = std::clamp(qd, 0.01, 0.99);
+    }
+}
+
 bool common_spec_smart::level_source(int32_t k) const {
     // widths with a confident shape only; when there is none, every width with a shape
     if (conf(shape_cells[k]) >= cfg.reprobe_n) {
@@ -388,7 +593,7 @@ void common_spec_smart::observe_acceptance(const float * p, int32_t k, int32_t n
     const int32_t last = std::min(n_accepted, k - 1);
     for (int32_t j = 0; j <= last; ++j) {
         const double  y = j < n_accepted ? 1.0 : 0.0;
-        const int32_t g = std::min<int32_t>(j, N_GROUPS - 1);
+        const int32_t g = std::min<int32_t>(j, n_groups - 1);
         cal_cells[(size_t) g * cfg.n_bins + bin(p[j])].add(y, decay, n_closed);
         qbar_cells[std::min<int32_t>(j, (int32_t) qbar_cells.size() - 1)].add(y, decay, n_closed);
     }
@@ -445,6 +650,8 @@ void common_spec_smart::request_begin(int32_t seq) {
     st.n_draft_tok = 0;
     st.n_acc_tok = 0;
     st.n_extend = 0;
+    st.blk_n_skip  = 0;
+    st.blk_n_probe = 0;
     std::fill(st.n_k.begin(), st.n_k.end(), 0);
     std::fill(st.obs_sum_k.begin(), st.obs_sum_k.end(), 0.0);
     std::fill(st.obs_n_k.begin(), st.obs_n_k.end(), 0);
@@ -858,6 +1065,19 @@ void common_spec_smart::log_round(int32_t seq, const char * end, double verify_u
             l += "}}";
         }
     }
+    if (cfg.block) {
+        // block drafter only: the decision to draft before the forward (tokens / s of drafting every round, from the
+        // kept blocks, and of a decode without a draft) and whether it was a probe after skipped rounds
+        l += ",\"blk\":{\"draft\":";
+        l += st.blk_draft ? "true" : "false";
+        l += ",\"probe\":";
+        l += st.blk_probe ? "true" : "false";
+        l += ",\"v_draft\":";
+        smart_json_num(l, st.blk_v_draft >= 0.0 ? st.blk_v_draft * 1e6 : NAN, "%.3f");
+        l += ",\"v_skip\":";
+        smart_json_num(l, st.blk_v_skip >= 0.0 ? st.blk_v_skip * 1e6 : NAN, "%.3f");
+        l += ",\"skips\":" + std::to_string(st.blk_skips) + ",\"kept\":" + std::to_string(st.blk.size()) + "}";
+    }
     l += ",\"wait_reset\":";
     const bool wr = std::string(end) == "closed" && wr_last;
     l += wr ? "true" : "false";
@@ -935,6 +1155,21 @@ std::string common_spec_smart::request_summary(int32_t seq) const {
             snprintf(buf, sizeof(buf), " %.3f", tconf_model.b[d]);
             s += buf;
         }
+        // per position group (LLAMA_SPEC_DSPARK_TCONF_POS=per): the other sets
+        for (int32_t m = 1; m < tc_n_models(); ++m) {
+            snprintf(buf, sizeof(buf), ", b%d", m);
+            s += buf;
+            for (int32_t d = 0; d < common_spec_tconf::DIM; ++d) {
+                snprintf(buf, sizeof(buf), " %.3f", tc_model(m).b[d]);
+                s += buf;
+            }
+        }
+    }
+    if (cfg.block) {
+        // block drafter: the rounds that drafted (the others skipped the forward) and the probes among them
+        snprintf(buf, sizeof(buf), ", block: forward skipped %lld of %lld rounds, probes %lld", (long long) st.blk_n_skip,
+                 (long long) st.n_rounds, (long long) st.blk_n_probe);
+        s += buf;
     }
     return s;
 }
@@ -1051,10 +1286,20 @@ static double tconf_lg(double x) {
     return std::log(x / (1.0 - x));
 }
 
-void common_spec_tconf::reset(int32_t k) {
+// static coefficients of the block drafter (draft-dspark), the same for every k: IRLS (ridge 0.1) on the drafted token of
+// every position whose prefix was accepted in the DS4F + DSpark Q8_0 round log ds4f-fullr-coll (2026-10-11; 30 requests of
+// roleplay ko / en and code, width 4, 7074 rows), p = the confidence head, trigram source = the request's own tokens (the
+// prompt RU, the generated tokens RA), the profile columns 0. Request-split log-loss 0.4474 / 0.4620 against 0.4540 /
+// 0.4629 of the raw confidence and 0.560 / 0.571 of the draft-mtp coefficients of k = 1 (fit on the drafter probability
+// of GLM MTP, too low for a calibrated confidence)
+static const double TCONF_B_BLOCK[common_spec_tconf::DIM] = {
+    0.246370, 1.014855, 0.947002, 0.731891, 1.160671, 0.526061, 0, 0, 0, 0, 0, 0, 0.210823, -0.212246
+};
+
+void common_spec_tconf::reset(int32_t k, bool block) {
     k = std::clamp<int32_t>(k, 1, K_MAX);
     for (int32_t d = 0; d < DIM; ++d) {
-        b[d] = TCONF_B[k - 1][d];
+        b[d] = block ? TCONF_B_BLOCK[d] : TCONF_B[k - 1][d];
         G[d] = 1e-3;
     }
 }
@@ -1180,14 +1425,24 @@ void common_spec_smart::tconf_profile(common_spec_tprof_vocab voc, const std::st
     // the coefficients this model pair and k learnt before
     tprof_coef_key = cfg.tprof_coef_key + " k=" + std::to_string(cfg.tconf_k) + " dim=" +
                      std::to_string(common_spec_tconf::DIM);
-    common_spec_tprof_coef cf;
-    if (tprof->get_coef(tprof_coef_key, cf) && (int32_t) cf.b.size() == common_spec_tconf::DIM) {
-        std::copy(cf.b.begin(), cf.b.end(), tconf_model.b);
-        std::copy(cf.G.begin(), cf.G.end(), tconf_model.G);
-        tc_updates_kept = cf.updates;
-        SMT_INF("trigram profile: the coefficients of %lld updates are used\n", (long long) cf.updates);
-    } else {
-        SMT_INF("%s", "trigram profile: no coefficients of this model pair and k, the static ones are used\n");
+    // one block per coefficient set (cfg.tconf_per_pos: " pos=<m>" appended to the key)
+    for (int32_t m = 0; m < tc_n_models(); ++m) {
+        const std::string key = cfg.tconf_per_pos ? tprof_coef_key + " pos=" + std::to_string(m) : tprof_coef_key;
+        const std::string what = tc_n_models() > 1 ? " of position group " + std::to_string(m) : std::string();
+        common_spec_tprof_coef cf;
+        if (tprof->get_coef(key, cf) && (int32_t) cf.b.size() == common_spec_tconf::DIM) {
+            std::copy(cf.b.begin(), cf.b.end(), tc_model(m).b);
+            std::copy(cf.G.begin(), cf.G.end(), tc_model(m).G);
+            tc_kept_m[m] = cf.updates;
+            if (m == 0) {
+                tc_updates_kept = cf.updates;
+            }
+            SMT_INF("trigram profile: the coefficients%s of %lld updates are used\n", what.c_str(),
+                    (long long) cf.updates);
+        } else {
+            SMT_INF("trigram profile: no coefficients%s of this model pair and k, the static ones are used\n",
+                    what.c_str());
+        }
     }
 }
 
@@ -1195,12 +1450,15 @@ void common_spec_smart::tprof_put_coef() {
     if (!tprof) {
         return;
     }
-    common_spec_tprof_coef cf;
-    cf.key = tprof_coef_key;
-    cf.b.assign(tconf_model.b, tconf_model.b + common_spec_tconf::DIM);
-    cf.G.assign(tconf_model.G, tconf_model.G + common_spec_tconf::DIM);
-    cf.updates = tc_updates_kept + tc_updates;
-    tprof->put_coef(cf);
+    for (int32_t m = 0; m < tc_n_models(); ++m) {
+        common_spec_tprof_coef cf;
+        cf.key = cfg.tconf_per_pos ? tprof_coef_key + " pos=" + std::to_string(m) : tprof_coef_key;
+        cf.b.assign(tc_model(m).b, tc_model(m).b + common_spec_tconf::DIM);
+        cf.G.assign(tc_model(m).G, tc_model(m).G + common_spec_tconf::DIM);
+        // one set: all updates of the process (as before the sets per position)
+        cf.updates = tc_n_models() == 1 ? tc_updates_kept + tc_updates : tc_kept_m[m] + tc_upd_m[m];
+        tprof->put_coef(cf);
+    }
 }
 
 void common_spec_smart::tconf_request(int32_t seq, const int32_t * prompt, size_t n) {
@@ -1290,12 +1548,13 @@ void common_spec_smart::tconf_begin(int32_t seq, const int32_t * toks, size_t n,
         st.tc_ctx.push_back(toks[i]);
     }
     st.tc_ctx.push_back(id_last);
+    st.tc_ctx0 = st.tc_ctx.size();
     st.tc_pos.clear();
     st.tc_pos0 = pos0;
 }
 
 int32_t common_spec_smart::tconf_pick(int32_t seq, const int32_t * ids, const float * p, int32_t n, int32_t fixed,
-                                      double * q) {
+                                      double * q, double * q_all) {
     constexpr int32_t NS = common_spec_tconf::N_SRC;
     auto & st = seqs[seq];
     const int32_t kk = std::min<int32_t>(cfg.tconf_k, n);
@@ -1332,10 +1591,14 @@ int32_t common_spec_smart::tconf_pick(int32_t seq, const int32_t * ids, const fl
         }
     }
     const bool mid = tconf_mid(st.tc_ctx);
+    // the coefficient set of the draft position (one set unless cfg.tconf_per_pos)
+    const int32_t mo = tc_model_of((int32_t) st.tc_pos.size());
+    const common_spec_tconf & model = tc_model(mo);
 
     tconf_pos ps;
     ps.n = kk;
     ps.N = N;
+    ps.m = mo;
     ps.ids.assign(ids, ids + kk);
     ps.X.assign((size_t) kk * common_spec_tconf::DIM, 0.0);
 
@@ -1345,9 +1608,12 @@ int32_t common_spec_smart::tconf_pick(int32_t seq, const int32_t * ids, const fl
     for (int32_t i = 0; i < nc; ++i) {
         const bool sw = ids[i] >= 0 && (size_t) ids[i] < tc_wf.size() && tc_wf[ids[i]] != 0;
         common_spec_tconf::features(p[i], cn[i], cN, mid, sw, x);
-        const double qi = tconf_model.q(x);
+        const double qi = model.q(x);
         if (i < kk) {
             std::copy(x, x + common_spec_tconf::DIM, ps.X.begin() + (size_t) i * common_spec_tconf::DIM);
+            if (q_all != nullptr) {
+                q_all[i] = qi;
+            }
         }
         if (fixed >= 0 ? i == fixed : (i < kk && qi > best_q)) {
             best   = i;
@@ -1370,6 +1636,18 @@ int32_t common_spec_smart::tconf_pick(int32_t seq, const int32_t * ids, const fl
     return best;
 }
 
+int32_t common_spec_smart::tconf_repick(int32_t seq, int32_t j, const int32_t * ids, const float * p, int32_t n,
+                                        double * q) {
+    auto & st = seqs[seq];
+    if (j < 0 || j >= (int32_t) st.tc_pos.size()) {
+        return 0;
+    }
+    // back to the context of position j (the positions after it are not verified), then the free choice
+    st.tc_pos.resize(j);
+    st.tc_ctx.resize(st.tc_ctx0 + j);
+    return tconf_pick(seq, ids, p, n, -1, q);
+}
+
 void common_spec_smart::tconf_learn(const tconf_pos & ps, int32_t target) {
     if (ps.n <= 0) {
         return;
@@ -1378,8 +1656,9 @@ void common_spec_smart::tconf_learn(const tconf_pos & ps, int32_t target) {
     for (int32_t i = 0; i < ps.n; ++i) {
         lab[i] = ps.ids[i] == target ? 1.0 : 0.0;
     }
-    tconf_model.update(ps.X.data(), lab, ps.n);
+    tc_model(ps.m).update(ps.X.data(), lab, ps.n);
     tc_updates++;
+    tc_upd_m[std::clamp<int32_t>(ps.m, 0, tc_n_models() - 1)]++;
 }
 
 void common_spec_smart::tconf_accepted(int32_t seq, int32_t n_accepted) {
@@ -1437,7 +1716,7 @@ bool common_spec_smart::save(const std::string & path) const {
     out += SMART_STORE_MAGIC;
     out += "\nkey ";
     out += smart_key_line(cfg.store_key);
-    out += "\nshape " + std::to_string(cfg.n_max) + " " + std::to_string(cfg.n_bins) + " " + std::to_string(N_GROUPS) + "\n";
+    out += "\nshape " + std::to_string(cfg.n_max) + " " + std::to_string(cfg.n_bins) + " " + std::to_string(n_groups) + "\n";
     out += "level ";
     smart_put(out, level_cell.mean); out += " ";
     smart_put(out, level_conf()); out += "\n";
@@ -1447,7 +1726,7 @@ bool common_spec_smart::save(const std::string & path) const {
         smart_put(out, conf(shape_cells[k])); out += " ";
         smart_put(out, shape_cells[k].var); out += "\n";
     }
-    for (int32_t g = 0; g < N_GROUPS; ++g) {
+    for (int32_t g = 0; g < n_groups; ++g) {
         for (int32_t b = 0; b < cfg.n_bins; ++b) {
             const auto & c = cal_cells[(size_t) g * cfg.n_bins + b];
             out += "cal " + std::to_string(g) + " " + std::to_string(b) + " ";
@@ -1534,7 +1813,7 @@ bool common_spec_smart::load(const std::string & path, std::string * why) {
             if (t.size() != 4 || !smart_get(t[1], n_max_f) || !smart_get(t[2], n_bins_f) || !smart_get(t[3], n_groups_f)) {
                 return fail("bad shape line");
             }
-            if (n_bins_f != cfg.n_bins || n_groups_f != N_GROUPS) {
+            if (n_bins_f != cfg.n_bins || n_groups_f != n_groups) {
                 return fail("another calibration layout");
             }
             shape_ok = true;
@@ -1559,7 +1838,7 @@ bool common_spec_smart::load(const std::string & path, std::string * why) {
         } else if (t[0] == "cal" && t.size() == 5) {
             int32_t g = 0, b = 0;
             if (!smart_get(t[1], g) || !smart_get(t[2], b) || !smart_get(t[3], c.mean) || !smart_get(t[4], c.n) ||
-                g < 0 || g >= N_GROUPS || b < 0 || b >= cfg.n_bins) {
+                g < 0 || g >= n_groups || b < 0 || b >= cfg.n_bins) {
                 return fail("bad cal line");
             }
             cal_new[(size_t) g * cfg.n_bins + b] = c;
