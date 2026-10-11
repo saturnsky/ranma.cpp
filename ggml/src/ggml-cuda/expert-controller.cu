@@ -2480,13 +2480,18 @@ private:
                 ub_reclaim_sync_locked("model join");
                 tier_->refresh_addresses();
             }
-            tier_->start_worker(); // no-op when it runs
-            report_tier_plan_locked("after a model joined");
         }
         if (!l1_->verify_current_assignment(reason)) {
             abort_locked(("exclusive assignment is inconsistent: " + reason).c_str());
         }
+        // what the loader wrote is verified against its digests while it is still in the host residents; the
+        // joined model's classes then join the unified policy (with the worker stopped) before the worker serves
         verify_all_locked();
+        if (tier_) {
+            unify_joined_locked();
+            tier_->start_worker(); // no-op when it runs
+            report_tier_plan_locked("after a model joined");
+        }
         log_members_locked("after a model joined");
         if (redraw_on_) {
             // the class mix changed: the next installs may redraw on their first proposal
@@ -2864,7 +2869,21 @@ private:
 
     // The unified host policy (RANMA_EXPERT_L2_UNIFIED) runs only where the host slots are touched by
     // nothing but the tier's own installs and worker: exclusive mode, no early routes, no prefetch copies,
-    // one model. The L1 redraw is turned off instead (it moves host capacity between size classes).
+    // and every storage class holding the layers of one model (checked once the tier knows its storage
+    // classes, in size_class_tier_locked). Models that join later take part: their classes join the policy
+    // when they have bound and loaded (unify_joined_locked). The L1 redraw is turned off instead (it moves
+    // host capacity between size classes).
+    //
+    // An explicit RANMA_EXPERT_L2_UNIFIED=1 is a request that fails (warning); the default only stays off (info).
+    void unified_off_locked(const char * why) const {
+        const char * set = getenv("RANMA_EXPERT_L2_UNIFIED");
+        if (set != nullptr && *set != '\0') {
+            GGML_LOG_WARN("expert cache: RANMA_EXPERT_L2_UNIFIED=1 is off: %s\n", why);
+        } else {
+            GGML_LOG_INFO("expert cache: the unified host policy (default) is off: %s\n", why);
+        }
+    }
+
     void unified_gate_locked(l2_config & c) {
         if (!c.unified.on) {
             return;
@@ -2878,38 +2897,63 @@ private:
             why = "RANMA_EXPERT_HASH_EARLY is set";
         } else if (xp_config_from_env().on) {
             why = "RANMA_EXPERT_PREFETCH is set";
-        } else if (joint_) {
-            why = "the cache holds several models";
         }
         if (why != nullptr) {
-            // an explicit RANMA_EXPERT_L2_UNIFIED=1 is a request that fails (warning); the default only stays off (info)
-            const char * set = getenv("RANMA_EXPERT_L2_UNIFIED");
-            if (set != nullptr && *set != '\0') {
-                GGML_LOG_WARN("expert cache: RANMA_EXPERT_L2_UNIFIED=1 is off: %s\n", why);
-            } else {
-                GGML_LOG_INFO("expert cache: the unified host policy (default) is off: %s\n", why);
-            }
+            unified_off_locked(why);
             c.unified.on = false;
-            return;
-        }
-        if (redraw_.enabled) {
-            GGML_LOG_WARN("expert cache: L1 redraw off: the unified host policy (RANMA_EXPERT_L2_UNIFIED) does not support it\n");
-            redraw_.enabled = false;
         }
     }
 
-    // Every non-VRAM expert as a file resident: the host locations of the unified policy.
-    expert_locations unified_homes_locked() const {
-        return host_locations(expert_slot_table(geo_.n_layers, std::vector<int32_t>(geo_.n_experts, -1)));
+    // Every non-VRAM expert as a file resident: the host locations of the unified policy. The layers of
+    // `hold` (storage classes outside the policy, see unified_hold_layers_locked) keep `kept`'s locations.
+    expert_locations unified_homes_locked(const std::vector<uint8_t> & hold = {}, const expert_locations * kept = nullptr) const {
+        expert_locations homes = host_locations(expert_slot_table(geo_.n_layers, std::vector<int32_t>(geo_.n_experts, -1)));
+        for (size_t l = 0; l < hold.size() && kept != nullptr; ++l) {
+            if (hold[l]) { homes[l] = (*kept)[l]; }
+        }
+        return homes;
+    }
+
+    // Per storage class: whether the layers of every model that is not dropped are bound and loaded, so the
+    // class can join the unified policy. A class of a model that joins later waits (unify_joined_locked).
+    std::vector<uint8_t> unified_ready_storages_locked() const {
+        const int n = tier_->storage().storages();
+        std::vector<uint8_t> has((size_t) n, 0), waits((size_t) n, 0), ready((size_t) n, 0);
+        for (int l = 0; l < geo_.n_layers; ++l) {
+            const int cls = geo_.layer_class[l];
+            if (cls < 0) { continue; }
+            const member_state & mb = members_[(size_t) member_of_layer(l)];
+            if (mb.dropped) { continue; }
+            const int s = tier_->storage().storage_of[cls];
+            has[(size_t) s] = 1;
+            if (!mb.bound || !mb.loaded) { waits[(size_t) s] = 1; }
+        }
+        for (int s = 0; s < n; ++s) { ready[(size_t) s] = has[(size_t) s] && !waits[(size_t) s] ? 1 : 0; }
+        return ready;
+    }
+
+    // Per layer, 1 where the layer's storage class is outside the policy for now (empty when none is): a
+    // model that has not bound yet. Its residents and ring are untouched by installs until it joins.
+    std::vector<uint8_t> unified_hold_layers_locked() const {
+        std::vector<uint8_t> hold;
+        if (!tier_ || !tier_->unified()) { return hold; }
+        bool any = false;
+        hold.assign((size_t) geo_.n_layers, 0);
+        for (int l = 0; l < geo_.n_layers; ++l) {
+            const int cls = geo_.layer_class[l];
+            if (cls >= 0 && !tier_->unified_storage(tier_->storage().storage_of[cls])) { hold[(size_t) l] = 1; any = true; }
+        }
+        if (!any) { hold.clear(); }
+        return hold;
     }
 
     // Under the unified policy every slot of a storage class is a ring slot: one layer's demand, at most
     // its non-VRAM experts or what one ubatch can select, has to fit in its class. Stops the process otherwise.
-    void check_unified_slots_locked(const std::vector<std::vector<int32_t>> & vram) {
+    void check_unified_slots_locked(const std::vector<std::vector<int32_t>> & vram, const std::vector<uint8_t> & hold = {}) {
         const int bound = storage_demand_bound(geo_.n_experts, cfg_.l2_experts_used, cfg_.l2_prefill_rows);
         for (int l = 0; l < geo_.n_layers; ++l) {
             const int cls = geo_.layer_class[l];
-            if (cls < 0) { continue; }
+            if (cls < 0 || (!hold.empty() && hold[(size_t) l])) { continue; }
             int in_vram = 0;
             for (int e = 0; e < geo_.experts(l); ++e) { in_vram += vram[(size_t) l][(size_t) e] >= 0 ? 1 : 0; }
             const int s = tier_->storage().storage_of[cls];
@@ -2925,10 +2969,22 @@ private:
 
     // The unified policy at the start, before the worker runs: the residents the loader wrote dissolve
     // into the rings, which are then filled with the best experts of the seed profile, in score order.
+    //
+    // A joint cache puts only the storage classes of the models that are bound and loaded into the policy.
+    // The classes of a model that joins later keep their residents and rings: the install leaves their layers
+    // as they are (their current host residents stay the plan's), and the model's slices are written to those
+    // homes when it binds. unify_joined_locked dissolves them then.
     void unify_tier_locked() {
         const auto t0 = std::chrono::steady_clock::now();
+        if (joint_) { tier_->set_unified_active(unified_ready_storages_locked()); }
+        const std::vector<uint8_t> hold = unified_hold_layers_locked();
         const auto layout = tier_layout_locked(true);
-        const expert_slot_table none((size_t) geo_.n_layers);
+        expert_slot_table none((size_t) geo_.n_layers);
+        for (size_t l = 0; l < hold.size(); ++l) {
+            for (int e = 0; hold[l] && e < geo_.experts((int) l); ++e) {
+                if (l1_->locations()[l][(size_t) e].storage == expert_storage::host) { none[l].push_back(e); }
+            }
+        }
         const auto tx = ggml_cuda_expert::plan_install(geo_, l1_->selected(), none, l1_->host_slots(), l1_->locations(),
             capacities_, l1_->layout(), layout, l1_->gpu_spares(), {false, cfg_.spare_slots}, true, /*retain =*/ true,
             /*unequal =*/ redraw_unequal_);
@@ -2939,15 +2995,82 @@ private:
                 !tier_->reseed_unified(tier_scores_, tx.gpu_slots, true, moved, reason)) {
             abort_locked(("unified host policy: " + reason).c_str());
         }
-        const expert_locations homes = unified_homes_locked();
+        const expert_locations homes = unified_homes_locked(hold, &tx.host);
         if (!l1_->assign_tier(tx.gpu_slots, homes, layout, l1_->selected(), tx.gpu_spares) ||
                 !l1_->verify_current_assignment(reason)) { abort_locked(("unified host policy: " + reason).c_str()); }
         tier_->set_homes(tx.gpu_slots, homes, host_geometry_locked(), true);
-        check_unified_slots_locked(tx.gpu_slots);
+        check_unified_slots_locked(tx.gpu_slots, hold);
         const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
         GGML_LOG_INFO("expert cache: unified host policy: %zu residents dissolved into the rings, %zu slices / %zu MiB of the "
                       "seed profile read into their empty slots, rings in score order%s, in %.1f ms\n", moved.demoted,
             moved.reseed_slices, moved.reseed_bytes/(1024*1024), tier_scores_.empty() ? " (no seed profile: slot order)" : "", ms);
+        if (!hold.empty()) { log_unified_waiting_locked(); }
+    }
+
+    void log_unified_waiting_locked() const {
+        for (int s = 0; s < tier_->storage().storages(); ++s) {
+            if (tier_->unified_storage(s)) { continue; }
+            std::string models;
+            for (size_t m = 0; m < members_.size(); ++m) {
+                bool owns = false;
+                for (int l = members_[m].offset; l < members_[m].offset + members_[m].geo.n_layers && l < geo_.n_layers; ++l) {
+                    owns = owns || (geo_.layer_class[l] >= 0 && tier_->storage().storage_of[geo_.layer_class[l]] == s);
+                }
+                if (owns) { models += (models.empty() ? "" : ",") + std::to_string(m); }
+            }
+            GGML_LOG_INFO("expert cache: unified host policy: storage class %d (model %s) stays as residents and ring until its "
+                          "model has bound and loaded\n", s, models.c_str());
+        }
+    }
+
+    // A model joined the installed cache and its slices are in their homes: its storage classes join the unified
+    // policy now, like the others did at the start. Its residents (what the loader wrote to host homes) dissolve
+    // into the class ring in place, the best experts of the seed profile fill the empty slots (read from the
+    // model's file, opened by the caller), the list is laid out in score order, and the model's experts outside
+    // VRAM become file homes. Only these classes change; the others keep running as they are. The worker is
+    // stopped, nothing computes while a model loads, and the pool is back at its homes.
+    void unify_joined_locked() {
+        if (!tier_ || !tier_->unified()) { return; }
+        std::vector<uint8_t> scope = unified_ready_storages_locked();
+        bool any = false;
+        for (int s = 0; s < (int) scope.size(); ++s) {
+            scope[(size_t) s] = scope[(size_t) s] && !tier_->unified_storage(s) ? 1 : 0;
+            any = any || scope[(size_t) s];
+        }
+        if (!any) { return; }
+        const auto t0 = std::chrono::steady_clock::now();
+        tier_->stop_worker();
+        ub_reclaim_sync_locked("model join");
+        ggml_cuda_set_device(device_);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        const expert_slot_table gpu_slots = l1_->host_slots();
+        const expert_slot_table selected  = l1_->selected();
+        const auto spares = l1_->gpu_spares();
+        const install_layout layout = l1_->layout();
+        l2_install_stats moved;
+        std::string reason;
+        if (!tier_->unify_storages(scope, tier_scores_, gpu_slots, moved, reason)) {
+            abort_locked(("unified host policy: " + reason).c_str());
+        }
+        // the classes' experts outside VRAM live in the file now
+        expert_locations homes = l1_->locations();
+        for (int l = 0; l < geo_.n_layers; ++l) {
+            const int cls = geo_.layer_class[l];
+            if (cls < 0 || !scope[(size_t) tier_->storage().storage_of[cls]]) { continue; }
+            for (size_t e = 0; e < homes[(size_t) l].size(); ++e) { homes[(size_t) l][e] = expert_location(); }
+        }
+        if (!l1_->assign_tier(gpu_slots, homes, layout, selected, spares) || !l1_->verify_current_assignment(reason)) {
+            abort_locked(("unified host policy: " + reason).c_str());
+        }
+        tier_->set_homes(gpu_slots, homes, host_geometry_locked(), true);
+        check_unified_slots_locked(gpu_slots, unified_hold_layers_locked());
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        std::string classes;
+        for (int s = 0; s < (int) scope.size(); ++s) { if (scope[(size_t) s]) { classes += (classes.empty() ? "" : ",") + std::to_string(s); } }
+        GGML_LOG_INFO("expert cache: unified host policy after a model joined: storage class %s: %zu residents dissolved into the "
+                      "ring, %zu slices / %zu MiB of the seed profile read into its empty slots, ring in score order%s, in %.1f ms\n",
+            classes.c_str(), moved.demoted, moved.reseed_slices, moved.reseed_bytes/(1024*1024),
+            tier_scores_.empty() ? " (no seed profile: slot order)" : "", ms);
     }
 
     tier_inputs tier_inputs_locked(const std::vector<uint64_t> & scores) const {
@@ -2967,6 +3090,9 @@ private:
     bool size_tier_locked(const std::vector<std::vector<int32_t>> & selected, std::vector<int> & host_capacities) {
         l2_config tier_cfg = l2_debug_config(cfg_, verify_all_);
         tier_cfg.early = hash_mode_.ssd && !early_decl_.empty();
+        if (joint_) {
+            for (int l = 0; l < geo_.n_layers; ++l) { tier_cfg.layer_owner.push_back(member_of_layer(l)); }
+        }
         unified_gate_locked(tier_cfg);
         tier_.reset(new l2_tier(geo_, tier_cfg));
         if (!tier_->sized()) {
@@ -3177,6 +3303,15 @@ private:
             tier_.reset();
             disable_locked("the SSD tier refused its storage class layout");
             return false;
+        }
+        if (tier_->unified_shared_storage() >= 0) {
+            const std::string why = "storage class " + std::to_string(tier_->unified_shared_storage()) +
+                " holds the layers of several models (the policy takes a class of one model)";
+            unified_off_locked(why.c_str());
+        }
+        if (tier_->unified() && redraw_.enabled) {
+            GGML_LOG_WARN("expert cache: L1 redraw off: the unified host policy (RANMA_EXPERT_L2_UNIFIED) does not support it\n");
+            redraw_.enabled = false;
         }
         GGML_LOG_INFO("expert cache: SSD tier budget %zu MiB (class layout): ring %zu MiB (slots %s, floors %s, "
                       "factor %g%s, per ubatch bound %d%s), tables %zu MiB, spares %zu MiB, host residents %zu MiB, "
@@ -3414,8 +3549,19 @@ private:
         return out;
     }
 
-    bool install_tier_locked(ggml_expert_plan_id id, const plan_state & plan, bool seed) {
+    bool install_tier_locked(ggml_expert_plan_id id, const plan_state & requested, bool seed) {
         const auto t0 = std::chrono::steady_clock::now();
+        // A storage class outside the unified policy (the model of its layers has not bound yet) is not
+        // installed: the layers keep their VRAM slices and host residents until unify_joined_locked.
+        const std::vector<uint8_t> hold = unified_hold_layers_locked();
+        plan_state held;
+        if (!hold.empty()) {
+            held = requested;
+            for (int l = 0; l < geo_.n_layers; ++l) {
+                if (hold[(size_t) l]) { held.selected[(size_t) l] = l1_->selected()[(size_t) l]; }
+            }
+        }
+        const plan_state & plan = hold.empty() ? requested : held;
         tier_->stop_worker();
         bool has_prefill = false;
         for (const bank_state & bank : banks_) { has_prefill |= bank.prompt && bank.latest_plan != GGML_EXPERT_PLAN_NONE; }
@@ -3438,6 +3584,12 @@ private:
                 const int c = geo_.layer_class[l];
                 if (c < 0) { continue; }
                 const auto & keep = plan.selected[(size_t) l];
+                if (!hold.empty() && hold[(size_t) l]) {
+                    for (int e = 0; e < geo_.experts(l); ++e) {
+                        if (l1_->locations()[(size_t) l][(size_t) e].storage == expert_storage::host) { host_plan.selected[(size_t) l].push_back(e); }
+                    }
+                    continue;
+                }
                 for (int e = 0; e < geo_.experts(l); ++e) {
                     if (gpu_now[(size_t) l][(size_t) e] >= 0 && room[(size_t) c] > 0 &&
                             std::find(keep.begin(), keep.end(), e) == keep.end()) {
@@ -3483,12 +3635,12 @@ private:
         // no lent slots and one ring size: a prompt/decode switch is an install like any other.
         const bool repartition = !tier_->class_layout() && tier_->set_prompt_ring(prompt);
         // the unified policy leaves every non-VRAM expert to the rings: no host home
-        const expert_locations homes = unified ? unified_homes_locked() : tx.host;
+        const expert_locations homes = unified ? unified_homes_locked(hold, &tx.host) : tx.host;
         if (!l1_->assign_tier(tx.gpu_slots, homes, layout, plan.selected, tx.gpu_spares) ||
                 !l1_->verify_current_assignment(reason)) { abort_locked(("install assignment: " + reason).c_str()); }
         // the tables are published after every read and copy of the transaction completed
         tier_->set_homes(tx.gpu_slots, homes, host_geometry_locked(), relabel);
-        if (unified) { check_unified_slots_locked(tx.gpu_slots); }
+        if (unified) { check_unified_slots_locked(tx.gpu_slots, hold); }
         const size_t host_total = host_->host_bytes() + tier_->host_bytes();
         GGML_ASSERT(host_total <= cfg_.l2_bytes);
         if (repartition) {
