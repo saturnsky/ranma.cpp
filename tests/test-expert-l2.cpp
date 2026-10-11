@@ -1422,15 +1422,28 @@ static int unified_tests() {
 // The unified policy's installs on the relabel byte model: no host residents but the demotions of the
 // install, which settle_unified turns into ring occupants; plan_unified_reseed brings each class ring to
 // the best experts of the plan's scores and lays it out in score order.
+//
+// With `active` (per storage class) the classes outside it are the ones of a model that has not bound yet:
+// their layers keep their VRAM slices and host residents, and the whole install leaves their lists alone.
 static bool unified_install(relabel_world & w, const std::vector<uint64_t> & score, int reseed, l2_install_plan & plan,
-        size_t & reads, int & demoted) {
+        size_t & reads, int & demoted, const std::vector<uint8_t> * active = nullptr) {
     const int E = relabel_world::experts, L = relabel_world::layers;
+    auto in_policy = [&](int s) { return active == nullptr || (*active)[(size_t) s] != 0; };
+    auto held = [&](int l) { return !in_policy(w.storage_of[(size_t) w.geo.layer_class[l]]); };
     expert_slot_table gs, hs;
     w.choose(score, gs, hs);
     hs.assign(L, {});
     std::vector<int> room = w.layout.host;
     for (int l = 0; l < L; ++l) {
         const int c = w.geo.layer_class[l];
+        if (held(l)) {
+            gs[l].clear();
+            for (int e = 0; e < E; ++e) {
+                if (w.gpu[l][e] >= 0) { gs[l].push_back(e); }
+                if (w.host[l][e].resident()) { hs[l].push_back(e); }
+            }
+            continue;
+        }
         for (int e = 0; e < E; ++e) {
             if (w.gpu[l][e] >= 0 && room[c] > 0 && std::find(gs[l].begin(), gs[l].end(), e) == gs[l].end()) {
                 hs[l].push_back(e);
@@ -1441,7 +1454,7 @@ static bool unified_install(relabel_world & w, const std::vector<uint64_t> & sco
     const install_transaction tx = plan_install(w.geo, gs, hs, w.gpu, w.host, w.vram_caps, w.layout, w.layout, w.spares,
         {false, w.spare}, true, true);
     if (!tx.valid) { return w.fail("plan_install: " + tx.reason); }
-    plan = plan_relabel_install(w.ledger, w.home_slot, w.geo.layer_class, w.storage_of, w.host, tx.host, tx.moves, true);
+    plan = plan_relabel_install(w.ledger, w.home_slot, w.geo.layer_class, w.storage_of, w.host, tx.host, tx.moves, true, active);
     if (!plan.ok) { return w.fail("relabel: " + plan.reason); }
     for (size_t k = 0; k < tx.moves.size(); ++k) {
         const install_move & m = tx.moves[k];
@@ -1460,12 +1473,16 @@ static bool unified_install(relabel_world & w, const std::vector<uint64_t> & sco
         }
     }
     w.gpu = tx.gpu_slots; w.spares = tx.gpu_spares;
-    demoted = settle_unified(w.ledger, w.home_slot, w.gpu);
-    w.host = host_locations(expert_slot_table(L, std::vector<int32_t>(E, -1)));
+    demoted = settle_unified(w.ledger, w.home_slot, w.gpu, active, &w.storage_of);
+    {
+        const expert_locations kept = tx.host;
+        w.host = host_locations(expert_slot_table(L, std::vector<int32_t>(E, -1)));
+        for (int l = 0; l < L; ++l) { if (held(l)) { w.host[l] = kept[l]; } }
+    }
     reads = 0;
     if (reseed > 0) {
         auto sc = [&](int l, int e) { return double(score[(size_t) (l*E + e)]); };
-        const auto got = plan_unified_reseed(w.ledger, std::vector<int>(L, E), w.gpu, sc, reseed == 2);
+        const auto got = plan_unified_reseed(w.ledger, std::vector<int>(L, E), w.gpu, sc, reseed == 2, active);
         for (const auto & r : got) { w.content[(size_t) w.ledger.storage_of(r.layer)][(size_t) r.slot] = r.layer*E + r.expert; }
         reads = got.size();
     }
@@ -1474,11 +1491,11 @@ static bool unified_install(relabel_world & w, const std::vector<uint64_t> & sco
     if (!w.ledger.check(why)) { return w.fail(why); }
     for (int s = 0; s < 2; ++s) {
         for (int slot = 0; slot < w.ledger.slots(s); ++slot) {
-            if (w.ledger.role_of(s, slot) != slot_role::ring) { return w.fail("a slot outside the ring"); }
+            if (in_policy(s) && w.ledger.role_of(s, slot) != slot_role::ring) { return w.fail("a slot outside the ring"); }
             int l = -1, e = -1;
             if (!w.ledger.occupant(s, slot, l, e)) { continue; }
             if (w.content[s][(size_t) slot] != l*E + e) { return w.fail("ring occupant bytes"); }
-            if (w.gpu[l][e] >= 0) { return w.fail("a VRAM resident in the ring"); }
+            if (in_policy(s) && w.gpu[l][e] >= 0) { return w.fail("a VRAM resident in the ring"); }
         }
     }
     for (int l = 0; l < L; ++l) for (int e = 0; e < E; ++e) {
@@ -1488,6 +1505,7 @@ static bool unified_install(relabel_world & w, const std::vector<uint64_t> & sco
     if (reseed == 2) {
         // each class ring holds exactly the best non-VRAM experts it has room for, in score order
         for (int s = 0; s < 2; ++s) {
+            if (!in_policy(s)) { continue; }
             std::vector<std::pair<uint64_t, int>> cands;
             for (int l = 0; l < L; ++l) {
                 if (w.ledger.storage_of(l) != s) { continue; }
@@ -1599,6 +1617,143 @@ static int unified_install_tests() {
         }
         printf("PASS: unified install: random plans, demands and reseed modes keep the rings and the byte model consistent\n");
     }
+    return 0;
+}
+
+// A model that binds later: its storage class stays as residents and ring through the start and every install
+// of the others, then joins the policy on its own, while the other class keeps its list untouched.
+struct ledger_snapshot {
+    std::vector<int> cells;
+    std::vector<int> order;
+    int ring = 0;
+    bool operator==(const ledger_snapshot & o) const { return cells == o.cells && order == o.order && ring == o.ring; }
+};
+
+static ledger_snapshot snapshot_of(const l2_class_ledger & ledger, int s) {
+    ledger_snapshot out;
+    for (int slot = 0; slot < ledger.slots(s); ++slot) {
+        int l = -1, e = -1;
+        out.cells.push_back((int) ledger.role_of(s, slot));
+        out.cells.push_back(ledger.occupant(s, slot, l, e) ? l*relabel_world::experts + e : -1);
+    }
+    out.order = ledger.order(s);
+    out.ring = ledger.ring_count(s);
+    return out;
+}
+
+static int unified_late_tests() {
+    const int E = relabel_world::experts, L = relabel_world::layers;
+    l2_unified_policy policy;
+    policy.on = true; policy.probation = 0.10; policy.ghost = 8;
+    for (int round = 0; round < 3; ++round) {
+        relabel_world w({6, 5}, false);
+        w.load(scores({}));
+        w.ledger.set_unified(policy);
+        for (int s = 0; s < 2; ++s) { w.ledger.set_probation_min(s, round); }
+        // storage class 1 (layers 1 and 3) belongs to the model that binds later
+        std::vector<uint8_t> active = {1, 0};
+        const ledger_snapshot late_before = snapshot_of(w.ledger, 1);
+        const int late_slots = w.ledger.slots(1);
+        l2_install_plan plan;
+        size_t reads = 0;
+        int demoted = 0;
+        if (!unified_install(w, scores({}), 2, plan, reads, demoted, &active)) {
+            fprintf(stderr, "FAIL line %d: %s\n", __LINE__, w.error.c_str());
+            return 1;
+        }
+        CHECK(reads > 0 && snapshot_of(w.ledger, 1) == late_before);
+        CHECK(w.host[1][3].resident() && w.host[3][3].resident() && !w.host[0][6].resident());
+        // installs and generations of the active class, with the late class untouched (even by a plan that
+        // wants other VRAM experts in its layers)
+        uint32_t rng = 77u + 13u*(uint32_t) round;
+        auto next = [&]() { rng = rng*1664525u + 1013904223u; return rng >> 8; };
+        for (int step = 0; step < 200; ++step) {
+            if (next()%8 == 0) {
+                std::vector<uint64_t> sc = scores({});
+                for (auto & v : sc) { v = 1 + next()%1000; }
+                if (!unified_install(w, sc, int(next()%3), plan, reads, demoted, &active)) {
+                    fprintf(stderr, "FAIL line %d: %s\n", __LINE__, w.error.c_str());
+                    return 1;
+                }
+                CHECK(snapshot_of(w.ledger, 1) == late_before);
+                continue;
+            }
+            const int layer = (next()%2) ? 0 : 2;
+            std::vector<int> ids;
+            for (int i = 0, n = 1 + int(next()%3); i < n; ++i) { ids.push_back(int(next()%E)); }
+            const uint32_t g = ++w.seq[(size_t) layer];
+            auto homed = [&](int l, int e) { return w.gpu[l][e] >= 0; };
+            const l2_service got = w.ledger.service(layer, ids, g, homed);
+            CHECK(got.ok);
+            for (const l2_read & r : got.reads) { w.content[(size_t) w.ledger.storage_of(r.layer)][(size_t) r.slot] = r.layer*E + r.expert; }
+            w.ledger.set_done(layer, g);
+        }
+        CHECK(snapshot_of(w.ledger, 1) == late_before);
+        // the model binds: its class joins, the other class's list is not touched
+        const ledger_snapshot run_before = snapshot_of(w.ledger, 0);
+        const std::vector<uint8_t> scope = {0, 1};
+        std::vector<uint64_t> sc = scores({});
+        for (auto & v : sc) { v = 1 + next()%1000; }
+        auto score = [&](int l, int e) { return double(sc[(size_t) (l*E + e)]); };
+        const int joined = w.ledger.residents_to_ring(l2_place::probation, &scope);
+        w.ledger.sink_empty(&scope);
+        for (int c = 0; c < 3; ++c) {
+            if (w.storage_of[(size_t) c] == 1) { std::fill(w.home_slot[(size_t) c].begin(), w.home_slot[(size_t) c].end(), -1); }
+        }
+        for (int l = 0; l < L; ++l) { if (w.storage_of[(size_t) w.geo.layer_class[l]] == 1) { w.host[l] = std::vector<expert_location>(E); } }
+        active = {1, 1};
+        CHECK(joined > 0);
+        const auto got = plan_unified_reseed(w.ledger, std::vector<int>(L, E), w.gpu, score, true, &scope);
+        for (const auto & r : got) { w.content[(size_t) w.ledger.storage_of(r.layer)][(size_t) r.slot] = r.layer*E + r.expert; }
+        CHECK(snapshot_of(w.ledger, 0) == run_before);
+        std::string why;
+        CHECK(w.ledger.check(why));
+        CHECK(w.ledger.ring_count(1) == late_slots);
+        // every slot of the class is a ring slot, holds its bytes, and the best experts it has room for are there, in score order
+        std::vector<std::pair<double, int>> cands;
+        for (int l = 0; l < L; ++l) {
+            if (w.ledger.storage_of(l) != 1) { continue; }
+            for (int e = 0; e < E; ++e) { if (w.gpu[l][e] < 0) { cands.push_back({score(l, e), l*E + e}); } }
+        }
+        std::sort(cands.begin(), cands.end(), [](auto a, auto b) { return a.first > b.first; });
+        for (size_t i = 0; i < std::min(cands.size(), (size_t) late_slots); ++i) {
+            CHECK(w.ledger.slot_of(cands[i].second/E, cands[i].second%E) >= 0);
+        }
+        double last = 0.0;
+        bool first = true;
+        for (int slot : w.ledger.order(1)) {
+            CHECK(w.ledger.role_of(1, slot) == slot_role::ring);
+            int l = -1, e = -1;
+            if (!w.ledger.occupant(1, slot, l, e)) { CHECK(first); continue; }
+            CHECK(w.content[1][(size_t) slot] == l*E + e && w.gpu[l][e] < 0);
+            const double v = score(l, e);
+            CHECK(first || v >= last);
+            last = v; first = false;
+        }
+        // the whole cache runs under the policy from here on
+        for (int step = 0; step < 150; ++step) {
+            if (next()%8 == 0) {
+                std::vector<uint64_t> s2 = scores({});
+                for (auto & v : s2) { v = 1 + next()%1000; }
+                if (!unified_install(w, s2, int(next()%3), plan, reads, demoted)) {
+                    fprintf(stderr, "FAIL line %d: %s\n", __LINE__, w.error.c_str());
+                    return 1;
+                }
+                continue;
+            }
+            const int layer = int(next()%L);
+            std::vector<int> ids;
+            for (int i = 0, n = 1 + int(next()%3); i < n; ++i) { ids.push_back(int(next()%E)); }
+            const uint32_t g = ++w.seq[(size_t) layer];
+            auto homed = [&](int l, int e) { return w.gpu[l][e] >= 0; };
+            const l2_service served = w.ledger.service(layer, ids, g, homed);
+            CHECK(served.ok);
+            for (const l2_read & r : served.reads) { w.content[(size_t) w.ledger.storage_of(r.layer)][(size_t) r.slot] = r.layer*E + r.expert; }
+            w.ledger.set_done(layer, g);
+        }
+        CHECK(w.ledger.check(why));
+    }
+    printf("PASS: unified late bind: a model's class stays untouched through the start and the others' installs, then joins on its own\n");
     return 0;
 }
 
@@ -1774,6 +1929,7 @@ int main() {
     CHECK(early_tests() == 0);
     CHECK(unified_tests() == 0);
     CHECK(unified_install_tests() == 0);
+    CHECK(unified_late_tests() == 0);
     printf("OK\n");
     return 0;
 }

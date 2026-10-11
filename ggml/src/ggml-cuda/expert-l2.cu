@@ -210,6 +210,19 @@ void l2_tier::set_storage(const class_storage & storage) {
         ok = ok && storage_.ring_slots[s] >= storage_.floor[s];
     }
     sized_ = ok;
+    // the policy needs a storage class to belong to one model (a later model dissolves its own classes)
+    uni_shared_ = -1;
+    if (ok && cfg_.unified.on && !cfg_.layer_owner.empty()) {
+        std::vector<int> owner(storage_.storages(), -1);
+        for (int l = 0; l < geo_.n_layers && uni_shared_ < 0; ++l) {
+            if (geo_.layer_class[l] < 0 || l >= (int) cfg_.layer_owner.size()) { continue; }
+            const int s = storage_.storage_of[geo_.layer_class[l]];
+            if (owner[(size_t) s] < 0) { owner[(size_t) s] = cfg_.layer_owner[(size_t) l]; }
+            else if (owner[(size_t) s] != cfg_.layer_owner[(size_t) l]) { uni_shared_ = s; }
+        }
+        if (uni_shared_ >= 0) { cfg_.unified.on = false; }
+    }
+    uni_active_.assign((size_t) storage_.storages(), 1);
 }
 
 int l2_tier::install_read_slots() const {
@@ -715,7 +728,7 @@ bool l2_tier::install_relabel(const install_transaction & tx, const expert_locat
     }
     stats.ring_before = occupants.size();
     const l2_install_plan plan = plan_relabel_install(cledger_, home_slot_, geo_.layer_class, storage_.storage_of,
-        before, tx.host, tx.moves, unified());
+        before, tx.host, tx.moves, unified(), unified_active());
     if (!plan.ok) {
         reason = plan.reason;
         return false;
@@ -804,7 +817,7 @@ bool l2_tier::install_relabel(const install_transaction & tx, const expert_locat
     stats.batches = plan.batches;
     if (unified()) {
         // every copy completed above: the ring copies of the VRAM promotions can go, the demotions join the rings
-        stats.unified_demoted = (size_t) settle_unified(cledger_, home_slot_, tx.gpu_slots);
+        stats.unified_demoted = (size_t) settle_unified(cledger_, home_slot_, tx.gpu_slots, unified_active(), &storage_.storage_of);
     }
     for (const auto & item : occupants) {
         const int slot = cledger_.slot_of(item[0], item[1]);
@@ -815,8 +828,9 @@ bool l2_tier::install_relabel(const install_transaction & tx, const expert_locat
 }
 
 bool l2_tier::reseed_unified(const std::vector<uint64_t> & counts, const std::vector<std::vector<int32_t>> & vram, bool fill,
-        l2_install_stats & stats, std::string & reason) {
+        l2_install_stats & stats, std::string & reason, const std::vector<uint8_t> * scope) {
     GGML_ASSERT(unified() && !worker_running() && mapped_);
+    if (scope == nullptr) { scope = unified_active(); }
     const auto t0 = std::chrono::steady_clock::now();
     std::lock_guard<std::mutex> lock(io_mutex_);
     if (counts.size() < (size_t) geo_.n_layers*(size_t) geo_.n_experts) {
@@ -832,7 +846,7 @@ bool l2_tier::reseed_unified(const std::vector<uint64_t> & counts, const std::ve
     };
     std::vector<int> experts_of((size_t) geo_.n_layers, 0);
     for (int l = 0; l < geo_.n_layers; ++l) { experts_of[(size_t) l] = geo_.layer_class[l] >= 0 ? geo_.experts(l) : 0; }
-    const std::vector<l2_reseed_read> plan = plan_unified_reseed(cledger_, experts_of, vram, score, fill);
+    const std::vector<l2_reseed_read> plan = plan_unified_reseed(cledger_, experts_of, vram, score, fill, scope);
     // distinct slots: one batch of reads is safe; chunks keep the queue's descriptor count small
     constexpr size_t chunk = 128;
     for (size_t i = 0; i < plan.size(); i += chunk) {
@@ -853,6 +867,33 @@ bool l2_tier::reseed_unified(const std::vector<uint64_t> & counts, const std::ve
     }
     stats.reseed_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     return true;
+}
+
+bool l2_tier::unify_storages(const std::vector<uint8_t> & scope, const std::vector<uint64_t> & counts,
+        const std::vector<std::vector<int32_t>> & vram, l2_install_stats & stats, std::string & reason) {
+    GGML_ASSERT(unified() && !worker_running() && mapped_ && (int) scope.size() == storage_.storages());
+    {
+        std::lock_guard<std::mutex> lock(io_mutex_);
+        // the device is idle: every generation the classes published is done and no slot is leased
+        for (int layer = 0; layer < geo_.n_layers; ++layer) {
+            cledger_.set_done(layer, expert_os::load_acquire(&static_cast<const l2_mailbox *>(mail_host_)[layer].done));
+        }
+        // no VRAM resident of these classes has a ring copy (nothing computed there); the residents join the
+        // rings in place, as the first install of the policy does, and lose their logical homes
+        stats.demoted += (size_t) cledger_.residents_to_ring(l2_place::probation, &scope);
+        cledger_.sink_empty(&scope);
+        for (size_t c = 0; c < home_slot_.size(); ++c) {
+            if (scope[(size_t) storage_.storage_of[c]]) { std::fill(home_slot_[c].begin(), home_slot_[c].end(), -1); }
+        }
+        if (uni_active_.empty()) { uni_active_.assign(scope.size(), 1); }
+        for (size_t s = 0; s < scope.size(); ++s) { uni_active_[s] = uni_active_[s] || scope[s]; }
+        std::string why;
+        if (!cledger_.check(why)) {
+            reason = "the ledger broke when a storage class joined the unified policy: " + why;
+            return false;
+        }
+    }
+    return reseed_unified(counts, vram, true, stats, reason, &scope);
 }
 
 bool l2_tier::run_reads(const std::vector<l2_read> & reads, std::string & reason, bool install,

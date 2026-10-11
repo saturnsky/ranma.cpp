@@ -122,10 +122,11 @@ public:
 
     // Every resident slot joins the ring of its class in place: one with an expert at `where`, an
     // empty one (a spare) at the least recently used end. Only while nothing computes. Returns the
-    // residents with an expert that joined.
-    int residents_to_ring(l2_place where) {
+    // residents with an expert that joined. `only` (per storage class, null = all) restricts it.
+    int residents_to_ring(l2_place where, const std::vector<uint8_t> * only = nullptr) {
         int joined = 0;
         for (int s = 0; s < storages(); ++s) {
+            if (only != nullptr && !(*only)[(size_t) s]) { continue; }
             for (int slot = 0; slot < slots(s); ++slot) {
                 owner & o = owners_[(size_t) s][(size_t) slot];
                 if (o.role != slot_role::resident) { continue; }
@@ -151,10 +152,12 @@ public:
     // each class list is laid out again: empty slots at the least recently used end, then the
     // occupants from the lowest to the highest `score(layer, expert)`, ties in slot order. Only while
     // nothing computes (every occupant is reusable at once). Returns the residents that joined.
+    // `only` (per storage class, null = all) restricts it to those classes; the others keep their lists.
     template <typename Score>
-    int dissolve(Score score) {
+    int dissolve(Score score, const std::vector<uint8_t> * only = nullptr) {
         int joined = 0;
         for (int s = 0; s < storages(); ++s) {
+            if (only != nullptr && !(*only)[(size_t) s]) { continue; }
             std::vector<owner> & row = owners_[(size_t) s];
             for (size_t slot = 0; slot < row.size(); ++slot) {
                 owner & o = row[slot];
@@ -415,8 +418,10 @@ public:
 
     // Moves every empty ring slot to the least recently used end, in list order, so the next
     // slots taken evict nothing.
-    void sink_empty() {
+    // `only` (per storage class, null = all) restricts it to those classes.
+    void sink_empty(const std::vector<uint8_t> * only = nullptr) {
         for (int s = 0; s < storages(); ++s) {
+            if (only != nullptr && !(*only)[(size_t) s]) { continue; }
             std::vector<int> empty_slots;
             for (int slot = head_[(size_t) s]; slot >= 0; slot = next_[(size_t) s][(size_t) slot]) {
                 if (owners_[(size_t) s][(size_t) slot].layer < 0) { empty_slots.push_back(slot); }
