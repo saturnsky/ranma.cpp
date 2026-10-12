@@ -8,10 +8,13 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <cinttypes>
 #include <cstdint>
 #include <cstring>
+#include <filesystem>
 #include <future>
+#include <map>
 #include <regex>
 #include <unordered_set>
 
@@ -544,7 +547,9 @@ llama_model_loader::llama_model_loader(
         bool no_alloc,
         bool load_mtp,
         const llama_model_kv_override * param_overrides_p,
-        const llama_model_tensor_buft_override * param_tensor_buft_overrides_p)
+        const llama_model_tensor_buft_override * param_tensor_buft_overrides_p,
+        bool engram_tables_attach,
+        const char * engram_tables)
         : metadata(meta), set_tensor_data(set_tensor_data), set_tensor_data_ud(set_tensor_data_ud) {
     int trace = 0;
     if (getenv("LLAMA_TRACE")) {
@@ -720,6 +725,12 @@ llama_model_loader::llama_model_loader(
         llm_kv = LLM_KV(llm_arch_from_string(arch_name));
     }
 
+    // the engram tables of a model that needs a table set of their own (their files join the model's), or a set that
+    // replaces the tables the model holds
+    if (engram_tables_attach && (!fname.empty() || file != nullptr)) {
+        attach_engram_tables(fname, engram_tables);
+    }
+
     // The type IDs from GGML_TYPE_EXL3_M1 (256) on are the EXL3 band of this fork, and another program may use the same IDs
     // for other data. Such tensors are accepted only from a model with the metadata that the EXL3 converter writes:
     // quantize.exl3.version (the format version of the source) and quantize.exl3.codebook (mul1, mcg or 3inst).
@@ -881,6 +892,535 @@ llama_model_loader::llama_model_loader(
     this->check_tensors = check_tensors;
     this->no_alloc = no_alloc;
     this->load_mtp = load_mtp;
+}
+
+// the value of key in ctx for a message ("(absent)" when it is not there), shortened
+static std::string llama_engram_kv_desc(const gguf_context * ctx, const std::string & key) {
+    const int64_t kid = gguf_find_key(ctx, key.c_str());
+    if (kid < 0) {
+        return "(absent)";
+    }
+    std::string s = gguf_kv_to_str(ctx, kid);
+    if (s.size() > 160) {
+        s = s.substr(0, 160) + " ...";
+    }
+    return s;
+}
+
+// key has the same type and value in a and b
+static bool llama_engram_kv_same(const gguf_context * a, const gguf_context * b, const std::string & key) {
+    const int64_t ka = gguf_find_key(a, key.c_str());
+    const int64_t kb = gguf_find_key(b, key.c_str());
+    if (ka < 0 || kb < 0 || gguf_get_kv_type(a, ka) != gguf_get_kv_type(b, kb)) {
+        return false;
+    }
+    if (gguf_get_kv_type(a, ka) == GGUF_TYPE_ARRAY && gguf_get_arr_type(a, ka) != gguf_get_arr_type(b, kb)) {
+        return false;
+    }
+    return gguf_kv_to_str(a, ka) == gguf_kv_to_str(b, kb);
+}
+
+// the value of a uint16 / int32 key, or -1 when it is absent or of another type
+static int64_t llama_engram_kv_int(const gguf_context * ctx, const std::string & key) {
+    const int64_t kid = gguf_find_key(ctx, key.c_str());
+    if (kid < 0) {
+        return -1;
+    }
+    switch (gguf_get_kv_type(ctx, kid)) {
+        case GGUF_TYPE_UINT16: return gguf_get_val_u16(ctx, kid);
+        case GGUF_TYPE_INT32:  return gguf_get_val_i32(ctx, kid);
+        case GGUF_TYPE_UINT32: return gguf_get_val_u32(ctx, kid);
+        default:               return -1;
+    }
+}
+
+// the array key of element type `type`, or -1
+static int64_t llama_engram_arr(const gguf_context * ctx, const std::string & key, gguf_type type) {
+    const int64_t kid = gguf_find_key(ctx, key.c_str());
+    if (kid < 0 || gguf_get_kv_type(ctx, kid) != GGUF_TYPE_ARRAY || gguf_get_arr_type(ctx, kid) != type) {
+        return -1;
+    }
+    return kid;
+}
+
+// an engram table or one of its tensors: blk.N.engram_embd.* (DeepSeek V4.1), per_layer_token_embd.* (PLE)
+static bool llama_engram_is_table(const std::string & name) {
+    return (name.rfind("blk.", 0) == 0 && name.find(".engram_embd.") != std::string::npos) ||
+        name.rfind("per_layer_token_embd.", 0) == 0;
+}
+
+// FNV-1a 64 (the piece check of gguf-py/gguf/engram_tables.py)
+static uint64_t llama_engram_fnv1a64(const uint8_t * data, size_t n, uint64_t h = 0xcbf29ce484222325ULL) {
+    for (size_t i = 0; i < n; ++i) {
+        h = (h ^ data[i]) * 0x100000001b3ULL;
+    }
+    return h;
+}
+
+// The files and tensors of an engram table set (index: its first file, n_split files; n_split 1 is a set of one file whose
+// index holds the pieces) join the model's, and every piece is checked against its piece check: FNV-1a 64 of its first and
+// last 4 KiB. replace: an engram table tensor of the model with the name of a set tensor gives way to it (embedded tables
+// replaced by the set).
+void llama_model_loader::attach_engram_set_files(const std::string & first, uint32_t n_split, gguf_context * index,
+                                                 bool replace) {
+    // the files of the pieces: every file after the index, or the index itself for a set of one file
+    const std::vector<std::string> paths = n_split > 1 ? llama_get_list_splits(first, 0, (int) n_split) :
+                                                         std::vector<std::string>{ first };
+    const size_t first_idx = files.size();
+    int64_t n_set_tensors = 0;
+    for (uint32_t i = n_split > 1 ? 1 : 0; i < n_split; ++i) {
+        const std::string & fname = paths[i];
+        ggml_context * ctx = nullptr;
+        gguf_context_ptr gctx { gguf_init_from_file(fname.c_str(), { /*.no_alloc =*/ true, /*.ctx =*/ &ctx }) };
+        if (!gctx) {
+            throw std::runtime_error(format("engram table set %s: cannot read file %u of %u, %s", first.c_str(), i + 1, n_split,
+                                            fname.c_str()));
+        }
+        if (n_split > 1 && (llama_engram_kv_int(gctx.get(), llm_kv(LLM_KV_SPLIT_NO)) != (int64_t) i ||
+                            llama_engram_kv_int(gctx.get(), llm_kv(LLM_KV_SPLIT_COUNT)) != (int64_t) n_split)) {
+            ggml_free(ctx);
+            throw std::runtime_error(format("engram table set %s: %s is not file %u of %u of the set", first.c_str(),
+                                            fname.c_str(), i + 1, n_split));
+        }
+
+        files.emplace_back(new llama_file(fname.c_str(), "rb", use_direct_io));
+        file_paths.emplace_back(fname);
+        contexts.emplace_back(ctx);
+        const uint16_t idx = (uint16_t) (files.size() - 1);
+
+        for (ggml_tensor * cur = ggml_get_first_tensor(ctx); cur; cur = ggml_get_next_tensor(ctx, cur)) {
+            const std::string tensor_name = cur->name;
+            if (const auto it = weights_map.find(tensor_name);
+                    replace && it != weights_map.end() && llama_engram_is_table(tensor_name)) {
+                // a replaced table's own tensor (the per-head bias next to piece 0): the set's one is used
+                n_elements -= ggml_nelements(it->second.tensor);
+                n_bytes    -= ggml_nbytes(it->second.tensor);
+                weights_map.erase(it);
+            }
+            if (weights_map.find(tensor_name) != weights_map.end()) {
+                throw std::runtime_error(format("tensor '%s' is both in the model and in its engram table set %s",
+                                                tensor_name.c_str(), first.c_str()));
+            }
+            n_elements += ggml_nelements(cur);
+            n_bytes    += ggml_nbytes(cur);
+            weights_map.emplace(tensor_name, llama_tensor_weight(files.back().get(), idx, gctx.get(), cur));
+            n_set_tensors++;
+        }
+    }
+    if (n_split > 1 && llama_engram_kv_int(index, llm_kv(LLM_KV_SPLIT_TENSORS_COUNT)) != n_set_tensors) {
+        throw std::runtime_error(format("engram table set %s: %s says %s tensors, the files hold %" PRId64, first.c_str(),
+                                        llm_kv(LLM_KV_SPLIT_TENSORS_COUNT).c_str(),
+                                        llama_engram_kv_desc(index, llm_kv(LLM_KV_SPLIT_TENSORS_COUNT)).c_str(), n_set_tensors));
+    }
+
+    // every piece against its piece check: FNV-1a 64 of its first and last 4 KiB. A file of another set (or of another
+    // run of the converter) under a name of this set stops the load here.
+    {
+        const int64_t kid_names = llama_engram_arr(index, llm_kv(LLM_KV_ENGRAM_TABLES_NAMES),       GGUF_TYPE_STRING);
+        const int64_t kid_parts = llama_engram_arr(index, llm_kv(LLM_KV_ENGRAM_TABLES_PARTS),       GGUF_TYPE_UINT32);
+        const int64_t kid_check = llama_engram_arr(index, llm_kv(LLM_KV_ENGRAM_TABLES_PIECE_CHECK), GGUF_TYPE_UINT64);
+        if (kid_names < 0 || kid_parts < 0 || kid_check < 0 ||
+            gguf_get_arr_n(index, kid_names) != gguf_get_arr_n(index, kid_parts)) {
+            throw std::runtime_error(format("engram table set %s: the index lacks %s / %s / %s or their types differ",
+                                            first.c_str(), llm_kv(LLM_KV_ENGRAM_TABLES_NAMES).c_str(),
+                                            llm_kv(LLM_KV_ENGRAM_TABLES_PARTS).c_str(), llm_kv(LLM_KV_ENGRAM_TABLES_PIECE_CHECK).c_str()));
+        }
+        const uint32_t * parts  = (const uint32_t *) gguf_get_arr_data(index, kid_parts);
+        const uint64_t * checks = (const uint64_t *) gguf_get_arr_data(index, kid_check);
+        const size_t n_checks   = gguf_get_arr_n(index, kid_check);
+        // engram_tables.type is the gguf-py name (MXFP8, BF16, EXL3R_M4), ggml_type_name the lower-case one
+        const std::string want_type = llama_engram_kv_desc(index, llm_kv(LLM_KV_ENGRAM_TABLES_TYPE));
+        auto same_type = [&](const char * name) {
+            if (strlen(name) != want_type.size()) {
+                return false;
+            }
+            for (size_t c = 0; c < want_type.size(); ++c) {
+                if (tolower((unsigned char) name[c]) != tolower((unsigned char) want_type[c])) {
+                    return false;
+                }
+            }
+            return true;
+        };
+        size_t k = 0;
+        std::vector<uint8_t> head;
+        std::vector<uint8_t> tail;
+        for (size_t t = 0; t < gguf_get_arr_n(index, kid_names); ++t) {
+            const std::string name = gguf_get_arr_str(index, kid_names, t);
+            for (uint32_t i = 0; i < parts[t]; ++i, ++k) {
+                const std::string piece = name + ".p" + std::to_string(i) + ".weight";
+                const auto it = weights_map.find(piece);
+                if (it == weights_map.end() || it->second.idx < first_idx) {
+                    throw std::runtime_error(format("engram table set %s: piece %s is not in the files of the set", first.c_str(),
+                                                    piece.c_str()));
+                }
+                if (k >= n_checks) {
+                    throw std::runtime_error(format("engram table set %s: %s has %zu entries, the set has more pieces",
+                                                    first.c_str(), llm_kv(LLM_KV_ENGRAM_TABLES_PIECE_CHECK).c_str(), n_checks));
+                }
+                const llama_tensor_weight & w = it->second;
+                if (!same_type(ggml_type_name(w.tensor->type))) {
+                    throw std::runtime_error(format("engram table set %s: piece %s in %s is %s, %s says %s", first.c_str(),
+                                                    piece.c_str(), file_paths[w.idx].c_str(), ggml_type_name(w.tensor->type),
+                                                    llm_kv(LLM_KV_ENGRAM_TABLES_TYPE).c_str(), want_type.c_str()));
+                }
+                const size_t n = ggml_nbytes(w.tensor);
+                const size_t m = std::min<size_t>(4096, n);
+                head.resize(m);
+                tail.resize(m);
+                llama_file f(file_paths[w.idx].c_str(), "rb", false);
+                f.seek(w.offs, SEEK_SET);
+                f.read_raw(head.data(), m);
+                f.seek(w.offs + n - m, SEEK_SET);
+                f.read_raw(tail.data(), m);
+                const uint64_t h = llama_engram_fnv1a64(tail.data(), m, llama_engram_fnv1a64(head.data(), m));
+                if (h != checks[k]) {
+                    throw std::runtime_error(format("engram table set %s: piece %s in %s fails its check (%016" PRIx64 ", the index "
+                                                    "says %016" PRIx64 "): the file is not the one this set was written with",
+                                                    first.c_str(), piece.c_str(), file_paths[w.idx].c_str(), h, checks[k]));
+                }
+            }
+        }
+        if (k != n_checks) {
+            throw std::runtime_error(format("engram table set %s: %zu pieces, %s has %zu entries", first.c_str(), k,
+                                            llm_kv(LLM_KV_ENGRAM_TABLES_PIECE_CHECK).c_str(), n_checks));
+        }
+    }
+}
+
+// ---- finding an engram table set (docs/ranma/engram-tables.md, "Finding the set") -------------------------------------
+
+// The folder and the name prefix P of a model file: <dir>/<P>-00001-of-0000K.gguf or <dir>/<P>.gguf
+static void llama_engram_model_names(const std::string & fname_model, std::string & dir, std::string & prefix) {
+    const std::filesystem::path p = std::filesystem::u8path(fname_model);
+    dir = p.parent_path().u8string();
+    std::string name = p.filename().u8string();
+    if (name.size() > 5 && name.compare(name.size() - 5, 5, ".gguf") == 0) {
+        name.resize(name.size() - 5);
+    }
+    static const std::regex split_re("^(.*)-[0-9]{5}-of-[0-9]{5}$");
+    std::smatch m;
+    prefix = std::regex_match(name, m, split_re) ? m[1].str() : name;
+}
+
+// The table sets of the model <P> in `dir`, one per set, sorted by name: the files <P>-engram*.gguf that are a set of one
+// file (no -0000N-of-0000M in the name) or the first file of a split set (-00001-of-0000M). The other files of a split
+// set are no candidates.
+static std::vector<std::string> llama_engram_candidates(const std::string & dir, const std::string & prefix) {
+    std::vector<std::string> found;
+    if (prefix.empty()) {
+        return found;
+    }
+    static const std::regex split_re("^.*-([0-9]{5})-of-[0-9]{5}\\.gguf$");
+    const std::string head = prefix + "-engram";
+    std::error_code ec;
+    for (const auto & e : std::filesystem::directory_iterator(std::filesystem::u8path(dir.empty() ? "." : dir), ec)) {
+        std::error_code ec_file;
+        if (!e.is_regular_file(ec_file)) {
+            continue;
+        }
+        const std::string name = e.path().filename().u8string();
+        if (name.size() < head.size() + 5 || name.compare(0, head.size(), head) != 0 ||
+                name.compare(name.size() - 5, 5, ".gguf") != 0) {
+            continue;
+        }
+        std::smatch m;
+        if (std::regex_match(name, m, split_re) && m[1].str() != "00001") {
+            continue;
+        }
+        found.push_back(e.path().generic_u8string());
+    }
+    std::sort(found.begin(), found.end());
+    return found;
+}
+
+// The file count of a table set from its first file: split.count, 1 for a set of one file (no split keys). Throws when the
+// file is not the first file of a set or its name does not let the loader find the other files.
+static uint32_t llama_engram_set_files(const std::string & first, const gguf_context * index) {
+    const int64_t n_split  = llama_engram_kv_int(index, "split.count");
+    const int64_t split_no = llama_engram_kv_int(index, "split.no");
+    if (n_split < 0 && split_no < 0) {
+        return 1;
+    }
+    if (split_no != 0 || n_split < 1 || n_split > 99999) {
+        throw std::runtime_error(format("engram table set %s: split.no / split.count are %" PRId64 " / %" PRId64 ", not the "
+                                        "first file of a table set", first.c_str(), split_no, n_split));
+    }
+    if (n_split > 1) {
+        std::vector<char> buf(llama_path_max(), 0);
+        if (llama_split_prefix(buf.data(), buf.size(), first.c_str(), 0, (int) n_split) == 0) {
+            throw std::runtime_error(format("engram table set %s: the first file of a table set of %" PRId64 " files must be "
+                                            "named <name>-00001-of-%05d.gguf, so that the other files can be found",
+                                            first.c_str(), n_split, (int) n_split));
+        }
+        if (gguf_get_n_tensors(index) != 0) {
+            throw std::runtime_error(format("engram table set %s: the index of a set of %" PRId64 " files holds %" PRId64
+                                            " tensors", first.c_str(), n_split, gguf_get_n_tensors(index)));
+        }
+    }
+    return (uint32_t) n_split;
+}
+
+// --engram-tables / LLAMA_ARG_ENGRAM_TABLES: a readable file is a file, anything else a folder (fopen fails on a folder on
+// Windows, and reading one fails on POSIX), whatever the name ends with
+static bool llama_engram_is_file(const std::string & path) {
+    bool is_file = false;
+    if (FILE * f = ggml_fopen(path.c_str(), "rb")) {
+        char magic[4];
+        is_file = fread(magic, 1, sizeof(magic), f) == sizeof(magic);
+        fclose(f);
+    }
+    return is_file;
+}
+
+// a table the model expects: its name, rows and row width (values per row)
+struct llama_engram_want {
+    std::string name;
+    int64_t     rows;
+    int64_t     width;
+};
+
+// What does not fit the tables the model expects in the table set `first` (index `g`, n_split files), "" when it fits: the
+// set's general.type and architecture, the same table names, the rows of each table, the row width of each (ne0 of its
+// piece 0, from the headers of the set's files). The type and the pieces (count, rows per piece) may differ.
+static std::string llama_engram_mismatch(const std::string & first, const gguf_context * g, uint32_t n_split,
+                                         const std::string & arch, const std::vector<llama_engram_want> & want) {
+    std::string problems;
+    if (llama_engram_kv_desc(g, "general.type") != "engram_tables") {
+        problems += format("\n  general.type is %s, not engram_tables (not the index of an engram table set)",
+                           llama_engram_kv_desc(g, "general.type").c_str());
+    }
+    if (llama_engram_kv_desc(g, "general.architecture") != arch) {
+        problems += format("\n  the set is for %s, the model is %s", llama_engram_kv_desc(g, "general.architecture").c_str(),
+                           arch.c_str());
+    }
+    const int64_t kid_names = llama_engram_arr(g, "engram_tables.names",     GGUF_TYPE_STRING);
+    const int64_t kid_parts = llama_engram_arr(g, "engram_tables.parts",     GGUF_TYPE_UINT32);
+    const int64_t kid_rows  = llama_engram_arr(g, "engram_tables.rows",      GGUF_TYPE_UINT64);
+    const int64_t kid_prow  = llama_engram_arr(g, "engram_tables.part_rows", GGUF_TYPE_UINT64);
+    const size_t  n_tables  = kid_names < 0 ? 0 : gguf_get_arr_n(g, kid_names);
+    if (kid_names < 0 || kid_parts < 0 || kid_rows < 0 || kid_prow < 0 || n_tables == 0 ||
+            gguf_get_arr_n(g, kid_parts) != n_tables || gguf_get_arr_n(g, kid_rows) != n_tables ||
+            gguf_get_arr_n(g, kid_prow) != n_tables) {
+        return problems + "\n  the index lacks engram_tables.names / parts / rows / part_rows or their lengths differ";
+    }
+    std::vector<std::string> names;
+    const uint64_t * rows = (const uint64_t *) gguf_get_arr_data(g, kid_rows);
+    for (size_t t = 0; t < n_tables; ++t) {
+        names.push_back(gguf_get_arr_str(g, kid_names, t));
+        const auto it = std::find_if(want.begin(), want.end(), [&](const llama_engram_want & w) { return w.name == names[t]; });
+        if (it == want.end()) {
+            problems += format("\n  the set has the table %s, the model has not", names[t].c_str());
+        } else if ((uint64_t) it->rows != rows[t]) {
+            problems += format("\n  %s: the model has %" PRId64 " rows, the set %" PRIu64, names[t].c_str(), it->rows, rows[t]);
+        }
+    }
+    for (const auto & w : want) {
+        if (std::find(names.begin(), names.end(), w.name) == names.end()) {
+            problems += format("\n  the model has the table %s, the set has not", w.name.c_str());
+        }
+    }
+    if (!problems.empty()) {
+        return problems;
+    }
+    // the widths: ne0 of piece 0 of every table (headers only)
+    const std::vector<std::string> paths = n_split > 1 ? llama_get_list_splits(first, 0, (int) n_split) :
+                                                         std::vector<std::string>{ first };
+    std::map<std::string, int64_t> width;
+    for (const auto & p : paths) {
+        ggml_context * ctx = nullptr;
+        gguf_context_ptr f { gguf_init_from_file(p.c_str(), { /*.no_alloc =*/ true, /*.ctx =*/ &ctx }) };
+        if (!f) {
+            return format("\n  cannot read %s", p.c_str());
+        }
+        for (const auto & n : names) {
+            if (const ggml_tensor * t = ggml_get_tensor(ctx, (n + ".p0.weight").c_str())) {
+                width[n] = t->ne[0];
+            }
+        }
+        ggml_free(ctx);
+    }
+    for (const auto & w : want) {
+        const auto it = width.find(w.name);
+        if (it == width.end()) {
+            problems += format("\n  %s: piece 0 (%s.p0.weight) is not in the files of the set", w.name.c_str(), w.name.c_str());
+        } else if (it->second != w.width) {
+            problems += format("\n  the rows of %s are %" PRId64 " wide in the model and %" PRId64 " in the set", w.name.c_str(),
+                               w.width, it->second);
+        }
+    }
+    return problems;
+}
+
+void llama_model_loader::attach_engram_tables(const std::string & fname_model, const char * path) {
+    // where the user put a set: the parameter, else the environment
+    std::string user = path != nullptr ? path : "";
+    std::string how  = "--engram-tables";
+    if (user.empty()) {
+        const char * env = getenv("LLAMA_ARG_ENGRAM_TABLES");
+        if (env != nullptr && env[0] != '\0') {
+            user = env;
+            how  = "LLAMA_ARG_ENGRAM_TABLES";
+        }
+    }
+
+    std::string model_dir;
+    std::string prefix;
+    if (!fname_model.empty()) {
+        llama_engram_model_names(fname_model, model_dir, prefix);
+    }
+    const std::string arch = llama_engram_kv_desc(metadata, llm_kv(LLM_KV_GENERAL_ARCHITECTURE));
+    const std::string p    = prefix.empty() ? std::string("<model>") : prefix;
+    const std::string usage = format("give its first file (any name) or its folder with --engram-tables PATH (or "
+                                     "LLAMA_ARG_ENGRAM_TABLES); in a folder the set is %s-engram*.gguf, a file of its own "
+                                     "or the first file *-00001-of-0000M.gguf", p.c_str());
+
+    // the tables the model expects: an index that lists tables it does not hold (engram_tables.names / rows / width) needs
+    // a set; else the tables the model holds itself (blk.N.engram_embd.weight, per_layer_token_embd.weight), which a set
+    // replaces only when the user gives one
+    std::vector<llama_engram_want> want;
+    std::map<std::string, const ggml_tensor *> embedded;   // table name -> its tensor <name>.weight in the model
+    const bool needs_set = gguf_find_key(metadata, llm_kv(LLM_KV_ENGRAM_TABLES_NAMES).c_str()) >= 0;
+    if (needs_set) {
+        std::vector<std::string> names;
+        std::vector<uint64_t> rows;
+        std::vector<uint64_t> width;
+        get_arr(LLM_KV_ENGRAM_TABLES_NAMES, names);
+        get_arr(LLM_KV_ENGRAM_TABLES_ROWS,  rows);
+        get_arr(LLM_KV_ENGRAM_TABLES_WIDTH, width);
+        if (rows.size() != names.size() || width.size() != names.size()) {
+            throw std::runtime_error(format("the engram table keys of the model index differ in length (%zu names, %zu rows, "
+                                            "%zu widths)", names.size(), rows.size(), width.size()));
+        }
+        for (size_t t = 0; t < names.size(); ++t) {
+            want.push_back({ names[t], (int64_t) rows[t], (int64_t) width[t] });
+        }
+    } else {
+        for (const auto & it : weights_map) {
+            const std::string & name   = it.first;
+            const std::string   suffix = ".weight";
+            if (name.size() > suffix.size() && name.compare(name.size() - suffix.size(), suffix.size(), suffix) == 0 &&
+                    llama_engram_is_table(name)) {
+                embedded[name.substr(0, name.size() - suffix.size())] = it.second.tensor;
+            }
+        }
+        for (const auto & e : embedded) {
+            want.push_back({ e.first, e.second->ne[1], e.second->ne[0] });
+        }
+        if (embedded.empty()) {
+            if (!user.empty()) {
+                LLAMA_LOG_WARN("%s: the model holds no engram table and needs no engram table set, %s %s is not used\n",
+                               __func__, how.c_str(), user.c_str());
+            }
+            return;
+        }
+        if (user.empty()) {
+            // the model's own tables are used; a set next to it is only mentioned
+            const std::vector<std::string> found = llama_engram_candidates(model_dir, prefix);
+            if (!found.empty()) {
+                LLAMA_LOG_WARN("%s: found %s, the model's own engram tables are used; give --engram-tables %s to use it\n",
+                               __func__, found[0].c_str(), found[0].c_str());
+            }
+            return;
+        }
+    }
+
+    // the set: a file the user gives (any name); else the one set <P>-engram*.gguf in the folder the user gives, or in the
+    // folder of the model
+    std::string first;
+    std::string where;
+    if (!user.empty() && llama_engram_is_file(user)) {
+        first = user;
+        where = how + " " + user;
+    } else {
+        if (user.empty() && fname_model.empty()) {
+            throw std::runtime_error(format("the model needs its engram table set, and it was not loaded from a file: %s",
+                                            usage.c_str()));
+        }
+        const std::string dir = user.empty() ? model_dir : user;
+        where = user.empty() ? "the folder of the model" : "the folder " + how + " " + user;
+        const std::vector<std::string> found = llama_engram_candidates(dir, prefix);
+        if (found.empty()) {
+            throw std::runtime_error(format("the model %s its engram table set, and %s holds no %s-engram*.gguf (%s): %s",
+                                            needs_set ? "needs" : "is to take", where.c_str(), p.c_str(),
+                                            dir.empty() ? "." : dir.c_str(), usage.c_str()));
+        }
+        if (found.size() > 1) {
+            std::string list;
+            for (const auto & f : found) {
+                list += "\n  " + f;
+            }
+            throw std::runtime_error(format("%s holds %zu engram table sets of the model:%s\n  Choose one: give its first file "
+                                            "with --engram-tables <file>, or a folder that holds only it with --engram-tables "
+                                            "<folder>", where.c_str(), found.size(), list.c_str()));
+        }
+        first = found[0];
+    }
+
+    ggml_context * ctx_index = nullptr;
+    gguf_context_ptr index { gguf_init_from_file(first.c_str(), { /*.no_alloc =*/ true, /*.ctx =*/ &ctx_index }) };
+    if (!index) {
+        throw std::runtime_error(format("engram table set %s (%s): cannot read it as GGUF", first.c_str(), where.c_str()));
+    }
+    contexts.emplace_back(ctx_index);
+
+    // the identity: architecture, table names, rows and row widths (the type and the pieces may differ)
+    const uint32_t n_split = llama_engram_set_files(first, index.get());
+    {
+        const std::string problems = llama_engram_mismatch(first, index.get(), n_split, arch, want);
+        if (!problems.empty()) {
+            throw std::runtime_error(format("the engram table set %s (from %s) does not fit the %s of the model:%s",
+                                            first.c_str(), where.c_str(),
+                                            needs_set ? "tables" : "embedded tables", problems.c_str()));
+        }
+    }
+
+    // embedded tables give way: they are neither read nor allocated
+    for (const auto & e : embedded) {
+        const auto it = weights_map.find(e.first + ".weight");
+        n_elements -= ggml_nelements(it->second.tensor);
+        n_bytes    -= ggml_nbytes(it->second.tensor);
+        weights_map.erase(it);
+    }
+    attach_engram_set_files(first, n_split, index.get(), !needs_set);
+
+    // the layout that the model code reads (llama_table_layout_get) is the set's
+    {
+        const int64_t kid_names = llama_engram_arr(index.get(), llm_kv(LLM_KV_ENGRAM_TABLES_NAMES), GGUF_TYPE_STRING);
+        const size_t  n_tables  = gguf_get_arr_n(index.get(), kid_names);
+        std::vector<std::string>  names;
+        std::vector<const char *> name_ptrs;
+        for (size_t t = 0; t < n_tables; ++t) {
+            names.push_back(gguf_get_arr_str(index.get(), kid_names, t));
+        }
+        for (const auto & n : names) {
+            name_ptrs.push_back(n.c_str());
+        }
+        gguf_set_arr_str(metadata, llm_kv(LLM_KV_ENGRAM_TABLES_NAMES).c_str(), name_ptrs.data(), n_tables);
+        for (const enum llm_kv k : { LLM_KV_ENGRAM_TABLES_PARTS, LLM_KV_ENGRAM_TABLES_ROWS, LLM_KV_ENGRAM_TABLES_PART_ROWS }) {
+            const int64_t kid = gguf_find_key(index.get(), llm_kv(k).c_str());
+            gguf_set_arr_data(metadata, llm_kv(k).c_str(), gguf_get_arr_type(index.get(), kid),
+                              gguf_get_arr_data(index.get(), kid), n_tables);
+        }
+    }
+
+    std::string list;
+    for (const auto & w : want) {
+        list += (list.empty() ? "" : ", ") + w.name;
+    }
+    if (needs_set) {
+        LLAMA_LOG_INFO("%s: engram table set %s: %u file%s, %s %s, source %s %s (from %s)\n", __func__, first.c_str(), n_split,
+                       n_split == 1 ? "" : "s",
+                       llama_engram_kv_desc(index.get(), llm_kv(LLM_KV_ENGRAM_TABLES_KIND)).c_str(),
+                       llama_engram_kv_desc(index.get(), llm_kv(LLM_KV_ENGRAM_TABLES_TYPE)).c_str(),
+                       llama_engram_kv_desc(index.get(), llm_kv(LLM_KV_ENGRAM_TABLES_SOURCE)).c_str(),
+                       llama_engram_kv_desc(index.get(), llm_kv(LLM_KV_ENGRAM_TABLES_SOURCE_REVISION)).c_str(), where.c_str());
+    } else {
+        LLAMA_LOG_INFO("%s: the engram tables of the model (%s) are replaced by the engram table set %s (%s %s, %u file%s, "
+                       "from %s)\n", __func__, list.c_str(), first.c_str(),
+                       llama_engram_kv_desc(index.get(), llm_kv(LLM_KV_ENGRAM_TABLES_KIND)).c_str(),
+                       llama_engram_kv_desc(index.get(), llm_kv(LLM_KV_ENGRAM_TABLES_TYPE)).c_str(), n_split,
+                       n_split == 1 ? "" : "s", where.c_str());
+    }
 }
 
 std::string llama_model_loader::get_arch_name() const {

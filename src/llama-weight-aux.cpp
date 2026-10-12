@@ -6,6 +6,7 @@
 #include "gguf.h"
 
 #include <algorithm>
+#include <cinttypes>
 #include <stdexcept>
 
 ggml_tensor * llama_weight_aux_mul_mat(
@@ -89,6 +90,145 @@ ggml_tensor * llama_weight_aux_get_rows(
     res = ggml_cast(ctx, ggml_cast(ctx, res, GGML_TYPE_F16), GGML_TYPE_F32);
 
     return ggml_reshape_2d(ctx, res, dim, n_heads * n);
+}
+
+void llama_table_pieces_split(const llama_table_pieces & t, const std::vector<int32_t> & rows,
+        std::vector<int32_t> & idx, std::vector<float> & mask) {
+    const size_t n_parts = t.parts.size();
+    GGML_ASSERT(n_parts >= 1);
+    if (n_parts == 1) {
+        idx = rows;
+        mask.clear();
+        return;
+    }
+
+    const size_t n = rows.size();
+    idx.assign(n_parts * n, 0);
+    mask.assign(n_parts * n, 0.0f);
+    for (size_t i = 0; i < n; ++i) {
+        const int64_t g = rows[i];
+        GGML_ASSERT(g >= 0 && g < t.rows && "table row outside the table");
+        const size_t k = (size_t) (g / t.part_rows);
+        GGML_ASSERT(k < n_parts);
+        idx [k*n + i] = (int32_t) (g - (int64_t) k*t.part_rows);
+        mask[k*n + i] = 1.0f;
+    }
+}
+
+ggml_tensor * llama_weight_aux_get_rows_pieces(
+        ggml_context             * ctx,
+        const llama_table_pieces & table,
+        ggml_tensor              * bias,
+        ggml_tensor              * rows,
+        ggml_tensor              * mask,
+        int64_t                    n_heads) {
+    const size_t n_parts = table.parts.size();
+    GGML_ASSERT(n_parts >= 1);
+    if (n_parts == 1) {
+        return llama_weight_aux_get_rows(ctx, table.parts[0], bias, rows, n_heads);
+    }
+
+    GGML_ASSERT(mask != nullptr && ggml_nelements(mask) == ggml_nelements(rows) && ggml_nelements(rows) % (int64_t) n_parts == 0);
+    const int64_t n = ggml_nelements(rows) / (int64_t) n_parts;
+
+    // every piece gathers all n rows (the ones it does not hold read its row 0) and the mask keeps one of them per row:
+    // the sum is exact, since every other term is 0 * a finite row
+    ggml_tensor * sum = nullptr;
+    for (size_t k = 0; k < n_parts; ++k) {
+        ggml_tensor * idx = ggml_view_1d(ctx, rows, n, k*n*ggml_element_size(rows));
+        ggml_tensor * g   = llama_weight_aux_get_rows(ctx, table.parts[k], bias, idx, n_heads);
+        ggml_tensor * m   = ggml_view_2d(ctx, mask, 1, n, ggml_element_size(mask), k*n*ggml_element_size(mask));
+        g = ggml_mul(ctx, g, m);
+        sum = sum ? ggml_add(ctx, sum, g) : g;
+    }
+    return sum;
+}
+
+llama_table_layout llama_table_layout_get(llama_model_loader & ml, const std::string & name) {
+    llama_table_layout l;
+    std::vector<std::string> names;
+    if (!ml.get_arr(LLM_KV_ENGRAM_TABLES_NAMES, names, false)) {
+        return l;
+    }
+    std::vector<uint32_t> parts;
+    std::vector<uint64_t> rows;
+    std::vector<uint64_t> part_rows;
+    ml.get_arr(LLM_KV_ENGRAM_TABLES_PARTS,     parts);
+    ml.get_arr(LLM_KV_ENGRAM_TABLES_ROWS,      rows);
+    ml.get_arr(LLM_KV_ENGRAM_TABLES_PART_ROWS, part_rows);
+    if (parts.size() != names.size() || rows.size() != names.size() || part_rows.size() != names.size()) {
+        throw std::runtime_error(format("the engram table keys of the model index differ in length (%zu names, %zu / %zu / %zu)",
+                                        names.size(), parts.size(), rows.size(), part_rows.size()));
+    }
+    for (size_t i = 0; i < names.size(); ++i) {
+        if (names[i] == name) {
+            l.parts     = parts[i];
+            l.rows      = (int64_t) rows[i];
+            l.part_rows = (int64_t) part_rows[i];
+            if (l.parts == 0) {
+                throw std::runtime_error(format("the engram table %s has 0 pieces in the model index", name.c_str()));
+            }
+            return l;
+        }
+    }
+    throw std::runtime_error(format("the engram table set of this model has no table %s", name.c_str()));
+}
+
+llama_table_pieces llama_table_pieces_create(
+        llama_model_loader                                                     & ml,
+        const std::string                                                      & what,
+        uint32_t                                                                 parts,
+        int64_t                                                                  rows,
+        int64_t                                                                  part_rows,
+        int64_t                                                                  dim,
+        const std::function<std::string(uint32_t)>                            & piece_name,
+        const std::function<ggml_tensor *(uint32_t, int64_t, int64_t)>         & create) {
+    llama_table_pieces t;
+    t.rows      = rows;
+    t.part_rows = part_rows;
+
+    if (parts == 0) {
+        // one tensor, which is the whole table
+        t.parts.push_back(create(0, rows, dim));
+        t.part_rows = rows;
+        return t;
+    }
+
+    if (part_rows <= 0 || rows <= 0 || (rows + part_rows - 1) / part_rows != (int64_t) parts) {
+        throw std::runtime_error(format("%s: the index says %u pieces of %" PRId64 " rows for a table of %" PRId64 " rows",
+                                        what.c_str(), parts, part_rows, rows));
+    }
+
+    // a model synthesised from metadata has no tensors to look at
+    const bool from_metadata = ml.n_tensors == 0;
+
+    ggml_type type = GGML_TYPE_COUNT;
+    for (uint32_t i = 0; i < parts; ++i) {
+        const std::string name = piece_name(i);
+        const int64_t piece_rows = std::min<int64_t>(part_rows, rows - (int64_t) i*part_rows);
+        const auto * w = from_metadata ? nullptr : ml.get_weight(name.c_str());
+        if (w == nullptr && from_metadata) {
+            t.parts.push_back(create(i, piece_rows, dim));
+            continue;
+        }
+        if (w == nullptr) {
+            throw std::runtime_error(format("%s: table piece %s is missing; the table set has %u pieces of %" PRId64 " rows",
+                                            what.c_str(), name.c_str(), parts, part_rows));
+        }
+        if (w->tensor->ne[0] != dim || w->tensor->ne[1] != piece_rows || w->tensor->ne[2] != 1 || w->tensor->ne[3] != 1) {
+            throw std::runtime_error(format("%s: table piece %s is %" PRId64 " x %" PRId64 ", the model index says %" PRId64 " x %" PRId64,
+                                            what.c_str(), name.c_str(),
+                                            w->tensor->ne[0], w->tensor->ne[1], dim, piece_rows));
+        }
+        if (i == 0) {
+            type = w->tensor->type;
+        } else if (w->tensor->type != type) {
+            throw std::runtime_error(format("%s: table piece %s is %s, piece 0 is %s (the pieces are from different sets)",
+                                            what.c_str(), name.c_str(), ggml_type_name(w->tensor->type), ggml_type_name(type)));
+        }
+        t.parts.push_back(create(i, piece_rows, dim));
+    }
+    return t;
 }
 
 ggml_tensor * llama_weight_aux_test_op(ggml_context * ctx, ggml_tensor * w, int n_ids) {

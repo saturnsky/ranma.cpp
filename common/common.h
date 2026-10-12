@@ -555,6 +555,10 @@ struct common_params {
 
     struct common_params_model model;
 
+    // ranma: an engram table set (first file or folder to search): the model's set, or the set that replaces the tables the
+    // model holds itself (llama_model_params::engram_tables), docs/ranma/engram-tables.md
+    std::string engram_tables;   // NOLINT
+
     std::set<std::string> model_alias;     // model aliases                                                 // NOLINT
     std::set<std::string> model_tags;      // model tags (informational, not used for routing)              // NOLINT
     std::string hf_token             = ""; // HF token (aka bearer token)                                   // NOLINT

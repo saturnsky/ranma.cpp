@@ -3130,6 +3130,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_COMMON, LLAMA_EXAMPLE_EXPORT_LORA, LLAMA_EXAMPLE_DOWNLOAD, LLAMA_EXAMPLE_TOKENIZE}).set_env("LLAMA_ARG_MODEL"));
     add_opt(common_arg(
+        {"--engram-tables"}, "PATH",
+        "engram table set (DeepSeek V4.1 engram, Qwen3.8 PLE): its first file (any name) or a folder to search.\n"
+        "A model that needs a set: by default the one <model>-engram*.gguf next to the model (<model>-00001-of-0000K.gguf\n"
+        "/ <model>.gguf; a file of its own or the first file of a split set). A model that holds its tables itself: the\n"
+        "set replaces them. A set fits by table names, rows and row width; the type and the pieces may differ",
+        [](common_params & params, const std::string & value) {
+            params.engram_tables = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_COMMON}).set_env("LLAMA_ARG_ENGRAM_TABLES"));
+    add_opt(common_arg(
         {"-mu", "--model-url"}, "MODEL_URL",
         "model download url (default: unused)",
         [](common_params & params, const std::string & value) {

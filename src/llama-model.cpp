@@ -1931,13 +1931,23 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
         can_prefetch.insert(per_layer_tok_embd);
     }
+    // a table in pieces: every piece is hinted
+    for (ggml_tensor * piece : per_layer_tok_embd_table.parts) {
+        if (piece && ml.lazy.has(piece)) {
+            LLAMA_LOG_INFO("%s: enabling prefetch for '%s'\n", __func__, piece->name);
+
+            can_prefetch.insert(piece);
+        }
+    }
 
     // DeepSeek V4.1 engram tables are lazily mapped too: their gathers are prefetched like the per-layer embeddings
     for (const auto & layer : layers) {
-        if (layer.engram_embd && ml.lazy.has(layer.engram_embd)) {
-            LLAMA_LOG_INFO("%s: enabling prefetch for '%s'\n", __func__, layer.engram_embd->name);
+        for (ggml_tensor * piece : layer.engram_table.parts) {
+            if (piece && ml.lazy.has(piece)) {
+                LLAMA_LOG_INFO("%s: enabling prefetch for '%s'\n", __func__, piece->name);
 
-            can_prefetch.insert(layer.engram_embd);
+                can_prefetch.insert(piece);
+            }
         }
     }
 
@@ -3479,6 +3489,7 @@ llama_model_params llama_model_default_params() {
         /*.no_alloc                    =*/ false,
         /*.load_mtp                    =*/ false,
         /*.expert_config               =*/ nullptr,
+        /*.engram_tables                =*/ nullptr,
     };
 
     return result;

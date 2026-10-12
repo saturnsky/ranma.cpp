@@ -2390,8 +2390,10 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
                 // 256 rows is the measured threshold; see docs/ranma/ple-prefetch.md.
                 const int64_t n_rows_ple = ggml_nelements(node->src[1]);
                 // (DeepSeek V4.1 engram tables, blk.N.engram_embd.weight, are lazily mapped the same way)
+                // a table stored in pieces names them <table>.p<i>.weight
                 const char * name_src0 = ggml_get_name(node->src[0]);
-                const bool is_ple = strcmp(name_src0, "per_layer_token_embd.weight") == 0 || strstr(name_src0, ".engram_embd.weight") != NULL;
+                const bool is_ple = strcmp(name_src0, "per_layer_token_embd.weight") == 0 || strncmp(name_src0, "per_layer_token_embd.p", 22) == 0 ||
+                    strstr(name_src0, ".engram_embd.") != NULL;
                 n_tasks = is_ple && n_rows_ple >= 256 ? (int) MIN((int64_t) n_threads, n_rows_ple) : 1;
             } break;
         case GGML_OP_SCALE:
