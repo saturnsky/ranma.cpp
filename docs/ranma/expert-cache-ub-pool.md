@@ -89,7 +89,7 @@ spans lends. In the table above it cut the fills by 54 % and lifted decode by 5 
 
 ## Ring admission (experimental)
 
-`RANMA_EXPERT_UB_POOL_RING=1` (default 0) also admits the experts that the SSD worker serves from its host
+The ring admission (on under the unified host policy, below, otherwise off) also admits the experts that the SSD worker serves from its host
 ring (ring occupants), under the same admission filter. A CPU replay of DS4F traces put the gain at r = 9 (the
 positions a 2048-row ubatch leaves on DS4.1F) at 1.5 to 2.6 ms per token over host residents only with a 24 GiB
 host tier, and 0.04 to 1.0 ms with 40.8 GiB; it is not measured on the model yet. File residents (in neither
@@ -124,6 +124,12 @@ ring nor host memory) are still not admitted.
   in the layers other than the one just served (an entry the pool let go, published again at the layer's next
   service); the layer just served and every layer after an install are still checked exactly.
 
+- **Under the unified host policy.** With the unified host policy past its gate
+  (`expert-cache-l2.md`), every host expert of the SSD tier is a ring occupant, so the pool could take
+  host experts only through this admission. With the pool on, the admission is therefore on (info line
+  `decode pool: ring admission on under the unified host policy`). Its own checks and its runtime judgement
+  of other contexts apply. Without the unified policy the admission is off.
+
 With the switch at 0 nothing is allocated, the step kernel's ring branch is never taken, the publish kernel
 gets a null bitmap, and the worker's checks see no bitmap.
 
@@ -137,7 +143,6 @@ ring admission follows the unified host policy.
 | Environment switch | Default | Effect |
 |---|---|---|
 | `RANMA_EXPERT_UB_POOL` | 1 | 0 turns the decode pool off. |
-| `RANMA_EXPERT_UB_POOL_RING` | 0 | 1: also admit ring occupants of the SSD tier (experimental, above). |
 | `RANMA_EXPERT_UB_POOL_LOG` | 0 | 1: lends, reclaims and counters. |
 
 It is read once at startup. `RANMA_EXPERT_VERIFY` compares every position with its home before every
@@ -160,7 +165,7 @@ The `--spec-smart-log` round log uses it to record each round's pool work (`docs
 
 ## Not done
 
-- Experts the SSD worker serves are not admitted (ring occupants are with `RANMA_EXPERT_UB_POOL_RING=1`; file
-  residents never).
+- Experts the SSD worker serves are not admitted (ring occupants are, with the ring admission that the unified
+  host policy turns on; file residents never).
 - Early-route (hash) layers and the layers of a joint cache's draft member get no positions.
 - A compute buffer of more than one chunk reports no extent, so the pool never lends from it.
