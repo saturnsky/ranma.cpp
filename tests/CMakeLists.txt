@@ -380,6 +380,7 @@ llama_build_and_test(test-expert-os.cpp
     ${PROJECT_SOURCE_DIR}/ggml/src/ggml-cuda/expert-os-posix.cpp)
 target_include_directories(test-expert-os PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src/ggml-cuda ${PROJECT_SOURCE_DIR}/ggml/src)
 llama_build_and_test(test-expert-config.cpp)
+llama_build_and_test(test-engram-tables-load.cpp)
 llama_build_and_test(test-server-expert.cpp)
 llama_build_and_test(test-spec-smart.cpp) # ranma: --spec-smart controller (no GPU)
 

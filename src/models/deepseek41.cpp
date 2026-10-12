@@ -207,12 +207,22 @@ void llama_model_deepseek41::load_arch_tensors(llama_model_loader & ml) {
 
             // The table has hundreds of millions of rows and is far too large to hold in memory,
             // but each token only touches n_cols of them, so read those rows on demand.
+            // It is one tensor of the model, or the pieces of the table set of the model
             const std::string embd_name = tn(LLM_TENSOR_ENGRAM_EMBD, "weight", i).str();
-            const auto * embd_w = ml.get_weight(embd_name.c_str());
-            if (embd_w == nullptr) {
-                throw std::runtime_error(format("%s is missing", embd_name.c_str()));
+            const llama_table_layout layout = llama_table_layout_get(ml, tn(LLM_TENSOR_ENGRAM_EMBD, i).str());
+            const bool pieces = layout.parts > 0;
+            int64_t n_rows    = 0;
+            int64_t part_rows = 0;
+            if (pieces) {
+                n_rows    = layout.rows;
+                part_rows = layout.part_rows;
+            } else {
+                const auto * embd_w = ml.get_weight(embd_name.c_str());
+                if (embd_w == nullptr) {
+                    throw std::runtime_error(format("%s is missing", embd_name.c_str()));
+                }
+                n_rows = embd_w->tensor->ne[1];
             }
-            const int64_t n_rows = embd_w->tensor->ne[1];
 
             // a row index is a bucket offset plus a hash, so the last bucket has to end inside
             uint64_t max_row = 0;
@@ -225,7 +235,13 @@ void llama_model_deepseek41::load_arch_tensors(llama_model_loader & ml) {
                                                 embd_name.c_str(), n_rows, max_row));
             }
 
-            layer.engram_embd = create_tensor(tn(LLM_TENSOR_ENGRAM_EMBD, "weight", i), {key_len, n_rows}, TENSOR_READ_LAZY);
+            layer.engram_table = llama_table_pieces_create(ml, format("engram layer %d table", i),
+                    layout.parts, n_rows, part_rows, key_len,
+                    [&](uint32_t k) { return tn(LLM_TENSOR_ENGRAM_EMBD, ("p" + std::to_string(k) + ".weight").c_str(), i).str(); },
+                    [&](uint32_t k, int64_t rows, int64_t dim) {
+                        const std::string sfx = pieces ? "p" + std::to_string(k) + ".weight" : "weight";
+                        return create_tensor(tn(LLM_TENSOR_ENGRAM_EMBD, sfx.c_str(), i), {dim, rows}, TENSOR_READ_LAZY);
+                    });
             layer.engram_wkv  = create_tensor(tn(LLM_TENSOR_ENGRAM_WKV,  "weight", i), {n_cols * key_len, n_embd * (hc_mult + 1)}, 0);
             layer.engram_q    = create_tensor(tn(LLM_TENSOR_ENGRAM_Q,    "weight", i), {n_embd, hc_mult}, 0);
             layer.engram_k    = create_tensor(tn(LLM_TENSOR_ENGRAM_K,    "weight", i), {n_embd, hc_mult}, 0);
@@ -300,7 +316,7 @@ public:
     llm_graph_input_engram(const llama_model_deepseek41 & pmodel,
                            const llama_kv_cache_dsv4_raw_context * mctx,
                            int eg,
-                           const ggml_tensor * table,
+                           const llama_table_pieces * table,
                            enum llama_ple_prefetch prefetch) : pmodel(pmodel), mctx(mctx), eg(eg), table(table), prefetch(prefetch) {}
     virtual ~llm_graph_input_engram() = default;
 
@@ -309,10 +325,12 @@ public:
     bool can_reuse(const llm_graph_params & params) override {
         mctx = static_cast<const llama_kv_cache_dsv4_context *>(params.mctx)->get_raw();
         const int64_t n_cols = (pmodel.hparams.engram_max_ngram_size - 1) * pmodel.hparams.engram_n_head;
-        return rows->ne[0] == n_cols * params.ubatch.n_tokens;
+        return rows->ne[0] == (int64_t) table->size() * n_cols * params.ubatch.n_tokens;
     }
 
-    ggml_tensor * rows = nullptr;   // I32 [n_cols * n_tokens]
+    // per piece of the table, the rows it holds as local row numbers (the others read its row 0), see llama_table_pieces_split
+    ggml_tensor * rows = nullptr;   // I32 [n_pieces * n_cols * n_tokens]
+    ggml_tensor * mask = nullptr;   // F32 [1, n_pieces * n_cols * n_tokens], 1 where the piece holds the row; null for one piece
 
     const llama_model_deepseek41 & pmodel;
 
@@ -323,7 +341,7 @@ public:
     const int eg;
 
     // this layer's lazily mapped table and the --ple-prefetch mode: the rows are handed to the OS before the gather
-    const ggml_tensor * table;
+    const llama_table_pieces * table;
     const enum llama_ple_prefetch prefetch;
 
     // scratch, reused across set_input() calls
@@ -389,11 +407,19 @@ void llm_graph_input_engram::set_input(const llama_ubatch * ubatch) {
         }
     }
 
-    if (pmodel.can_prefetch.count(table)) {
-        llama_prefetch_table_rows(table, idx, prefetch);
+    if (pmodel.can_prefetch.count(table->parts[0])) {
+        llama_prefetch_table_pieces_rows(table->parts, table->part_rows, idx, prefetch);
     }
 
-    ggml_backend_tensor_set(rows, idx.data(), 0, idx.size()*ggml_element_size(rows));
+    // global row numbers -> per piece local row numbers and the mask that keeps the piece which holds the row
+    std::vector<int32_t> piece_idx;
+    std::vector<float>   piece_mask;
+    llama_table_pieces_split(*table, idx, piece_idx, piece_mask);
+
+    ggml_backend_tensor_set(rows, piece_idx.data(), 0, piece_idx.size()*ggml_element_size(rows));
+    if (mask) {
+        ggml_backend_tensor_set(mask, piece_mask.data(), 0, piece_mask.size()*ggml_element_size(mask));
+    }
 }
 
 ggml_tensor * llama_model_deepseek41::graph::build_inp_engram(
@@ -406,17 +432,27 @@ ggml_tensor * llama_model_deepseek41::graph::build_inp_engram(
 
     const auto * mctx_cur = static_cast<const llama_kv_cache_dsv4_context *>(mctx);
 
+    const llama_table_pieces & table = model.layers[il].engram_table;
     auto inp = std::make_unique<llm_graph_input_engram>(pmodel, mctx_cur->get_raw(), pmodel.engram_index(il),
-                                                        model.layers[il].engram_embd, cparams.ple_prefetch);
+                                                        &table, cparams.ple_prefetch);
 
-    inp->rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_cols * n_tokens);
+    // the shapes depend on the number of pieces of the table, never on the rows: every piece gathers n_cols * n_tokens rows
+    // and a mask keeps the piece that holds each one
+    const int64_t n_gather = n_cols * n_tokens;
+    inp->rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_gather * (int64_t) table.size());
     ggml_set_input(inp->rows);
     ggml_tensor * rows = inp->rows;
+    ggml_tensor * mask = nullptr;
+    if (table.size() > 1) {
+        inp->mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 1, n_gather * (int64_t) table.size());
+        ggml_set_input(inp->mask);
+        mask = inp->mask;
+    }
     res->add_input(std::move(inp));
 
     // gather then flatten, laying the buckets out slowest, as the reference does
     // (the table is MXFP8 rows read in place from the mapping; the gather dequantizes to F32 on the CPU)
-    ggml_tensor * emb = ggml_get_rows(ctx0, model.layers[il].engram_embd, rows);
+    ggml_tensor * emb = llama_weight_aux_get_rows_pieces(ctx0, table, nullptr, rows, mask, 1);
     emb = ggml_reshape_2d(ctx0, emb, key_len * n_cols, n_tokens);
     cb(emb, "engram_embd", il);
 

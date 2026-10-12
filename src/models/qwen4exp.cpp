@@ -202,9 +202,20 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
             ple_rows = std::max(ple_rows, (int64_t) hparams.ple_head_offsets[h] + hparams.ple_head_vocab_sizes[h]);
         }
 
+        // the table is one tensor of the model, or the pieces of the table set of the model
         // the converter pads the table; a model synthesised from metadata has no tensor to ask
         const std::string ple_name = tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight").str();
-        if (const auto * ple_w = ml.get_weight(ple_name.c_str())) {
+        const llama_table_layout layout = llama_table_layout_get(ml, tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD).str());
+        const bool pieces = layout.parts > 0;
+        int64_t part_rows = 0;
+        if (pieces) {
+            if (layout.rows < ple_rows) {
+                throw std::runtime_error(format("the PLE table has %" PRId64 " rows, too few for the PLE head ranges (%" PRId64 ")",
+                                                layout.rows, ple_rows));
+            }
+            ple_rows  = layout.rows;
+            part_rows = layout.part_rows;
+        } else if (const auto * ple_w = ml.get_weight(ple_name.c_str())) {
             if (ple_w->tensor->ne[1] < ple_rows) {
                 throw std::runtime_error(format("%s has %" PRId64 " rows, too few for the PLE head ranges (%" PRId64 ")",
                                                 ple_name.c_str(), ple_w->tensor->ne[1], ple_rows));
@@ -212,10 +223,20 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
             ple_rows = ple_w->tensor->ne[1];
         }
 
-        per_layer_tok_embd = create_tensor(tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "weight"),
-                                           { hparams.ple_head_dim, ple_rows }, TENSOR_READ_LAZY);
-        // an EXL3 row codec table comes with its per-head bias
-        if (per_layer_tok_embd && ggml_is_exl3_row(per_layer_tok_embd->type)) {
+        per_layer_tok_embd_table = llama_table_pieces_create(ml, "PLE engram table",
+                layout.parts, ple_rows, part_rows, hparams.ple_head_dim,
+                [&](uint32_t k) { return tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, ("p" + std::to_string(k) + ".weight").c_str()).str(); },
+                [&](uint32_t k, int64_t rows, int64_t dim) {
+                    const std::string sfx = pieces ? "p" + std::to_string(k) + ".weight" : "weight";
+                    return create_tensor(tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, sfx.c_str()), { dim, rows }, TENSOR_READ_LAZY);
+                });
+        per_layer_tok_embd = per_layer_tok_embd_table.parts[0];
+
+        // an EXL3 row codec table comes with its per-head bias (next to its first piece in a table set): required for it.
+        // Another table may carry one (a zero bias of the earlier table shard layout, kept by a converted set); it is
+        // created so that the tensor count matches, and the gather does not read it (qwen4exp graph: exl3 row only)
+        const std::string ple_bias = tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "bias").str();
+        if (per_layer_tok_embd && (ggml_is_exl3_row(per_layer_tok_embd->type) || ml.get_weight(ple_bias.c_str()) != nullptr)) {
             per_layer_tok_embd_b = create_tensor(tn(LLM_TENSOR_PER_LAYER_TOKEN_EMBD, "bias"),
                                                  { hparams.ple_head_dim, hparams.ple_n_heads }, 0);
         }
@@ -1212,10 +1233,12 @@ public:
 
     bool can_reuse(const llm_graph_params & params) override {
         mctx = static_cast<const llama_memory_hybrid_idx_context *>(params.mctx)->get_attn();
-        return rows->ne[0] == (int64_t) model.hparams.ple_n_heads * params.ubatch.n_tokens;
+        return rows->ne[0] == (int64_t) model.per_layer_tok_embd_table.size() * model.hparams.ple_n_heads * params.ubatch.n_tokens;
     }
 
-    ggml_tensor * rows = nullptr;   // I32 [ple_n_heads * n_tokens]
+    // per piece of the table, the rows it holds as local row numbers (the others read its row 0), see llama_table_pieces_split
+    ggml_tensor * rows = nullptr;   // I32 [n_pieces * ple_n_heads * n_tokens]
+    ggml_tensor * mask = nullptr;   // F32 [1, n_pieces * ple_n_heads * n_tokens], 1 where the piece holds the row; null for one piece
 
     const llama_model & model;
 
@@ -1272,9 +1295,18 @@ void llm_graph_input_qwen4exp_ple::set_input(const llama_ubatch * ubatch) {
                 hparams.ple_head_offsets.data(), hparams.ple_head_vocab_sizes.data(), idx.data() + i*n_heads);
     }
 
-    llama_prefetch_table_rows(model.per_layer_tok_embd, idx, ple_prefetch);
+    const llama_table_pieces & table = model.per_layer_tok_embd_table;
+    llama_prefetch_table_pieces_rows(table.parts, table.part_rows, idx, ple_prefetch);
 
-    ggml_backend_tensor_set(rows, idx.data(), 0, idx.size()*ggml_element_size(rows));
+    // global row numbers -> per piece local row numbers and the mask that keeps the piece which holds the row
+    std::vector<int32_t> piece_idx;
+    std::vector<float>   piece_mask;
+    llama_table_pieces_split(table, idx, piece_idx, piece_mask);
+
+    ggml_backend_tensor_set(rows, piece_idx.data(), 0, piece_idx.size()*ggml_element_size(rows));
+    if (mask) {
+        ggml_backend_tensor_set(mask, piece_mask.data(), 0, piece_mask.size()*ggml_element_size(mask));
+    }
 }
 
 // Read a conv history out of its own recurrent row and write the new tail back.
@@ -1340,13 +1372,25 @@ ggml_tensor * llama_model_qwen4exp::graph::build_inp_ple(
     // the attention cells see every ubatch regardless of the layer types
     auto ple_inp = std::make_unique<llm_graph_input_qwen4exp_ple>(model, mctx_hyb->get_attn(), cparams.ple_prefetch);
 
-    ple_inp->rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_heads * n_tokens);
+    // the shapes depend on the number of pieces of the table, never on the rows: every piece gathers n_heads * n_tokens rows
+    // and a mask keeps the piece that holds each one
+    const llama_table_pieces & table = model.per_layer_tok_embd_table;
+    const int64_t n_gather = n_heads * n_tokens;
+    ple_inp->rows = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_gather * (int64_t) table.size());
     ggml_set_input(ple_inp->rows);
     ggml_tensor * rows = ple_inp->rows;
+    ggml_tensor * mask = nullptr;
+    if (table.size() > 1) {
+        ple_inp->mask = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, 1, n_gather * (int64_t) table.size());
+        ggml_set_input(ple_inp->mask);
+        mask = ple_inp->mask;
+    }
     res->add_input(std::move(ple_inp));
 
     // gather then flatten the heads: get_rows lays the head dimension out slowest, as the reference does
-    ggml_tensor * emb = llama_weight_aux_get_rows(ctx0, model.per_layer_tok_embd, model.per_layer_tok_embd_b, rows, n_heads);
+    // (the per-head bias belongs to an EXL3 row codec table only)
+    ggml_tensor * bias = ggml_is_exl3_row(table.parts[0]->type) ? model.per_layer_tok_embd_b : nullptr;
+    ggml_tensor * emb = llama_weight_aux_get_rows_pieces(ctx0, table, bias, rows, mask, n_heads);
     emb = ggml_reshape_2d(ctx0, emb, hparams.ple_head_dim * n_heads, n_tokens);
     cb(emb, "ple_embd", -1);
 

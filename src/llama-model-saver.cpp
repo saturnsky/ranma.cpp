@@ -498,7 +498,13 @@ void llama_model_saver::add_tensors_from_model() {
     add_tensor(model->hc_head_fn);
     add_tensor(model->hc_head_base);
     add_tensor(model->hc_head_scale);
-    add_tensor(model->per_layer_tok_embd);
+    if (model->per_layer_tok_embd_table.size() > 1) {
+        for (const ggml_tensor * piece : model->per_layer_tok_embd_table.parts) {
+            add_tensor(piece);
+        }
+    } else {
+        add_tensor(model->per_layer_tok_embd);
+    }
     add_tensor(model->per_layer_tok_embd_b);
     add_tensor(model->hc_head_norm);
     add_tensor(model->hc_head_down);

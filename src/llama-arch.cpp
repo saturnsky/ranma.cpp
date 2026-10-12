@@ -337,6 +337,16 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
     { LLM_KV_PLE_HEAD_VOCAB_SIZES,                   "%s.ple.head_vocab_sizes"                   },
     { LLM_KV_PLE_EOS_TOKEN_ID,                       "%s.ple.eos_token_id"                       },
     { LLM_KV_PLE_IMAGE_TOKEN_ID,                     "%s.ple.image_token_id"                     },
+    { LLM_KV_ENGRAM_TABLES_KIND,                      "engram_tables.kind"                         },
+    { LLM_KV_ENGRAM_TABLES_TYPE,                      "engram_tables.type"                         },
+    { LLM_KV_ENGRAM_TABLES_NAMES,                     "engram_tables.names"                        },
+    { LLM_KV_ENGRAM_TABLES_PARTS,                     "engram_tables.parts"                        },
+    { LLM_KV_ENGRAM_TABLES_ROWS,                      "engram_tables.rows"                         },
+    { LLM_KV_ENGRAM_TABLES_PART_ROWS,                 "engram_tables.part_rows"                    },
+    { LLM_KV_ENGRAM_TABLES_WIDTH,                     "engram_tables.width"                        },
+    { LLM_KV_ENGRAM_TABLES_PIECE_CHECK,               "engram_tables.piece_check"                  },
+    { LLM_KV_ENGRAM_TABLES_SOURCE,                    "engram_tables.source"                       },
+    { LLM_KV_ENGRAM_TABLES_SOURCE_REVISION,           "engram_tables.source_revision"              },
 
     { LLM_KV_HASH_LAYER_COUNT,                       "%s.hash_layer_count"                       },
 
