@@ -62,6 +62,9 @@ occupant stays marked in the serve bitmap so that the worker extends its lease b
 can evict a slot the current layer still reads. The replacement decides which slices are read from
 the file and where they land, never their contents.
 
+This is the plain ring. With the unified host policy ("The unified host policy") the same ledger runs
+with a probation part and a ghost filter, and every host slot is a ring slot.
+
 ### Staged service for prompt batches
 
 A ubatch with more rows than the decode bound (`n_parallel * (draft_max + 1)`) is served one weight
@@ -295,6 +298,79 @@ ring), `ring-copy` (VRAM promotions from the ring) and `read`, and the ring occu
 install; the `install` metric adds `read_bytes` (bytes actually read; `ssd_bytes` still counts every
 move from the file), `relabel_bytes`, `ring_copy_bytes`, `ring_kept` and `demoted_to_ring`.
 
+## The unified host policy
+
+In the plain class layout a host slot is either a resident (placed by the plan) or a ring slot (least
+recently used replacement), and an install moves slots between the two roles. The unified host policy
+drops the distinction: every host slot of the SSD tier is a ring slot under one replacement policy, and
+the plan decides only what is in VRAM. It is always on where its gate (below) allows it; where the gate
+refuses it, every path, budget and cut is the one described above.
+
+**Gate.** The policy runs only where the host slots are touched by nothing but the tier's own installs
+and worker. It stays off, with one log line naming the reason, when:
+
+- the tier has no class layout;
+- the cache mode is inclusive (`--expert-cache-mode exclusive` is needed; the mode default is
+  inclusive, so the policy does nothing until exclusive is given);
+- `RANMA_EXPERT_HASH_EARLY` is set;
+- `RANMA_EXPERT_PREFETCH` is set;
+- one storage class holds the layers of two models (a joint cache whose models share a class).
+
+The line is an info line (`the unified host policy (default) is off: <reason>`). After each install every layer's possible demand outside VRAM has to fit in its
+storage class, or the process stops with the numbers.
+
+**Policy.** Each class list is split at a probation point into a main part and a probation part at the
+least recently used end. A hit moves its slot to the most recently used end. A miss that also missed in
+its layer within the last 32 decode generations (stamped after the step's
+decisions, so a miss never passes itself) is filled at the most recently used end; any other miss is
+filled at the probation point, so a one-off expert leaves through probation without pushing out the
+main part. A prompt generation follows the same rules: the rings are the SSD tier's read buffer and its
+cache at once, so what a prompt reads is cached like what a token reads. An older rule filled a prompt
+generation at the least recently used end, moved no hit and took no ghost step. Measured
+(2026-10-12, reseed `order`, one pair per setting): prompt time of short prompts -2.5 to -34 % (DS4F
+EXL3 and UD-IQ3_XXS, DS4.1F, GLM-5.3 EXL3, larger with a larger part in the file), long prompts -2.3 to
++3.3 % (the loss reproduced on GLM-5.3 with 60 GiB L2), decode unchanged or up to a few % faster.
+
+**Start.** The residents the loader wrote dissolve into their rings in place, the empty ring slots are
+filled with the next best experts of the seed profile, and each class list is laid out in score order.
+The arena starts full. The log line is `unified host policy: N residents dissolved into the rings, ...
+rings in score order`, with `(no seed profile: slot order)` when there is no profile.
+
+**Installs.** The plan then has no host residents: every expert outside VRAM is published as a file
+resident, so the worker serves every host hit through the address table. An expert demoted from VRAM
+is copied back into the ring at the probation point, and the ring copy of an expert promoted to VRAM
+is emptied. L1 and L2 stay exclusive: an expert is in VRAM or in a ring, not both. What else an
+install does to the rings is the reseed in score order, without reading.
+
+**Joint cache.** A storage class of a model that has not bound when the cache is installed keeps its
+residents and ring, and installs leave its layers as they are (one info line per class). When the model
+has bound and loaded, only that class dissolves into its ring, is filled from the seed profile and laid
+out in score order, and its experts outside VRAM go to the file (`unified host policy after a model
+joined: ...`).
+
+**Decode pool.** With the pool on, the pool's ring admission turns on by itself ("Ring admission" in
+`expert-cache-ub-pool.md`), because under this policy every host expert is a ring occupant.
+
+The policy has no switches. Its settings are fixed: the probation part is 0.10 of each class list, with
+at least the class's ring of the layout as probation slots; a miss passes the ghost within 32 decode
+generations of its layer; prompt generations follow the decode rules; a plan install lays the rings out
+in score order without reading. Reading the plan's best experts into the rings at each install (a
+`full` reseed) was the first default and was dropped: on DS4.1F it read 8.7 to 15.5 GiB from the SSD at
+each request end (0.65 to 1.15 s) and gave no decode gain over the score-order layout (14.07 against
+14.24 t/s on the 48 GiB mixed prompt set, one run each).
+
+**Measured.** DS4.1F (EXL3 3.0 bpw), ub 2048, L1 17727 MiB, decode pool on, one run per row after a GPU
+rest, the plain ring against the unified policy (reseed `full`), the pool's ring admission on in both:
+
+| L2 | prompts | plain ring | unified | change |
+|---|---|---|---|---|
+| 80 GiB | 10 Korean | 17.82 t/s | 19.14 t/s | +7.4 % |
+| 80 GiB | 6 mixed | 15.83 t/s | 17.73 t/s | +12.0 % |
+| 48 GiB | 10 Korean | 14.38 t/s | 15.55 t/s | +8.1 % |
+| 48 GiB | 6 mixed | 12.52 t/s | 14.10 t/s | +12.6 % |
+
+Decode t/s is the tokens over the time, summed over the prompts. Prompt processing changed by 1 to 3 %.
+
 ## Options
 
 The cache reads host and ring memory from the kernels, which is the host-direct path
@@ -309,7 +385,7 @@ or `--n-cpu-moe`.
 | `--expert-l2-prefill-ring-mib N` | the staging value | Overrides the staging value; 0 is automatic. |
 | `--expert-l2-worker-cpu N` | -1 | Logical CPU of the worker thread; -1 is the last active logical CPU. |
 | `--expert-l1-mib N` | 0 | VRAM budget; zero is valid with a finite tier. |
-| `--expert-cache-mode MODE` | inclusive | Relation of the VRAM set to the host set. |
+| `--expert-cache-mode MODE` | inclusive | Relation of the VRAM set to the host set. The unified host policy needs `exclusive`. |
 
 `llama-bench` accepts the same host tier options.
 
@@ -361,6 +437,8 @@ samples count the wait for the up slices only; `staged_wait_ms` adds up the gate
 - **Several models.** In a joint cache (`expert-cache-joint.md`) each model's file-resident experts
   are read from its own GGUF; the tier numbers files by path. A model that joins later opens its
   files and has its backing checked when its load ends.
+  The unified host policy runs in a joint cache: the classes of a model that joins later take part
+  once it has bound, and a storage class that holds the layers of two models keeps the policy off.
 - **Windows and HIP only**, for the unbuffered read queue and the address reservation. The validator
   refuses the option elsewhere before the model loads.
 - **The up reads of a layer are not overlapped.** The staged service hides the gate and down reads
@@ -384,6 +462,7 @@ samples count the wait for the up slices only; `staged_wait_ms` adds up the gate
 - **Demoted residents go first.** A resident that the install moves to the file joins its ring as the
   least recently used occupant, so the reads of the same install evict it before older occupants
   (after the empty slots). Whether another order keeps more useful experts is not measured.
+  With the unified host policy a demotion joins the ring at the probation point instead.
 - **No correctness check yet** for a finite tier with a multimodal projector or speculative decoding
   other than a draft model in the joint cache; the validator refuses those.
 - **A lazily mapped model file slows the unbuffered reads.** A read-only mapping of a shard makes
@@ -403,6 +482,10 @@ samples count the wait for the up slices only; `staged_wait_ms` adds up the gate
   the ring, promotions from the ring without a read, VRAM promotions and demotions, leased slots
   skipped and never relabeled, read batches that never reuse a slot, a prompt/decode switch back and
   forth without reads, and random plans and demands for both modes and several ring sizes.
+- The unified policy is covered by the same tests: the probation split, the ghost window and the
+  prompt rule against a slow reference, dissolve, sink and adopt with leases, unified installs on the
+  byte model with every reseed mode, and (in `test-expert-l2-gpu`) dissolve, reseed and generations
+  through the worker.
 - `test-expert-os` covers the OS wrapper: the reservation, the commit of the host arena and the
   unbuffered read queue.
 - `test-expert-plan` covers the four-location transaction, including promotions out of the file.
