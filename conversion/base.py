@@ -121,6 +121,9 @@ class ModelBase:
     mtp_only: bool = False
     no_mtp: bool = False
 
+    resume_shards: bool = False         # --resume: keep the shards that an earlier run completed (see GGUFWriter._open_shards)
+    resume_check: bool = False          # --resume-check: report skip/rewrite per shard, write nothing
+
     def __init__(self, dir_model: Path, ftype: gguf.LlamaFileType, fname_out: Path, *, is_big_endian: bool = False,
                  use_temp_file: bool = False, eager: bool = False,
                  metadata_override: Path | None = None, model_name: str | None = None,
@@ -197,7 +200,8 @@ class ModelBase:
 
         # Configure GGUF Writer
         self.gguf_writer = gguf.GGUFWriter(path=None, arch=gguf.MODEL_ARCH_NAMES[self.model_arch], endianess=self.endianess, use_temp_file=self.use_temp_file,
-                                           split_max_tensors=split_max_tensors, split_max_size=split_max_size, dry_run=dry_run, small_first_shard=small_first_shard)
+                                           split_max_tensors=split_max_tensors, split_max_size=split_max_size, dry_run=dry_run, small_first_shard=small_first_shard,
+                                           resume=self.resume_shards, resume_check=self.resume_check)
 
         # Mistral specific
         self.disable_mistral_community_chat_template = disable_mistral_community_chat_template

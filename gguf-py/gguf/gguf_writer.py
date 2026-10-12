@@ -85,7 +85,8 @@ class GGUFWriter:
 
     def __init__(
         self, path: os.PathLike[str] | str | None, arch: str, use_temp_file: bool = False, endianess: GGUFEndian = GGUFEndian.LITTLE,
-        split_max_tensors: int = 0, split_max_size: int = 0, dry_run: bool = False, small_first_shard: bool = False
+        split_max_tensors: int = 0, split_max_size: int = 0, dry_run: bool = False, small_first_shard: bool = False,
+        resume: bool = False, resume_check: bool = False,
     ):
         self.fout = None
         self.path = Path(path) if path else None
@@ -100,6 +101,11 @@ class GGUFWriter:
         self.split_max_size = split_max_size
         self.dry_run = dry_run
         self.small_first_shard = small_first_shard
+        self.resume = resume or resume_check      # skip the shards that an earlier run completed (see _open_shards)
+        self.resume_check = resume_check          # only report which shards would be skipped, write nothing
+        self.shard_paths: list[Path] = []         # final name of each shard this writer covers
+        self.shard_skipped: list[bool] = []
+        self._part_paths: list[Path | None] = []
         logger.info("gguf: This GGUF file is for {0} Endian only".format(
             "Big" if self.endianess == GGUFEndian.BIG else "Little",
         ))
@@ -166,6 +172,15 @@ class GGUFWriter:
             return [path]
         return [path.with_name(SHARD_NAME_FORMAT.format(path.stem, i + 1, len(self.tensors))) for i in range(len(self.tensors))]
 
+    def new_shard(self) -> None:
+        """Start a new shard: the tensors added from here on go into it (a split chosen by the caller, e.g. one table piece
+        per shard; split_max_size / split_max_tensors still split further)."""
+        if self.state is not WriterState.NO_FILE:
+            raise ValueError(f'Expected output file to be not yet opened, got {self.state}')
+        if not self.tensors[-1]:
+            raise ValueError("the current shard holds no tensor yet")
+        self.tensors.append({})
+
     def open_output_file(self, path: Path | None = None) -> None:
         if self.state is WriterState.EMPTY and self.fout is not None and (path is None or path == self.path):
             # allow calling this multiple times as long as the path is the same
@@ -179,7 +194,12 @@ class GGUFWriter:
 
         if self.path is not None:
             filenames = self.print_plan()
-            self.fout = [open(filename, "wb") for filename in filenames]
+            # the files are opened by write_header_to_file(), once the metadata of every shard is known: with resume,
+            # a shard that an earlier run completed is not opened (and not touched) at all
+            self.shard_paths = filenames
+            self.shard_skipped = [False] * len(filenames)
+            self._part_paths = [None] * len(filenames)
+            self.fout = [None] * len(filenames)  # type: ignore[list-item]
             self.state = WriterState.EMPTY
 
     def print_plan(self) -> list[Path]:
@@ -212,10 +232,10 @@ class GGUFWriter:
             kv_data[Keys.Split.LLM_KV_SPLIT_TENSORS_COUNT] = GGUFValue(total_tensors, GGUFValueType.INT32)
 
     def write_header_to_file(self, path: Path | None = None) -> None:
+        self.open_output_file(path)
+
         if len(self.tensors) == 1 and (self.split_max_tensors != 0 or self.split_max_size != 0):
             logger.warning("Model fails split requirements, not splitting")
-
-        self.open_output_file(path)
 
         if self.state is not WriterState.EMPTY:
             raise ValueError(f'Expected output file to be empty, got {self.state}')
@@ -225,14 +245,116 @@ class GGUFWriter:
         assert len(self.kv_data) == 1
 
         self.add_shard_kv_data()
+        self._open_shards()
 
         for fout, tensors, kv_data in zip(self.fout, self.tensors, self.kv_data):
-            fout.write(self._pack("<I", GGUF_MAGIC, skip_pack_prefix = True))
-            fout.write(self._pack("I", GGUF_VERSION))
-            fout.write(self._pack("Q", len(tensors)))
-            fout.write(self._pack("Q", len(kv_data)))
+            if fout is None:
+                continue
+            fout.write(self._shard_header_bytes(tensors, kv_data))
             fout.flush()
         self.state = WriterState.HEADER
+
+    def _shard_header_bytes(self, tensors: dict[str, TensorInfo], kv_data: dict[str, GGUFValue]) -> bytes:
+        return bytes(self._pack("<I", GGUF_MAGIC, skip_pack_prefix = True) + self._pack("I", GGUF_VERSION)
+                     + self._pack("Q", len(tensors)) + self._pack("Q", len(kv_data)))
+
+    def _shard_kv_bytes(self, kv_data: dict[str, GGUFValue]) -> bytes:
+        kv_bytes = bytearray()
+        for key, val in kv_data.items():
+            kv_bytes += self._pack_val(key, GGUFValueType.STRING, add_vtype=False)
+            kv_bytes += self._pack_val(val.value, val.type, add_vtype=True, sub_type=val.sub_type)
+        return bytes(kv_bytes)
+
+    def _shard_ti_bytes(self, tensors: dict[str, TensorInfo]) -> bytes:
+        ti_data = bytearray()
+        offset_tensor = 0
+        for name, ti in tensors.items():
+            ti_data += self._pack_val(name, GGUFValueType.STRING, add_vtype=False)
+            n_dims = len(ti.shape)
+            ti_data += self._pack("I", n_dims)
+            for j in range(n_dims):
+                ti_data += self._pack("Q", ti.shape[n_dims - 1 - j])
+            ti_data += self._pack("I", ti.dtype)
+            ti_data += self._pack("Q", offset_tensor)
+            offset_tensor += GGUFWriter.ggml_pad(ti.nbytes, self.data_alignment)
+        return bytes(ti_data)
+
+    def shard_prefix(self, i: int) -> bytes:
+        """The bytes in front of the tensor data of shard i of this writer, generated in memory: header, KV, tensor info and
+        the zero padding up to the data alignment (what write_header/kv/ti + write_tensors_to_file put in the file)."""
+        tensors, kv_data = self.tensors[i], self.kv_data[i]
+        prefix = self._shard_header_bytes(tensors, kv_data) + self._shard_kv_bytes(kv_data) + self._shard_ti_bytes(tensors)
+        return prefix + bytes(GGUFWriter.ggml_pad(len(prefix), self.data_alignment) - len(prefix))
+
+    def shard_total_size(self, i: int) -> int:
+        """The size of the finished file of shard i: the prefix plus every tensor padded to the data alignment."""
+        return len(self.shard_prefix(i)) + sum(GGUFWriter.ggml_pad(ti.nbytes, self.data_alignment) for ti in self.tensors[i].values())
+
+    @staticmethod
+    def part_path(path: Path) -> Path:
+        return path.with_name(path.name + ".part")
+
+    def judge_shard(self, i: int) -> tuple[bool, str]:
+        """(complete, reason): whether the file under the final name of shard i is what this run would write. Reads the file
+        size and the first bytes only, never a tensor."""
+        path = self.shard_paths[i]
+        if not path.is_file():
+            return False, "no file"
+        want = self.shard_total_size(i)
+        got = path.stat().st_size
+        prefix = self.shard_prefix(i)
+        with open(path, "rb") as f:
+            head = f.read(len(prefix))
+        n = next((k for k, (a, b) in enumerate(zip(head, prefix)) if a != b), None)
+        if got != want:
+            where = f", first differing header byte {n} (of {len(prefix)})" if n is not None else ", header bytes identical"
+            return False, f"size {got} != expected {want}{where}"
+        if head != prefix:
+            return False, f"header/KV/tensor info differ from this run's at byte {n} (of {len(prefix)})"
+        return True, f"complete: {got} B, header {len(prefix)} B identical"
+
+    def _open_shards(self) -> None:
+        """Open `<final name>.part` for every shard to write; with resume, decide first which shards are already complete.
+        With resume_check nothing is opened: the writing that follows writes nothing and computes no tensor."""
+        assert self.fout is not None
+        n = len(self.shard_paths)
+        for i, path in enumerate(self.shard_paths):
+            part = GGUFWriter.part_path(path)
+            if self.resume:
+                ok, why = self.judge_shard(i)
+                self.shard_skipped[i] = ok
+                no = i + 1
+                if ok:
+                    logger.info("resume: shard %d/%d %s: skip (%s)", no, n, path.name, why)
+                elif path.is_file():
+                    logger.warning("resume: shard %d/%d %s: rewrite (%s)", no, n, path.name, why)
+                else:
+                    logger.info("resume: shard %d/%d %s: write (%s)", no, n, path.name, why)
+                if self.resume_check:
+                    continue
+                if part.exists():
+                    logger.warning("resume: removing the leftover %s", part.name)
+                    part.unlink()
+                if ok:
+                    continue
+            self._part_paths[i] = part
+            self.fout[i] = open(part, "wb")
+        if self.resume_check:
+            logger.info("resume check: %d of %d shards are complete, nothing written", sum(self.shard_skipped), n)
+
+    def _finish_shard(self, i: int) -> None:
+        """Flush and fsync shard i, close it and give it its final name: from here on the final name means complete."""
+        assert self.fout is not None
+        fout = self.fout[i]
+        part = self._part_paths[i]
+        if fout is None or part is None:
+            return
+        fout.flush()
+        os.fsync(fout.fileno())
+        fout.close()
+        self.fout[i] = None  # type: ignore[call-overload]
+        self._part_paths[i] = None
+        os.replace(part, self.shard_paths[i])
 
     def write_kv_data_to_file(self) -> None:
         if self.state is not WriterState.HEADER:
@@ -240,13 +362,8 @@ class GGUFWriter:
         assert self.fout is not None
 
         for fout, kv_data in zip(self.fout, self.kv_data):
-            kv_bytes = bytearray()
-
-            for key, val in kv_data.items():
-                kv_bytes += self._pack_val(key, GGUFValueType.STRING, add_vtype=False)
-                kv_bytes += self._pack_val(val.value, val.type, add_vtype=True, sub_type=val.sub_type)
-
-            fout.write(kv_bytes)
+            if fout is not None:
+                fout.write(self._shard_kv_bytes(kv_data))
 
         self.flush()
         self.state = WriterState.KV_DATA
@@ -257,21 +374,9 @@ class GGUFWriter:
         assert self.fout is not None
 
         for fout, tensors in zip(self.fout, self.tensors):
-            ti_data = bytearray()
-            offset_tensor = 0
-
-            for name, ti in tensors.items():
-                ti_data += self._pack_val(name, GGUFValueType.STRING, add_vtype=False)
-                n_dims = len(ti.shape)
-                ti_data += self._pack("I", n_dims)
-                for j in range(n_dims):
-                    ti_data += self._pack("Q", ti.shape[n_dims - 1 - j])
-                ti_data += self._pack("I", ti.dtype)
-                ti_data += self._pack("Q", offset_tensor)
-                offset_tensor += GGUFWriter.ggml_pad(ti.nbytes, self.data_alignment)
-
-            fout.write(ti_data)
-            fout.flush()
+            if fout is not None:
+                fout.write(self._shard_ti_bytes(tensors))
+                fout.flush()
         self.state = WriterState.TI_DATA
 
     def add_key_value(self, key: str, val: Any, vtype: GGUFValueType, sub_type: GGUFValueType | None = None) -> None:
@@ -341,27 +446,9 @@ class GGUFWriter:
         if any(name in tensors for tensors in self.tensors):
             raise ValueError(f'Duplicated tensor name {name!r}')
 
-        if raw_dtype is None:
-            if tensor_dtype == np.float16:
-                dtype = GGMLQuantizationType.F16
-            elif tensor_dtype == np.float32:
-                dtype = GGMLQuantizationType.F32
-            elif tensor_dtype == np.float64:
-                dtype = GGMLQuantizationType.F64
-            elif tensor_dtype == np.int8:
-                dtype = GGMLQuantizationType.I8
-            elif tensor_dtype == np.int16:
-                dtype = GGMLQuantizationType.I16
-            elif tensor_dtype == np.int32:
-                dtype = GGMLQuantizationType.I32
-            elif tensor_dtype == np.int64:
-                dtype = GGMLQuantizationType.I64
-            else:
-                raise ValueError("Only F16, F32, F64, I8, I16, I32, I64 tensors are supported for now")
-        else:
-            dtype = raw_dtype
-            if tensor_dtype == np.uint8:
-                tensor_shape = quant_shape_from_byte_shape(tensor_shape, raw_dtype)
+        dtype = self._tensor_dtype(tensor_dtype, raw_dtype)
+        if raw_dtype is not None and tensor_dtype == np.uint8:
+            tensor_shape = quant_shape_from_byte_shape(tensor_shape, raw_dtype)
 
         # make sure there is at least one tensor before splitting
         if len(self.tensors[-1]) > 0:
@@ -375,6 +462,26 @@ class GGUFWriter:
                 self.tensors.append({})
 
         self.tensors[-1][name] = TensorInfo(shape=tensor_shape, dtype=dtype, nbytes=tensor_nbytes)
+
+    @staticmethod
+    def _tensor_dtype(tensor_dtype: np.dtype, raw_dtype: GGMLQuantizationType | None) -> GGMLQuantizationType:
+        if raw_dtype is None:
+            if tensor_dtype == np.float16:
+                return GGMLQuantizationType.F16
+            if tensor_dtype == np.float32:
+                return GGMLQuantizationType.F32
+            if tensor_dtype == np.float64:
+                return GGMLQuantizationType.F64
+            if tensor_dtype == np.int8:
+                return GGMLQuantizationType.I8
+            if tensor_dtype == np.int16:
+                return GGMLQuantizationType.I16
+            if tensor_dtype == np.int32:
+                return GGMLQuantizationType.I32
+            if tensor_dtype == np.int64:
+                return GGMLQuantizationType.I64
+            raise ValueError("Only F16, F32, F64, I8, I16, I32, I64 tensors are supported for now")
+        return raw_dtype
 
     def add_tensor(
         self, name: str, tensor: np.ndarray[Any, Any], raw_shape: Sequence[int] | None = None,
@@ -445,7 +552,8 @@ class GGUFWriter:
         assert self.fout is not None
 
         for fout in self.fout:
-            self.write_padding(fout, fout.tell())
+            if fout is not None:
+                self.write_padding(fout, fout.tell())
 
         if self.temp_file is None:
             shard_bar = None
@@ -454,13 +562,18 @@ class GGUFWriter:
             if progress:
                 from tqdm import tqdm
 
-                total_bytes = sum(ti.nbytes for t in self.tensors for ti in t.values())
+                total_bytes = sum(ti.nbytes for t, fout in zip(self.tensors, self.fout) if fout is not None for ti in t.values())
 
                 if len(self.fout) > 1:
                     shard_bar = tqdm(desc=f"Shard (0/{len(self.fout)})", total=None, unit="byte", unit_scale=True)
                 bar = tqdm(desc="Writing", total=total_bytes, unit="byte", unit_scale=True)
 
             for i, (fout, tensors) in enumerate(zip(self.fout, self.tensors)):
+                if fout is None:
+                    # a shard that is complete already (resume): its tensors are dropped without being computed
+                    for ti in tensors.values():
+                        ti.tensor = None
+                    continue
                 if shard_bar is not None:
                     shard_bar.set_description(f"Shard ({i + 1}/{len(self.fout)})")
                     total = sum(ti.nbytes for ti in tensors.values())
@@ -482,6 +595,7 @@ class GGUFWriter:
                         bar.update(ti.nbytes)
                     self.write_padding(fout, ti.nbytes)
                     ti.tensor = None
+                self._finish_shard(i)
         else:
             self.temp_file.seek(0)
 
@@ -494,12 +608,19 @@ class GGUFWriter:
     def flush(self) -> None:
         assert self.fout is not None
         for fout in self.fout:
-            fout.flush()
+            if fout is not None:
+                fout.flush()
 
     def close(self) -> None:
         if self.fout is not None:
+            # a shard that is still open here was not completed by write_tensors_to_file (a metadata-only file such as
+            # write_vocab, or the temporary-file path): it is finished the same way
+            if self.state in (WriterState.HEADER, WriterState.KV_DATA, WriterState.WEIGHTS) or self.temp_file is not None:
+                for i in range(len(self.fout)):
+                    self._finish_shard(i)
             for fout in self.fout:
-                fout.close()
+                if fout is not None:
+                    fout.close()
             self.fout = None
 
     def add_type(self, type_name: str) -> None:
