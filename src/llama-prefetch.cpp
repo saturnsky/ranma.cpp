@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <utility>
 #include <vector>
 
 #if defined(_WIN32)
@@ -103,16 +104,19 @@ void llama_prefetch_ranges(const llama_prefetch_range * ranges, size_t n_ranges)
 static const size_t PLE_PREFETCH_MIN_ROWS_PREFILL = 256;
 static const size_t PLE_PREFETCH_MIN_ROWS_DECODE  = 16;
 
-void llama_prefetch_table_rows(const ggml_tensor * table, const std::vector<int32_t> & rows,
-                               enum llama_ple_prefetch mode) {
-    if (mode == LLAMA_PLE_PREFETCH_OFF || table == nullptr || table->data == nullptr) {
-        return;
+static bool prefetch_enough_rows(size_t n_rows, enum llama_ple_prefetch mode) {
+    if (mode == LLAMA_PLE_PREFETCH_OFF) {
+        return false;
     }
-
     const size_t min_rows = mode == LLAMA_PLE_PREFETCH_ALWAYS
         ? PLE_PREFETCH_MIN_ROWS_DECODE
         : PLE_PREFETCH_MIN_ROWS_PREFILL;
-    if (rows.size() < min_rows) {
+    return n_rows >= min_rows;
+}
+
+// the rows (any order, repeats allowed) of one table or one piece of it
+static void prefetch_table_rows_unchecked(const ggml_tensor * table, std::vector<int32_t> sorted) {
+    if (table == nullptr || table->data == nullptr) {
         return;
     }
 
@@ -122,7 +126,6 @@ void llama_prefetch_table_rows(const ggml_tensor * table, const std::vector<int3
         return;
     }
 
-    std::vector<int32_t> sorted = rows;
     std::sort(sorted.begin(), sorted.end());
     sorted.erase(std::unique(sorted.begin(), sorted.end()), sorted.end());
 
@@ -141,4 +144,37 @@ void llama_prefetch_table_rows(const ggml_tensor * table, const std::vector<int3
     }
 
     llama_prefetch_ranges(ranges.data(), ranges.size());
+}
+
+void llama_prefetch_table_rows(const ggml_tensor * table, const std::vector<int32_t> & rows,
+                               enum llama_ple_prefetch mode) {
+    if (!prefetch_enough_rows(rows.size(), mode)) {
+        return;
+    }
+    prefetch_table_rows_unchecked(table, rows);
+}
+
+void llama_prefetch_table_pieces_rows(const std::vector<ggml_tensor *> & parts, int64_t part_rows,
+                                      const std::vector<int32_t> & rows, enum llama_ple_prefetch mode) {
+    if (parts.empty() || !prefetch_enough_rows(rows.size(), mode)) {
+        return;
+    }
+    if (parts.size() == 1) {
+        prefetch_table_rows_unchecked(parts[0], rows);
+        return;
+    }
+
+    // the threshold counts the rows of the whole gather, each piece then gets its own (local) rows
+    std::vector<std::vector<int32_t>> local(parts.size());
+    for (const int32_t g : rows) {
+        const size_t k = (size_t) ((int64_t) g / part_rows);
+        if (g >= 0 && k < parts.size()) {
+            local[k].push_back((int32_t) ((int64_t) g - (int64_t) k*part_rows));
+        }
+    }
+    for (size_t k = 0; k < parts.size(); ++k) {
+        if (!local[k].empty()) {
+            prefetch_table_rows_unchecked(parts[k], std::move(local[k]));
+        }
+    }
 }
