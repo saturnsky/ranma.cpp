@@ -7,6 +7,58 @@ The series is rebuilt for every release and follow-up fixes are folded into the 
 release does not show a fix as a separate change. This file is where the fixes between releases are recorded.
 The refs and the release cycle are described in [releases.md](releases.md).
 
+## ranma_20261013
+
+Upstream base: `3d65c90d0`, tagged 2026-10-13
+
+### Added
+
+- DeepSeek V4.1 Flash from the upstream pull request #28696, with the top-k reuse fix from its review, the two level
+  candidate mask, EXL3 conversions and the DSpark drafter ([deepseek-v41.md](deepseek-v41.md)).
+- `GGML_TYPE_MXFP8` rows for the V4.1 engram tables (gather only), read from the original FP8 checkpoint.
+- Engram tables (V4.1 engram, Qwen3.8 PLE) as a GGUF set of their own (`<model>-engram…`) that every quantization
+  shares, found next to the model or by `--engram-tables`, which also replaces tables a model holds itself;
+  `convert_hf_to_gguf.py --resume` / `--resume-check` for split conversions.
+- The expert cache joins models with different expert counts (the 128-expert DSpark drafter of a 384-expert target).
+- Decode pool (on by default with the expert cache, `RANMA_EXPERT_UB_POOL=0` turns it off): the unused part of the
+  compute buffer holds extra expert positions during decode; its ring admission takes the SSD tier's ring occupants.
+- `LLAMA_DRAFT_SHARE_COMPUTE=1` (off by default): a drafting context (MTP or a draft model) computes in its target's
+  compute buffers; `LLAMA_MTP_SHARE_COMPUTE` is an alias.
+- `--spec-smart` for `draft-dspark` (on by default as for `draft-mtp`), with a block drafter and the DSpark round log
+  (`LLAMA_SPEC_DSPARK_LOG`).
+- Trigram confidence of a draft token from the request's own trigram counts, and a trigram profile next to the
+  smart store that keeps the counts and the learnt coefficients across requests and restarts.
+- Expert prefetch into the decode pool for GLM-5.3 Flash (`RANMA_EXPERT_PREFETCH=1`, experimental, off by default;
+  [expert-prefetch.md](expert-prefetch.md)).
+- Settings by model and hardware for the published DeepSeek V4.1 Flash files: context, expert cache budgets and the
+  draft model, with the memory measured ([recipes.md](recipes.md)).
+- Release table of this release in `docs/ranma/benchmarks/`: the server scenarios of Qwen3.8-Flash-Next, DeepSeek V4
+  Flash, GLM-5.3 Flash and DeepSeek V4.1 Flash in EXL3, DeepSeek V4.1 Flash also with 224 GB and on the RX 9070 XT
+  emulation with 64 GB.
+
+### Changed
+
+- The expert cache needs no environment switch and no `--load-mode`: an expert cache budget turns the host-direct
+  path on when `GGML_CUDA_HOST_DIRECT` is not set, raises its in-place token limit to the ubatch size when
+  `GGML_CUDA_HOST_DIRECT_MAX_BATCH` is not set, and loads the model with `--load-mode none` unless `--load-mode` is
+  given. Values that are set are kept; without the expert cache nothing changes.
+- The SSD tier's unified host policy is on by default (`RANMA_EXPERT_L2_UNIFIED=0` turns it off); with it the
+  decode pool's ring admission is on, a plan install lays the rings out in score order without reading
+  (`RANMA_EXPERT_L2_UNIFIED_RESEED=order`), and a prompt's reads are cached like decode reads
+  (`RANMA_EXPERT_L2_UNIFIED_PROMPT=lru`).
+- Trigram confidence is on by default (`LLAMA_SPEC_TRIGRAM_CONF=0` turns it off); the trigram profile is on by
+  default with a smart store (`--no-spec-trigram-profile`).
+- Graph reuse keeps 64 llama graphs and 96 HIP graphs per context, without the timed sweep
+  (`GGML_CUDA_GRAPH_EVICT_SECONDS` defaults to 0).
+- Graph slots and the graph metadata buffer give back what their graph does not use (`LLAMA_GRAPH_META_TRIM=0`
+  keeps the worst case).
+- The smart draft length leaves graph builds, captures and decode pool lends out of the round cost.
+
+### Fixed
+
+- `--gpu-heartbeat-seconds` starts the heartbeat before the model load, so a long expert cache setup does not let
+  Windows evict the VRAM of the process.
+
 ## ranma_20261009
 
 Upstream base: `462524043`, tagged 2026-10-09
