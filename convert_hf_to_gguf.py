@@ -181,6 +181,18 @@ def parse_args() -> argparse.Namespace:
         help="DeepSeek V4.1: folder of the original FP8 checkpoint to read the engram tables from (they are not in "
              "an EXL3 conversion); written as MXFP8 without changing a value. Default: the model folder",
     )
+    parser.add_argument(
+        "--resume", action="store_true",
+        help="continue an interrupted split conversion: a shard whose file already exists "
+             "under its final name, has exactly the size this run computes and starts with exactly the header + KV + tensor "
+             "info this run generates is kept (its tensors are not read or computed); any other shard is written again. "
+             "Shards are written to <name>.part and renamed when complete. Off by default",
+    )
+    parser.add_argument(
+        "--resume-check", action="store_true",
+        help="implies --resume; print for every shard of this run whether it would be kept or written again, without "
+             "writing or deleting anything (no tensor data is read)",
+    )
 
     args = parser.parse_args()
     if not args.print_supported_models and args.model is None:
@@ -294,6 +306,16 @@ def main() -> None:
             if args.mtp:
                 model_class.mtp_only = True
 
+        if args.resume or args.resume_check:
+            if not is_split:
+                logger.error("--resume / --resume-check need a split output (--split-max-size or --split-max-tensors)")
+                sys.exit(1)
+            if args.use_temp_file or args.vocab_only:
+                logger.error("--resume / --resume-check do not work with --use-temp-file or --vocab-only")
+                sys.exit(1)
+            model_class.resume_shards = True
+            model_class.resume_check = args.resume_check
+
         if args.engram_source is not None:
             if not hasattr(model_class, "engram_source"):
                 logger.error("--engram-source is not supported for %s", model_architecture)
@@ -343,6 +365,9 @@ def main() -> None:
         else:
             logger.info("Exporting model...")
             model_instance.write()
+            if args.resume_check:
+                logger.info("resume check done: nothing was written")
+                sys.exit(0)
             out_path = f"{model_instance.fname_out.parent}{os.sep}" if is_split else model_instance.fname_out
             logger.info(f"Model successfully exported to {out_path}")
 
