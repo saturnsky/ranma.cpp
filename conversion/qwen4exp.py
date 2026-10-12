@@ -11,6 +11,7 @@ import numpy as np
 from .base import ModelBase
 from .qwen import _LinearAttentionVReorderBase, _Qwen35MRopeMixin
 from .qwen3vl import Qwen3VLVisionModel
+from .engram_tables import find_original_table, original_source
 
 
 @ModelBase.register("Qwen4ExpForConditionalGeneration", "Qwen4ExpForCausalLM")
@@ -24,6 +25,7 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
     """
 
     model_arch = gguf.MODEL_ARCH.QWEN4EXP
+    engram_kind = "ple"
 
     # the MTP head: one full-attention QSA block after the trunk, fed by the trunk's hc-wide residual
     supports_mtp_export = True
@@ -183,6 +185,10 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
         if len(self._ple_shards) < n_parts:
             return []
 
+        if self.engram_tables().active:
+            # a split conversion: the table is a set of its own, registered by prepare_tensors()
+            return []
+
         # the checkpoint may yield the shards in any order, the row order is by index
         shards = [self._ple_shards[i] for i in sorted(self._ple_shards)]
         rows = 0
@@ -210,6 +216,22 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
             return eager.to(torch.float32).contiguous().numpy()
         return load
 
+    def _emit_ple_original(self):
+        """The engram table of the checkpoint (--engram-source, else the model folder), in its own dtype, as the table set."""
+        folder = self.engram_source if self.engram_source is not None else self.dir_model
+        src = find_original_table(folder)
+        if self._ple_row_dim is not None and self._ple_row_dim != src.cols:
+            raise ValueError(f"PLE table rows have {src.cols} values, the shards said {self._ple_row_dim}")
+        self._ple_row_dim = src.cols
+        self.engram_tables().set_tables("ple", [original_source(gguf.TENSOR_NAMES[gguf.MODEL_TENSOR.PER_LAYER_TOKEN_EMBD], src)],
+                                       folder)
+
+    def prepare_engram_tables(self):
+        """--engram-stage tables of a model converted from its original checkpoint."""
+        if self.mtp_only or not self.hparams.get("ple_layer_ids"):
+            raise ValueError("this model has no engram table (--engram-stage tables)")
+        self._emit_ple_original()
+
     def prepare_tensors(self):
         super().prepare_tensors()
         if self._mtp_fc:
@@ -219,6 +241,8 @@ class Qwen4ExpTextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
             raise ValueError(
                 f"got {len(self._ple_shards)} PLE embedding shards, expected {n_parts}"
             )
+        if self._ple_shards and self.engram_tables().active:
+            self._emit_ple_original()
 
 
 @ModelBase.register("Qwen4ExpForConditionalGeneration")

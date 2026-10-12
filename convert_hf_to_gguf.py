@@ -177,13 +177,38 @@ def parse_args() -> argparse.Namespace:
     )
 
     parser.add_argument(
-        "--engram-source", type=Path, default=None,
-        help="DeepSeek V4.1: folder of the original FP8 checkpoint to read the engram tables from (they are not in "
-             "an EXL3 conversion); written as MXFP8 without changing a value. Default: the model folder",
+        "--engram-source", dest="engram_source", type=Path, default=None,
+        help="folder of the ORIGINAL checkpoint to read the engram tables from. DeepSeek V4.1: the FP8 checkpoint (the "
+             "engram tables are not in an EXL3 conversion), written as MXFP8 without changing a value; default: the model "
+             "folder. Qwen3.8 (EXL3 source): the table is then written in the original dtype instead of the EXL3 row codec "
+             "of the EXL3 folder; also gives the dtype that sizes the pieces",
+    )
+    parser.add_argument(
+        "--engram-stage", choices=["all", "weights", "tables"], default="all",
+        help="n-gram models (DeepSeek V4.1 engram, Qwen3.8 PLE) converted with --split-max-size: the tables are written as a "
+             "GGUF set of their own (<outfile name>-engram..., one piece of a table per file, or one file when all fit the "
+             "split size), which the model set does not contain; the model index lists the tables (names, rows, widths). "
+             "'all' writes both sets, 'weights' the model set, 'tables' the table set (docs/ranma/engram-tables.md)",
+    )
+    parser.add_argument(
+        "--engram-tables-out", type=Path, default=None,
+        help="where the table set goes: a folder, created when missing (the name is <outfile name>-engram), or a file name "
+             "ending in .gguf (<S>.gguf gives <S>.gguf or <S>-0000N-of-0000M.gguf). Default: the folder of --outfile. The "
+             "loader takes the one set <model>-engram*.gguf next to the model; a set elsewhere or of another name is given "
+             "with --engram-tables",
+    )
+    parser.add_argument(
+        "--engram-source-name", type=str, default=None,
+        help="checkpoint name recorded in the table set (default: the name of the folder the tables are read from)",
+    )
+    parser.add_argument(
+        "--engram-source-rev", type=str, default=None,
+        help="revision (commit) of that checkpoint recorded in the table set (default: from the metadata of "
+             "`hf download --local-dir`, if present)",
     )
     parser.add_argument(
         "--resume", action="store_true",
-        help="continue an interrupted split conversion: a shard whose file already exists "
+        help="continue an interrupted split conversion (the model set and the table set): a shard whose file already exists "
              "under its final name, has exactly the size this run computes and starts with exactly the header + KV + tensor "
              "info this run generates is kept (its tensors are not read or computed); any other shard is written again. "
              "Shards are written to <name>.part and renamed when complete. Off by default",
@@ -191,7 +216,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--resume-check", action="store_true",
         help="implies --resume; print for every shard of this run whether it would be kept or written again, without "
-             "writing or deleting anything (no tensor data is read)",
+             "writing or deleting anything (no tensor data is read, apart from the ends of the engram table pieces for their "
+             "piece checks)",
+    )
+    parser.add_argument(
+        "--engram-parts", type=int, default=None,
+        help="pieces per engram table instead of the count that the original table size and --split-max-size give",
+    )
+    parser.add_argument(
+        "--engram-orig-dtype", choices=["bf16", "f16", "f32"], default=None,
+        help="Qwen3.8: dtype of the original engram table when its size is not read from --engram-source "
+             "(default: the dtype of the model's config)",
     )
 
     args = parser.parse_args()
@@ -244,6 +279,7 @@ def main() -> None:
     }
 
     is_split = args.split_max_tensors > 0 or args.split_max_size != "0"
+    is_split_by_size = args.split_max_size != "0"
     if args.use_temp_file and is_split:
         logger.error("Error: Cannot use temp file when splitting")
         sys.exit(1)
@@ -317,13 +353,36 @@ def main() -> None:
             model_class.resume_check = args.resume_check
 
         if args.engram_source is not None:
-            if not hasattr(model_class, "engram_source"):
+            if model_class.engram_kind is None:
                 logger.error("--engram-source is not supported for %s", model_architecture)
                 sys.exit(1)
             if not args.engram_source.is_dir():
                 logger.error("--engram-source %s is not a folder", args.engram_source)
                 sys.exit(1)
             model_class.engram_source = args.engram_source
+
+        engram_opts = (args.engram_stage != "all" or args.engram_parts is not None or args.engram_orig_dtype is not None
+                      or args.engram_tables_out is not None or args.engram_source_name is not None or args.engram_source_rev is not None)
+        if engram_opts:
+            if model_class.engram_kind is None:
+                logger.error("--engram-stage / --engram-parts / --engram-orig-dtype / --engram-tables-out / --engram-source-name / "
+                             "--engram-source-rev are not supported for %s", model_architecture)
+                sys.exit(1)
+            if not is_split_by_size:
+                logger.error("--engram-stage / --engram-parts / --engram-tables-out / --engram-source-* concern the table set of a "
+                             "split conversion: add --split-max-size")
+                sys.exit(1)
+            model_class.engram_stage = args.engram_stage
+            model_class.engram_parts = args.engram_parts
+            model_class.engram_orig_dtype = args.engram_orig_dtype
+            model_class.engram_tables_out = args.engram_tables_out
+            model_class.engram_source_name = args.engram_source_name
+            model_class.engram_source_rev = args.engram_source_rev
+
+        if model_class.engram_kind is not None and is_split_by_size and not args.no_tensor_first_split:
+            # the convention of a model whose tables are a set of their own: the first shard holds the metadata only (the index)
+            logger.info("n-gram model split by size: the first shard is the index, as with --no-tensor-first-split")
+            args.no_tensor_first_split = True
 
         if not is_mistral_format:
             from conversion import exl3

@@ -17,6 +17,7 @@ if TYPE_CHECKING:
 from .base import LazyTorchTensor, MmprojModel, ModelBase, TextModel, gguf, logger
 
 from .qwen import QwenModel
+from .engram_tables import TableSource
 
 
 @ModelBase.register("DeepseekOCRForCausalLM")
@@ -1213,7 +1214,7 @@ class _Mxfp8Table:
 
     CHUNK_ROWS = 1 << 21
 
-    def __init__(self, weight: _SafetensorsEntry, scale: _SafetensorsEntry):
+    def __init__(self, weight: _SafetensorsEntry, scale: _SafetensorsEntry, row0: int = 0, row1: int | None = None):
         block, sub, block_bytes = gguf.mxfp8.BLOCK, gguf.mxfp8.SUB, gguf.mxfp8.BLOCK_BYTES
         if weight.dtype != "F8_E4M3" or scale.dtype != "F8_E8M0":
             raise ValueError(
@@ -1228,13 +1229,44 @@ class _Mxfp8Table:
             if e.offset + e.nbytes > e.path.stat().st_size:
                 raise ValueError(f"{e.path.name} is shorter than its header says (incomplete download?)")
         self.weight, self.scale = weight, scale
-        self.rows = rows
-        self.shape = (rows, block_bytes)
+        self.table_rows = rows
+        # rows [row0, row1) of the table: a piece of a table that is stored in several tensors
+        self.row0 = row0
+        self.rows = (rows if row1 is None else row1) - row0
+        if not 0 <= row0 < row0 + self.rows <= rows:
+            raise ValueError(f"engram rows [{row0}, {row0 + self.rows}) are outside the {rows} rows of the table")
+        self.shape = (self.rows, block_bytes)
         self.dtype = np.dtype(np.uint8)
-        self.nbytes = rows * block_bytes
+        self.nbytes = self.rows * block_bytes
+
+    def piece(self, row0: int, row1: int) -> "_Mxfp8Table":
+        return _Mxfp8Table(self.weight, self.scale, row0, row1)
 
     def byteswap(self, inplace: bool = False):
         return self  # bytes
+
+    def _repack(self, fw, fs, start: int, n: int, w: np.ndarray, sc: np.ndarray, out: np.ndarray) -> None:
+        """MXFP8 rows [start, start + n) of this piece into out[:n]."""
+        block, nsc = gguf.mxfp8.BLOCK, gguf.mxfp8.BLOCK // gguf.mxfp8.SUB
+        fw.seek(self.weight.offset + (self.row0 + start) * block)
+        if fw.readinto(memoryview(w).cast("B")[: n * block]) != n * block:
+            raise ValueError(f"short read of {self.weight.path.name}")
+        fs.seek(self.scale.offset + (self.row0 + start) * nsc)
+        if fs.readinto(memoryview(sc).cast("B")[: n * nsc]) != n * nsc:
+            raise ValueError(f"short read of {self.scale.path.name}")
+        gguf.mxfp8.repack_rows(w[:n], sc[:n], out[:n])
+
+    def read_rows(self, r0: int, r1: int) -> np.ndarray:
+        """The MXFP8 rows [r0, r1) of the table (row numbers of this piece), uint8 [n, 264]: the ends of the pieces for the piece checks."""
+        n = r1 - r0
+        if not 0 <= r0 <= r1 <= self.rows:
+            raise ValueError(f"engram rows [{r0}, {r1}) are outside the {self.rows} rows")
+        w = np.empty((n, gguf.mxfp8.BLOCK), dtype=np.uint8)
+        sc = np.empty((n, gguf.mxfp8.BLOCK // gguf.mxfp8.SUB), dtype=np.uint8)
+        out = np.empty((n, gguf.mxfp8.BLOCK_BYTES), dtype=np.uint8)
+        with open(self.weight.path, "rb") as fw, open(self.scale.path, "rb") as fs:
+            self._repack(fw, fs, r0, n, w, sc, out)
+        return out
 
     def tofile(self, fout) -> None:
         block, sub = gguf.mxfp8.BLOCK, gguf.mxfp8.SUB
@@ -1246,16 +1278,10 @@ class _Mxfp8Table:
         with open(self.weight.path, "rb") as fw, open(self.scale.path, "rb") as fs:
             for start in range(0, self.rows, chunk):
                 n = min(chunk, self.rows - start)
-                fw.seek(self.weight.offset + start * block)
-                if fw.readinto(memoryview(w).cast("B")[: n * block]) != n * block:
-                    raise ValueError(f"short read of {self.weight.path.name}")
-                fs.seek(self.scale.offset + start * nsc)
-                if fs.readinto(memoryview(sc).cast("B")[: n * nsc]) != n * nsc:
-                    raise ValueError(f"short read of {self.scale.path.name}")
-                gguf.mxfp8.repack_rows(w[:n], sc[:n], out[:n])
+                self._repack(fw, fs, start, n, w, sc, out)
                 fout.write(memoryview(out).cast("B")[: n * gguf.mxfp8.BLOCK_BYTES])
                 if (start // chunk) % 8 == 0:
-                    logger.info("  engram table: %d / %d rows", start + n, self.rows)
+                    logger.info("  engram table rows [%d, %d): %d / %d", self.row0, self.row0 + self.rows, start + n, self.rows)
 
 
 @ModelBase.register("DeepseekV41ForCausalLM")
@@ -1445,8 +1471,9 @@ class DeepseekV41Model(DeepseekV4Model):
                         multipliers.shape, primes_array.shape, offsets_array.shape, len(token_map))
 
 
-    # Folder holding the original FP8 checkpoint's engram tables (--engram-source); None: look in dir_model.
-    engram_source: Path | None = None
+    engram_kind = "engram"
+    # engram_source: folder holding the original FP8 checkpoint's engram tables (--engram-source, formerly --engram-source);
+    # None: look in dir_model.
 
     def _find_engram_entry(self, name: str) -> "_SafetensorsEntry | None":
         """Header of tensor `name` in the first folder that has it (engram_source, then dir_model)."""
@@ -1482,23 +1509,56 @@ class DeepseekV41Model(DeepseekV4Model):
             )
         return _Mxfp8Table(weight, scale)
 
-    def generate_extra_tensors(self):
-        yield from super().generate_extra_tensors()
-
+    def _engram_layers(self) -> list[tuple[int, int | None]]:
+        """(layer id, rows of the table from the config) of each engram layer; no table in an MTP-only file."""
         engram_ids = self.hparams.get("engram_layer_ids") or []
         if self.mtp_only:
-            return
+            return []
         counts = self.hparams.get("engram_num_embeddings") or []
-        for i, bid in enumerate(engram_ids):
-            table = self._engram_table(int(bid))
-            if i < len(counts) and int(counts[i]) != table.rows:
-                raise ValueError(f"engram layer {bid}: config has {counts[i]} rows, the table has {table.rows}")
-            new_name = self.format_tensor_name(gguf.MODEL_TENSOR.ENGRAM_EMBD, int(bid), ".weight")
-            logger.info("engram layer %d: %s as MXFP8, %d rows x %d, %.1f GB, streamed from %s",
-                        bid, new_name, table.rows, gguf.mxfp8.BLOCK, table.nbytes / 1e9, table.weight.path.name)
-            self.gguf_writer.add_tensor(new_name, table, raw_dtype=gguf.GGMLQuantizationType.MXFP8)
-            for name in (f"layers.{bid}.engram.embed.weight", f"layers.{bid}.engram.embed.scale"):
-                self.model_tensors.pop(name, None)
+        return [(int(bid), int(counts[i]) if i < len(counts) else None) for i, bid in enumerate(engram_ids)]
+
+    def _emit_engram_tables(self):
+        """The engram tables as MXFP8: one tensor per table in an unsplit file, else registered as the table set
+        (conversion/engram_tables.py), which the model set does not contain."""
+        layers = self._engram_layers()
+        if not layers:
+            return
+        tables = self.engram_tables()
+        sources = []
+        folder = None
+        for bid, rows in layers:
+            table = self._engram_table(bid)
+            folder = folder or table.weight.path.parent
+            if rows is not None and rows != table.rows:
+                raise ValueError(f"engram layer {bid}: config has {rows} rows, the table has {table.rows}")
+            if not tables.active:
+                new_name = self.format_tensor_name(gguf.MODEL_TENSOR.ENGRAM_EMBD, bid, ".weight")
+                logger.info("engram layer %d: %s as MXFP8, %d rows x %d, %.1f GB, streamed from %s",
+                            bid, new_name, table.rows, gguf.mxfp8.BLOCK, table.nbytes / 1e9, table.weight.path.name)
+                self.gguf_writer.add_tensor(new_name, table, raw_dtype=gguf.GGMLQuantizationType.MXFP8)
+            else:
+                # the original row (FP8 values + E8M0 scales) is the MXFP8 row: 264 B
+                sources.append(TableSource(
+                    self.format_tensor_name(gguf.MODEL_TENSOR.ENGRAM_EMBD, bid, ""), table.rows, gguf.mxfp8.BLOCK_BYTES,
+                    gguf.mxfp8.BLOCK_BYTES, gguf.GGMLQuantizationType.MXFP8, table.read_rows, table.piece))
+            self._drop_engram_source(bid)
+        if sources:
+            assert folder is not None
+            tables.set_tables("engram", sources, folder)
+
+    def _drop_engram_source(self, bid: int):
+        for name in (f"layers.{bid}.engram.embed.weight", f"layers.{bid}.engram.embed.scale"):
+            self.model_tensors.pop(name, None)
+
+    def generate_extra_tensors(self):
+        yield from super().generate_extra_tensors()
+        self._emit_engram_tables()
+
+    def prepare_engram_tables(self):
+        """--engram-stage tables: the engram tables only."""
+        if not self._engram_layers():
+            raise ValueError("this model has no engram tables (--engram-stage tables)")
+        self._emit_engram_tables()
 
     def _map_dsv4_tensor_name(self, name: str, bid):
         match = re.match(r"layers\.(\d+)\.(.+)$", name)

@@ -271,6 +271,26 @@ class Keys:
         EOS_TOKEN_ID       = "{arch}.ple.eos_token_id"
         IMAGE_TOKEN_ID     = "{arch}.ple.image_token_id"
 
+    class EngramTables:
+        # engram tables (DeepSeek V4.1 engram, Qwen3.8 PLE) in a GGUF set of their own, docs/ranma/engram-tables.md.
+        # Absent from a model: its tables are tensors of the model (one tensor <table>.weight each). A model index with
+        # NAMES / ROWS / WIDTH needs a table set with these tables; the loader finds it by the name <model>-engram*.gguf.
+        # in the index of the model and of the table set (the loader compares the names and rows, and the width with the pieces)
+        NAMES           = "engram_tables.names"            # base name of each table, e.g. blk.1.engram_embd
+        ROWS            = "engram_tables.rows"             # uint64 [tables]: rows of the whole table
+        # in the index of the model only
+        WIDTH           = "engram_tables.width"            # uint64 [tables]: values per row (ne0 of the pieces)
+        # in the index of the table set only (the type and the pieces of a set may differ from those the model was converted with)
+        KIND            = "engram_tables.kind"             # "engram" or "ple"
+        TYPE            = "engram_tables.type"             # ggml type name of the pieces, e.g. MXFP8
+        PARTS           = "engram_tables.parts"            # uint32 [tables]: pieces <name>.p<i>.weight
+        PART_ROWS       = "engram_tables.part_rows"        # uint64 [tables]: rows of a piece (the last holds the rest)
+        VERSION         = "engram_tables.version"          # uint32: 1
+        SOURCE          = "engram_tables.source"           # name of the checkpoint the tables were read from
+        SOURCE_REVISION = "engram_tables.source_revision"  # its revision (commit), when known
+        PIECE_CHECK     = "engram_tables.piece_check"      # uint64 [pieces]: FNV-1a 64 of the first + last 4 KiB of each piece
+        GENERAL_TYPE    = "engram_tables"                  # general.type of a table set
+
     class Rope:
         DIMENSION_COUNT           = "{arch}.rope.dimension_count"
         DIMENSION_COUNT_SWA       = "{arch}.rope.dimension_count_swa"
