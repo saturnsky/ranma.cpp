@@ -55,12 +55,23 @@ requests in turn it rarely gets the chance. If you serve many users, use upstrea
   GGUF files in this fork's format: an ordinary GGUF or an EXL3 safetensors checkpoint is not read
   directly. Take the converted files from Hugging Face
   ([Qwen3.8-Flash-Next](https://huggingface.co/SaturnHeaven/Qwen3.8-Flash-Next-RANMA-EXL3-GGUF),
-  [DeepSeek-V4-Flash-0731](https://huggingface.co/SaturnHeaven/DeepSeek-V4-Flash-0731-RANMA-EXL3-GGUF)).
+  [DeepSeek-V4-Flash-0731](https://huggingface.co/SaturnHeaven/DeepSeek-V4-Flash-0731-RANMA-EXL3-GGUF),
+  [DeepSeek-V4.1-Flash](https://huggingface.co/SaturnHeaven/DeepSeek-V4.1-Flash-RANMA-EXL3-GGUF),
+  [DeepSeek-V4.1-Flash-UNCENSORED](https://huggingface.co/SaturnHeaven/DeepSeek-V4.1-Flash-UNCENSORED-RANMA-EXL3-GGUF)).
   For another EXL3 model, convert its EXL3 checkpoint with `convert_hf_to_gguf.py`. Several
   architectures have been converted and run ([checked models](docs/ranma/exl3.md#checked-models)), but
   not every model is guaranteed to work yet. These files use tensor types of this fork and do not open
   in upstream llama.cpp, LM Studio, Ollama or other llama.cpp-based tools.
   [docs/ranma/exl3.md](docs/ranma/exl3.md)
+- **DeepSeek V4.1 Flash** - runs from the upstream pull request for this model, which is not merged yet,
+  with EXL3 support and the DSpark drafter on top. If upstream merges a different implementation, this fork
+  follows upstream, and GGUF files made for the current one, EXL3 GGUF files in particular, may stop loading
+  and need to be converted again. [docs/ranma/deepseek-v41.md](docs/ranma/deepseek-v41.md)
+  - Both EXL3 files on Hugging Face need the engram tables, which are published once for every quantization in
+    [DeepSeek-V4.1-Flash-RANMA-Engram-GGUF](https://huggingface.co/SaturnHeaven/DeepSeek-V4.1-Flash-RANMA-Engram-GGUF).
+
+Starting settings for the published DeepSeek V4.1 Flash files by hardware (context, expert cache budgets, draft model):
+[docs/ranma/recipes.md](docs/ranma/recipes.md).
 
 Every other change, one line each with its page: [docs/ranma/README.md](docs/ranma/README.md).
 
@@ -74,10 +85,6 @@ The benchmark of a release is the last commit of its series
 Planned, not done yet. Nothing here is promised or scheduled.
 
 - **DeepSeek V4 Flash**: try further performance work. It may not pay off.
-- **DeepSeek V4.1 Flash**: take the upstream pull request for this model while it is not merged yet,
-  then add EXL3 support on top. If upstream merges a different implementation, this fork follows
-  upstream, and GGUF files made for the earlier one, EXL3 GGUF files in particular, may stop loading and
-  need to be converted again.
 - **Experimental RDNA3 and NVIDIA (CUDA) builds**: open the paths that do not depend on RDNA4
   instructions and check only that they compile. Whether they work is not guaranteed; reports and pull
   requests are welcome.

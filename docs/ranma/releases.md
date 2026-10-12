@@ -52,7 +52,9 @@ their tag; older releases are tags only. Like the tags, these branches never mov
    Commit hashes therefore change from release to release.
    - Commits taken unchanged from upstream pull requests that are not merged upstream yet
      (for example a model's draft head) stay byte-for-byte as in the pull request, so that
-     they can be replaced by the upstream commit once it is merged.
+     they can be replaced by the upstream commit once it is merged. A commit that has to be adapted
+     to the upstream base of the series keeps its authors and message, and a `[ranma: ...]` line at
+     the end of the message says what was changed (DeepSeek V4.1, #28696).
    - The benchmark of the release is always the last commit of the series.
 4. **Publish.** The series is tagged `ranma_YYYYMMDD` (annotated), `ranma` is moved to it, and
    `master` is moved to its upstream base commit. The three latest releases are also kept as

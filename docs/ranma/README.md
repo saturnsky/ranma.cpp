@@ -2,6 +2,7 @@
 
 Each user-visible change gets a line here and a page under `docs/ranma/` that describes what it is, when it
 applies, how to switch it, and its limits. The main features are summarized in the [README](../../README.md#main-features).
+Starting settings by model and hardware are in [recipes.md](recipes.md).
 
 ### RDNA4 kernels (HIP)
 
@@ -38,12 +39,22 @@ applies, how to switch it, and its limits. The main features are summarized in t
   server is idle and while the model is freed, so that Windows does not evict the VRAM of the process between
   turns. Off by default. [gpu-heartbeat.md](gpu-heartbeat.md)
 - **Per-position draft thresholds** - `--spec-draft-p-min` takes one probability per draft position, and
-  `--spec-draft-p-continue` keeps a token in the draft but stops drafting after it. Defaults unchanged.
+  `--spec-draft-p-continue` keeps a token in the draft but stops drafting after it. Defaults unchanged; with
+  `draft-mtp`, giving either turns the smart draft length off.
   [spec-draft-thresholds.md](spec-draft-thresholds.md)
-- **Smart draft length for draft-mtp (llama-server)** - `--spec-smart` chooses the draft length at every step from
+- **Shared compute buffers of a drafting context** - `LLAMA_DRAFT_SHARE_COMPUTE=1` lets an MTP context or a draft
+  model's context compute in views of its target's compute buffers (`LLAMA_MTP_SHARE_COMPUTE` is an alias). Off by
+  default. [expert-cache-ub-pool.md](expert-cache-ub-pool.md)
+- **Trigram confidence and profile** - the smart draft length takes the acceptance of a draft token from the
+  request's own trigram counts (on by default, `LLAMA_SPEC_TRIGRAM_CONF=0` turns it off), and with a smart store the
+  counts and the learnt coefficients are kept in `<store>.trigram` across requests and restarts.
+  [spec-smart.md](spec-smart.md)
+- **Smart draft length for draft-mtp (llama-server)** - `draft-mtp` chooses the draft length at every step from
   the measured verification time per width and a calibrated acceptance of the draft probabilities, up to
-  `--spec-draft-n-max`; `--spec-smart-store PATH` keeps the estimates across restarts of the same model, build and
-  cache settings. Off by default. [spec-smart.md](spec-smart.md)
+  `--spec-draft-n-max` (7 when not given); `--spec-smart-store PATH` keeps the estimates across restarts of the same
+  model, build and cache settings. On by default with `draft-mtp`; `--no-spec-smart`, or giving
+  `--spec-draft-p-min` or `--spec-draft-p-continue`, returns to the single-argument rule.
+  [spec-smart.md](spec-smart.md)
 - **Reuse of a just-restored context checkpoint (llama-server)** - when the first prompt batch after a checkpoint
   restore starts at that checkpoint, the server keeps the restored entry instead of serializing the unchanged
   state again. `LLAMA_SERVER_CKPT_REUSE=0` restores the upstream behaviour.
@@ -85,6 +96,17 @@ applies, how to switch it, and its limits. The main features are summarized in t
   slots that the kernels address directly. [expert-cache-l2.md](expert-cache-l2.md)
 - **`llama-perplexity` takes the expert cache options**, with the cache frozen, so a model whose routed experts
   do not fit in VRAM can be scored without `--n-cpu-moe`.
+- **Unified host policy of the SSD tier** - every host slot of the finite tier is a ring slot under one LRU policy
+  with a probation part; a plan install lays the rings out in score order without reading, and a prompt's reads are
+  cached like decode reads. On by default; `RANMA_EXPERT_L2_UNIFIED=0` returns to the separate resident and ring
+  slots. [expert-cache-l2.md](expert-cache-l2.md)
+- **Decode pool** - lends the part of the compute buffer that decode graphs do not use to extra expert positions;
+  on by default with the expert cache (`RANMA_EXPERT_UB_POOL=0` turns it off). Its ring admission takes the SSD
+  tier's ring occupants (on by default under the unified policy). [expert-cache-ub-pool.md](expert-cache-ub-pool.md)
+- **Expert prefetch (experimental, GLM-5.3 Flash)** - `RANMA_EXPERT_PREFETCH=1` copies the predicted experts of the
+  next layer into the decode pool with the copy engine. [expert-prefetch.md](expert-prefetch.md)
+- **Joint cache of models with different expert counts** - a draft model with another expert count (the DSpark
+  drafter of DeepSeek V4.1 Flash) joins the target's cache. [expert-cache-joint.md](expert-cache-joint.md)
 
 ### Graph runtime
 
@@ -105,6 +127,8 @@ applies, how to switch it, and its limits. The main features are summarized in t
   the first node, so a speculative verification whose width changes between rounds launches the graph it already
   captured for that width. On by default in HIP builds, at most 96 graphs per context;
   `GGML_CUDA_GRAPH_PER_SHAPE=0` restores the keying by the first node. Same page.
+- **Graph metadata given back** - stored graph slots and graph metadata buffers keep only what their graph uses
+  (`LLAMA_GRAPH_META_TRIM=0` keeps the worst case). [graph-runtime.md](graph-runtime.md#graph-metadata-given-back)
 - **One llama graph per batch shape** - a context keeps the built graph of up to 64 batch shapes together with
   its scheduler split and allocation, so a verification width seen before is made current again instead of
   being built, split and allocated anew. On by default; `LLAMA_GRAPH_REUSE_SHAPES=0` turns it off. With both
@@ -148,6 +172,13 @@ applies, how to switch it, and its limits. The main features are summarized in t
 - **No dummy HCA compression** on the decode steps in which no block completes. Same page.
 - **Raw and compressed K of a layer in one tensor**, so the attention reads a view instead of a concatenated
   copy on every token. Same page.
+
+### DeepSeek V4.1 Flash
+
+- **DeepSeek V4.1 Flash** - upstream pull request
+  [ggml-org/llama.cpp#28696](https://github.com/ggml-org/llama.cpp/pull/28696) (not merged), with the top-k reuse
+  fix from its review, the two level candidate mask, EXL3 conversions, MXFP8 engram tables and the DSpark drafter
+  with `--spec-smart`. [deepseek-v41.md](deepseek-v41.md), [engram-mxfp8.md](engram-mxfp8.md)
 
 ### GLM-5.3 Flash
 
