@@ -9,6 +9,8 @@ the two caches of a layer are laid out. The attention section is a HIP kernel
 path, measured on RDNA4 (gfx1201) only; the other sections are backend
 independent and have CPU and CUDA/HIP implementations.
 
+DeepSeek V4.1 Flash shares this path; what differs is on [deepseek-v41.md](deepseek-v41.md).
+
 ## Gathering the selected cells for head size 512
 
 ### What it is
