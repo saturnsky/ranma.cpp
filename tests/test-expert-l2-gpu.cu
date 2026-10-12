@@ -829,6 +829,125 @@ static int host_chunk_cost_test() {
     return 0;
 }
 
+// ---- the unified host policy on the class layout, through the real tier worker ---------------------
+
+// Two layers of one storage class with 4 resident and 4 ring slots. The residents the loader wrote
+// dissolve into the ring, a profile reseeds it (reads only what it lacks), and every generation then
+// reads the file's bytes through the address table: the held experts as ring hits, the others read on
+// demand into slots the policy gives up. A second profile reseeds the ring again with the worker stopped.
+static int unified_test(const std::filesystem::path & dir) {
+    constexpr int K = 256, M = 64, experts = 9;
+    constexpr size_t slice = size_t(K/32)*24*M, shift = 512;
+    const auto path = dir / "unified-weights.bin";
+    std::vector<char> file(shift + 2*experts*slice + 4096);
+    for (size_t i = 0; i < file.size(); ++i) { file[i] = char((i*157 + i/1013) & 0xff); }
+    { std::ofstream out(path, std::ios::binary); out.write(file.data(), file.size()); CHECK(bool(out)); }
+    geometry geo;
+    geo.n_layers = 2; geo.n_experts = experts;
+    geo.layer_class = {0, 0}; geo.class_layers = {2};
+    geo.class_bytes = {{slice, slice, slice}};
+    ggml_tensor weights = {};
+    weights.type = GGML_TYPE_Q5_1; weights.ne[0] = K; weights.ne[1] = M; weights.ne[2] = experts; weights.ne[3] = 1;
+    geo.tensors = {{{&weights, &weights, &weights}}, {{&weights, &weights, &weights}}};
+    std::vector<std::array<size_t, 3>> tails = {{arena_tail_bytes(geo, 0, 0), arena_tail_bytes(geo, 0, 1), arena_tail_bytes(geo, 0, 2)}};
+    class_storage st = plan_storage_classes(geo, tails, expert_os::io_alignment, 8);
+    CHECK(st.valid() && st.place({4}, {4}));
+    st.floor = {2};
+    l2_config cfg; cfg.verify = true; cfg.class_layout = true; cfg.decode_rows = 1; cfg.prefill_rows = 8;
+    cfg.unified.on = true; cfg.unified.ghost = 4; cfg.unified_probation_min = 1;
+    l2_tier tier(geo, cfg);
+    tier.set_storage(st);
+    CHECK(tier.sized() && tier.unified());
+    host_arena host(geo);
+    CHECK(host.allocate({4}, 0, 0, &tier.storage()));
+    CHECK(tier.allocate(0));
+    auto expect = [&](int layer, int expert) { return file.data() + shift + (layer*experts + expert)*slice; };
+    // the loader: layer 0 experts 0..3 are the host residents
+    for (int i = 0; i < 4; ++i) for (int k = 0; k < 3; ++k) { memcpy(static_cast<char *>(host.slice(0, k, i)) + shift, expect(0, i), slice); }
+    CHECK(host.map());
+    l2_host_geometry host_geo;
+    host_geo.device_base.assign(1, {nullptr, nullptr, nullptr});
+    host_geo.host_base.assign(1, {nullptr, nullptr, nullptr});
+    for (int k = 0; k < 3; ++k) { host_geo.device_base[0][k] = host.storage_base(0, k, true); host_geo.host_base[0][k] = host.storage_base(0, k, false); }
+    const std::vector<std::vector<int32_t>> vram(2, std::vector<int32_t>(experts, -1));
+    std::vector<std::vector<int32_t>> resident(2, std::vector<int32_t>(experts, -1));
+    for (int i = 0; i < 4; ++i) { resident[0][i] = i; }
+    const expert_locations homes = host_locations(resident), file_homes = host_locations(vram);
+    tier.set_homes(vram, homes, host_geo);
+    const std::string filename = path.string();
+    for (int l = 0; l < 2; ++l) for (int k = 0; k < 3; ++k) { tier.set_backing(l, k, 0, filename.c_str(), shift + l*experts*slice); }
+    std::string reason;
+    CHECK(tier.open_files(reason));
+    CHECK(tier.map());
+    l1_arena gpu(geo);
+    CHECK(gpu.allocate({1}, 0, 0));
+    // the start: the residents dissolve, the profile's next best experts fill the empty ring slots
+    install_transaction tx;
+    tx.valid = true; tx.gpu_slots = vram; tx.host = file_homes;
+    l2_install_stats stats;
+    CHECK(tier.install_relabel(tx, homes, gpu, stats, reason));
+    CHECK(stats.demoted == 4);
+    std::vector<uint64_t> counts((size_t) 2*experts, 0);
+    for (int e = 0; e < 3; ++e) { counts[(size_t) e] = 50 - e; }               // layer 0 experts 0..2
+    for (int e = 5; e < 9; ++e) { counts[(size_t) (experts + e)] = 40 - e; }   // layer 1 experts 5..8
+    CHECK(tier.reseed_unified(counts, vram, true, stats, reason));
+    CHECK(stats.reseed_slices == 4);
+    tier.set_homes(vram, file_homes, host_geo, true);
+    const l2_class_ledger & led = tier.class_ledger();
+    CHECK(led.ring_count(0) == 8 && led.slot_of(1, 5) >= 0 && led.slot_of(0, 3) >= 0);
+    int32_t * dev_ids = nullptr; char * copy = nullptr;
+    CUDA_CHECK(hipMalloc(&dev_ids, sizeof(int32_t)));
+    CUDA_CHECK(hipMalloc(&copy, slice));
+    hipStream_t stream; CUDA_CHECK(hipStreamCreate(&stream));
+    ggml_tensor ids = {}; ids.type = GGML_TYPE_I32; ids.data = dev_ids;
+    ids.ne[0] = 1; ids.ne[1] = 1; ids.ne[2] = ids.ne[3] = 1; ids.nb[0] = ids.nb[1] = 4;
+    std::vector<char> back(slice);
+    auto generation = [&](int layer, int expert) {
+        CUDA_CHECK(hipMemcpyAsync(dev_ids, &expert, sizeof(int32_t), hipMemcpyHostToDevice, stream));
+        CUDA_CHECK(hipStreamSynchronize(stream));
+        tier.publish_and_wait(layer, &ids, stream);
+        readback<<<32, 128, 0, stream>>>(tier.addresses(layer, 2), expert, copy, slice);
+        tier.mark_done(layer, stream);
+        CUDA_CHECK(hipMemcpyAsync(back.data(), copy, slice, hipMemcpyDeviceToHost, stream));
+        CUDA_CHECK(hipStreamSynchronize(stream));
+        return memcmp(back.data(), expect(layer, expert), slice) == 0;
+    };
+    tier.start_worker();
+    // every host expert reaches the worker (the A/B choice point serves them all): the held ones are hits
+    const std::vector<std::pair<int, int>> held = {{0, 0}, {0, 1}, {0, 2}, {0, 3}, {1, 5}, {1, 6}, {1, 7}, {1, 8}};
+    for (const auto & h : held) { CHECK(generation(h.first, h.second)); }
+    CHECK(wait_until([&] { return tier.counters().generations == held.size(); }));
+    CHECK(tier.counters().ring_hits == held.size() && tier.counters().ssd_reads == 0);
+    // every expert of both layers, twice: the bytes are the file's whatever the ring gives up
+    for (int round = 0; round < 2; ++round) {
+        for (int l = 0; l < 2; ++l) for (int e = 0; e < experts; ++e) { CHECK(generation(l, e)); }
+    }
+    tier.stop_worker();
+    // a second profile, with the worker stopped and the device idle: layer 0 experts 4..8 are its best
+    std::fill(counts.begin(), counts.end(), uint64_t(0));
+    for (int e = 4; e < 9; ++e) { counts[(size_t) e] = 90 - e; }
+    l2_install_stats again;
+    CHECK(tier.install_relabel(tx, file_homes, gpu, again, reason));
+    CHECK(tier.reseed_unified(counts, vram, true, again, reason));
+    tier.set_homes(vram, file_homes, host_geo, true);
+    for (int e = 4; e < 9; ++e) { CHECK(led.slot_of(0, e) >= 0); }
+    const uint64_t hits = tier.counters().ring_hits, reads = tier.counters().ssd_reads;
+    tier.start_worker();
+    for (int e = 4; e < 9; ++e) { CHECK(generation(0, e)); }
+    CHECK(wait_until([&] { return tier.counters().ring_hits == hits + 5; }));
+    CHECK(tier.counters().ssd_reads == reads);
+    tier.stop_worker();
+    const l2_counters c = tier.counters();
+    const l2_unified_stats & u = led.unified_stats();
+    CHECK(c.verify_bad == 0 && u.fills > 0 && u.fills == u.mru_fills + u.probation_fills + u.prompt_fills);
+    printf("PASS: unified host policy: dissolve, reseed-read %zu + %zu slices, %llu hits, %llu demand reads, %llu fills "
+           "(%llu at the probation point), %llu evictions\n", stats.reseed_slices, again.reseed_slices,
+        (unsigned long long) c.ring_hits, (unsigned long long) c.ssd_reads, (unsigned long long) u.fills,
+        (unsigned long long) u.probation_fills, (unsigned long long) u.evictions);
+    CUDA_CHECK(hipStreamDestroy(stream)); CUDA_CHECK(hipFree(copy)); CUDA_CHECK(hipFree(dev_ids));
+    return 0;
+}
+
 int main(int argc, char ** argv) {
     if (argc != 2) { return 2; }
     setvbuf(stdout, nullptr, _IONBF, 0);
@@ -843,6 +962,7 @@ int main(int argc, char ** argv) {
     CHECK(host_table_test() == 0);
     CHECK(host_chunk_cost_test() == 0);
     CHECK(early_ssd_test(argv[1]) == 0);
+    CHECK(unified_test(argv[1]) == 0);
     constexpr int K = 640, M = 2560, N = 14, J = 16, experts = 17, selected = 4;
     constexpr size_t slice = size_t(K/32)*24*M, shift = 4064, tail = 288;
     const auto path = std::filesystem::path(argv[1]) / "ring-weights.bin";

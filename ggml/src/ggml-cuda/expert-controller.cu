@@ -223,6 +223,9 @@ static l2_config l2_debug_config(const ggml_expert_config & cfg, bool verify_all
             GGML_LOG_INFO("expert cache: RANMA_EXPERT_L2_RING_FACTOR sets %g\n", value);
         }
     }
+    // The unified host policy (expert-l2-class-ledger.h) with its defaults: ghost 32 decode generations, probation 0.10,
+    // probation slots = the class's ring, prompt generations follow the decode rules, installs reseed in score order.
+    out.unified.on = l2_unified_default;
     return out;
 }
 
@@ -887,8 +890,10 @@ public:
             }
         }
         const plan_state & plan = kept ? patched : stored;
-        // Installing what is already in the arena costs nothing: no drain, no copies, one line.
-        if (!tier_ && plan.selected == l1_->selected()) {
+        // Installing what is already in the arena costs nothing: no drain, no copies, one line. The unified
+        // host policy also skips it unless the rings are reseeded from the plan's profile at every install.
+        const bool tier_static = !tier_ || (tier_->unified() && tier_->unified_reseed() == 0);
+        if (tier_static && plan.selected == l1_->selected()) {
             finish_plan_locked(id);
             if (cfg_.log_mask & GGML_EXPERT_LOG_INSTALL) {
                 GGML_LOG_INFO("expert cache: plan %u of bank '%s' is already installed; nothing to do\n",
@@ -1417,6 +1422,13 @@ public:
             return;
         }
         ub_cfg_ = ub_pool_config_from_env();
+        // The unified host policy (after its gate) serves every host expert from the rings: the pool takes
+        // them through its ring admission, which is then on. The admission's own checks below and its runtime
+        // judgement (ub_ring_order_locked) apply.
+        if (tier_ && tier_->unified()) {
+            ub_cfg_.ring = true;
+            GGML_LOG_INFO("expert cache: decode pool: ring admission on under the unified host policy\n");
+        }
         if (tier_ && !tier_->class_layout()) {
             GGML_LOG_WARN("expert cache: decode pool needs the class layout of the SSD tier; off\n");
             return;
@@ -1514,7 +1526,7 @@ public:
                 why = "the tier's bitmap layout differs";
             }
             if (why != nullptr) {
-                GGML_LOG_WARN("expert cache: decode pool: RANMA_EXPERT_UB_POOL_RING=1 is off: %s\n", why);
+                GGML_LOG_WARN("expert cache: decode pool: ring admission is off: %s\n", why);
             }
         }
         ub_member_ = 0;
@@ -2489,6 +2501,90 @@ private:
         return out;
     }
 
+    // The unified host policy runs only where the host slots are touched by
+    // nothing but the tier's own installs and worker: exclusive mode, no early routes, no prefetch copies,
+    // one model.
+    void unified_gate_locked(l2_config & c) {
+        if (!c.unified.on) {
+            return;
+        }
+        const char * why = nullptr;
+        if (!c.class_layout) {
+            why = "it needs the class layout";
+        } else if (cfg_.mode == GGML_EXPERT_MODE_INCLUSIVE) {
+            why = "it supports exclusive mode only";
+        } else if (hash_mode_.any()) {
+            why = "RANMA_EXPERT_HASH_EARLY is set";
+        } else if (xp_config_from_env().on) {
+            why = "RANMA_EXPERT_PREFETCH is set";
+        } else if (joint_) {
+            why = "the cache holds several models";
+        }
+        if (why != nullptr) {
+            // an explicit RANMA_EXPERT_L2_UNIFIED=1 is a request that fails (warning); the default only stays off (info)
+            const char * set = getenv("RANMA_EXPERT_L2_UNIFIED");
+            if (set != nullptr && *set != '\0') {
+                GGML_LOG_WARN("expert cache: RANMA_EXPERT_L2_UNIFIED=1 is off: %s\n", why);
+            } else {
+                GGML_LOG_INFO("expert cache: the unified host policy (default) is off: %s\n", why);
+            }
+            c.unified.on = false;
+            return;
+        }
+    }
+
+    // Every non-VRAM expert as a file resident: the host locations of the unified policy.
+    expert_locations unified_homes_locked() const {
+        return host_locations(expert_slot_table(geo_.n_layers, std::vector<int32_t>(geo_.n_experts, -1)));
+    }
+
+    // Under the unified policy every slot of a storage class is a ring slot: one layer's demand, at most
+    // its non-VRAM experts or what one ubatch can select, has to fit in its class. Stops the process otherwise.
+    void check_unified_slots_locked(const std::vector<std::vector<int32_t>> & vram) {
+        const int bound = storage_demand_bound(geo_.n_experts, cfg_.l2_experts_used, cfg_.l2_prefill_rows);
+        for (int l = 0; l < geo_.n_layers; ++l) {
+            const int cls = geo_.layer_class[l];
+            if (cls < 0) { continue; }
+            int in_vram = 0;
+            for (int e = 0; e < geo_.experts(l); ++e) { in_vram += vram[(size_t) l][(size_t) e] >= 0 ? 1 : 0; }
+            const int s = tier_->storage().storage_of[cls];
+            const int demand = std::min(geo_.experts(l) - in_vram, bound);
+            if (demand > tier_->class_slots(s)) {
+                char text[256];
+                snprintf(text, sizeof(text), "unified host policy: layer %d can demand %d experts outside VRAM at once, "
+                         "its storage class %d has %d slots", l, demand, s, tier_->class_slots(s));
+                abort_locked(text);
+            }
+        }
+    }
+
+    // The unified policy at the start, before the worker runs: the residents the loader wrote dissolve
+    // into the rings, which are then filled with the best experts of the seed profile, in score order.
+    void unify_tier_locked() {
+        const auto t0 = std::chrono::steady_clock::now();
+        const auto layout = tier_layout_locked(true);
+        const expert_slot_table none((size_t) geo_.n_layers);
+        const auto tx = ggml_cuda_expert::plan_install(geo_, l1_->selected(), none, l1_->host_slots(), l1_->locations(),
+            capacities_, l1_->layout(), layout, l1_->gpu_spares(), {false, cfg_.spare_slots}, true, /*retain =*/ true,
+            /*unequal =*/ unequal_);
+        if (!tx.valid) { abort_locked(("unified host policy: " + tx.reason).c_str()); }
+        l2_install_stats moved;
+        std::string reason;
+        if (!tier_->install_relabel(tx, l1_->locations(), *l1_, moved, reason) ||
+                !tier_->reseed_unified(tier_scores_, tx.gpu_slots, true, moved, reason)) {
+            abort_locked(("unified host policy: " + reason).c_str());
+        }
+        const expert_locations homes = unified_homes_locked();
+        if (!l1_->assign_tier(tx.gpu_slots, homes, layout, l1_->selected(), tx.gpu_spares) ||
+                !l1_->verify_current_assignment(reason)) { abort_locked(("unified host policy: " + reason).c_str()); }
+        tier_->set_homes(tx.gpu_slots, homes, host_geometry_locked(), true);
+        check_unified_slots_locked(tx.gpu_slots);
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        GGML_LOG_INFO("expert cache: unified host policy: %zu residents dissolved into the rings, %zu slices / %zu MiB of the "
+                      "seed profile read into their empty slots, rings in score order%s, in %.1f ms\n", moved.demoted,
+            moved.reseed_slices, moved.reseed_bytes/(1024*1024), tier_scores_.empty() ? " (no seed profile: slot order)" : "", ms);
+    }
+
     tier_inputs tier_inputs_locked(const std::vector<uint64_t> & scores) const {
         tier_inputs in;
         in.inclusive = cfg_.mode == GGML_EXPERT_MODE_INCLUSIVE;
@@ -2506,6 +2602,7 @@ private:
     bool size_tier_locked(const std::vector<std::vector<int32_t>> & selected, std::vector<int> & host_capacities) {
         l2_config tier_cfg = l2_debug_config(cfg_, verify_all_);
         tier_cfg.early = hash_mode_.ssd && !early_decl_.empty();
+        unified_gate_locked(tier_cfg);
         tier_.reset(new l2_tier(geo_, tier_cfg));
         if (!tier_->sized()) {
             tier_.reset();
@@ -2859,6 +2956,9 @@ private:
         l2_tier * tier = tier_.get();
         l1_->attach_addresses([tier](int layer, int kind) { return tier->addresses(layer, kind); });
         tier_->set_homes(l1_->host_slots(), l1_->locations(), host_geometry_locked());
+        if (tier_->unified()) {
+            unify_tier_locked();
+        }
         tier_->set_early_layers(early_joint_locked());
         tier_->start_worker();
         return true;
@@ -2960,10 +3060,33 @@ private:
         auto cut = host_capacities_base_;
         for (size_t c = 0; c < cut.size(); ++c) { cut[c] += layout.lent_count[c]; }
         vram_table_locked(plan.selected, tier_vram_);
-        tier_inputs in = tier_inputs_locked(plan.scores);
-        in.fixed_capacities = &cut;
-        const tier_plan host_plan = plan_host_tier(in);
-        if (!host_plan.valid) { abort_locked(host_plan.reason.c_str()); }
+        const bool unified = tier_->unified();
+        tier_plan host_plan;
+        if (unified) {
+            // No host resident but the demotions from VRAM, which the install copies back into the rings.
+            host_plan.valid = true;
+            host_plan.selected.assign((size_t) geo_.n_layers, {});
+            std::vector<int> room(layout.host.size(), 0);
+            for (size_t c = 0; c < room.size(); ++c) { room[c] = layout.host[c] + layout.lent_count[c]; }
+            const auto & gpu_now = l1_->host_slots();
+            for (int l = 0; l < geo_.n_layers; ++l) {
+                const int c = geo_.layer_class[l];
+                if (c < 0) { continue; }
+                const auto & keep = plan.selected[(size_t) l];
+                for (int e = 0; e < geo_.experts(l); ++e) {
+                    if (gpu_now[(size_t) l][(size_t) e] >= 0 && room[(size_t) c] > 0 &&
+                            std::find(keep.begin(), keep.end(), e) == keep.end()) {
+                        host_plan.selected[(size_t) l].push_back(e);
+                        --room[(size_t) c];
+                    }
+                }
+            }
+        } else {
+            tier_inputs in = tier_inputs_locked(plan.scores);
+            in.fixed_capacities = &cut;
+            host_plan = plan_host_tier(in);
+            if (!host_plan.valid) { abort_locked(host_plan.reason.c_str()); }
+        }
         const auto tx = ggml_cuda_expert::plan_install(geo_, plan.selected, host_plan.selected, l1_->host_slots(), l1_->locations(),
             capacities_, l1_->layout(), layout, l1_->gpu_spares(),
             {cfg_.mode == GGML_EXPERT_MODE_INCLUSIVE, cfg_.spare_slots}, true, /*retain =*/ true,
@@ -2978,6 +3101,11 @@ private:
             if (!tier_->install_relabel(tx, l1_->locations(), *l1_, moved, reason)) {
                 abort_locked(("install relabel: " + reason).c_str());
             }
+            // the unified policy: the rings start every plan from its profile
+            if (unified && tier_->unified_reseed() > 0 &&
+                    !tier_->reseed_unified(plan.scores, tx.gpu_slots, tier_->unified_reseed() == 2, moved, reason)) {
+                abort_locked(("unified reseed: " + reason).c_str());
+            }
         } else {
             if (!l1_->execute(tx)) { abort_locked("the install mover refused a move"); }
             for (const auto & move : tx.moves) for (int k = 0; k < geometry::n_kinds; ++k) {
@@ -2989,10 +3117,13 @@ private:
         // The old lent sources stay readable until every move has completed. The class layout has
         // no lent slots and one ring size: a prompt/decode switch is an install like any other.
         const bool repartition = !tier_->class_layout() && tier_->set_prompt_ring(prompt);
-        if (!l1_->assign_tier(tx.gpu_slots, tx.host, layout, plan.selected, tx.gpu_spares) ||
+        // the unified policy leaves every non-VRAM expert to the rings: no host home
+        const expert_locations homes = unified ? unified_homes_locked() : tx.host;
+        if (!l1_->assign_tier(tx.gpu_slots, homes, layout, plan.selected, tx.gpu_spares) ||
                 !l1_->verify_current_assignment(reason)) { abort_locked(("install assignment: " + reason).c_str()); }
         // the tables are published after every read and copy of the transaction completed
-        tier_->set_homes(tx.gpu_slots, tx.host, host_geometry_locked(), relabel);
+        tier_->set_homes(tx.gpu_slots, homes, host_geometry_locked(), relabel);
+        if (unified) { check_unified_slots_locked(tx.gpu_slots); }
         const size_t host_total = host_->host_bytes() + tier_->host_bytes();
         GGML_ASSERT(host_total <= cfg_.l2_bytes);
         if (repartition) {
@@ -3000,9 +3131,17 @@ private:
                 ring_before, tier_->ring_count(), tier_->prompt_slots() - tier_->ring_count(), host_total);
         }
         tier_->start_worker();
-        log_budget_split_locked(host_plan, prompt);
+        if (!unified) {
+            log_budget_split_locked(host_plan, prompt);
+        }
         const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
         std::string relabel_text;
+        if (unified) {
+            char text[224];
+            snprintf(text, sizeof(text), " unified: %zu demotions into the rings, reseed-read %zu slices / %zu MiB in %.1f ms",
+                moved.unified_demoted, moved.reseed_slices, moved.reseed_bytes/(1024*1024), moved.reseed_ms);
+            relabel_text = text;
+        }
         if (relabel) {
             char text[256];
             snprintf(text, sizeof(text), " relabel=%zu slices / %zu MiB ring-copy=%zu slices / %zu MiB read=%zu slices / %zu MiB "
@@ -3010,7 +3149,7 @@ private:
                 moved.relabel_slices, moved.relabel_bytes/(1024*1024), moved.ring_copy_slices, moved.ring_copy_bytes/(1024*1024),
                 moved.read_slices, moved.read_bytes/(1024*1024), moved.ring_kept, moved.ring_before, moved.ring_after,
                 moved.demoted, moved.batches);
-            relabel_text = text;
+            relabel_text += text;
         }
         GGML_LOG_INFO("expert cache: installed plan %u of bank '%s': mode=%s-l2 ring=%s%s retained=%zu/%zu "
                       "h2d=%zu slices / %zu MiB d2h=%zu slices / %zu MiB ssd=%zu slices / %zu MiB%s in %.1f ms\n",

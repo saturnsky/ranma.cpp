@@ -17,7 +17,6 @@ ub_pool_config ub_pool_config_from_env() {
     ub_pool_config c;
     c.enabled   = true;   // regions of at least 256 MiB, 64 MiB of margin, 64 positions per layer, the decode rows, ghost:8
     c.log       = ub_env_int("RANMA_EXPERT_UB_POOL_LOG", 0) != 0;
-    c.ring      = ub_env_int("RANMA_EXPERT_UB_POOL_RING", 0) != 0;
     return c;
 }
 
