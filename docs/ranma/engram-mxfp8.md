@@ -32,13 +32,17 @@ A missing table, an unexpected dtype (not F8_E4M3 values with F8_E8M0 scales), a
 `[rows, 256]` / `[rows, 8]`, or a row count that differs from `engram_num_embeddings` stops the conversion.
 The dense engram tensors (q, k) and the EXL3 `wkv` still come from the model folder.
 
+With `--split-max-size` the tables are a GGUF set of their own (`<model>-engram…`, one piece of at most the split size per
+file), which the model set lists and does not contain; one table set serves every quantization of the model. See
+`engram-tables.md`.
+
 The table is written by streaming: `GGUFWriter` calls the table object's `tofile()` when it writes the data, and
 the object reads the two shard ranges in chunks of 2M rows, joins them and writes them. There is no staging file;
 the peak memory is a few chunk buffers (about 1.2 GB). The output file grows by about 101.5 GB per table.
 
 ## Runtime
 
-`blk.N.engram_embd.weight` is a lazily mapped tensor. Before the gather, `llm_graph_input_engram::set_input`
+`blk.N.engram_embd.weight` (or its pieces `blk.N.engram_embd.p<i>.weight` in the table set) is a lazily mapped tensor. Before the gather, `llm_graph_input_engram::set_input`
 hands the sorted, merged row ranges to the operating system with `llama_prefetch_table_rows()` (the helper of
 the per-layer embedding prefetch, `ple-prefetch.md`). It follows `--ple-prefetch` and its thresholds
 (256 rows for `prefill`, 16 for `always`; a decode token gathers 24 rows per engram layer). A CPU `GET_ROWS` of
