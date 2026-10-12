@@ -121,8 +121,18 @@ class ModelBase:
     mtp_only: bool = False
     no_mtp: bool = False
 
+    # engram tables in a GGUF set of their own (conversion/engram_tables.py), set from the command line by convert_hf_to_gguf.py
+    # kind of the engram table of the class: "engram" (DeepSeek V4.1), "ple" (Qwen3.8) or None (no engram table)
+    engram_kind: str | None = None
+    engram_stage: str = "all"            # --engram-stage: all, weights (the model set) or tables (the table set only)
+    engram_parts: int | None = None      # --engram-parts: pieces per table instead of the count the original size gives
+    engram_source: Path | None = None    # --engram-source: folder of the original checkpoint that holds the tables
+    engram_tables_out: Path | None = None  # --engram-tables-out: folder or base name of the table set
+    engram_source_name: str | None = None  # --engram-source-name: the checkpoint name recorded in the table set
+    engram_source_rev: str | None = None   # --engram-source-rev: its revision (default: from the hf download metadata)
     resume_shards: bool = False         # --resume: keep the shards that an earlier run completed (see GGUFWriter._open_shards)
     resume_check: bool = False          # --resume-check: report skip/rewrite per shard, write nothing
+    engram_orig_dtype: str | None = None # --engram-orig-dtype: dtype of the original table when no checkpoint of it is given
 
     def __init__(self, dir_model: Path, ftype: gguf.LlamaFileType, fname_out: Path, *, is_big_endian: bool = False,
                  use_temp_file: bool = False, eager: bool = False,
@@ -146,6 +156,7 @@ class ModelBase:
         self.dir_model = dir_model
         self.ftype = ftype
         self.fname_out = fname_out
+        self.split_max_size = split_max_size
         self.is_big_endian = is_big_endian
         self.endianess = gguf.GGUFEndian.BIG if is_big_endian else gguf.GGUFEndian.LITTLE
         self.use_temp_file = use_temp_file
@@ -1401,12 +1412,32 @@ class ModelBase:
         raise NotImplementedError("write_vocab() must be implemented in subclasses")
 
     def write(self):
+        if self.engram_stage == "tables":
+            # the table set only: no weight, no model metadata
+            self.prepare_engram_tables()
+            self.engram_tables().write_table_set()
+            return
         self.prepare_tensors()
         self.prepare_metadata(vocab_only=False)
+        # the model index lists the tables of the table set (nothing when the tables are tensors of the model)
+        self.engram_tables().write_index_keys(self.gguf_writer)
         self.gguf_writer.write_header_to_file(path=self.fname_out)
         self.gguf_writer.write_kv_data_to_file()
         self.gguf_writer.write_tensors_to_file(progress=True)
         self.gguf_writer.close()
+        if self.engram_stage == "all" and self.engram_tables().registered:
+            self.engram_tables().write_table_set()
+
+    def engram_tables(self):
+        """The engram tables of this conversion (conversion/engram_tables.py); a model class registers its tables in it."""
+        if getattr(self, "_engram_tables", None) is None:
+            from .engram_tables import EngramTables
+            self._engram_tables = EngramTables(self)
+        return self._engram_tables
+
+    def prepare_engram_tables(self):
+        """Register the engram tables without the weights (--engram-stage tables)."""
+        raise NotImplementedError(f"{type(self).__name__} has no engram tables (--engram-stage tables)")
 
     @staticmethod
     def get_model_part_names(dir_model: Path, prefix: str, suffix: str) -> list[str]:
