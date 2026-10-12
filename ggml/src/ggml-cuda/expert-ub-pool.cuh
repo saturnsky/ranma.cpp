@@ -60,10 +60,12 @@ struct ub_pool_config {
     bool   log       = false;
     int    ghost     = 8;                 // admission filter ghost:K; 0 = admit every admissible miss
     bool   ring      = false;             // also admit the SSD tier's ring occupants (see "Ring admission" below)
+    int    ring_env  = -1;                // RANMA_EXPERT_UB_POOL_RING as given: -1 = not set, 0, 1
 };
 
 // RANMA_EXPERT_UB_POOL=0|1, _MIN_MIB, _MARGIN_MIB, _RCAP, _ROWS, _LOG,
-// _FILTER=ghost:K|off (default ghost:8), _RING=0|1 (default 0). Read once.
+// _FILTER=ghost:K|off (default ghost:8), _RING=0|1 (default 0; 1 under the unified host policy of the SSD
+// tier, l2_unified_pool_ring). Read once.
 ub_pool_config ub_pool_config_from_env();
 
 static constexpr int ub_pool_max_experts = 1024;
