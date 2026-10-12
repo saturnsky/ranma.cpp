@@ -53,6 +53,12 @@ applies, how to switch it, and its limits. The main features are summarized in t
   tensor runs on the threadpool. [ple-prefetch.md](ple-prefetch.md)
 - **Only the shards with lazy tensors are mapped** - with mmap loading off, the loader no longer maps model
   files that nothing reads through the mapping. Same page.
+- **Engram tables as a GGUF set of their own** - a split conversion of DeepSeek V4.1 (engram) or Qwen3.8 (PLE)
+  writes the tables as their own set `<model>-engram…`, which the model index lists by table name, rows and row width;
+  one set serves every quantization (and an F16 or EXL3 variant of the tables fits too). The loader takes the one
+  `<model>-engram*.gguf` next to the model or the set given by `--engram-tables PATH`, and `--engram-tables` also
+  replaces the tables that a model holds itself.
+  [engram-tables.md](engram-tables.md)
 
 ### Host-resident MoE experts
 
