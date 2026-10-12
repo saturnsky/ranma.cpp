@@ -16,8 +16,8 @@
 //
 // The unified policy (set_unified, off by default): every slot of a class is a ring slot once the
 // residents of the seed plan are dissolved into the rings (dissolve), and each class list is split
-// into a probation part at the least recently used end, a fixed share of the class's ring slots
-// (empty slots included), and a main part above it. A hit moves its slot to the most recently used
+// into a probation part at the least recently used end, the larger of a fixed share of the class's
+// ring slots (empty slots included) and a per-class minimum, and a main part above it. A hit moves its slot to the most recently used
 // end. A miss of an expert that also missed in its layer within the last K decode generations (the
 // ghost) is filled at the most recently used end, any other miss at the bottom of the main part, so
 // that exactly the probation share of the list lies below it; a prompt generation fills at the least
@@ -46,8 +46,15 @@ struct l2_unified_policy {
     bool     on         = false;
     double   probation  = 0.10;   // share of each class list below the probation point, 0..0.5
     uint32_t ghost      = 32;     // a miss within this many decode generations of its layer passes the ghost
-    bool     prompt_lru = false;  // prompt generations follow the decode rules; false: misses at the LRU end, hits stay
+    bool     prompt_lru = true;   // prompt generations follow the decode rules (default); false: misses at the LRU end, hits stay
 };
+
+// Whether the decode pool admits the SSD tier's ring occupants (RANMA_EXPERT_UB_POOL_RING, `ring_env`
+// -1 when not set). Under the unified policy every host expert is a ring occupant, so the pool takes
+// host experts only with ring admission: it is on unless the switch says 0.
+inline bool l2_unified_pool_ring(int ring_env, bool unified) {
+    return ring_env < 0 ? unified : ring_env != 0;
+}
 
 // Counts of the unified policy. Probation fills that were evicted before any hit are the immediate
 // evictions; probation hits are the probation fills that hit before their eviction.
@@ -100,7 +107,7 @@ public:
         uni_ = policy;
         uni_.probation = std::min(std::max(uni_.probation, 0.0), 0.5);
         if (!uni_.on) {
-            in_p_.clear(); unhit_.clear(); pcount_.clear(); bnd_.clear(); last_miss_.clear(); step_.clear();
+            in_p_.clear(); unhit_.clear(); pcount_.clear(); pmin_.clear(); bnd_.clear(); last_miss_.clear(); step_.clear();
             return;
         }
         unified_init();
@@ -112,6 +119,40 @@ public:
     void set_prompt(bool prompt) { prompt_ = prompt; }
     // Slots in the probation part of a class (unified policy only).
     int probation_count(int s) const { return uni_.on ? pcount_[(size_t) s] : 0; }
+    // The least number of slots in the probation part of a class (unified policy only; the share
+    // applies when it is larger, the class's ring slots when they are fewer).
+    void set_probation_min(int s, int slots) {
+        if (!uni_.on || s < 0 || s >= storages()) { return; }
+        pmin_[(size_t) s] = std::max(slots, 0);
+        rebalance(s);
+    }
+
+    // Every resident slot joins the ring of its class in place: one with an expert at `where`, an
+    // empty one (a spare) at the least recently used end. Only while nothing computes. Returns the
+    // residents with an expert that joined.
+    int residents_to_ring(l2_place where) {
+        int joined = 0;
+        for (int s = 0; s < storages(); ++s) {
+            for (int slot = 0; slot < slots(s); ++slot) {
+                owner & o = owners_[(size_t) s][(size_t) slot];
+                if (o.role != slot_role::resident) { continue; }
+                o.role = slot_role::ring;
+                ++ring_count_[(size_t) s];
+                link_head(s, slot);
+                if (o.layer >= 0) {
+                    ++joined;
+                    const int other = map_[(size_t) o.layer][(size_t) o.expert];
+                    if (other >= 0 && other != slot) { empty(s, other); }
+                    map_[(size_t) o.layer][(size_t) o.expert] = slot;
+                    o.seq = done_[(size_t) o.layer];   // nothing computes
+                    place(s, slot, where);
+                }
+                if (uni_.on) { rebalance(s); }
+            }
+        }
+        ustats_.dissolved += (uint64_t) joined;
+        return joined;
+    }
 
     // Every resident slot joins the ring of its class in place, with its expert if it has one, and
     // each class list is laid out again: empty slots at the least recently used end, then the
@@ -589,7 +630,7 @@ private:
     // ---- the unified policy --------------------------------------------------------------------------
     int probation_target(int s) const {
         const int n = ring_count_[(size_t) s];
-        return std::min(n, int(uni_.probation*double(n) + 1e-9));
+        return std::min(n, std::max(int(uni_.probation*double(n) + 1e-9), pmin_[(size_t) s]));
     }
 
     bool ghost_ok(int layer, int expert, uint32_t step) const {
@@ -611,6 +652,7 @@ private:
         in_p_.assign(n, {});
         unhit_.assign(n, {});
         pcount_.assign(n, 0);
+        pmin_.assign(n, 0);
         bnd_.assign(n, -1);
         for (size_t s = 0; s < n; ++s) {
             in_p_[s].assign(owners_[s].size(), 0);
@@ -773,6 +815,7 @@ private:
     std::vector<std::vector<uint8_t>> in_p_;    // [storage class][slot] in the probation part
     std::vector<std::vector<uint8_t>> unhit_;   // [storage class][slot] a probation fill not hit yet
     std::vector<int> pcount_, bnd_;             // probation slots; the least recently used slot of the main part or -1
+    std::vector<int> pmin_;                     // [storage class] the least number of probation slots
     std::vector<uint32_t> last_miss_;           // [layer*experts + expert] ghost step of the last miss, 0 = none
     std::vector<uint32_t> step_;                // [layer] decode generations served
 };

@@ -17,6 +17,12 @@
 // Moves from the file run in batches: all reads of a batch go out together, then the batch's copies to
 // VRAM run, and the next batch starts after they complete. No slot is read into, or copied from, twice
 // in one batch.
+//
+// The unified policy (l2_unified_policy): the plan has no host residents but the demotions from VRAM
+// of this install, every slot is a ring slot, and a logical host slot without a home stays without
+// one. After the moves, settle_unified turns the demotions into ring occupants at the probation point
+// and empties the ring copies of the VRAM promotions; plan_unified_reseed then brings each class's
+// ring to the best experts of a profile and lays it out in score order.
 
 #include "expert-l2-class-ledger.h"
 #include "expert-plan.h"
@@ -53,7 +59,8 @@ struct l2_install_plan {
 // ledger and `home_slot`. Nothing may compute meanwhile.
 inline l2_install_plan plan_relabel_install(l2_class_ledger & ledger, std::vector<std::vector<int>> & home_slot,
         const std::vector<int> & layer_class, const std::vector<int> & storage_of,
-        const expert_locations & before, const expert_locations & after, const std::vector<install_move> & moves) {
+        const expert_locations & before, const expert_locations & after, const std::vector<install_move> & moves,
+        bool unified = false) {
     l2_install_plan out;
     auto fail = [&](const std::string & why) { out.ok = false; out.reason = why; return out; };
     const int classes = (int) home_slot.size();
@@ -119,6 +126,7 @@ inline l2_install_plan plan_relabel_install(l2_class_ledger & ledger, std::vecto
             for (size_t i = 0; i < home_slot[(size_t) c].size(); ++i) {
                 const int was = old_of[(size_t) c][i];
                 if (was == new_of[(size_t) c][i] || leaves[(size_t) c][i] || (pass == 0) != (was >= 0)) { continue; }
+                if (unified && home_slot[(size_t) c][i] < 0) { continue; }   // a logical slot without a home: nothing joins
                 if (was >= 0) {
                     const expert_location to = after[(size_t) (was/experts)][(size_t) (was%experts)];
                     if (to.storage != expert_storage::file) { return fail("a resident changes its host slot without a move"); }
@@ -234,9 +242,9 @@ inline l2_install_plan plan_relabel_install(l2_class_ledger & ledger, std::vecto
     out.batches = batch + 1;
 
     // Logical slots left without a home end the plan empty (spares): they take an empty ring slot
-    // when there is one.
+    // when there is one. Under the unified policy they stay without one.
     ledger.sink_empty();
-    for (int c = 0; c < classes; ++c) {
+    for (int c = 0; c < classes && !unified; ++c) {
         const int s = storage_of[(size_t) c];
         for (size_t i = 0; i < home_slot[(size_t) c].size(); ++i) {
             if (home_slot[(size_t) c][i] >= 0) { continue; }
@@ -251,7 +259,7 @@ inline l2_install_plan plan_relabel_install(l2_class_ledger & ledger, std::vecto
     ledger.sink_empty();
 
     // the rings kept their size, and every home is one resident slot holding the plan's expert
-    for (int s = 0; s < ledger.storages(); ++s) {
+    for (int s = 0; s < ledger.storages() && !unified; ++s) {
         if (ledger.ring_count(s) != ring_before[(size_t) s]) {
             return fail("the ring of storage class " + std::to_string(s) + " changed its size");
         }
@@ -262,9 +270,13 @@ inline l2_install_plan plan_relabel_install(l2_class_ledger & ledger, std::vecto
         const int s = storage_of[(size_t) c];
         for (size_t i = 0; i < home_slot[(size_t) c].size(); ++i) {
             const int slot = home_slot[(size_t) c][i];
+            const int want = new_of[(size_t) c][i];
+            if (unified && slot < 0) {
+                if (want >= 0) { return fail("a host resident of the new plan has no home"); }
+                continue;
+            }
             int l = -1, e = -1;
             const bool holds = ledger.occupant(s, slot, l, e);
-            const int want = new_of[(size_t) c][i];
             if (taken[(size_t) s][(size_t) slot] || ledger.role_of(s, slot) != slot_role::resident ||
                     (want < 0 ? holds : (!holds || l*experts + e != want))) {
                 return fail("the homes do not match the new plan");
@@ -275,6 +287,97 @@ inline l2_install_plan plan_relabel_install(l2_class_ledger & ledger, std::vecto
     std::string why;
     if (!ledger.check(why)) { return fail(why); }
     out.ok = true;
+    return out;
+}
+
+// The unified policy after the moves of an install: the ring copy of every VRAM resident (`vram`
+// [layer][expert] slot or -1) is emptied, the demotions homed by this install join their rings at the
+// probation point, empty slots go to the least recently used end, and no logical host slot keeps a home.
+// Nothing may compute meanwhile. Returns the demotions that joined.
+inline int settle_unified(l2_class_ledger & ledger, std::vector<std::vector<int>> & home_slot,
+        const std::vector<std::vector<int32_t>> & vram) {
+    for (int l = 0; l < (int) vram.size(); ++l) {
+        const int s = ledger.storage_of(l);
+        if (s < 0) { continue; }
+        for (int e = 0; e < (int) vram[(size_t) l].size(); ++e) {
+            if (vram[(size_t) l][(size_t) e] < 0) { continue; }
+            const int slot = ledger.slot_of(l, e);
+            if (slot >= 0 && ledger.owns(slot, l, e)) { ledger.sink(s, slot); }
+        }
+    }
+    const int joined = ledger.residents_to_ring(l2_place::probation);
+    ledger.sink_empty();
+    for (auto & row : home_slot) { std::fill(row.begin(), row.end(), -1); }
+    return joined;
+}
+
+// One read of a reseed: (layer, expert) into ring slot `slot` of its storage class.
+struct l2_reseed_read {
+    int layer = -1, expert = -1, slot = -1;
+};
+
+// The unified policy at an install: each class's ring is brought to the best experts of a profile.
+// `score(layer, expert)` > 0 for an expert the profile selected; `experts_of` [layer] the experts of a
+// layer; `vram` [layer][expert] slot or -1 (VRAM residents are not candidates). With `fill`, the
+// candidates the ring of a class can hold (best first) that it does not hold yet take, in score order,
+// its empty slots first and then the slots of the lowest scored occupants outside that set; the caller
+// reads them in. Either way every class list is laid out again in score order (dissolve). Nothing may
+// compute meanwhile.
+template <typename Score>
+inline std::vector<l2_reseed_read> plan_unified_reseed(l2_class_ledger & ledger, const std::vector<int> & experts_of,
+        const std::vector<std::vector<int32_t>> & vram, Score score, bool fill) {
+    std::vector<l2_reseed_read> out;
+    const int layers = (int) experts_of.size();
+    if (fill) {
+        for (int s = 0; s < ledger.storages(); ++s) {
+            struct cand { double score; int layer, expert; };
+            std::vector<cand> cands;
+            int experts = 0;
+            for (int l = 0; l < layers; ++l) {
+                if (ledger.storage_of(l) != s) { continue; }
+                experts = std::max(experts, experts_of[(size_t) l]);
+                for (int e = 0; e < experts_of[(size_t) l]; ++e) {
+                    if (vram[(size_t) l][(size_t) e] >= 0) { continue; }
+                    const double v = double(score(l, e));
+                    if (v > 0.0) { cands.push_back({v, l, e}); }
+                }
+            }
+            std::stable_sort(cands.begin(), cands.end(), [](const cand & a, const cand & b) { return a.score > b.score; });
+            const size_t keep = std::min(cands.size(), (size_t) std::max(ledger.ring_count(s), 0));
+            std::vector<uint8_t> wanted((size_t) layers*(size_t) std::max(experts, 1), 0);
+            std::vector<cand> missing;
+            for (size_t i = 0; i < keep; ++i) {
+                wanted[(size_t) cands[i].layer*(size_t) experts + (size_t) cands[i].expert] = 1;
+                if (ledger.slot_of(cands[i].layer, cands[i].expert) < 0) { missing.push_back(cands[i]); }
+            }
+            if (missing.empty()) { continue; }
+            // victims: empty slots in list order, then occupants outside the wanted set, lowest score first
+            std::vector<int> victims;
+            std::vector<std::pair<double, int>> held;
+            for (int slot : ledger.order(s)) {
+                int l = -1, e = -1;
+                if (!ledger.occupant(s, slot, l, e)) {
+                    victims.push_back(slot);
+                } else if (!wanted[(size_t) l*(size_t) experts + (size_t) e]) {
+                    held.push_back({double(score(l, e)), slot});
+                }
+            }
+            std::stable_sort(held.begin(), held.end(),
+                [](const std::pair<double, int> & a, const std::pair<double, int> & b) { return a.first < b.first; });
+            for (const auto & item : held) { victims.push_back(item.second); }
+            size_t v = 0;
+            for (const cand & c : missing) {
+                bool placed = false;
+                for (; v < victims.size() && !placed; ++v) {
+                    const int slot = victims[v];
+                    placed = ledger.sink(s, slot) && ledger.adopt(s, slot, c.layer, c.expert, l2_place::lru);
+                    if (placed) { out.push_back({c.layer, c.expert, slot}); }
+                }
+                if (!placed) { break; }
+            }
+        }
+    }
+    ledger.dissolve(score);
     return out;
 }
 

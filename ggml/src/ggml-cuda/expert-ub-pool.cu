@@ -29,7 +29,10 @@ ub_pool_config ub_pool_config_from_env() {
     c.r_cap     = std::min(std::max(ub_env_int("RANMA_EXPERT_UB_POOL_RCAP", c.r_cap), 1), ub_pool_max_rcap);
     c.rows      = std::max(ub_env_int("RANMA_EXPERT_UB_POOL_ROWS", 0), 0);
     c.log       = ub_env_int("RANMA_EXPERT_UB_POOL_LOG", 0) != 0;
-    c.ring      = ub_env_int("RANMA_EXPERT_UB_POOL_RING", 0) != 0;
+    if (const char * r = getenv("RANMA_EXPERT_UB_POOL_RING"); r != nullptr && *r != '\0') {
+        c.ring_env = atoi(r) != 0 ? 1 : 0;   // not set: -1, the default the controller decides
+    }
+    c.ring      = c.ring_env == 1;
     if (const char * f = getenv("RANMA_EXPERT_UB_POOL_FILTER"); f != nullptr && *f != '\0') {
         const std::string s = f;
         const int k = s.rfind("ghost:", 0) == 0 ? atoi(s.c_str() + 6) : -1;
