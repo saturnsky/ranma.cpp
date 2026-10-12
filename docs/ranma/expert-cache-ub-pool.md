@@ -91,7 +91,7 @@ spans lends. On by default with K = 8 (`off` turns it off): in the table above i
 
 ## Ring admission (experimental)
 
-`RANMA_EXPERT_UB_POOL_RING=1` (default 0) also admits the experts that the SSD worker serves from its host
+`RANMA_EXPERT_UB_POOL_RING=1` (default 0, or 1 under the unified host policy, below) also admits the experts that the SSD worker serves from its host
 ring (ring occupants), under the same admission filter. A CPU replay of DS4F traces put the gain at r = 9 (the
 positions a 2048-row ubatch leaves on DS4.1F) at 1.5 to 2.6 ms per token over host residents only with a 24 GiB
 host tier, and 0.04 to 1.0 ms with 40.8 GiB; it is not measured on the model yet. File residents (in neither
@@ -125,6 +125,14 @@ ring nor host memory) are still not admitted.
   in the layers other than the one just served (an entry the pool let go, published again at the layer's next
   service); the layer just served and every layer after an install are still checked exactly.
 
+- **Under the unified host policy.** With `RANMA_EXPERT_L2_UNIFIED` on and past its gate
+  (`expert-cache-l2.md`), every host expert of the SSD tier is a ring occupant, so the pool could take
+  host experts only through this admission. With the pool on, an unset `RANMA_EXPERT_UB_POOL_RING` then
+  means 1 (info line `decode pool: ring admission on by default under the unified host policy`). An
+  explicit 0 is kept, with a warning (`unified on, ub pool RING off: the pool takes no host experts`).
+  The admission's own checks and its runtime judgement of other contexts are those of the switch at 1.
+  Without the unified policy the default stays 0.
+
 With the switch at 0 nothing is allocated, the step kernel's ring branch is never taken, the publish kernel
 gets a null bitmap, and the worker's checks see no bitmap.
 
@@ -138,7 +146,7 @@ gets a null bitmap, and the worker's checks see no bitmap.
 | `RANMA_EXPERT_UB_POOL_MARGIN_MIB` | 64 | Least headroom above the decode graphs' largest extent. |
 | `RANMA_EXPERT_UB_POOL_RCAP` | 64 | Positions per layer allocated (the most a lend can use). |
 | `RANMA_EXPERT_UB_POOL_ROWS` | decode rows | Launches of at most this many rows step the pool and are planned compactly. |
-| `RANMA_EXPERT_UB_POOL_RING` | 0 | 1: also admit ring occupants of the SSD tier (experimental, above). |
+| `RANMA_EXPERT_UB_POOL_RING` | 0; 1 when `RANMA_EXPERT_L2_UNIFIED` is on and the pool is on | 1: also admit ring occupants of the SSD tier (experimental, above); an explicit 0 is kept. |
 | `RANMA_EXPERT_UB_POOL_LOG` | 0 | 1: lends, reclaims and counters. |
 
 All are read once at startup. `RANMA_EXPERT_VERIFY` compares every position with its home before every
@@ -161,7 +169,7 @@ The `--spec-smart-log` round log uses it to record each round's pool work (`docs
 
 ## Not done
 
-- Experts the SSD worker serves are not admitted (ring occupants are with `RANMA_EXPERT_UB_POOL_RING=1`; file
-  residents never).
+- Experts the SSD worker serves are not admitted (ring occupants are with `RANMA_EXPERT_UB_POOL_RING=1`, which
+  the unified host policy turns on by default; file residents never).
 - Early-route (hash) layers and the layers of a joint cache's draft member get no positions.
 - A compute buffer of more than one chunk reports no extent, so the pool never lends from it.
