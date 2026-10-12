@@ -40,6 +40,7 @@ import gguf
 from gguf import exl3 as gexl3
 
 from .base import LazyTorchTensor
+from .engram_tables import TableSource, chunked_reader, config_dtype, find_original_table, orig_dtype_bytes, original_source
 
 logger = logging.getLogger("exl3")
 
@@ -623,6 +624,10 @@ class Exl3State:
             del data
             return out
 
+        if model.engram_tables().active:
+            self._emit_engram_pieces(model, name, row_bytes, rows_of)
+            return
+
         chunks = [lambda e=e, r0=r0: rows_of(e, r0, min(r0 + step, e.shape[0]))
                   for e in t["parts"] for r0 in range(0, e.shape[0], step)]
         model.gguf_writer.add_tensor(name + ".weight", gguf.LazyChunkedTensor(chunks, shape=(t["rows"], row_bytes), dtype=np.uint8),
@@ -630,6 +635,37 @@ class Exl3State:
         model.gguf_writer.add_tensor(name + ".bias", np.ascontiguousarray(t["bias"].array("<f2")))
         logger.info(f"{name + '.weight,':<48} exl3 n-gram --> {t['qtype'].name}, shape = {{{gexl3.ROW_DIM}, {t['rows']}}}")
         logger.info(f"{name + '.bias,':<48} exl3 n-gram --> F16, shape = {{{gexl3.ROW_DIM}, {t['heads']}}}")
+
+    def _emit_engram_pieces(self, model: Any, name: str, row_bytes: int, rows_of: Callable[[StEntry, int, int], np.ndarray]) -> None:
+        """The table of a split conversion, as a table set of its own (conversion/engram_tables.py): the EXL3 row codec of the
+        EXL3 folder with its bias, or, with --engram-source, the rows of that original checkpoint in their own dtype. The
+        pieces are planned from the ORIGINAL table size in both cases."""
+        t = self.engram_table
+        assert t is not None
+        tables = model.engram_tables()
+        if model.engram_source is not None:
+            src = find_original_table(model.engram_source)
+            if src.rows != t["rows"] or src.cols != gexl3.ROW_DIM:
+                raise Exl3Error(f"--engram-source table is {src.rows} x {src.cols}, the EXL3 table {t['rows']} x {gexl3.ROW_DIM}")
+            tables.set_tables("ple", [original_source(name, src)], model.engram_source)
+            return
+        orig_row_bytes = gexl3.ROW_DIM * orig_dtype_bytes(config_dtype(model.hparams, model.engram_orig_dtype))
+        step = max(1, CHUNK_BYTES // row_bytes)
+
+        def chunks_of(r0: int, r1: int) -> list:
+            out = []
+            base = 0
+            for e in t["parts"]:
+                lo, hi = max(r0, base), min(r1, base + e.shape[0])
+                for a in range(lo, hi, step):
+                    out.append(lambda e=e, a=a - base, b=min(a + step, hi) - base: rows_of(e, a, b))
+                base += e.shape[0]
+            return out
+
+        source = TableSource(name, t["rows"], orig_row_bytes, row_bytes, t["qtype"],
+                             lambda r0, r1: chunked_reader(chunks_of(r0, r1), row_bytes),
+                             lambda r0, r1: gguf.LazyChunkedTensor(chunks_of(r0, r1), shape=(r1 - r0, row_bytes), dtype=np.uint8))
+        tables.set_tables("ple", [source], self.dir_model, extras=[(name + ".bias", np.ascontiguousarray(t["bias"].array("<f2")))])
 
     def _type_counts(self) -> dict[gguf.GGMLQuantizationType, int]:
         counts: dict[gguf.GGMLQuantizationType, int] = {}
@@ -910,6 +946,13 @@ class _Exl3Model:
         self._exl3_adapter_check()
         self._exl3.emit_ngram(self)
         self._exl3.finish()
+
+    def prepare_engram_tables(self):
+        # the table of the EXL3 folder (or the original table of --engram-source) for a set whose other stage is already written
+        self._exl3.install(self)
+        if self._exl3.engram_table is None:
+            return super().prepare_engram_tables()  # ty: ignore[unresolved-attribute]
+        self._exl3.emit_ngram(self)
 
     def prepare_metadata(self, vocab_only: bool):
         self.ftype = gguf.LlamaFileType.MOSTLY_EXL3
