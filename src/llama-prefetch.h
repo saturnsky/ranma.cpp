@@ -31,3 +31,8 @@ void llama_prefetch_ranges(const llama_prefetch_range * ranges, size_t n_ranges)
 // mode off, for a gather below the threshold, or for a table that is not in host memory.
 void llama_prefetch_table_rows(const struct ggml_tensor * table, const std::vector<int32_t> & rows,
                                enum llama_ple_prefetch mode);
+
+// The same for a table stored as pieces of part_rows consecutive rows (a table of one piece is the call above): rows are the
+// GLOBAL row numbers of the gather, the threshold counts all of them, and each piece is hinted with its own rows.
+void llama_prefetch_table_pieces_rows(const std::vector<struct ggml_tensor *> & parts, int64_t part_rows,
+                                      const std::vector<int32_t> & rows, enum llama_ple_prefetch mode);

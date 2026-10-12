@@ -190,7 +190,9 @@ struct llama_model_loader {
         bool no_alloc,
         bool load_mtp,
         const llama_model_kv_override * param_overrides_p,
-        const llama_model_tensor_buft_override * param_tensor_buft_overrides_p);
+        const llama_model_tensor_buft_override * param_tensor_buft_overrides_p,
+        bool engram_tables_attach = true,        // false: leave the engram table set of the model alone (quantization)
+        const char * engram_tables = nullptr);   // llama_model_params::engram_tables
 
     template<typename T>
     typename std::enable_if<std::is_integral<T>::value, bool>::type
@@ -252,6 +254,19 @@ struct llama_model_loader {
     void check_weight_aux(const ggml_tensor * w) const;
 
     void done_getting_tensors(bool partial = false) const;
+
+    // The engram tables of the model (docs/ranma/engram-tables.md). A model whose index lists tables it does not hold
+    // (engram_tables.names / rows / width) needs a table set: the file `path` (else LLAMA_ARG_ENGRAM_TABLES) of any name,
+    // else the one <P>-engram*.gguf (a file of its own or the first file of a split set) in the folder `path` or the folder
+    // of fname_model (<P>-00001-of-0000K.gguf / <P>.gguf). A model that holds its tables takes a set only from `path` / the
+    // environment, and its own tensors give way. The set must have the architecture, table names, rows and row widths
+    // (type and pieces may differ); every piece is checked against its piece check; the files and tensors join the model's
+    // and the set's layout keys replace the index's. Throws when the set is missing, ambiguous or does not fit.
+    void attach_engram_tables(const std::string & fname_model, const char * path);
+
+    // The files and tensors of an engram table set (n_split files; 1: the index holds the pieces) join the model's, every
+    // piece checked against its piece check.
+    void attach_engram_set_files(const std::string & first, uint32_t n_split, struct gguf_context * index, bool replace);
 
     void init_mappings(bool prefetch = true, llama_mlocks * mlock_mmaps = nullptr);
 

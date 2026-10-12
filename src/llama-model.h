@@ -592,7 +592,7 @@ struct llama_layer {
     struct ggml_tensor * hc_ffn_inject  = nullptr;
 
     // Engram (n-gram keyed lookup table) for DeepSeek-V4.1
-    struct ggml_tensor * engram_embd    = nullptr;
+    llama_table_pieces   engram_table;   // the table of this layer: its pieces in the table set, or the one tensor of the model
     struct ggml_tensor * engram_k       = nullptr;
     struct ggml_tensor * engram_q       = nullptr;
     struct ggml_tensor * engram_wkv     = nullptr;
@@ -747,6 +747,7 @@ struct llama_model {
     struct ggml_tensor * altup_unembd_proj    = nullptr;
     struct ggml_tensor * per_layer_tok_embd   = nullptr;
     struct ggml_tensor * per_layer_tok_embd_b = nullptr; // per-head bias of an EXL3 row codec table
+    llama_table_pieces   per_layer_tok_embd_table;       // qwen4exp: the n-gram table in its pieces; per_layer_tok_embd is the first
 
     struct ggml_tensor * hc_head_norm = nullptr;
     struct ggml_tensor * hc_head_down = nullptr;

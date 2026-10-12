@@ -370,6 +370,12 @@ extern "C" {
 
         // ranma: optional backend-managed cache of MoE expert weights (ggml-expert.h); NULL = off
         const struct ggml_expert_config * expert_config;
+
+        // ranma: an engram table set (docs/ranma/engram-tables.md), its first file or a folder to search: for a model that
+        // needs a set, where it is (NULL = the environment variable LLAMA_ARG_ENGRAM_TABLES, else the one <model>-engram*.gguf
+        // next to the model); for a model that holds its tables itself, the set that replaces them (NULL =
+        // LLAMA_ARG_ENGRAM_TABLES, else none)
+        const char * engram_tables;
     };
 
     struct llama_sampler_seq_config {
