@@ -336,6 +336,17 @@ bool l2_tier::allocate(int device) {
                 storage_.ring_base[s], storage_.ring_slots[s],
                 size_t(storage_.ring_slots[s])*storage_.stride(s)/(1024*1024), storage_.floor[s]);
         }
+        if (cfg_.unified.on) {
+            cledger_.set_unified(cfg_.unified);
+            for (int s = 0; s < storage_.storages(); ++s) {
+                // the default probation minimum is the ring the layout gave the class
+                cledger_.set_probation_min(s, cfg_.unified_probation_min < 0 ? storage_.ring_slots[s] : cfg_.unified_probation_min);
+            }
+            GGML_LOG_INFO("expert cache: SSD tier unified host policy: probation %g of each class list, at least %s slots, "
+                          "ghost %u decode generations, prompt %s, reseed %s\n", cfg_.unified.probation,
+                cfg_.unified_probation_min < 0 ? "its ring" : std::to_string(cfg_.unified_probation_min).c_str(), cfg_.unified.ghost,
+                cfg_.unified.prompt_lru ? "lru" : "ring", cfg_.unified_reseed == 2 ? "full" : cfg_.unified_reseed == 1 ? "order" : "off");
+        }
         char factor[48];
         if (storage_.factor > 0.0) { snprintf(factor, sizeof(factor), "ring factor %g", storage_.factor); }
         else { snprintf(factor, sizeof(factor), "explicit ring size"); }
@@ -525,6 +536,9 @@ void l2_tier::publish_tables() {
             any_lent_ = any_lent_ || (routed && homes_[layer][expert].storage == expert_storage::lent);
             any_ssd_ = any_ssd_ || ssd;
             // A ring occupant is `ssd` as well: it must reach the worker to get its lease extended.
+            // The unified policy's host hit choice point (design A/B, not decided): with every host expert a
+            // ring occupant, this marks all of them, so every host hit reaches the worker (A). B would leave
+            // the bit clear for a ring occupant and keep the bitmap up to date at each fill and eviction.
             if (ssd && serve_host_ != nullptr) {
                 serve_host_[(size_t) layer*words + size_t(expert/32)] |= 1u << (expert%32);
             }
@@ -701,7 +715,7 @@ bool l2_tier::install_relabel(const install_transaction & tx, const expert_locat
     }
     stats.ring_before = occupants.size();
     const l2_install_plan plan = plan_relabel_install(cledger_, home_slot_, geo_.layer_class, storage_.storage_of,
-        before, tx.host, tx.moves);
+        before, tx.host, tx.moves, unified());
     if (!plan.ok) {
         reason = plan.reason;
         return false;
@@ -788,11 +802,56 @@ bool l2_tier::install_relabel(const install_transaction & tx, const expert_locat
     counters_.install_ring_copy_bytes += stats.ring_copy_bytes;
     stats.demoted = plan.demoted;
     stats.batches = plan.batches;
+    if (unified()) {
+        // every copy completed above: the ring copies of the VRAM promotions can go, the demotions join the rings
+        stats.unified_demoted = (size_t) settle_unified(cledger_, home_slot_, tx.gpu_slots);
+    }
     for (const auto & item : occupants) {
         const int slot = cledger_.slot_of(item[0], item[1]);
         stats.ring_kept += slot >= 0 && cledger_.owns(slot, item[0], item[1]) ? 1 : 0;
     }
     for (int s = 0; s < storage_.storages(); ++s) { stats.ring_after += (size_t) cledger_.ring_occupants(s); }
+    return true;
+}
+
+bool l2_tier::reseed_unified(const std::vector<uint64_t> & counts, const std::vector<std::vector<int32_t>> & vram, bool fill,
+        l2_install_stats & stats, std::string & reason) {
+    GGML_ASSERT(unified() && !worker_running() && mapped_);
+    const auto t0 = std::chrono::steady_clock::now();
+    std::lock_guard<std::mutex> lock(io_mutex_);
+    if (counts.size() < (size_t) geo_.n_layers*(size_t) geo_.n_experts) {
+        return true;   // no profile: the rings keep their contents and order
+    }
+    for (int layer = 0; layer < geo_.n_layers; ++layer) {
+        cledger_.set_done(layer, expert_os::load_acquire(&static_cast<const l2_mailbox *>(mail_host_)[layer].done));
+    }
+    // the host cut's score: selections x the bytes a choice saves reading
+    auto score = [&](int l, int e) {
+        const int cls = geo_.layer_class[l];
+        return cls < 0 ? 0.0 : double(counts[(size_t) l*(size_t) geo_.n_experts + (size_t) e])*double(geo_.class_total_bytes(cls));
+    };
+    std::vector<int> experts_of((size_t) geo_.n_layers, 0);
+    for (int l = 0; l < geo_.n_layers; ++l) { experts_of[(size_t) l] = geo_.layer_class[l] >= 0 ? geo_.experts(l) : 0; }
+    const std::vector<l2_reseed_read> plan = plan_unified_reseed(cledger_, experts_of, vram, score, fill);
+    // distinct slots: one batch of reads is safe; chunks keep the queue's descriptor count small
+    constexpr size_t chunk = 128;
+    for (size_t i = 0; i < plan.size(); i += chunk) {
+        std::vector<l2_read> reads;
+        for (size_t j = i; j < std::min(plan.size(), i + chunk); ++j) {
+            for (int kind = 0; kind < geometry::n_kinds; ++kind) { reads.push_back({plan[j].layer, kind, plan[j].expert, plan[j].slot}); }
+            ++stats.reseed_slices;
+            stats.reseed_bytes += geo_.class_total_bytes(geo_.layer_class[plan[j].layer]);
+        }
+        if (!run_reads(reads, reason, true)) {
+            return false;
+        }
+    }
+    std::string why;
+    if (!cledger_.check(why)) {
+        reason = "the unified reseed broke the ledger: " + why;
+        return false;
+    }
+    stats.reseed_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
     return true;
 }
 
@@ -985,6 +1044,7 @@ void l2_tier::service_layer(int layer, uint32_t seq, const std::vector<int> & id
         if (class_layout()) { cledger_.set_done(other, done); } else { ledger_.set_done(other, done); }
     }
     auto homed = [this](int l, int e) { return wanted(l, e); };
+    if (unified()) { cledger_.set_prompt(item.prompt); }
     l2_service service;
     if (cfg_.early) {
         // a slot an early read filled for this demand is not a ring hit: its read was counted
@@ -1530,6 +1590,16 @@ void l2_tier::report_counters(const char * what) {
         out << ",\"class_ring_slots\":[";
         for (int s = 0; s < storage_.storages(); ++s) { out << (s ? "," : "") << storage_.ring_slots[s]; }
         out << ']';
+    }
+    if (unified()) {
+        const l2_unified_stats & u = cledger_.unified_stats();
+        out << ",\"unified\":{\"hits\":" << u.hits << ",\"fills\":" << u.fills << ",\"mru_fills\":" << u.mru_fills
+            << ",\"probation_fills\":" << u.probation_fills << ",\"prompt_fills\":" << u.prompt_fills
+            << ",\"probation_hits\":" << u.probation_hits << ",\"probation_evicted_unhit\":" << u.probation_evicted_unhit
+            << ",\"evictions\":" << u.evictions << ",\"sunk\":" << u.sunk << ",\"adopted\":" << u.adopted
+            << ",\"dissolved\":" << u.dissolved << ",\"probation_slots\":[";
+        for (int s = 0; s < storage_.storages(); ++s) { out << (s ? "," : "") << cledger_.probation_count(s); }
+        out << "]}";
     }
     out
         << ",\"samples\":[";

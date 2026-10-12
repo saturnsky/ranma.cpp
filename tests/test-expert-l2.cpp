@@ -1087,6 +1087,7 @@ struct reference_unified {
     double q = 0.1;
     uint32_t ghost = 32;
     bool prompt_lru = false;
+    int pmin = 0;
     int experts = 0;
     std::vector<int> layer_storage;
     std::vector<std::vector<int>> order;          // [class] LRU end first
@@ -1095,7 +1096,7 @@ struct reference_unified {
     l2_unified_stats stats;
 
     reference_unified(const std::vector<int> & storage, const std::vector<int> & n, int experts, double q, uint32_t ghost,
-            bool prompt_lru) : q(q), ghost(ghost), prompt_lru(prompt_lru), experts(experts), layer_storage(storage) {
+            bool prompt_lru, int pmin = 0) : q(q), ghost(ghost), prompt_lru(prompt_lru), pmin(pmin), experts(experts), layer_storage(storage) {
         order.resize(n.size());
         slots.resize(n.size());
         for (size_t s = 0; s < n.size(); ++s) {
@@ -1123,7 +1124,7 @@ struct reference_unified {
             o.push_back(slot);
         } else {
             const int n = (int) slots[(size_t) s].size();
-            const size_t p = (size_t) std::min(n, int(q*double(n) + 1e-9));
+            const size_t p = (size_t) std::min(n, std::max(int(q*double(n) + 1e-9), pmin));
             o.insert(o.begin() + (std::ptrdiff_t) std::min(p, o.size()), slot);
         }
     }
@@ -1237,6 +1238,31 @@ static int unified_tests() {
         CHECK(serve({9}).misses == 1 && ledger.order(0)[2] == ledger.slot_of(0, 9) && ledger.check(why));
         printf("PASS: unified policy: misses at the probation point, ghost passes at the MRU end, hits move up\n");
     }
+    // ---- the probation minimum, capped at the class's slots -------------------------------------------
+    {
+        l2_class_ledger ledger = all_ring(2, 32, {0, 0}, {20});
+        ledger.set_unified(policy);
+        ledger.set_probation_min(0, 5);
+        CHECK(ledger.probation_count(0) == 5 && ledger.check(why));
+        CHECK(ledger.service(0, {7}, 1, none).ok && ledger.order(0)[5] == ledger.slot_of(0, 7) && ledger.check(why));
+        ledger.set_probation_min(0, 1);
+        CHECK(ledger.probation_count(0) == 2 && ledger.check(why));   // the share is larger
+        ledger.set_probation_min(0, 50);
+        CHECK(ledger.probation_count(0) == 20 && ledger.check(why));  // capped: the probation point is the MRU end
+        ledger.set_done(0, 1);
+        CHECK(ledger.service(0, {8}, 2, none).ok && ledger.order(0).back() == ledger.slot_of(0, 8) && ledger.check(why));
+        // residents join their ring: an expert at the requested point, a spare at the LRU end
+        l2_class_ledger mixed;
+        mixed.reset(2, 16, {0, 0}, {10}, 3);
+        CHECK(mixed.set_resident(0, 0, 1, 3) && mixed.set_resident(0, 1, -1, -1));
+        for (int slot = 2; slot < 10; ++slot) { CHECK(mixed.make_ring(0, slot)); }
+        mixed.set_unified(policy);
+        mixed.set_probation_min(0, 3);
+        CHECK(mixed.residents_to_ring(l2_place::probation) == 1 && mixed.ring_count(0) == 10 && mixed.check(why));
+        // the spare joined below the expert after it, which moved it one slot up
+        CHECK(mixed.order(0)[4] == 0 && mixed.order(0)[0] == 1 && mixed.slot_of(1, 3) == 0);
+        printf("PASS: unified policy: the probation minimum per class, capped at its slots; residents join the ring\n");
+    }
     // ---- prompt rule ---------------------------------------------------------------------------------
     for (bool prompt_lru : {false, true}) {
         l2_unified_policy p = policy;
@@ -1336,13 +1362,14 @@ static int unified_tests() {
         const std::vector<int> storage = {0, 1, 0, 1};
         const int experts = 24;
         int runs = 0;
-        for (double q : {0.0, 0.1, 0.25}) for (uint32_t k : {1u, 4u, 32u}) for (bool prompt_lru : {false, true}) {
+        for (double q : {0.0, 0.1, 0.25}) for (uint32_t k : {1u, 4u, 32u}) for (bool prompt_lru : {false, true}) for (int pmin : {0, 4}) {
             const std::vector<int> n = {10, 23};
             l2_class_ledger ledger = all_ring(4, experts, storage, n);
             l2_unified_policy p;
             p.on = true; p.probation = q; p.ghost = k; p.prompt_lru = prompt_lru;
             ledger.set_unified(p);
-            reference_unified ref(storage, n, experts, q, k, prompt_lru);
+            for (int c = 0; c < 2; ++c) { ledger.set_probation_min(c, pmin); }
+            reference_unified ref(storage, n, experts, q, k, prompt_lru, pmin);
             uint32_t rng = 99u + 7u*(uint32_t) runs;
             auto next = [&]() { rng = rng*1664525u + 1013904223u; return rng >> 8; };
             std::vector<uint32_t> seq(4, 0u);
@@ -1387,7 +1414,190 @@ static int unified_tests() {
                   ledger.unified_stats().fills);
             ++runs;
         }
-        printf("PASS: unified policy: %d random runs (probation share, ghost K, prompt rule) match the slow reference\n", runs);
+        printf("PASS: unified policy: %d random runs (probation share and minimum, ghost K, prompt rule) match the slow reference\n", runs);
+    }
+    return 0;
+}
+
+// The unified policy's installs on the relabel byte model: no host residents but the demotions of the
+// install, which settle_unified turns into ring occupants; plan_unified_reseed brings each class ring to
+// the best experts of the plan's scores and lays it out in score order.
+static bool unified_install(relabel_world & w, const std::vector<uint64_t> & score, int reseed, l2_install_plan & plan,
+        size_t & reads, int & demoted) {
+    const int E = relabel_world::experts, L = relabel_world::layers;
+    expert_slot_table gs, hs;
+    w.choose(score, gs, hs);
+    hs.assign(L, {});
+    std::vector<int> room = w.layout.host;
+    for (int l = 0; l < L; ++l) {
+        const int c = w.geo.layer_class[l];
+        for (int e = 0; e < E; ++e) {
+            if (w.gpu[l][e] >= 0 && room[c] > 0 && std::find(gs[l].begin(), gs[l].end(), e) == gs[l].end()) {
+                hs[l].push_back(e);
+                --room[c];
+            }
+        }
+    }
+    const install_transaction tx = plan_install(w.geo, gs, hs, w.gpu, w.host, w.vram_caps, w.layout, w.layout, w.spares,
+        {false, w.spare}, true, true);
+    if (!tx.valid) { return w.fail("plan_install: " + tx.reason); }
+    plan = plan_relabel_install(w.ledger, w.home_slot, w.geo.layer_class, w.storage_of, w.host, tx.host, tx.moves, true);
+    if (!plan.ok) { return w.fail("relabel: " + plan.reason); }
+    for (size_t k = 0; k < tx.moves.size(); ++k) {
+        const install_move & m = tx.moves[k];
+        const l2_install_step & st = plan.steps[k];
+        const int s = w.storage_of[m.cls], key = m.layer*E + m.expert;
+        if (m.from.storage == expert_storage::file) {
+            const int slot = m.to.storage == expert_storage::host ? st.dst : st.src;
+            if (st.read) { w.content[s][(size_t) slot] = key; }
+            if (w.content[s][(size_t) slot] != key) { return w.fail("a ring copy of a slot that does not hold the expert"); }
+            w.vram[m.cls][(size_t) m.to.slot] = key;
+        } else if (m.from.storage == expert_storage::vram) {
+            if (w.vram[m.cls][(size_t) m.from.slot] != key) { return w.fail("VRAM model"); }
+            w.content[s][(size_t) st.dst] = key;
+        } else {
+            return w.fail("a host source under the unified policy");
+        }
+    }
+    w.gpu = tx.gpu_slots; w.spares = tx.gpu_spares;
+    demoted = settle_unified(w.ledger, w.home_slot, w.gpu);
+    w.host = host_locations(expert_slot_table(L, std::vector<int32_t>(E, -1)));
+    reads = 0;
+    if (reseed > 0) {
+        auto sc = [&](int l, int e) { return double(score[(size_t) (l*E + e)]); };
+        const auto got = plan_unified_reseed(w.ledger, std::vector<int>(L, E), w.gpu, sc, reseed == 2);
+        for (const auto & r : got) { w.content[(size_t) w.ledger.storage_of(r.layer)][(size_t) r.slot] = r.layer*E + r.expert; }
+        reads = got.size();
+    }
+    // every slot is a ring slot, every occupant holds its bytes, no VRAM resident keeps a ring copy
+    std::string why;
+    if (!w.ledger.check(why)) { return w.fail(why); }
+    for (int s = 0; s < 2; ++s) {
+        for (int slot = 0; slot < w.ledger.slots(s); ++slot) {
+            if (w.ledger.role_of(s, slot) != slot_role::ring) { return w.fail("a slot outside the ring"); }
+            int l = -1, e = -1;
+            if (!w.ledger.occupant(s, slot, l, e)) { continue; }
+            if (w.content[s][(size_t) slot] != l*E + e) { return w.fail("ring occupant bytes"); }
+            if (w.gpu[l][e] >= 0) { return w.fail("a VRAM resident in the ring"); }
+        }
+    }
+    for (int l = 0; l < L; ++l) for (int e = 0; e < E; ++e) {
+        const int c = w.geo.layer_class[l];
+        if (w.gpu[l][e] >= 0 && w.vram[c][(size_t) w.gpu[l][e]] != l*E + e) { return w.fail("VRAM home"); }
+    }
+    if (reseed == 2) {
+        // each class ring holds exactly the best non-VRAM experts it has room for, in score order
+        for (int s = 0; s < 2; ++s) {
+            std::vector<std::pair<uint64_t, int>> cands;
+            for (int l = 0; l < L; ++l) {
+                if (w.ledger.storage_of(l) != s) { continue; }
+                for (int e = 0; e < E; ++e) {
+                    if (w.gpu[l][e] < 0) { cands.push_back({score[(size_t) (l*E + e)], l*E + e}); }
+                }
+            }
+            std::sort(cands.begin(), cands.end(), [](auto a, auto b) { return a.first > b.first; });
+            const size_t keep = std::min(cands.size(), (size_t) w.ledger.ring_count(s));
+            for (size_t i = 0; i < keep; ++i) {
+                if (w.ledger.slot_of(cands[i].second/E, cands[i].second%E) < 0) { return w.fail("a best expert left out"); }
+            }
+            uint64_t last = 0;
+            bool first = true;
+            for (int slot : w.ledger.order(s)) {
+                int l = -1, e = -1;
+                if (!w.ledger.occupant(s, slot, l, e)) {
+                    if (!first) { return w.fail("an empty slot above an occupant"); }
+                    continue;
+                }
+                const uint64_t v = score[(size_t) (l*E + e)];
+                if (!first && v < last) { return w.fail("the ring is not in score order"); }
+                last = v; first = false;
+            }
+        }
+    }
+    return true;
+}
+
+static int unified_install_tests() {
+    const int E = relabel_world::experts;
+    l2_unified_policy policy;
+    policy.on = true; policy.probation = 0.10; policy.ghost = 8;
+    // ---- the start: residents dissolve, the empty ring slots take the next best experts ------------------
+    {
+        relabel_world w({6, 5}, false);
+        w.load(scores({}));
+        w.ledger.set_unified(policy);
+        for (int s = 0; s < 2; ++s) { w.ledger.set_probation_min(s, w.rings[s]); }
+        const int slots0 = w.ledger.slots(0), slots1 = w.ledger.slots(1);
+        l2_install_plan plan;
+        size_t reads = 0;
+        int demoted = 0;
+        CHECK(unified_install(w, scores({}), 2, plan, reads, demoted));
+        CHECK(plan.demoted > 0 && demoted == 0 && reads > 0);
+        CHECK(w.ledger.ring_count(0) == slots0 && w.ledger.ring_count(1) == slots1);
+        CHECK(w.ledger.probation_count(0) == std::max(int(0.1*slots0), 6) && w.ledger.probation_count(1) == std::max(int(0.1*slots1), 5));
+        // the same plan again reads nothing
+        CHECK(unified_install(w, scores({}), 2, plan, reads, demoted) && reads == 0 && plan.reads == 0);
+        printf("PASS: unified install: residents dissolve into the rings, the seed fills the empty slots in score order\n");
+    }
+    // ---- VRAM changes: promotions leave no ring copy, demotions join at the probation point ----------
+    {
+        relabel_world w({6, 5}, false);
+        w.load(scores({}));
+        w.ledger.set_unified(policy);
+        for (int s = 0; s < 2; ++s) { w.ledger.set_probation_min(s, 2); }
+        l2_install_plan plan;
+        size_t reads = 0;
+        int demoted = 0;
+        CHECK(unified_install(w, scores({}), 2, plan, reads, demoted));
+        // layer 0 expert 6 (in the ring) goes to VRAM, expert 5 (in VRAM) comes down; no reseed
+        CHECK(w.ledger.slot_of(0, 6) >= 0 && w.gpu[0][5] >= 0);
+        if (!unified_install(w, scores({{0*E + 6, 1001}}), 0, plan, reads, demoted)) {
+            fprintf(stderr, "FAIL line %d: %s\n", __LINE__, w.error.c_str());
+            return 1;
+        }
+        CHECK(w.gpu[0][6] >= 0 && w.ledger.slot_of(0, 6) < 0 && plan.ring_copies == 1 && plan.reads == 0);
+        CHECK(demoted == 1 && w.ledger.slot_of(0, 5) >= 0 && w.ledger.order(0)[(size_t) w.ledger.probation_count(0)] == w.ledger.slot_of(0, 5));
+        // a reseed in order only keeps the contents and sorts them
+        CHECK(unified_install(w, scores({{0*E + 6, 1001}}), 1, plan, reads, demoted) && reads == 0);
+        printf("PASS: unified install: VRAM promotions leave no ring copy, demotions join the ring at the probation point\n");
+    }
+    // ---- random plans, demands and reseed modes ---------------------------------------------------
+    {
+        for (int round = 0; round < 3; ++round) {
+            relabel_world w({6, 5}, false);
+            w.load(scores({}));
+            w.ledger.set_unified(policy);
+            for (int s = 0; s < 2; ++s) { w.ledger.set_probation_min(s, round); }
+            l2_install_plan plan;
+            size_t reads = 0;
+            int demoted = 0;
+            CHECK(unified_install(w, scores({}), 2, plan, reads, demoted));
+            uint32_t rng = 31u + 17u*(uint32_t) round;
+            auto next = [&]() { rng = rng*1664525u + 1013904223u; return rng >> 8; };
+            for (int step = 0; step < 300; ++step) {
+                if (next()%10 == 0) {
+                    std::vector<uint64_t> sc = scores({});
+                    for (auto & v : sc) { v = 1 + next()%1000; }
+                    CHECK(unified_install(w, sc, int(next()%3), plan, reads, demoted));
+                    continue;
+                }
+                const int layer = int(next()%relabel_world::layers);
+                std::vector<int> ids;
+                for (int i = 0, n = 1 + int(next()%3); i < n; ++i) { ids.push_back(int(next()%E)); }
+                const uint32_t g = ++w.seq[(size_t) layer];
+                w.ledger.set_prompt(next()%4 == 0);
+                auto homed = [&](int l, int e) { return w.gpu[l][e] >= 0; };
+                const l2_service got = w.ledger.service(layer, ids, g, homed);
+                CHECK(got.ok);
+                for (const l2_read & r : got.reads) {
+                    w.content[(size_t) w.ledger.storage_of(r.layer)][(size_t) r.slot] = r.layer*E + r.expert;
+                }
+                w.ledger.set_done(layer, g);
+            }
+            std::string why;
+            CHECK(w.ledger.check(why));
+        }
+        printf("PASS: unified install: random plans, demands and reseed modes keep the rings and the byte model consistent\n");
     }
     return 0;
 }
@@ -1563,6 +1773,7 @@ int main() {
     CHECK(relabel_install_tests() == 0);
     CHECK(early_tests() == 0);
     CHECK(unified_tests() == 0);
+    CHECK(unified_install_tests() == 0);
     printf("OK\n");
     return 0;
 }

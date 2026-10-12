@@ -55,12 +55,22 @@ struct l2_config {
     // Early reads (RANMA_EXPERT_HASH_EARLY ssd|both): the demand of a layer whose route is known before
     // its generation (post_early) is read into the ring by the worker as soon as it is posted.
     bool    early             = false;
+    // The unified host policy (class layout only): the residents of the seed plan
+    // are dissolved into the rings at the start, every host slot is a ring slot from then on, and each
+    // install reseeds the rings from the plan's profile (expert-l2-class-ledger.h, expert-l2-relabel.h).
+    l2_unified_policy unified;
+    int     unified_probation_min = -1;   // probation slots per storage class at least; -1 = its ring slots of the layout
+    int     unified_reseed        = 1;    // per install: 0 = the rings stay, 1 = laid out in score order (default), 2 = also read the best experts
 };
 
 // Whether the staged service is on when RANMA_EXPERT_L2_STAGED is not set. On, it covers the
 // ubatches with more rows than the decode bound, i.e. prompt processing; generation keeps the
 // single wait. It reads the same bytes into the same slots and runs the same kernels.
 static constexpr bool l2_staged_default = true;
+
+// Whether the unified host policy is on. Its gate
+// (class layout, exclusive mode, no early routes, no prefetch, one model) still switches it off where it cannot run.
+static constexpr bool l2_unified_default = true;
 
 // What the tier reports every so often under GGML_EXPERT_LOG_L2.
 struct l2_counters {
@@ -107,6 +117,9 @@ struct l2_install_stats {
     size_t demoted = 0;                                 // residents that stayed in their slot as ring occupants
     size_t ring_before = 0, ring_kept = 0, ring_after = 0;   // ring occupants before, of those still there, after
     int    batches = 0;
+    // the unified policy: demotions from VRAM that joined the rings; the reseed's reads and its host time
+    size_t unified_demoted = 0, reseed_slices = 0, reseed_bytes = 0;
+    double reseed_ms = 0.0;
 };
 
 // Class arena addresses. Lent residents use the common location map. With the class layout the
@@ -192,6 +205,18 @@ public:
     int install_read_slots() const;
     // Class layout: installs run through install_relabel.
     bool relabel_installs() const { return class_layout(); }
+    // The unified host policy (l2_config::unified). Under it install_relabel leaves no host resident: the
+    // demotions from VRAM join the rings at the probation point, and the ring copies of VRAM residents are
+    // emptied; the caller publishes every non-VRAM expert as a file resident (set_homes(..., true)).
+    bool unified() const { return class_layout() && cfg_.unified.on; }
+    int  unified_reseed() const { return cfg_.unified_reseed; }
+    // Brings every class ring to the best experts of `counts` (a profile, [layer*experts + expert]; empty =
+    // no profile: nothing is read and the order stays) that are not VRAM residents of `vram`, reading what it
+    // lacks when `fill`, and lays the rings out in score order. The worker must be stopped and the device idle.
+    bool reseed_unified(const std::vector<uint64_t> & counts, const std::vector<std::vector<int32_t>> & vram, bool fill,
+                        l2_install_stats & stats, std::string & reason);
+    // The least ring slots a storage class has under the unified policy (every slot of its arena).
+    int  class_slots(int s) const { return cledger_.ring_count(s); }
     // Runs the moves of `tx` (host locations `before` -> tx.host) by relabeling slots: reads only the
     // file promotions the rings do not hold, straight into their final slot, copies to and from VRAM
     // through `l1`. The worker must be stopped and the device idle. Publish with set_homes(..., true).
