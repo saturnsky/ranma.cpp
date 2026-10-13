@@ -1795,6 +1795,23 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CACHE_IDLE_SLOTS").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
+        {"--slot0-priority"}, "{off,prefill,strict}",
+        "priority of slot 0 over the other slots: 'off' batches all slots alike, 'prefill' holds the prompts of the "
+        "other slots while slot 0 works on a request, 'strict' also holds their generation while slot 0 generates "
+        "(default: 'prefill')",
+        [](common_params & params, const std::string & value) {
+            if (value == "off") {
+                params.slot0_priority = 0;
+            } else if (value == "prefill") {
+                params.slot0_priority = 1;
+            } else if (value == "strict") {
+                params.slot0_priority = 2;
+            } else {
+                throw std::invalid_argument("unknown value for --slot0-priority: " + value);
+            }
+        }
+    ).set_env("LLAMA_ARG_SLOT0_PRIORITY").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
         {"--context-shift"},
         {"--no-context-shift"},
         string_format("whether to use context shift on infinite text generation (default: %s)", params.ctx_shift ? "enabled" : "disabled"),

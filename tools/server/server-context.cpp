@@ -3705,12 +3705,30 @@ private:
         // track if given slot can be batched with slots already in the batch
         auto & slot_batched = batch.slot_batched;
 
+        // ranma slot 0 priority: while slot 0 works on a request, the prompts of the other slots wait, and with
+        // --slot0-priority strict their generation waits while it generates (see docs/ranma/slot0-priority.md)
+        const server_slot & slot0 = slots.front();
+        const bool slot0_busy = params_base.slot0_priority > 0 && slot0.is_processing() && slot0.state != SLOT_STATE_WAIT_OTHER;
+        auto slot0_holds = [&](const server_slot & slot) {
+            // the other completions of the same request are not held
+            const auto root = [](const server_task & t) { return t.is_child() ? t.id_parent : t.id; };
+            const bool held = slot0_busy && slot.id != slot0.id && root(*slot.task) != root(*slot0.task);
+            if (held) {
+                SLT_DBG(slot, "held by slot 0 priority (slot 0 state = %d)\n", (int) slot0.state);
+            }
+            return held;
+        };
+
         std::vector<server_slot *> generating;
         std::vector<server_slot *> drafting;
 
         // determine which slots are generating and drafting
         iterate(slots, [&](server_slot & slot) {
             if (slot.state != SLOT_STATE_GENERATING) {
+                return;
+            }
+
+            if (params_base.slot0_priority > 1 && slot0.state == SLOT_STATE_GENERATING && slot0_holds(slot)) {
                 return;
             }
 
@@ -3876,6 +3894,11 @@ private:
 
                 // this slot still has a prompt to be processed
                 if (slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_STARTED) {
+                    // an empty batch is never held back
+                    if (batch.size() > 0 && slot0_holds(slot)) {
+                        return;
+                    }
+
                     const auto & input_tokens = slot.task->tokens;
 
                     // used to determine the number of tokens added to the batch for the current slot
