@@ -8,10 +8,13 @@
 #include "gguf.h"
 
 #include "../src/llama-ext.h"
+#include "../ggml/src/ggml-cuda/moe-ffn-had-layout.h"
+
 #include <algorithm>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <map>
 #include <set>
 #include <string>
 #include <vector>
@@ -79,9 +82,10 @@ struct lm_model {
     int64_t  n_expert     = 0;
     int64_t  n_used       = 0;
     int64_t  n_ctx_train  = 0;
-    int      n_moe_layers = 0;
-    uint64_t exps_bytes   = 0;    // every routed expert weight, three kinds
-    uint64_t expert_bytes = 0;    // largest staging slot: one expert of a layer, three kinds, each padded to 256 B
+    int      n_moe_layers = 0;    // routed layers of the trunk (an MTP block of its own is not computed by a prompt step)
+    uint64_t exps_bytes   = 0;    // the routed expert weights of those layers, three kinds
+    uint64_t exps_all     = 0;    // every routed expert weight, MTP blocks included (the expert cache holds them all)
+    uint64_t expert_bytes = 0;    // largest staging slot: one expert of the largest layer, three kinds, each padded to 256 B
     bool     exl3         = true; // every routed expert weight is EXL3
     bool     merged       = false; // gate and up merged (the expert-major op does not take it)
 };
@@ -143,7 +147,9 @@ static bool lm_read_model(const std::string & path, lm_model & m, std::string & 
             paths.emplace_back(sp);
         }
     }
-    std::set<int> layers;
+    std::map<int, uint64_t> layer_bytes;  // trunk and MTP layers: routed bytes
+    std::map<int, uint64_t> layer_expert; // one expert of the layer, each kind padded to 256 B
+    std::set<int> mtp;                    // blocks with NextN tensors (an MTP head)
     for (size_t f = 0; f < paths.size(); ++f) {
         gguf_context_ptr other;
         const gguf_context * g = first.get();
@@ -159,6 +165,10 @@ static bool lm_read_model(const std::string & path, lm_model & m, std::string & 
             const char * name = gguf_get_tensor_name(g, i);
             int  il = -1;
             char kind[16] = {};
+            if (sscanf(name, "blk.%d.%15[a-z_]", &il, kind) == 2 && strcmp(kind, "nextn") == 0) {
+                mtp.insert(il);
+                continue;
+            }
             if (sscanf(name, "blk.%d.ffn_%15[a-z_]", &il, kind) != 2) {
                 continue;
             }
@@ -173,20 +183,51 @@ static bool lm_read_model(const std::string & path, lm_model & m, std::string & 
                 continue;
             }
             const size_t bytes = gguf_get_tensor_size(g, i);
-            m.exps_bytes += bytes;
             m.exl3 = m.exl3 && ggml_is_exl3(gguf_get_tensor_type(g, i));
-            layers.insert(il);
+            layer_bytes[il] += bytes;
+            layer_expert[il] += (bytes/std::max<int64_t>(m.n_expert, 1) + 255)/256*256;
         }
     }
-    m.n_moe_layers = (int) layers.size();
+    for (const auto & [il, bytes] : layer_bytes) {
+        m.exps_all += bytes;
+        if (mtp.count(il) > 0) {
+            continue;
+        }
+        m.exps_bytes  += bytes;
+        m.expert_bytes = std::max(m.expert_bytes, layer_expert[il]);
+        m.n_moe_layers++;
+    }
     if (m.n_moe_layers == 0 || m.n_expert <= 0 || m.n_used <= 0 || m.n_embd <= 0 || m.n_ff_exp <= 0) {
         why = "the model has no routed experts";
         return false;
     }
-    // one expert of a layer, the three kinds each padded as the op pads them (the mean layer: EXL3 layers of one model
-    // share the bits of each kind in the RANMA releases; a larger layer only lowers its staging slots)
-    const uint64_t per_layer = m.exps_bytes/m.n_moe_layers;
-    m.expert_bytes = (per_layer/m.n_expert + 3*255)/256*256;
+    return true;
+}
+
+// the largest rank of the routed expert deltas of a LoRA file (blk.N.ffn_{up,gate,down}_exps.weight.lora_a [k, rank, E])
+// and how many of them the expert-major op cannot take (not F16/F32)
+static bool lm_lora_rank(const std::string & path, int64_t & rank, int & n_other) {
+    ggml_context * meta = nullptr;
+    gguf_init_params gp = { /*.no_alloc =*/ true, /*.ctx =*/ &meta };
+    gguf_context_ptr g(gguf_init_from_file(path.c_str(), gp));
+    if (!g || meta == nullptr) {
+        return false;
+    }
+    ggml_context_ptr meta_ptr(meta);
+    rank    = 0;
+    n_other = 0;
+    for (ggml_tensor * t = ggml_get_first_tensor(meta); t != nullptr; t = ggml_get_next_tensor(meta, t)) {
+        const std::string name = ggml_get_name(t);
+        if (name.find("_exps.weight.lora_") == std::string::npos || name.rfind("blk.", 0) != 0) {
+            continue;
+        }
+        if (t->type != GGML_TYPE_F16 && t->type != GGML_TYPE_F32) {
+            n_other++;
+        }
+        if (name.size() > 7 && name.compare(name.size() - 7, 7, ".lora_a") == 0) {
+            rank = std::max<int64_t>(rank, t->ne[1]);
+        }
+    }
     return true;
 }
 
@@ -220,16 +261,37 @@ void common_layer_mode_apply(common_params & params) {
         off(m.merged ? "merged gate/up experts are not supported" : "only EXL3 routed experts are supported");
         return;
     }
-    if (params.n_parallel > 1 && !params.kv_unified) {
-        LOG_WRN("layer mode: -np %d without a unified KV cache: the attention runs unchunked (one stream only)\n", params.n_parallel);
-    }
-    if (!params.lora_adapters.empty()) {
-        LOG_WRN("%s", "layer mode: a LoRA on expert weights keeps those layers on the per-kind MoE path, whose intermediates "
-            "this sizing does not count\n");
-    }
+    // contexts the no_alloc measurement does not build (a draft or MTP context, a multimodal projector) are not planned
+    // for yet: the mode stays off with them rather than guessing their memory
     if (params.speculative.has_dft() || std::any_of(params.speculative.types.begin(), params.speculative.types.end(),
             [](common_speculative_type t) { return t != COMMON_SPECULATIVE_TYPE_NONE; })) {
-        LOG_WRN("%s", "layer mode: the draft context is not included in the memory check\n");
+        off("a draft model or MTP context is not covered by the memory check yet");
+        return;
+    }
+    if (!params.mmproj.path.empty()) {
+        off("a multimodal projector (--mmproj) is not covered by the memory check yet");
+        return;
+    }
+    // several sequences: the measurement builds the context with every sequence, so its graph is in the plan; without a
+    // unified KV cache a ubatch of several sequences is not chunked (llm_graph_chunk_mask_usable)
+    if (params.n_parallel > 1 && !params.kv_unified) {
+        LOG_WRN("layer mode: -np %d without a unified KV cache: the attention runs unchunked\n", params.n_parallel);
+    }
+    // LoRA on routed experts: the op adds F16/F32 deltas itself (its rank rows are in the scratch below); a delta of
+    // another type keeps its layer on the per-kind MoE path, whose intermediates this plan does not count
+    int64_t max_rank = 0;
+    for (const common_adapter_lora_info & la : params.lora_adapters) {
+        int64_t rank = 0;
+        int n_other = 0;
+        if (!lm_lora_rank(la.path, rank, n_other)) {
+            LOG_WRN("layer mode: cannot read the LoRA %s; its expert deltas are not in the plan\n", la.path.c_str());
+            continue;
+        }
+        max_rank = std::max(max_rank, rank);
+        if (n_other > 0) {
+            LOG_WRN("layer mode: LoRA %s: %d routed expert deltas are neither F16 nor F32: those layers keep the per-kind MoE "
+                "path, whose intermediates the plan does not count\n", la.path.c_str(), n_other);
+        }
     }
     if (params.n_ctx == 0) {
         LOG_WRN("%s", "layer mode: no -c given: sized for the training context; set -c for a tighter plan\n");
@@ -243,7 +305,7 @@ void common_layer_mode_apply(common_params & params) {
     const int64_t l1 = (int64_t) params.expert_l1_mib*(int64_t) MiB;
     // host: what is available now, less what the expert cache will take in host memory (the finite L2, or every expert
     // outside L1 when it is unlimited) and a reserve for the rest of the process and the other programs on the host
-            std::max<int64_t>(0, (int64_t) m.exps_bytes - l1);
+            std::max<int64_t>(0, (int64_t) m.exps_all - l1);
 
     // ---- width: the widest that fits, at most the context of one sequence -------------------------------------------
     // No rate of the link or of the GEMMs enters: the measurement below decides. The upper end is the context of one
@@ -268,10 +330,11 @@ void common_layer_mode_apply(common_params & params) {
     // rows per op chunk: all rows of the width (width * top_k), so that every expert is read once per layer; the op's
     // scratch then grows with the width (about 40 KiB per row on GLM-5.3), which the memory check below counts
     auto rows_of = [=](int64_t w) { return w*m.n_used; };
-    // scratch (HIP pool, op lifetime, kept by the pool): R rows of x (fp16), up, gate (f32), y (f32), plus routing tables
-    auto scratch_bytes = [&](int64_t w) {
-        const int64_t r = std::min<int64_t>(rows_of(w), w*m.n_used);
-        return r*(2*std::max(m.n_embd, m.n_ff_exp) + 8*m.n_ff_exp + 4*m.n_embd + 8) + w*m.n_used*12;
+    // scratch: every device buffer of one launch of the width (moe-ffn-had-layout.h, the op's own layout), with the
+    // rank rows of the LoRA deltas
+    auto scratch_bytes = [&](int64_t w) -> int64_t {
+        return (int64_t) ggml_moe_ffn_had_scratch_bytes(w, m.n_used, rows_of(w), m.n_expert, m.n_embd, m.n_ff_exp,
+            rows_of(w) < w*m.n_used ? LM_STAGE_SLOTS : 0, max_rank);
     };
     // staging (two buffers): only experts with at least stage_min rows of a chunk are staged, at most R/stage_min of them
     auto stage_bytes = [&](int64_t w) -> int64_t {

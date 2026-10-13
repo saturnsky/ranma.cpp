@@ -52,6 +52,14 @@ cache or the first batch (the 500 tokens/s assumption) the wait of slot 0 can ex
 
 The expert cache must be on (`--expert-l1-mib` or `--expert-l2-mib`), the model must be GLM-5.3 (`glm5-next`) with
 EXL3 routed experts (separate gate and up). Anything else logs `layer mode: ...; prompt processing runs as with
---layer-mode off` and runs as `off`. Not covered by the memory check yet: a LoRA on expert weights (those layers keep
-the per-kind MoE path and its intermediates) and a draft or MTP context. With `-np` > 1 and no unified KV cache the
-attention is not chunked.
+--layer-mode off` and runs as `off`. So does a setup with a context the memory check does not build yet: a draft
+model or an MTP context (`-md`, `--spec-type`), or a multimodal projector (`--mmproj`).
+
+- MTP blocks of their own (blocks with `nextn` tensors) are not counted as routed layers of a prompt step; the
+  staging slot is sized for the largest routed layer.
+- LoRA on routed experts: F16/F32 deltas are added by the expert-major op itself; the largest rank of the adapters'
+  routed deltas is read from the files and its rows are part of the op's scratch. Deltas of another type keep their
+  layer on the per-kind MoE path (a warning names the file), whose intermediates the plan does not count.
+- `-np` > 1: the measurement builds the context with every sequence. Without a unified KV cache a ubatch of several
+  sequences runs its attention unchunked (a warning says so).
+- The op's scratch is sized by the same layout function the op uses (`ggml/src/ggml-cuda/moe-ffn-had-layout.h`).
