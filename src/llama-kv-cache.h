@@ -213,7 +213,10 @@ public:
     // under the mask of set_input_kq_mask (cells outside are masked for every token of the ubatch, causal or not).
     // Returns false when this cannot be told cheaply (several streams, chunked or symmetric SWA, no visible cell); the
     // caller then reads all cells.
-    bool get_visible_range(const slot_info & sinfo, const llama_ubatch & ubatch, uint32_t & lo, uint32_t & hi) const;
+    // ranma: [t0, t1) limits this to the tokens t0 .. t1 - 1 of the ubatch (a chunk of query rows); causal also drops the
+    // cells after the largest position of each sequence among them (masked by the causal mask for every one of them)
+    bool get_visible_range(const slot_info & sinfo, const llama_ubatch & ubatch, uint32_t & lo, uint32_t & hi,
+                           uint32_t t0 = 0, uint32_t t1 = UINT32_MAX, bool causal = false) const;
 
     // get views of the current state of the cache
     ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;

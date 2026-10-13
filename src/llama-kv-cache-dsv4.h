@@ -240,6 +240,27 @@ public:
     uint32_t get_k_lo() const;
     uint32_t get_n_write() const;
 
+    // ranma: the raw cells [lo, lo + n) of [get_k_lo(), get_k_lo() + get_n_kv()) that the tokens [t0, t0 + n_tok) of the
+    // current ubatch can see under the causal mask, on 256 cells (a chunk of query rows of a chunked graph,
+    // the raw chunk); every other cell is masked for each of those tokens. The whole window when this cannot be
+    // told cheaply (several streams, no visible cell, a context without a ubatch).
+    void get_chunk_window(uint32_t t0, uint32_t n_tok, uint32_t & lo, uint32_t & n) const;
+
+    // ranma: the context applied a ubatch, so its cells and plans are those of a real ubatch (false for the reserve
+    // context, whose graph has to be sized at the widest)
+    bool has_ubatch() const { return !ubatches_write.empty(); }
+
+    struct chunk_window {
+        uint32_t t0, n_tok; // the token rows of the chunk
+        uint32_t lo, n;     // its raw cells
+    };
+
+    // RANMA_DSV4_RAW_NKV_CHECK=1: aborts unless every cell outside [lo, lo + n) is -inf for the tokens [t0, t0 + n_tok)
+    // of each chunk in the causal mask of the ubatch over the whole raw cache (a host buffer of n_tokens x raw cache
+    // cells per ubatch; for correctness runs only)
+    void check_chunk_windows(const llama_ubatch * ubatch, const std::vector<chunk_window> & windows) const;
+    static bool check_enabled();
+
     ggml_tensor * get_k(ggml_context * ctx, int32_t il) const;
     ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const;
 

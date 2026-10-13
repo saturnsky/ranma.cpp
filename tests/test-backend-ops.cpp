@@ -10312,6 +10312,13 @@ struct test_flash_attn_ext_large_logits : public test_flash_attn_ext {
 // err() fails when the two halves differ on either backend, besides the usual comparison with the CPU.
 // compare = false (perf, TBO_DSV4_RAW_NKV=1): only the window; one timed repetition is the whole chain from the
 // top-k mask to the attention.
+//
+// chunk > 0 (the raw chunk): the query rows are split into chunks of chunk tokens as in the chunked graph of
+// deepseek4.cpp. Every chunk reads only the raw cells its tokens can see (the cells of the positions from the window
+// behind its first token to its last token, on 256 cells, inside [k_lo, k_lo + n_raw)) and, with chunk_comp, only the
+// compressed rows visible to its last token (on 256 rows, at least 256, at most n_comp); its K is [raw window |
+// compressed rows] concatenated, its masks are those columns of the masks of the ubatch (the top-k mask made at the
+// width of the chunk). The outputs of the chunks are joined; compare checks them against the whole raw cache.
 struct test_dsv4_raw_attn : public test_case {
     const int64_t hs;
     const int64_t nh;
@@ -10325,8 +10332,26 @@ struct test_dsv4_raw_attn : public test_case {
     const int64_t n_swa;
     const int64_t top_k;
     const bool    compare;
+    const int64_t chunk;
+    const bool    chunk_comp;
+    // S2 probe (TBO_S2_PROBE=1), timing only: part repeats one group of the chain (0 all, 1 FA, 2 masks, 3 K concat,
+    // 4 output join; the whole chain still runs once per graph, see make_test_cases_perf); comp_first puts the
+    // compressed rows before the raw window; gqa_kv > 1 hands FA a K view of gqa_kv heads with stride 0 (GQA 64/gqa_kv);
+    // tile sets GGML_HIP_FATTN_TILE512 for this case ("" = default dispatch)
+    int         part       = 0;
+    bool        comp_first = false;
+    int64_t     gqa_kv     = 1;
+    std::string tile;
 
     std::vector<ggml_tensor *> chain;
+    std::vector<ggml_tensor *> fa_nodes, mask_nodes, kcat_nodes, join_nodes;
+
+    // a chunk of query rows [i0, i0 + n): its raw window [lo, lo + nr) and compressed width w
+    struct chunk_part {
+        int64_t i0, n;
+        int64_t lo, nr;
+        int64_t w;
+    };
 
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
@@ -10337,8 +10362,14 @@ struct test_dsv4_raw_attn : public test_case {
         std::ostringstream ss;
         ss << "kind=" << (csa ? "csa" : "hca") << ",hs=" << hs << ",nh=" << nh << ",n_tokens=" << n_tokens << ",p0=" << p0
            << ",raw_cache=" << n_raw_cache << ",k_lo=" << k_lo << ",n_raw=" << n_raw << ",n_comp=" << n_comp
-           << ",k=" << (joint_view() ? "view" : "concat") << ",n_swa=" << n_swa << ",top_k=" << top_k
+           << ",k=" << (is_chunked() ? "chunk" : joint_view() ? "view" : "concat") << ",n_swa=" << n_swa << ",top_k=" << top_k
            << ",compare=" << compare;
+        if (is_chunked()) {
+            ss << ",chunk=" << chunk << ",chunk_comp=" << chunk_comp;
+        }
+        if (part != 0 || comp_first || gqa_kv != 1 || !tile.empty()) {
+            ss << ",part=" << part << ",comp_first=" << comp_first << ",gqa_kv=" << gqa_kv << ",tile=" << (tile.empty() ? "def" : tile);
+        }
         return ss.str();
     }
 
@@ -10359,7 +10390,7 @@ struct test_dsv4_raw_attn : public test_case {
         const double e_a = nmse(a, a + h, h);
         const double e_b = nmse(b, b + h, h);
         if (e_a > 1e-6 || e_b > 1e-6) {
-            printf("[window differs from the whole raw cache: NMSE %.3g, %.3g] ", e_a, e_b);
+            printf("[%s differs from the whole raw cache: NMSE %.3g, %.3g] ", is_chunked() ? "chunk windows" : "window", e_a, e_b);
             return 1.0;
         }
 
@@ -10370,18 +10401,82 @@ struct test_dsv4_raw_attn : public test_case {
 
     std::vector<ggml_tensor *> perf_nodes(ggml_tensor * out) override {
         GGML_UNUSED(out);
-        return chain;
+        switch (part) {
+            case 1:  return fa_nodes;
+            case 2:  return mask_nodes;
+            case 3:  return kcat_nodes;
+            case 4:  return join_nodes;
+            default: return chain;
+        }
     }
 
-    int perf_max_reps() override { return 3; }
+    int perf_max_reps() override { return part != 0 ? 9 : 3; }
 
     test_dsv4_raw_attn(bool csa, int64_t n_tokens, int64_t p0, int64_t n_raw_cache, int64_t k_lo, int64_t n_raw,
                        int64_t n_comp, bool compare, int64_t hs = 512, int64_t nh = 64, int64_t n_swa = 128,
-                       int64_t top_k = 512)
+                       int64_t top_k = 512, int64_t chunk = 0, bool chunk_comp = true)
         : hs(hs), nh(nh), n_tokens(n_tokens), p0(p0), n_raw_cache(n_raw_cache), k_lo(k_lo), n_raw(n_raw), n_comp(n_comp),
-          csa(csa), n_swa(n_swa), top_k(top_k), compare(compare) {
+          csa(csa), n_swa(n_swa), top_k(top_k), compare(compare), chunk(chunk), chunk_comp(chunk_comp) {
         GGML_ASSERT(k_lo >= 0 && n_raw > 0 && k_lo + n_raw <= n_raw_cache);
         GGML_ASSERT(!csa || top_k <= n_comp);
+        GGML_ASSERT(chunk >= 0);
+        for (const auto & c : parts()) {
+            // the top-k rows of a token are drawn below the width of its chunk (the indexer of a chunk scores only those)
+            GGML_ASSERT(!csa || top_k <= c.w);
+        }
+    }
+
+    bool is_chunked() const {
+        return chunk > 0 && chunk < n_tokens;
+    }
+
+    // the chunks of the query rows (one over the whole window without chunk), as get_chunk_window and the compressed
+    // widths of deepseek4.cpp
+    std::vector<chunk_part> parts() const {
+        std::vector<chunk_part> res;
+        if (!is_chunked()) {
+            res.push_back({ 0, n_tokens, k_lo, n_raw, n_comp });
+            return res;
+        }
+
+        const int64_t n_align = 256;
+        for (int64_t i0 = 0; i0 < n_tokens; i0 += chunk) {
+            const int64_t n    = std::min(chunk, n_tokens - i0);
+            const int64_t pmin = p0 + i0;
+            const int64_t pmax = p0 + i0 + n - 1;
+
+            // the cells some token of the chunk sees: p > pmin - n_swa and p <= pmax
+            int64_t c_lo = INT64_MAX;
+            int64_t c_hi = 0;
+            for (int64_t c = 0; c < n_raw_cache; ++c) {
+                const int64_t p = cell_pos(c);
+                if (p >= 0 && p > pmin - n_swa && p <= pmax) {
+                    c_lo = std::min(c_lo, c);
+                    c_hi = c + 1;
+                }
+            }
+
+            int64_t lo = k_lo;
+            int64_t hi = k_lo + n_raw;
+            if (c_lo < c_hi) {
+                const int64_t a = std::max(k_lo, c_lo/n_align*n_align);
+                const int64_t b = std::min(k_lo + n_raw, (c_hi + n_align - 1)/n_align*n_align);
+                if (a < b) {
+                    lo = a;
+                    hi = b;
+                }
+            }
+
+            int64_t w = n_comp;
+            if (chunk_comp) {
+                const int64_t v = std::min((pmax + 1)/ratio(), n_comp);
+                w = std::min(n_comp, std::max((v + n_align - 1)/n_align*n_align, n_align));
+            }
+
+            res.push_back({ i0, n, lo, hi - lo, w });
+        }
+
+        return res;
     }
 
     bool joint_view() const {
@@ -10392,36 +10487,100 @@ struct test_dsv4_raw_attn : public test_case {
         return csa ? 4 : 128;
     }
 
-    // the raw K of [lo, lo + n) followed by the compressed K, as get_k_joint / ggml_concat in deepseek4.cpp
-    ggml_tensor * build_k(ggml_context * ctx, ggml_tensor * joint, int64_t lo, int64_t n) {
-        if (lo + n == n_raw_cache) {
+    // the raw K of [lo, lo + n) followed by the first nc compressed K rows, as get_k_joint / ggml_concat in deepseek4.cpp
+    // (a chunk always concatenates)
+    ggml_tensor * build_k(ggml_context * ctx, ggml_tensor * joint, int64_t lo, int64_t n, int64_t nc, bool concat = false) {
+        if (lo + n == n_raw_cache && nc == n_comp && !concat) {
             return ggml_view_3d(ctx, joint, hs, n + n_comp, 1, joint->nb[1], joint->nb[1]*(n + n_comp), joint->nb[1]*lo);
         }
 
-        ggml_tensor * raw  = ggml_view_3d(ctx, joint, hs, n,      1, joint->nb[1], joint->nb[1]*n,      joint->nb[1]*lo);
-        ggml_tensor * comp = ggml_view_3d(ctx, joint, hs, n_comp, 1, joint->nb[1], joint->nb[1]*n_comp, joint->nb[1]*n_raw_cache);
+        ggml_tensor * raw  = ggml_view_3d(ctx, joint, hs, n,  1, joint->nb[1], joint->nb[1]*n,  joint->nb[1]*lo);
+        ggml_tensor * comp = ggml_view_3d(ctx, joint, hs, nc, 1, joint->nb[1], joint->nb[1]*nc, joint->nb[1]*n_raw_cache);
 
-        ggml_tensor * k = ggml_concat(ctx, raw, comp, 1);
+        ggml_tensor * k = concat && comp_first ? ggml_concat(ctx, comp, raw, 1) : ggml_concat(ctx, raw, comp, 1);
         chain.push_back(k);
+        kcat_nodes.push_back(k);
         return k;
     }
 
     ggml_tensor * build_attn(ggml_context * ctx, ggml_tensor * q, ggml_tensor * k, ggml_tensor * raw_mask,
-                             ggml_tensor * comp_mask, ggml_tensor * sinks) {
-        ggml_tensor * mask = ggml_concat(ctx, raw_mask, comp_mask, 0);
+                             ggml_tensor * comp_mask, ggml_tensor * sinks, bool cf = false) {
+        ggml_tensor * mask = cf ? ggml_concat(ctx, comp_mask, raw_mask, 0) : ggml_concat(ctx, raw_mask, comp_mask, 0);
         chain.push_back(mask);
+        mask_nodes.push_back(mask);
 
+        if (gqa_kv > 1) {
+            // a stride-0 head dimension: made as one head, then widened (the size check of a view assumes no overlap)
+            k = ggml_view_3d(ctx, k, k->ne[0], k->ne[1], 1, k->nb[1], k->nb[1]*k->ne[1], 0);
+            k->ne[2] = gqa_kv;
+            k->nb[2] = 0;
+        }
         ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, k, mask, 1.0f/sqrtf((float) hs), 0.0f, 0.0f);
         ggml_flash_attn_ext_add_sinks(out, sinks);
         ggml_flash_attn_ext_set_n_kv_max(out, csa ? (int32_t) (std::min(raw_mask->ne[0], n_swa) + top_k) : 0);
         ggml_prec_set_acc(out, GGML_PREC_F32);
         chain.push_back(out);
+        fa_nodes.push_back(out);
 
         return out;
     }
 
+    // build_top_k_mask over the prefix mask [w, n] of the rows [i0, i0 + n): -inf except the top-k rows of each token,
+    // then the causal compressed mask on top; the prefix itself for HCA
+    ggml_tensor * build_comp_mask(ggml_context * ctx, ggml_tensor * prefix, ggml_tensor * top_k_ids, int64_t i0) {
+        if (!csa) {
+            return prefix;
+        }
+
+        const int64_t n = prefix->ne[1];
+
+        ggml_tensor * all = ggml_fill(ctx, prefix, -INFINITY);
+        chain.push_back(all);
+        mask_nodes.push_back(all);
+        all = ggml_view_4d(ctx, all, 1, all->ne[0], all->ne[1], all->ne[3], all->nb[0], all->nb[1], all->nb[2], 0);
+
+        ggml_tensor * ids = ggml_view_4d(ctx, top_k_ids, top_k, n, 1, 1,
+                top_k_ids->nb[1], top_k_ids->nb[1]*n, top_k_ids->nb[1]*n, top_k_ids->nb[1]*i0);
+
+        ggml_tensor * zeros = ggml_fill(ctx, ggml_new_tensor_4d(ctx, GGML_TYPE_F16, 1, top_k, n, 1), 0.0f);
+        chain.push_back(zeros);
+        mask_nodes.push_back(zeros);
+
+        ggml_tensor * sel = ggml_set_rows(ctx, all, zeros, ids);
+        chain.push_back(sel);
+        mask_nodes.push_back(sel);
+        sel = ggml_view_4d(ctx, sel, sel->ne[1], sel->ne[2], 1, sel->ne[3], sel->nb[2], sel->nb[3], sel->nb[3], 0);
+
+        ggml_tensor * res = ggml_add(ctx, sel, prefix);
+        chain.push_back(res);
+        mask_nodes.push_back(res);
+
+        return res;
+    }
+
+    // the columns [c0, c0 + nc) of the rows [i0, i0 + n) of a [ne0, n_tokens] mask, contiguous
+    ggml_tensor * mask_part(ggml_context * ctx, ggml_tensor * m, int64_t c0, int64_t nc, int64_t i0, int64_t n) {
+        if (c0 == 0 && nc == m->ne[0] && i0 == 0 && n == m->ne[1]) {
+            return m;
+        }
+        ggml_tensor * v = ggml_cont(ctx, ggml_view_4d(ctx, m, nc, n, 1, 1, m->nb[1], m->nb[1]*n, m->nb[1]*n,
+                m->nb[1]*i0 + m->nb[0]*c0));
+        chain.push_back(v);
+        mask_nodes.push_back(v);
+        return v;
+    }
+
     ggml_tensor * build_graph(ggml_context * ctx) override {
         chain.clear();
+        fa_nodes.clear();
+        mask_nodes.clear();
+        kcat_nodes.clear();
+        join_nodes.clear();
+#ifdef _WIN32
+        _putenv_s("GGML_HIP_FATTN_TILE512", tile.c_str());
+#else
+        setenv("GGML_HIP_FATTN_TILE512", tile.c_str(), 1);
+#endif
 
         ggml_tensor * joint = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, hs, n_raw_cache + n_comp);
         ggml_set_name(joint, "joint");
@@ -10435,43 +10594,50 @@ struct test_dsv4_raw_attn : public test_case {
         // the host masks of the model: compare builds the whole raw mask and takes the window out of it
         ggml_tensor * raw_mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, compare ? n_raw_cache : n_raw, n_tokens, 1, 1);
         ggml_set_name(raw_mask, "raw_mask");
+        const int64_t c0 = compare ? 0 : k_lo; // the cell of column 0 of raw_mask
 
         ggml_tensor * comp_mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, n_comp, n_tokens, 1, 1);
         ggml_set_name(comp_mask, "comp_mask");
 
+        ggml_tensor * top_k_ids = nullptr;
         if (csa) {
-            // build_top_k_mask: -inf except the top-k rows of each token, then the causal compressed mask on top
-            ggml_tensor * top_k_ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, top_k, n_tokens);
+            top_k_ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, top_k, n_tokens);
             ggml_set_name(top_k_ids, "top_k");
-
-            ggml_tensor * all = ggml_fill(ctx, comp_mask, -INFINITY);
-            chain.push_back(all);
-            all = ggml_view_4d(ctx, all, 1, all->ne[0], all->ne[1], all->ne[3], all->nb[0], all->nb[1], all->nb[2], 0);
-
-            ggml_tensor * ids = ggml_view_4d(ctx, top_k_ids, top_k, n_tokens, 1, 1,
-                    top_k_ids->nb[1], top_k_ids->nb[1]*n_tokens, top_k_ids->nb[1]*n_tokens, 0);
-
-            ggml_tensor * zeros = ggml_fill(ctx, ggml_new_tensor_4d(ctx, GGML_TYPE_F16, 1, top_k, n_tokens, 1), 0.0f);
-            chain.push_back(zeros);
-
-            ggml_tensor * sel = ggml_set_rows(ctx, all, zeros, ids);
-            chain.push_back(sel);
-            sel = ggml_view_4d(ctx, sel, sel->ne[1], sel->ne[2], 1, sel->ne[3], sel->nb[2], sel->nb[3], sel->nb[3], 0);
-
-            comp_mask = ggml_add(ctx, sel, comp_mask);
-            chain.push_back(comp_mask);
         }
 
-        ggml_tensor * win_mask = raw_mask;
-        if (compare) {
-            win_mask = ggml_cont(ctx, ggml_view_4d(ctx, raw_mask, n_raw, n_tokens, 1, 1,
-                    raw_mask->nb[1], raw_mask->nb[2], raw_mask->nb[3], raw_mask->nb[0]*k_lo));
+        // the compressed mask of the whole ubatch, made once
+        ggml_tensor * comp_all = nullptr;
+        auto comp_whole = [&]() {
+            if (comp_all == nullptr) {
+                comp_all = build_comp_mask(ctx, comp_mask, top_k_ids, 0);
+            }
+            return comp_all;
+        };
+
+        ggml_tensor * out = nullptr;
+        if (!is_chunked()) {
+            ggml_tensor * win_mask = mask_part(ctx, raw_mask, k_lo - c0, n_raw, 0, n_tokens);
+            out = build_attn(ctx, q, build_k(ctx, joint, k_lo, n_raw, n_comp), win_mask, comp_whole(), sinks);
+        } else {
+            for (const auto & c : parts()) {
+                ggml_tensor * qc = ggml_view_3d(ctx, q, hs, c.n, nh, q->nb[1], q->nb[2], q->nb[1]*c.i0);
+
+                ggml_tensor * raw_c  = mask_part(ctx, raw_mask, c.lo - c0, c.nr, c.i0, c.n);
+                ggml_tensor * comp_c = build_comp_mask(ctx, mask_part(ctx, comp_mask, 0, c.w, c.i0, c.n), top_k_ids, c.i0);
+
+                ggml_tensor * oc = build_attn(ctx, qc, build_k(ctx, joint, c.lo, c.nr, c.w, true), raw_c, comp_c, sinks, comp_first);
+                if (out == nullptr) {
+                    out = oc;
+                } else {
+                    out = ggml_concat(ctx, out, oc, 2);
+                    chain.push_back(out);
+                    join_nodes.push_back(out);
+                }
+            }
         }
 
-        ggml_tensor * out = build_attn(ctx, q, build_k(ctx, joint, k_lo, n_raw), win_mask, comp_mask, sinks);
-
         if (compare) {
-            ggml_tensor * out_all = build_attn(ctx, q, build_k(ctx, joint, 0, n_raw_cache), raw_mask, comp_mask, sinks);
+            ggml_tensor * out_all = build_attn(ctx, q, build_k(ctx, joint, 0, n_raw_cache, n_comp), raw_mask, comp_whole(), sinks);
             out = ggml_concat(ctx, out_all, out, 3);
         }
 
@@ -10525,20 +10691,130 @@ struct test_dsv4_raw_attn : public test_case {
                 }
                 ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(ggml_fp16_t));
             } else if (strcmp(t->name, "top_k") == 0) {
-                // distinct rows per token, the visible ones first (as the indexer picks them), then hidden ones
+                // distinct rows per token, the visible ones first (as the indexer picks them), then hidden ones below the
+                // compressed width of the token's chunk
                 std::vector<int32_t> data(top_k*n_tokens);
                 std::vector<int32_t> rows(n_comp);
+                const std::vector<chunk_part> cp = parts();
                 for (int64_t i = 0; i < n_tokens; ++i) {
-                    const int64_t n_vis = std::min<int64_t>((p0 + i + 1)/ratio(), n_comp);
+                    const int64_t w     = is_chunked() ? cp[i/chunk].w : n_comp;
+                    const int64_t n_vis = std::min<int64_t>((p0 + i + 1)/ratio(), w);
                     for (int64_t j = 0; j < n_comp; ++j) {
                         rows[j] = (int32_t) j;
                     }
                     std::shuffle(rows.begin(), rows.begin() + n_vis, gen);
-                    std::shuffle(rows.begin() + n_vis, rows.end(), gen);
+                    std::shuffle(rows.begin() + n_vis, rows.begin() + w, gen);
                     std::copy(rows.begin(), rows.begin() + top_k, data.begin() + i*top_k);
                 }
                 ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(int32_t));
             } else if (t->type == GGML_TYPE_F32 || t->type == GGML_TYPE_F16) {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
+// ranma S2 probe (TBO_S2_PROBE=1), timing upper bound only: the HCA attention of n_tokens tokens when every block of
+// blk query tokens gets its own K of only the cells it can see, gathered beforehand: the raw window of the block
+// (blk + n_swa - 1 cells) followed by the compressed rows visible to its last token (ratio 128), padded with masked
+// cells to a multiple of 256. Q [hs, blk, nh, n_blk], K [hs, w, 1, n_blk] (ne[3] = block), mask [w, blk, 1, n_blk].
+// The K values are random (not a real gather); the mask has the visibility of the real tokens, so the FA does the
+// same work as a kernel that walks only the visible window. The gather itself is not timed.
+struct test_dsv4_win_fa : public test_case {
+    const int64_t hs;
+    const int64_t nh;
+    const int64_t n_tokens;
+    const int64_t blk;
+    const int64_t n_swa;
+    const int64_t ratio;
+    const int64_t gqa_kv;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "DSV4_WIN_FA";
+    }
+
+    std::string vars() override {
+        std::ostringstream ss;
+        ss << "hs=" << hs << ",nh=" << nh << ",n_tokens=" << n_tokens << ",blk=" << blk << ",w=" << width()
+           << ",n_blk=" << n_blk() << ",gqa_kv=" << gqa_kv;
+        return ss.str();
+    }
+
+    int64_t n_blk() const { return (n_tokens + blk - 1)/blk; }
+    int64_t n_raw() const { return blk + n_swa - 1; }
+    int64_t n_cmp() const { return (n_blk()*blk)/ratio; }
+    int64_t width() const { return (n_raw() + n_cmp() + 255)/256*256; }
+
+    double max_nmse_err() override { return 5e-4; }
+
+    int perf_max_reps() override { return 16; }
+
+    test_dsv4_win_fa(int64_t n_tokens, int64_t blk, int64_t gqa_kv = 1, int64_t hs = 512, int64_t nh = 64,
+                     int64_t n_swa = 128, int64_t ratio = 128)
+        : hs(hs), nh(nh), n_tokens(n_tokens), blk(blk), n_swa(n_swa), ratio(ratio), gqa_kv(gqa_kv) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+#ifdef _WIN32
+        _putenv_s("GGML_HIP_FATTN_TILE512", "");
+#else
+        setenv("GGML_HIP_FATTN_TILE512", "", 1);
+#endif
+        const int64_t w = width();
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hs, blk, nh, n_blk());
+        ggml_set_name(q, "q");
+        ggml_tensor * k = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, hs, w, 1, n_blk());
+        ggml_set_name(k, "k");
+        ggml_tensor * m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, w, blk, 1, n_blk());
+        ggml_set_name(m, "mask");
+        ggml_tensor * sinks = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, nh);
+        ggml_set_name(sinks, "s");
+
+        ggml_tensor * kv = k;
+        if (gqa_kv > 1) {
+            // a stride-0 head dimension: made as one head, then widened (the size check of a view assumes no overlap)
+            kv = ggml_view_4d(ctx, k, hs, w, 1, n_blk(), k->nb[1], k->nb[2], k->nb[3], 0);
+            kv->ne[2] = gqa_kv;
+            kv->nb[2] = 0;
+        }
+        ggml_tensor * out = ggml_flash_attn_ext(ctx, q, kv, kv, m, 1.0f/sqrtf((float) hs), 0.0f, 0.0f);
+        ggml_flash_attn_ext_add_sinks(out, sinks);
+        ggml_flash_attn_ext_set_n_kv_max(out, 0);
+        ggml_prec_set_acc(out, GGML_PREC_F32);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->op != GGML_OP_NONE) {
+                continue;
+            }
+            if (strcmp(t->name, "s") == 0) {
+                init_tensor_uniform(t, -4.0f, 4.0f);
+            } else if (strcmp(t->name, "mask") == 0) {
+                const int64_t w = width();
+                std::vector<ggml_fp16_t> data(w*blk*n_blk());
+                const ggml_fp16_t keep = ggml_fp32_to_fp16(0.0f);
+                const ggml_fp16_t drop = ggml_fp32_to_fp16(-INFINITY);
+                for (int64_t b = 0; b < n_blk(); ++b) {
+                    for (int64_t i = 0; i < blk; ++i) {
+                        const int64_t p1 = b*blk + i;
+                        ggml_fp16_t * row = data.data() + (b*blk + i)*w;
+                        for (int64_t c = 0; c < w; ++c) {
+                            bool vis = false;
+                            if (c < n_raw()) {
+                                const int64_t p = b*blk - (n_swa - 1) + c;
+                                vis = p >= 0 && p <= p1 && p1 - p < n_swa;
+                            } else if (c < n_raw() + n_cmp()) {
+                                vis = c - n_raw() < (p1 + 1)/ratio;
+                            }
+                            row[c] = vis ? keep : drop;
+                        }
+                    }
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(ggml_fp16_t));
+            } else {
                 init_tensor_uniform(t);
             }
         }
@@ -14107,6 +14383,29 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_dsv4_raw_attn(csa,  1, 256 + 32, 1024, 256, 256, 256, true, 512, 8, 32, 64));
     }
 
+    // TBO_S2_PROBE=1: the chunk windows with a stride-0 K of 8 heads (GQA 8) and with the compressed rows first
+    if (getenv("TBO_S2_PROBE") != nullptr && atoi(getenv("TBO_S2_PROBE")) != 0) {
+        for (bool csa : { true, false }) {
+            for (int v = 0; v < 3; ++v) {
+                auto * t = new test_dsv4_raw_attn(csa, 700, 1000, 2048, 768, 1024, csa ? 768 : 512, true, 512, 64, 128, 256, 256, true);
+                t->gqa_kv     = v != 1 ? 8 : 1;
+                t->comp_first = v != 0;
+                test_cases.emplace_back(t);
+            }
+        }
+    }
+    // the chunk windows of the raw chunk against the whole raw cache (last args: chunk, chunk_comp):
+    //   700 tokens at p0 1000 in a 2048-cell cache, ubatch window [768, 1792), chunks of 256 -> raw windows [768, 1280),
+    //   [1024, 1536), [1280, 1792), compressed widths 512 of 768 (CSA) / 256 of 512 (HCA); also with the whole width
+    //   700 tokens from 0 in a 768-cell cache: [0, 256), [0, 512), [256, 768) (the last ends at the end of the raw cache)
+    //   300 tokens at p0 544 in chunks of 100 (the last window wider than the others)
+    for (bool csa : { true, false }) {
+        test_cases.emplace_back(new test_dsv4_raw_attn(csa, 700, 1000, 2048, 768, 1024, csa ? 768 : 512, true, 512, 8, 32, 64, 256, true));
+        test_cases.emplace_back(new test_dsv4_raw_attn(csa, 700, 1000, 2048, 768, 1024, csa ? 768 : 512, true, 512, 8, 32, 64, 256, false));
+        test_cases.emplace_back(new test_dsv4_raw_attn(csa, 700,    0,  768,   0,  768, 256, true, 512, 8, 32, 64, 256, true));
+        test_cases.emplace_back(new test_dsv4_raw_attn(csa, 300,  544, 1024, 512,  512, 256, true, 512, 8, 32, 64, 100, true));
+    }
+
     // sparse attn (qwen4 shape - gqa 12)
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 4096,  1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false,  512));
     test_cases.emplace_back(new test_flash_attn_ext(256, 256, 2, {12, 1}, 8192, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false,  512));
@@ -14454,6 +14753,57 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     }
 
 
+    // TBO_S2_PROBE=1: falsification probes for the DS4F layer-mode attention. One process, the list twice in the same order. For the 7305-token chunk-2048 chain of one CSA / HCA layer:
+    //   (1) the chain split into FA / masks / K concat / join: part p repeats only that group 8 more times on top of one
+    //       whole chain, so group = (9*t_part - t_all)/8
+    //   (2) CSA and HCA: the chain with the compressed rows first (FA can then stop at the last visible raw tile); HCA: the
+    //       FA over only the visible cells of each block of blk queries (DSV4_WIN_FA, upper bound)
+    //   (3) FA only with other tiles: K as gqa_kv heads of stride 0 (GQA 8 -> RDNA4 WMMA prefill), dense tile shapes
+    //       <ncols2>x<cols per block> forced by GGML_HIP_FATTN_TILE512; then the whole chain at chunk 512/1024/2048
+    //       (CSA with the whole compressed width: top-k 512 needs it below chunk 2048)
+    // TBO_S2_PROBE_SET selects the groups (default "123").
+    if (getenv("TBO_S2_PROBE") != nullptr && atoi(getenv("TBO_S2_PROBE")) != 0) {
+        const char * sel_env = getenv("TBO_S2_PROBE_SET");
+        const std::string sel = sel_env ? sel_env : "123";
+        auto raw = [](bool csa, int64_t chunk, bool chunk_comp, int part, bool comp_first, int64_t gqa_kv, const char * tile) {
+            auto * t = new test_dsv4_raw_attn(csa, 7305, 0, 16384, 0, 7424, csa ? 2048 : 256, false, 512, 64, 128, 512, chunk, chunk_comp);
+            t->part = part;
+            t->comp_first = comp_first;
+            t->gqa_kv = gqa_kv;
+            t->tile = tile;
+            return t;
+        };
+        for (int pass = 0; pass < 2; ++pass) {
+            for (bool csa : { true, false }) {
+                if (sel.find('1') != std::string::npos) {
+                    for (int part : { 0, 1, 2, 3, 4 }) {
+                        test_cases.emplace_back(raw(csa, 2048, true, part, false, 1, ""));
+                    }
+                }
+                if (sel.find('2') != std::string::npos) {
+                    test_cases.emplace_back(raw(csa, 2048, true, 0, true, 1, ""));
+                    test_cases.emplace_back(raw(csa, 2048, true, 1, true, 1, ""));
+                }
+                if (sel.find('2') != std::string::npos && !csa) {
+                    for (int64_t blk : { 32, 64, 128, 256 }) {
+                        test_cases.emplace_back(new test_dsv4_win_fa(7305, blk));
+                    }
+                    test_cases.emplace_back(new test_dsv4_win_fa(7305, 128, 8));
+                }
+                if (sel.find('3') != std::string::npos) {
+                    test_cases.emplace_back(raw(csa, 2048, true, 1, false, 8, ""));
+                    for (const char * tile : { "8x8", "8x16", "8x32", "16x16", "16x32", "32x32" }) {
+                        test_cases.emplace_back(raw(csa, 2048, true, 1, false, 1, tile));
+                    }
+                    for (int64_t chunk : { 512, 1024, 2048 }) {
+                        test_cases.emplace_back(raw(csa, chunk, !csa, 0, false, 1, ""));
+                    }
+                }
+            }
+        }
+        return test_cases;
+    }
+
     // TBO_DSV4_RAW_NKV=1: is the raw width most of the DS4F layer-mode loss? The raw attention chain (top-k mask, mask
     // concat, K concat or view, FA) of one DS4F CSA / HCA layer (64 heads of 512, n_swa 128, top-k 512; compressed
     // plan width 2048 / 256 for 7305 tokens at ctx 16384) for the 7305-token prompt at several raw widths:
@@ -14463,6 +14813,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     //   raw 7424  view  - the same width without the K copy
     //   raw 2304  view  - a 2304-cell ring (cost of the n_ubatch 2048 width only, not a valid cache for 7305 tokens)
     //   plus the n_ubatch 2048 case itself: one 2048-token ubatch at p0 4096 in a 2304-cell ring
+    //   raw 7424 in chunks of 2048 (raw chunk 2048): raw windows 2048 / 2304 / 2304 / 1536, compressed
+    //     widths 512 / 1024 / 1536 / 2048 (CSA), then the same with the whole compressed width (V4.1 keeps it); the
+    //     chunk masks here are columns of the host masks, the device masks of the model are not timed
     // The list runs twice in the same order (A B C .. A B C ..). Per layer kind, multiply by 21 CSA / 20 HCA layers.
     if (getenv("TBO_DSV4_RAW_NKV") != nullptr && atoi(getenv("TBO_DSV4_RAW_NKV")) != 0) {
         for (int pass = 0; pass < 2; ++pass) {
@@ -14474,6 +14827,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
                 test_cases.emplace_back(new test_dsv4_raw_attn(csa, 7305,    0,  7424, 0,  7424, n_comp, false));
                 test_cases.emplace_back(new test_dsv4_raw_attn(csa, 7305,    0,  2304, 0,  2304, n_comp, false));
                 test_cases.emplace_back(new test_dsv4_raw_attn(csa, 2048, 4096,  2304, 0,  2304, csa ? 1536 : 256, false));
+                test_cases.emplace_back(new test_dsv4_raw_attn(csa, 7305,    0, 16384, 0,  7424, n_comp, false, 512, 64, 128, 512, 2048, true));
+                test_cases.emplace_back(new test_dsv4_raw_attn(csa, 7305,    0, 16384, 0,  7424, n_comp, false, 512, 64, 128, 512, 2048, false));
             }
         }
         return test_cases;
