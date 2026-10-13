@@ -2285,6 +2285,10 @@ void llama_kv_cache_dsv4_raw_context::set_input_kq_mask(ggml_tensor * dst, const
     kv_swa->set_input_kq_mask(dst, ubatch, causal_attn);
 }
 
+void llama_kv_cache_dsv4_raw_context::set_input_kq_pos(ggml_tensor * dst, const llama_ubatch * ubatch) const {
+    kv_swa->set_input_kq_pos(dst, ubatch);
+}
+
 void llama_kv_cache_dsv4_raw_context::set_input_k_rot(ggml_tensor * dst) const {
     kv_swa->set_input_k_rot(dst);
 }
