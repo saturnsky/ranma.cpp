@@ -1146,6 +1146,27 @@ private:
     // slots / clients
     std::vector<server_slot> slots;
 
+    // ranma layer mode with slot 0 priority: the prompt batches of the other slots are held to about
+    // layer_mode_preempt_ms of compute, the longest a new request on slot 0 waits behind one (docs/ranma/layer-mode.md).
+    // The rate is measured on those batches: tokens over the time from their decode to the next one.
+    double  lm_rate       = 0.0; // prompt tokens per second of an other-slot prompt batch (0: not measured yet)
+    int64_t lm_t_start    = 0;   // decode start of the previous batch (us)
+    int32_t lm_n_other    = 0;   // prompt tokens of slots other than 0 in the previous batch
+    int32_t lm_n_zero     = 0;   // tokens of slot 0 in the previous batch
+    int32_t lm_cur_other  = 0;   // ... of the batch being built
+    int32_t lm_cur_zero   = 0;
+
+    int32_t lm_other_prompt_cap(int32_t n_batch) const {
+        if (params_base.layer_mode == 0 || params_base.layer_mode_preempt_ms <= 0 || params_base.n_parallel < 2 ||
+                params_base.slot0_priority == 0) {
+            return n_batch;
+        }
+        // before the first measurement: 500 tokens/s (GLM-5.3 EXL3 host-direct, ub 2048, measured 578)
+        const double  rate = lm_rate > 0.0 ? lm_rate : 500.0;
+        const int32_t cap  = (int32_t) (rate*params_base.layer_mode_preempt_ms/1000.0)/256*256;
+        return std::clamp(cap, std::min<int32_t>(256, n_batch), n_batch);
+    }
+
     int trace = 0;        // env: LLAMA_TRACE
     int slots_debug = 0;  // env: LLAMA_SERVER_SLOTS_DEBUG
     int slots_n_diff = 0; // env: LLAMA_SERVER_SLOTS_N_DIFF
@@ -3691,6 +3712,19 @@ private:
             llama_set_embeddings(ctx_tgt, slot_batched->need_embd());
         }
 
+        // ranma layer mode: the rate of the previous batch when it held only the prompt of other slots
+        if (params_base.layer_mode != 0 && params_base.layer_mode_preempt_ms > 0 && params_base.n_parallel > 1) {
+            const int64_t t_now = ggml_time_us();
+            if (lm_t_start > 0 && lm_n_other >= 256 && lm_n_zero == 0 && t_now > lm_t_start) {
+                const double r = lm_n_other/((t_now - lm_t_start)/1e6);
+                lm_rate = lm_rate > 0.0 ? 0.5*lm_rate + 0.5*r : r;
+                SRV_DBG("layer mode: other-slot prompt batch of %d tokens at %.0f tokens/s (mean %.0f)\n", lm_n_other, r, lm_rate);
+            }
+            lm_t_start = t_now;
+            lm_n_other = lm_cur_other;
+            lm_n_zero  = lm_cur_zero;
+        }
+
         int32_t off_next = 0;
         int32_t n_batch = llama_n_batch(ctx_tgt);
         for (int32_t off = 0; off < batch.size(); off = off_next) {
@@ -3799,6 +3833,8 @@ private:
 
         // start populating the batch for this iteration
         batch.clear();
+        lm_cur_other = 0;
+        lm_cur_zero  = 0;
 
         // track if given slot can be batched with slots already in the batch
         auto & slot_batched = batch.slot_batched;
@@ -4511,7 +4547,10 @@ private:
                     const int32_t n_decision_first = slot.task->type == SERVER_TASK_TYPE_DECISION ? slot.task->decision.pos_first() : -1;
 
                     // add prompt tokens for processing in the current batch
-                    while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch) {
+                    // ranma layer mode: the prompt batch of a slot other than 0 is held to the preemption target
+                    const int32_t n_batch_slot = slot.id != slots.front().id ?
+                        std::min<int32_t>(n_batch, n_tokens_prev + lm_other_prompt_cap(n_batch)) : n_batch;
+                    while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch_slot) {
                         // get next token to process
                         llama_token cur_tok = input_tokens[slot.prompt.n_tokens()];
                         if (cur_tok == LLAMA_TOKEN_NULL) {
@@ -4583,6 +4622,7 @@ private:
 
                     // the number of tokens added to the batch for the current slot
                     const auto n_tokens_cur = batch.size() - n_tokens_prev;
+                    (slot.id != slots.front().id ? lm_cur_other : lm_cur_zero) += n_tokens_cur;
 
                     const auto n_tokens_start = slot.prompt.n_tokens() - n_tokens_cur;
 

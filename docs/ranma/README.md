@@ -55,6 +55,9 @@ Starting settings by model and hardware are in [recipes.md](recipes.md).
 - **Slot 0 priority (llama-server)** - with several slots, the prompts of the other slots wait while slot 0 works
   on a request; their generation still shares slot 0's batches (`--slot0-priority strict` holds it too while slot 0
   generates). On by default, `--slot0-priority off` restores the upstream batching. [slot0-priority.md](slot0-priority.md)
+- **Layer compute mode** - `--layer-mode on` computes a prompt step as one wide ubatch layer by layer (routed experts
+  expert by expert, attention in chunks) and sizes the width, the attention chunk and the staging buffers from the
+  model and the free memory. GLM-5.3 EXL3 with the expert cache; off by default. [layer-mode.md](layer-mode.md)
 - **Reuse of a just-restored context checkpoint (llama-server)** - when the first prompt batch after a checkpoint
   restore starts at that checkpoint, the server keeps the restored entry instead of serializing the unchanged
   state again.
