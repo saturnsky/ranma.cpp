@@ -23,7 +23,7 @@
 extern "C" {
 #endif
 
-#define GGML_EXPERT_ABI_VERSION      11
+#define GGML_EXPERT_ABI_VERSION      12
 #define GGML_EXPERT_IFACE_PROC_NAME  "ggml_backend_expert_iface"
 
 #define GGML_EXPERT_BANK_NONE        0xFFFFFFFFu
@@ -98,6 +98,11 @@ struct ggml_expert_config {
     // RANMA_EXPERT_HASH_EARLY (0, ssd, vram or both) decides what the cache does with the hints.
     const int32_t * early_route_layers; // [n_early_route_layers] the model's own layer indices
     uint32_t n_early_route_layers;
+
+    // Bytes of a fixed VRAM block the expert-major MoE op (MOE_FFN_HAD) takes its device buffers from instead of the
+    // pool; 0 = none. Between wide prompt graphs the decode pool (RANMA_EXPERT_UB_POOL) lends it as positions, and a
+    // graph with the op takes it back first (no copy: the pooled experts' entries return to their homes).
+    size_t   op_scratch_bytes;
 };
 
 // The experts one layer of the next graph will select, known before the graph is built. `ids`

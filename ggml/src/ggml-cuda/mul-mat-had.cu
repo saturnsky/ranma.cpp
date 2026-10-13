@@ -2895,8 +2895,16 @@ void ggml_cuda_moe_ffn_had(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     // every device buffer of the launch in one block (moe-ffn-had-layout.h, shared with the layer mode's sizing)
     const ggml_moe_ffn_had_layout lay = ggml_moe_ffn_had_layout_of(n_rows, R, n_exp, n_embd, n_ff, max_items_v, max_items_r,
         c_max, stage_cap, max_rank);
-    ggml_cuda_pool_alloc<char> block(ctx.pool(), lay.bytes);
-    char * blk = block.get();
+    // the expert cache's scratch block when there is one (lent to the decode pool between prompt graphs), else the pool
+    ggml_cuda_pool_alloc<char> block(ctx.pool());
+#if defined(GGML_USE_HIP)
+    char * blk = (char *) ggml_cuda_expert_op_scratch(ctx, lay.bytes);
+#else
+    char * blk = nullptr;
+#endif // defined(GGML_USE_HIP)
+    if (blk == nullptr) {
+        blk = block.alloc(lay.bytes);
+    }
     int   * route  = (int   *) (blk + lay.route);
     int   * items  = (int   *) (blk + lay.items);
     int   * iota   = (int   *) (blk + lay.iota);

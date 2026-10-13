@@ -236,9 +236,13 @@ public:
     bool allocated() const { return blob_ != nullptr; }
     size_t device_bytes() const { return bytes_; }
 
-    // Lends [base, base + bytes) on `stream`: lays out the positions (the same r for every enabled
-    // layer), empty, and zeroes their tails. Returns r (0 = too small, nothing lent).
-    int  lend(void * base, size_t bytes, cudaStream_t stream);
+    // Lends [base, base + bytes) and [base2, base2 + bytes2) on `stream`: lays out the positions (the same r for every
+    // enabled layer; the positions of the first region come first, r2() of them are in the second), empty, and zeroes
+    // their tails. Either region may be empty. Returns r (0 = too small, nothing lent).
+    int  lend(void * base, size_t bytes, cudaStream_t stream, void * base2 = nullptr, size_t bytes2 = 0);
+    int  r2() const { return r2_; }
+    // Device idle (the caller synchronized): positions of the second region that hold an expert (all layers).
+    long owned_in_second() const;
     // Writes every pooled entry back and sets r = 0 on `stream`. The region may be overwritten by any
     // work queued on `stream` after this.
     void reclaim(cudaStream_t stream);
@@ -305,6 +309,7 @@ private:
     void * blob_   = nullptr;
     size_t bytes_  = 0;
     int    r_      = 0;
+    int    r2_     = 0;      // positions per layer in the second region (the last r2_ of r_)
     int    ghost_  = 0;
     void * base_   = nullptr;
     size_t lent_bytes_ = 0;

@@ -515,6 +515,8 @@ void common_layer_mode_apply(common_params & params) {
         lm_setenv("RANMA_EXPERT_MAJOR_STAGE_MIB", std::to_string(stage/MiB));
     }
     params.layer_mode_l1_carve_mib = (int32_t) ((carve_bytes(ub) + MiB - 1)/MiB);
+    // the op's scratch is one fixed block of the expert cache, lent to the decode pool between prompt graphs
+    params.layer_mode_scratch_mib  = (int32_t) ((scratch_bytes(ub) + MiB - 1)/MiB);
     if (params.layer_mode_preempt_ms <= 0) {
         params.layer_mode_preempt_ms = LM_PREEMPT_MS;
     }

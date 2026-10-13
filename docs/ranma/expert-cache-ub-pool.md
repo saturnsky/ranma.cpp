@@ -36,6 +36,9 @@ is lent (r = 0 makes them return at once), so a captured graph stays valid eithe
 
 ## Where the region comes from
 
+- With the layer mode, a second region: the expert-major op's scratch block (`op_scratch_bytes` of the config, ABI 12).
+  Its positions follow those of the compute buffer; a graph with `MOE_FFN_HAD` takes the pool back before it runs
+  (docs/ranma/layer-mode.md, "The op's scratch during generation").
 - The graph allocator places a graph of at most `rows` rows on its own (`ggml_backend_sched_set_alloc_compact`),
   so that it uses only the start of the buffer; `ggml_backend_sched_get_buffer_extent` reports how far
   it reaches, also for a resumed graph.
