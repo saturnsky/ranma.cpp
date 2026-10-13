@@ -734,22 +734,23 @@ uint32_t llama_memory_hybrid_idx_context::get_n_kpool_new() const {
     return kpool_cur().n_new_g;
 }
 
-void llama_memory_hybrid_idx_context::set_input_kpool_pos(ggml_tensor * dst, const llama_ubatch * ubatch) const {
+void llama_memory_hybrid_idx_context::set_input_kpool_pos(ggml_tensor * dst, ggml_tensor * tok_rank, const llama_ubatch * ubatch) const {
     GGML_ASSERT(mem != nullptr && mem->get_mem_idx() != nullptr);
-    GGML_ASSERT(!mem->get_kpool_by_order());
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
     GGML_ASSERT(dst->type == GGML_TYPE_F32);
     GGML_ASSERT(dst->ne[1] == (int64_t) ubatch->n_seqs_unq);
 
-    const uint32_t kpool  = mem->get_kpool();
-    const int64_t  n_pool = dst->ne[0];
+    const uint32_t kpool    = mem->get_kpool();
+    const int64_t  n_pool   = dst->ne[0];
+    const bool     by_order = mem->get_kpool_by_order();
 
     const auto & lay = mem->kpool_layout_get();
 
     float * data = (float *) dst->data;
     std::fill(data, data + n_pool*ubatch->n_seqs_unq, -INFINITY);
 
-    // the pool order of set_input_kpool: per sequence, each pool ending at its last member's position
+    // the pool order of set_input_kpool: per sequence, each pool ending at its last member's position, or in order mode
+    // at its last member's rank in the sequence
     int64_t ip0 = 0;
     for (llama_seq_id s = 0; s < LLAMA_MAX_SEQ; ++s) {
         const auto & sq = lay.seqs[s];
@@ -758,10 +759,27 @@ void llama_memory_hybrid_idx_context::set_input_kpool_pos(ggml_tensor * dst, con
         if (col >= 0) {
             float * row = data + n_pool*col;
             for (size_t pi = 0; pi < sq.pools.size(); ++pi) {
-                row[ip0 + pi] = -(float) sq.cells[sq.pools[pi] + kpool - 1].first;
+                row[ip0 + pi] = by_order ? -(float) ((pi + 1)*kpool - 1) : -(float) sq.cells[sq.pools[pi] + kpool - 1].first;
             }
         }
         ip0 += (int64_t) sq.pools.size();
+    }
+
+    // order mode: the token key is its rank in the sequence, -(rank + 0.5) as llm_graph_chunk_pos stores positions
+    GGML_ASSERT(by_order == (tok_rank != nullptr));
+    if (by_order) {
+        GGML_ASSERT(ggml_backend_buffer_is_host(tok_rank->buffer));
+        GGML_ASSERT(tok_rank->type == GGML_TYPE_F32 && tok_rank->ne[0] == 1 && tok_rank->ne[1] == (int64_t) ubatch->n_tokens);
+
+        const auto &   sinfo = sinfos_kpool[i_cur];
+        const uint32_t n_tps = (uint32_t) sinfo.size();
+
+        float * rk = (float *) tok_rank->data;
+        for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
+            const int64_t r = kpool_rank(lay.seqs[ubatch->seq_id[i][0]].cells, ubatch->pos[i], sinfo.idxs[i / n_tps][i % n_tps]);
+            GGML_ASSERT(r >= 0 && r < (1 << 24));
+            rk[i] = -((float) r + 0.5f);
+        }
     }
 }
 

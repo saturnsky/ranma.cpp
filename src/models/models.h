@@ -2678,6 +2678,8 @@ struct llama_model_clef : public llama_model_qwen35 {
 };
 
 
+class llm_graph_input_chunk_mask;
+
 struct llama_model_qwen4exp : public llama_model_base {
     llama_model_qwen4exp(const struct llama_model_params & params) : llama_model_base(params) {}
 
@@ -2741,6 +2743,44 @@ struct llama_model_qwen4exp : public llama_model_base {
                     ggml_tensor * inp_pos,
                     ggml_tensor * kq_mask,
                             int * sections,
+                            int   il);
+
+        // ranma: a chunked graph (the attention chunk) whose masks are made on the device, see llm_graph_chunk_mask;
+        // null otherwise. The QSA selection and the attention then run per chunk of query rows.
+        llm_graph_input_chunk_mask * inp_cm = nullptr;
+
+        // the QSA pooled keys and the rotated indexer queries of the whole ubatch, cache writes included
+        std::pair<ggml_tensor *, ggml_tensor *> build_qsa_pooled(
+  const llama_memory_hybrid_idx_context * mctx_hyb,
+          llm_graph_input_kpool * inp_kpool,
+                    ggml_tensor * cur,
+                    ggml_tensor * inp_pos,
+                            int * sections,
+                            int   il);
+
+        // the QSA mask [n_kv, n] of the rows [i0, i0 + n), causal mask included, from build_qsa_pooled
+        ggml_tensor * build_qsa_sel_rows(
+          llm_graph_input_kpool * inp_kpool,
+                    ggml_tensor * pooled,
+                    ggml_tensor * q,
+                      ggml_type   type,
+                        int64_t   i0,
+                        int64_t   n,
+                            int   il);
+
+        // the attention of a chunked graph: cache writes for the whole ubatch, then mask and attention per chunk
+        ggml_tensor * build_attn_chunked(
+        llm_graph_input_attn_kv * inp,
+  const llama_memory_hybrid_idx_context * mctx_hyb,
+          llm_graph_input_kpool * inp_kpool,
+                    ggml_tensor * cur,
+                    ggml_tensor * inp_pos,
+                            int * sections,
+                    ggml_tensor * q_cur,
+                    ggml_tensor * k_cur,
+                    ggml_tensor * v_cur,
+                           bool   qsa,
+                          float   kq_scale,
                             int   il);
 
         ggml_tensor * build_layer_attn_linear(
