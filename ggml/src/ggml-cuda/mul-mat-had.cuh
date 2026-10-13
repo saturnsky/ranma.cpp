@@ -14,3 +14,7 @@ void ggml_cuda_moe_ffn_had(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 
 // false while the expert-major staging (RANMA_EXPERT_MAJOR_STAGE_MIB) is on: its side stream is not captured
 bool ggml_cuda_moe_ffn_had_graph_ok(void);
+
+// stage-falsify probe U (diagnostic): op 0 sets the experts per group of the one-chunk MOE_FFN_HAD (0 = off), op 1 turns the
+// phase stamps on or off, op 2 reads the phase times (ms) of the last stamped op into out[12]
+bool ggml_cuda_moe_group_diag(int op, int a, double * out);

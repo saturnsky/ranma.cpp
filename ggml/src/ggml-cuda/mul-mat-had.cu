@@ -26,6 +26,7 @@
 
 #include "ggml-account.h"
 
+#include <algorithm>
 #include <cfloat>
 #include <map>
 #include <mutex>
@@ -2001,7 +2002,7 @@ static __device__ __forceinline__ int mmh_moe_expert(const int32_t * ids, const 
 static __global__ void __launch_bounds__(1024) mmh_moe_route_kernel(const int32_t * __restrict__ ids, const int64_t ids_nb0,
         const int64_t ids_nb1, const int n_used, const int n_rows, const int n_exp, const int chunk_rows, const int c_max,
         const int32_t * __restrict__ slots, const bool all_local, const int stage_cap, const int stage_min, const bool host_last,
-        const mmh_moe_route rt) {
+        const int8_t * __restrict__ keep, const mmh_moe_route rt) {
     __shared__ int  s_count[MMH_MAX_EXPERTS];
     __shared__ int  s_offs[MMH_MAX_EXPERTS];
     __shared__ int  s_scan[1024];
@@ -2017,7 +2018,8 @@ static __global__ void __launch_bounds__(1024) mmh_moe_route_kernel(const int32_
     for (int g = tid; g < n_rows; g += nth) {
         const int e = mmh_moe_expert(ids, ids_nb0, ids_nb1, n_used, g, n_exp);
         rt.eid[g] = e;
-        rt.pos[g] = atomicAdd(&s_count[e], 1);
+        // bench filter: a row of an expert that is not kept is dropped (no chunk holds position -1)
+        rt.pos[g] = keep != nullptr && keep[e] == 0 ? -1 : atomicAdd(&s_count[e], 1);
     }
     __syncthreads();
 
@@ -2059,6 +2061,9 @@ static __global__ void __launch_bounds__(1024) mmh_moe_route_kernel(const int32_
     }
     __syncthreads();
     for (int g = tid; g < n_rows; g += nth) {
+        if (rt.pos[g] < 0) {
+            continue;
+        }
         const int p = s_offs[rt.eid[g]] + rt.pos[g];
         rt.pos[g] = p;
         rt.rows_sorted[p] = g;
@@ -2685,9 +2690,98 @@ static size_t mmh_moe_stage_bytes() {
     return mib << 20;
 }
 
-bool ggml_cuda_moe_ffn_had_graph_ok(void) {
-    return mmh_moe_stage_bytes() == 0;
+// stage-falsify probe U (diagnostic, not for release): RANMA_EXPERT_MAJOR_GROUP_DIAG=n (or ggml_cuda_moe_group_diag) runs a
+// one-chunk op as groups of n used experts. Route, sort and the chunk table are made once; per group the prologue and GEMM
+// of up and gate, the GLU, the prologue and GEMM of down run on the rows of the group only (exact grids), into the row
+// range of the group in vu/vg/vy; one scatter at the end over all rows. All weights are in VRAM, nothing waits.
+#define MMH_MOE_DIAG_N 12 // phase_ms: route, plan, items, prologue, gemm, glu, scatter, total, groups, launches, experts, rows
+static int    g_mmh_moe_group_diag   = -1; // experts per group, 0 = off, -1 = not read yet
+static int    g_mmh_moe_group_phases = 0;
+static double g_mmh_moe_group_phase_ms[MMH_MOE_DIAG_N];
+
+static int mmh_moe_group_diag_group() {
+    if (g_mmh_moe_group_diag < 0) {
+        g_mmh_moe_group_diag = std::max(0, mmh_moe_env_int("RANMA_EXPERT_MAJOR_GROUP_DIAG", 0));
+    }
+    return g_mmh_moe_group_diag;
 }
+
+// op 0: set the group size a (0 = off), op 1: stamps on (a != 0) or off, op 2: copy the phase ms of the last stamped op to out
+bool ggml_cuda_moe_group_diag(const int op, const int a, double * out) {
+    if (op == 0) {
+        g_mmh_moe_group_diag = std::max(0, a);
+        return true;
+    }
+    if (op == 1) {
+        g_mmh_moe_group_phases = a != 0;
+        return true;
+    }
+    if (op == 2 && out != nullptr) {
+        memcpy(out, g_mmh_moe_group_phase_ms, sizeof(g_mmh_moe_group_phase_ms));
+        return true;
+    }
+    return false;
+}
+
+bool ggml_cuda_moe_ffn_had_graph_ok(void) {
+    return mmh_moe_stage_bytes() == 0 && mmh_moe_group_diag_group() == 0;
+}
+
+#if defined(GGML_USE_HIP) && !defined(cudaEventElapsedTime)
+#define cudaEventElapsedTime hipEventElapsedTime
+#endif
+
+// timing stamps of probe U: events recorded on the compute stream between the phases; the time from the stamp before to this
+// one is attributed to the phase named at the stamp (it includes the launch gaps of that phase)
+struct mmh_moe_diag_stamps {
+    enum { CAP = 512, PHASE_ROUTE = 0, PHASE_PLAN, PHASE_ITEMS, PHASE_PROLOGUE, PHASE_GEMM, PHASE_GLU, PHASE_SCATTER };
+    bool         on  = false;
+    int          n   = 0;
+    int          lab[CAP];
+    cudaEvent_t * pool = nullptr;
+
+    explicit mmh_moe_diag_stamps(const bool enable) {
+        on = enable;
+        if (!on) {
+            return;
+        }
+        static std::vector<cudaEvent_t> events;
+        if (events.empty()) {
+            events.resize(CAP);
+            for (cudaEvent_t & e : events) {
+                CUDA_CHECK(cudaEventCreateWithFlags(&e, 0));
+            }
+        }
+        pool = events.data();
+    }
+    void at(cudaStream_t stream, const int label) {
+        if (on && n < CAP) {
+            lab[n] = label;
+            CUDA_CHECK(cudaEventRecord(pool[n++], stream));
+        }
+    }
+    void finish(double * ms, const int groups, const int launches, const int experts, const int rows) {
+        if (!on || n < 2) {
+            return;
+        }
+        CUDA_CHECK(cudaEventSynchronize(pool[n - 1]));
+        for (int i = 0; i < MMH_MOE_DIAG_N; ++i) {
+            ms[i] = 0.0;
+        }
+        for (int i = 1; i < n; ++i) {
+            float t = 0.0f;
+            CUDA_CHECK(cudaEventElapsedTime(&t, pool[i - 1], pool[i]));
+            ms[lab[i]] += t;
+        }
+        float tot = 0.0f;
+        CUDA_CHECK(cudaEventElapsedTime(&tot, pool[0], pool[n - 1]));
+        ms[7]  = tot;
+        ms[8]  = groups;
+        ms[9]  = launches;
+        ms[10] = experts;
+        ms[11] = rows;
+    }
+};
 
 static mmh_moe_stage_dev * mmh_moe_stage_get(const int device) {
     static std::mutex mutex;
@@ -2858,6 +2952,18 @@ void ggml_cuda_moe_ffn_had(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int64_t max_items_r = mmh_moe_max_items(R, n_exp, mt_r);
     GGML_ASSERT(max_items_v <= GGML_MOE_FFN_HAD_MAX_ITEMS && max_items_r <= GGML_MOE_FFN_HAD_MAX_ITEMS);
 
+    // probe U (diagnostic): groups of experts of a one-chunk op; not with LoRA, not with several chunks
+    int u_group = mmh_moe_group_diag_group();
+    if (u_group > 0 && (max_rank > 0 || R != n_rows)) {
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            GGML_LOG_WARN("%s: RANMA_EXPERT_MAJOR_GROUP_DIAG needs one chunk (rows %d, chunk %d) and no LoRA (rank %d); off\n",
+                __func__, (int) n_rows, (int) R, max_rank);
+        }
+        u_group = 0;
+    }
+
     // staging: slots of whole experts (all three kinds) in each of the two buffers
     static const int stage_min_env = mmh_moe_env_int("RANMA_EXPERT_MAJOR_STAGE_MIN", 0);
     static const int stage_blocks  = std::max(32, mmh_moe_env_int("RANMA_EXPERT_MAJOR_STAGE_BLOCKS", 64));
@@ -2881,7 +2987,7 @@ void ggml_cuda_moe_ffn_had(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int stage_min = stage_min_env > 0 ? stage_min_env : mt_r + 1;
     int stage_cap = 0;
     int64_t c_max = 3*((n_rows + R - 1)/R) + 1;
-    if (remote && mmh_moe_stage_bytes() > 0) {
+    if (u_group == 0 && remote && mmh_moe_stage_bytes() > 0) {
         stage_cap = (int) std::min<int64_t>(MMH_MOE_STAGE_MAX_SLOTS, (int64_t) (mmh_moe_stage_bytes()/2)/ss.koff[3]);
         if (stage_cap > 0) {
             c_max += n_rows/((int64_t) stage_cap*std::max(1, stage_min)) + 1;
@@ -2892,6 +2998,9 @@ void ggml_cuda_moe_ffn_had(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     }
     if (stage_cap == 0) {
         c_max = 3*((n_rows + R - 1)/R) + 1;
+    }
+    if (u_group > 0) {
+        c_max = std::max<int64_t>(c_max, n_exp + 1); // one chunk-table entry per group, one more for the scatter
     }
 
     // every device buffer of the launch in one block (moe-ffn-had-layout.h, shared with the layer mode's sizing)
@@ -2936,6 +3045,8 @@ void ggml_cuda_moe_ffn_had(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int64_t   ids_nb0 = ids->nb[0];
     const int64_t   ids_nb1 = ids->nb[1];
     const int32_t * slots   = p[0].w_slots; // one table per layer, for all kinds
+    // bench filter (stage-falsify): src[6] = I8 [n_exp], the experts to compute; the other rows are dropped
+    const int8_t  * keep    = dst->src[6] != nullptr ? (const int8_t *) dst->src[6]->data : nullptr;
 
     mmh_moe_stage_dev * sd = stage_cap > 0 ? mmh_moe_stage_get(ctx.device) : nullptr;
     // gate and down waits still to enqueue (lazy mode). The staging plan and table init read the host addresses of
@@ -2983,11 +3094,14 @@ void ggml_cuda_moe_ffn_had(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         CUDA_CHECK(cudaMemsetAsync(sd->flags, 0, sizeof(mmh_moe_stage_flags), stream));
     }
 
+    mmh_moe_diag_stamps stamps(u_group > 0 && g_mmh_moe_group_phases != 0);
+    stamps.at(stream, mmh_moe_diag_stamps::PHASE_ROUTE);
     mmh_moe_route_kernel<<<1, 1024, 0, stream>>>(ids_d, ids_nb0, ids_nb1, n_used, (int) n_rows, (int) n_exp, (int) R,
-        (int) c_max, slots, all_local, stage_cap, stage_min, host_last, rt);
+        (int) c_max, slots, all_local, stage_cap, stage_min, host_last, keep, rt);
     CUDA_CHECK(cudaGetLastError());
     mmh_moe_iota<<<(unsigned) ((R + 255)/256), 256, 0, stream>>>(iota, (int) R);
     CUDA_CHECK(cudaGetLastError());
+    stamps.at(stream, mmh_moe_diag_stamps::PHASE_ROUTE);
 
     char * buf0 = sd ? sd->buf : nullptr;
     char * buf1 = sd ? sd->buf + (sd->bytes/2)/256*256 : nullptr;
@@ -3048,6 +3162,99 @@ void ggml_cuda_moe_ffn_had(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     float * outs[3] = { vu, vg, vy };
     const dim3 grid_glu((unsigned) ((R*n_ff + 255)/256));
     const dim3 grid_scatter((unsigned) n_tokens);
+
+    if (u_group > 0) {
+        enqueue_kind_wait(1); // the lazy waits of the gate and down kinds: the groups read all three kinds
+        enqueue_kind_wait(2);
+        // probe U: the plan of the groups is read back once (one host sync), then every launch has the exact grid of its group
+        std::vector<int> h_offs(n_exp), h_cnt(n_exp);
+        CUDA_CHECK(cudaMemcpyAsync(h_offs.data(), rt.offs, n_exp*sizeof(int), cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaMemcpyAsync(h_cnt.data(), rt.cnt, n_exp*sizeof(int), cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        std::vector<int> order;
+        for (int e = 0; e < n_exp; ++e) {
+            if (h_cnt[e] > 0) {
+                order.push_back(e);
+            }
+        }
+        std::sort(order.begin(), order.end(), [&](const int a, const int b) { return h_offs[a] < h_offs[b]; });
+        const int mt_min = all_local ? mt_v : std::min(mt_v, mt_r);
+        std::vector<int> tbl;     // per group: first sorted row, rows; the last entry covers all rows (the scatter)
+        std::vector<int> g_items; // per group: bound of the items of one list
+        int rows_total = 0;
+        for (size_t i = 0; i < order.size(); i += (size_t) u_group) {
+            int n = 0;
+            int mi = 0;
+            for (size_t j = i; j < std::min(order.size(), i + (size_t) u_group); ++j) {
+                n  += h_cnt[order[j]];
+                mi += (h_cnt[order[j]] + mt_min - 1)/mt_min;
+            }
+            tbl.push_back(h_offs[order[i]]);
+            tbl.push_back(n);
+            g_items.push_back(mi);
+            rows_total += n;
+        }
+        const int n_groups = (int) g_items.size();
+        if (n_groups > 0) {
+            tbl.push_back(0);
+            tbl.push_back(rows_total);
+            const int n_tbl = n_groups + 1;
+            GGML_ASSERT(n_tbl <= c_max);
+            CUDA_CHECK(cudaMemcpyAsync(rt.chunks, tbl.data(), tbl.size()*sizeof(int), cudaMemcpyHostToDevice, stream));
+            CUDA_CHECK(cudaMemcpyAsync(rt.n_chunks, &n_tbl, sizeof(int), cudaMemcpyHostToDevice, stream));
+            CUDA_CHECK(cudaStreamSynchronize(stream)); // the pageable sources above go out of scope
+            stamps.at(stream, mmh_moe_diag_stamps::PHASE_PLAN);
+            int launches = 2;
+            for (int c = 0; c < n_groups; ++c) {
+                const int b = tbl[2*c + 0];
+                const int n = tbl[2*c + 1];
+                float * go[3] = { vu + (int64_t) b*n_ff, vg + (int64_t) b*n_ff, vy + (int64_t) b*n_embd };
+                mmh_moe_items_kernel<<<1, 1024, 0, stream>>>(rt, c, (int) n_exp, slots, all_local, stage_cap, mt_v, mt_r,
+                    items_v, n_items_v, items_r, n_items_r);
+                CUDA_CHECK(cudaGetLastError());
+                stamps.at(stream, mmh_moe_diag_stamps::PHASE_ITEMS);
+                ++launches;
+                for (int i = 0; i < 3; ++i) {
+                    const bool local = i == 2;
+                    mmh_moe_prologue<<<(unsigned) n, 256, 0, stream>>>(p[i], rt, c, ids_d, ids_nb0, ids_nb1, n_used,
+                        local ? go[0] : (const float *) x->data, local ? n_ff*(int64_t) sizeof(float) : (int64_t) x->nb[1], local,
+                        xh, rscale);
+                    CUDA_CHECK(cudaGetLastError());
+                    stamps.at(stream, mmh_moe_diag_stamps::PHASE_PROLOGUE);
+                    ++launches;
+                    mmh_params q = p[i];
+                    q.dst = go[i];
+                    const unsigned groups = (unsigned) (desc[i]->src[0]->ne[1]/MMH_NG);
+                    mmh_moe_gemm(desc[i]->src[0]->type, mt_v, dim3(groups, (unsigned) std::min<int64_t>(g_items[c], max_items_v), 1),
+                        stream, q, wd[i], xh, rscale, items_v, n_items_v, iota);
+                    CUDA_CHECK(cudaGetLastError());
+                    ++launches;
+                    if (!all_local) {
+                        mmh_moe_gemm(desc[i]->src[0]->type, mt_r, dim3(groups, (unsigned) std::min<int64_t>(g_items[c], max_items_r), 1),
+                            stream, q, wd[i], xh, rscale, items_r, n_items_r, iota);
+                        CUDA_CHECK(cudaGetLastError());
+                        ++launches;
+                    }
+                    stamps.at(stream, mmh_moe_diag_stamps::PHASE_GEMM);
+                    if (i == 1) {
+                        mmh_moe_glu<<<(unsigned) (((int64_t) n*n_ff + 255)/256), 256, 0, stream>>>(rt, c, go[0], go[1], n_ff,
+                            glu == GGML_GLU_OP_SWIGLU_CLAMP, limit);
+                        CUDA_CHECK(cudaGetLastError());
+                        stamps.at(stream, mmh_moe_diag_stamps::PHASE_GLU);
+                        ++launches;
+                    }
+                }
+            }
+            // one scatter over all rows: the slot order of a token is the one of the one-chunk op
+            mmh_moe_scatter<<<grid_scatter, 256, 0, stream>>>(rt, n_groups, vy, (const float *) weights->data, weights->nb[1],
+                weights->nb[2], n_used, (float *) dst->data, dst->nb[1], (int) n_embd);
+            CUDA_CHECK(cudaGetLastError());
+            stamps.at(stream, mmh_moe_diag_stamps::PHASE_SCATTER);
+            ++launches;
+            stamps.finish(g_mmh_moe_group_phase_ms, n_groups, launches, (int) order.size(), rows_total);
+        }
+        n_loop = 0;
+    }
 
     for (int c = 0; c < n_loop; ++c) {
         mmh_moe_items_kernel<<<1, 1024, 0, stream>>>(rt, c, (int) n_exp, slots, all_local, stage_cap, mt_v, mt_r,

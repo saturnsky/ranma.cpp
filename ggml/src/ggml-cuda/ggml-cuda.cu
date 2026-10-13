@@ -7710,6 +7710,122 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
     GGML_UNUSED(reg);
 }
 
+// ranma bench only (tests/test-backend-ops.cpp stage-falsify, not for release): a side stream and an event for the copies
+// of a measurement that overlaps the copy engine with the graphs of the compute stream. copy issues the copies in order on
+// the side stream, records the event and flushes the stream (an unflushed stream may not start); wait makes the compute
+// stream wait for that event; sync waits on the host. kind: 0 default (unified addressing), 1 host to device, 2 device to device.
+struct ggml_cuda_stage_bench_state {
+    cudaStream_t side = nullptr;
+    cudaEvent_t  ev   = nullptr;
+};
+
+static ggml_cuda_stage_bench_state * ggml_cuda_stage_bench_get(const int device) {
+    static std::mutex mutex;
+    static std::map<int, ggml_cuda_stage_bench_state> states;
+    std::lock_guard<std::mutex> lock(mutex);
+    ggml_cuda_stage_bench_state & s = states[device];
+    if (s.side == nullptr) {
+        ggml_cuda_set_device(device);
+        CUDA_CHECK(cudaStreamCreateWithFlags(&s.side, cudaStreamNonBlocking));
+        CUDA_CHECK(cudaEventCreateWithFlags(&s.ev, cudaEventDisableTiming));
+    }
+    return &s;
+}
+
+#if defined(GGML_USE_HIP)
+#define cudaMemcpyDefault hipMemcpyDefault
+#define cudaStreamQuery hipStreamQuery
+#define cudaEventElapsedTime hipEventElapsedTime
+#endif
+
+static bool ggml_backend_cuda_stage_bench_copy(ggml_backend_t backend, const int n, const void * const * src,
+        void * const * dst, const size_t * bytes, const int kind) {
+    if (backend == nullptr || !ggml_backend_is_cuda(backend)) {
+        return false;
+    }
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_stage_bench_state * s = ggml_cuda_stage_bench_get(cuda_ctx->device);
+    const cudaMemcpyKind k = kind == 1 ? cudaMemcpyHostToDevice : kind == 2 ? cudaMemcpyDeviceToDevice : cudaMemcpyDefault;
+    for (int i = 0; i < n; ++i) {
+        CUDA_CHECK(cudaMemcpyAsync(dst[i], src[i], bytes[i], k, s->side));
+    }
+    CUDA_CHECK(cudaEventRecord(s->ev, s->side));
+    (void) cudaStreamQuery(s->side);
+    return true;
+}
+
+static bool ggml_backend_cuda_stage_bench_wait(ggml_backend_t backend) {
+    if (backend == nullptr || !ggml_backend_is_cuda(backend)) {
+        return false;
+    }
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_stage_bench_state * s = ggml_cuda_stage_bench_get(cuda_ctx->device);
+    CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx->stream(), s->ev, 0));
+    return true;
+}
+
+static bool ggml_backend_cuda_stage_bench_sync(ggml_backend_t backend) {
+    if (backend == nullptr || !ggml_backend_is_cuda(backend)) {
+        return false;
+    }
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    CUDA_CHECK(cudaStreamSynchronize(ggml_cuda_stage_bench_get(cuda_ctx->device)->side));
+    return true;
+}
+
+// timing events of the stage bench (probes Y and Z): a pool of events with timing enabled, recorded on the compute stream
+// (stream 0) or on the side stream (stream 1) and read back after a host sync. op 0 record slot a on stream b, op 1 the
+// compute stream waits for slot a, op 2 elapsed ms from slot a to slot b into *ms (waits for slot b on the host).
+#define GGML_CUDA_STAGE_BENCH_EVENTS 512
+static bool ggml_backend_cuda_stage_bench_ev(ggml_backend_t backend, const int op, const int a, const int b, float * ms) {
+    if (backend == nullptr || !ggml_backend_is_cuda(backend) || a < 0 || a >= GGML_CUDA_STAGE_BENCH_EVENTS) {
+        return false;
+    }
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_stage_bench_state * s = ggml_cuda_stage_bench_get(cuda_ctx->device);
+    static std::mutex mutex;
+    static std::map<int, std::vector<cudaEvent_t>> pools;
+    cudaEvent_t * pool;
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        std::vector<cudaEvent_t> & p = pools[cuda_ctx->device];
+        if (p.empty()) {
+            ggml_cuda_set_device(cuda_ctx->device);
+            p.resize(GGML_CUDA_STAGE_BENCH_EVENTS);
+            for (cudaEvent_t & e : p) {
+                CUDA_CHECK(cudaEventCreateWithFlags(&e, 0));
+            }
+        }
+        pool = p.data();
+    }
+    if (op == 0) {
+        cudaStream_t st = b == 1 ? s->side : cuda_ctx->stream();
+        CUDA_CHECK(cudaEventRecord(pool[a], st));
+        if (b == 1) {
+            (void) cudaStreamQuery(st); // flush, an unflushed side stream may not start
+        }
+        return true;
+    }
+    if (op == 1) {
+        CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx->stream(), pool[a], 0));
+        return true;
+    }
+    if (op == 2 && b >= 0 && b < GGML_CUDA_STAGE_BENCH_EVENTS && ms != nullptr) {
+        CUDA_CHECK(cudaEventSynchronize(pool[b]));
+        CUDA_CHECK(cudaEventElapsedTime(ms, pool[a], pool[b]));
+        return true;
+    }
+    return false;
+}
+
+// probe U of the stage bench: the group diagnostic of MOE_FFN_HAD (mul-mat-had.cuh)
+static bool ggml_backend_cuda_moe_group_diag(ggml_backend_t backend, const int op, const int a, double * out) {
+    if (backend == nullptr || !ggml_backend_is_cuda(backend)) {
+        return false;
+    }
+    return ggml_cuda_moe_group_diag(op, a, out);
+}
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
@@ -7748,6 +7864,21 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, "ggml_backend_cuda_graph_counts") == 0) {
         // ranma: diagnostics of the graph calls (captures and direct calls), see ggml_backend_cuda_graph_counts
         return (void *)ggml_backend_cuda_graph_counts;
+    }
+    if (strcmp(name, "ggml_backend_cuda_stage_bench_copy") == 0) {
+        return (void *)ggml_backend_cuda_stage_bench_copy;
+    }
+    if (strcmp(name, "ggml_backend_cuda_stage_bench_wait") == 0) {
+        return (void *)ggml_backend_cuda_stage_bench_wait;
+    }
+    if (strcmp(name, "ggml_backend_cuda_stage_bench_sync") == 0) {
+        return (void *)ggml_backend_cuda_stage_bench_sync;
+    }
+    if (strcmp(name, "ggml_backend_cuda_stage_bench_ev") == 0) {
+        return (void *)ggml_backend_cuda_stage_bench_ev;
+    }
+    if (strcmp(name, "ggml_backend_cuda_moe_group_diag") == 0) {
+        return (void *)ggml_backend_cuda_moe_group_diag;
     }
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_cuda_get_features;
