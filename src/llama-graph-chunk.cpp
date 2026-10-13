@@ -162,6 +162,7 @@ ggml_tensor * llm_graph_chunk_mask(ggml_context * ctx, llm_graph_rows_cache & ro
     if (type != GGML_TYPE_F32) {
         m = ggml_cast(ctx, m, type);
     }
+    ggml_set_name(m, "chunk_mask");
     return m;
 }
 

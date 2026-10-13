@@ -3746,8 +3746,11 @@ void account_print_locked(account_state & st, std::map<uint64_t, account_rec>::i
         out += buf;
     }
     account_field(out, "engram_logical_bytes", r, GGML_ACCOUNT_ENGRAM_LOGICAL_BYTES, bytes_fmt);
-    out += ",\"process_fault_delta\":null,\"gpu_stream_ms\":null,\"gpu_moe_interval_ms\":null,"
-           "\"gpu_attn_interval_ms\":null,\"gpu_other_interval_ms\":null";
+    out += ",\"process_fault_delta\":null";
+    account_field(out, "gpu_stream_ms",         r, GGML_ACCOUNT_GPU_STREAM_MS, ms_fmt);
+    account_field(out, "gpu_moe_interval_ms",   r, GGML_ACCOUNT_GPU_MOE_MS,    ms_fmt);
+    account_field(out, "gpu_attn_interval_ms",  r, GGML_ACCOUNT_GPU_ATTN_MS,   ms_fmt);
+    account_field(out, "gpu_other_interval_ms", r, GGML_ACCOUNT_GPU_OTHER_MS,  ms_fmt);
     account_sum(out, "ssd_payload_bytes",  r, GGML_ACCOUNT_SSD_PAYLOAD_BYTES, bytes_fmt);
     account_sum(out, "ssd_io_bytes",       r, GGML_ACCOUNT_SSD_IO_BYTES,      bytes_fmt);
     account_sum(out, "ssd_worker_wait_ms", r, GGML_ACCOUNT_SSD_WORKER_MS,     ms_fmt);
@@ -3771,7 +3774,8 @@ void account_print_locked(account_state & st, std::map<uint64_t, account_rec>::i
     account_field(out, "op_stage_bytes",  r, GGML_ACCOUNT_OP_STAGE_BYTES,  bytes_fmt);
     account_field(out, "ctrl_stage_bytes", r, GGML_ACCOUNT_CTRL_STAGE_BYTES, bytes_fmt);
     account_field(out, "host_sync_ms",    r, GGML_ACCOUNT_HOST_SYNC_MS,    ms_fmt);
-    out += ",\"checkpoint_ms\":null,\"residual_ms\":null,\"timing\":\"cpu_only\"}\n";
+    out += ",\"checkpoint_ms\":null,\"residual_ms\":null";
+    out += r.set[GGML_ACCOUNT_GPU_STREAM_MS] ? ",\"timing\":\"gpu_stamp\"}\n" : ",\"timing\":\"cpu_only\"}\n";
     fputs(out.c_str(), stderr);
     fflush(stderr);
     st.recs.erase(it);
@@ -3861,9 +3865,22 @@ void ggml_account_node_span(const void * node, int64_t t0_us, int64_t t1_us) {
     }
 }
 
+int32_t ggml_account_tokens(uint64_t key) {
+    if (key == 0 || !ggml_account_enabled()) {
+        return -1;
+    }
+    account_state & st = account_get();
+    std::lock_guard<std::mutex> lock(st.mutex);
+    auto it = st.recs.find(key);
+    return it != st.recs.end() ? it->second.tokens : -1;
+}
+
 void ggml_account_note(const char * name, const char * value) {
-    const uint64_t key = ggml_account_current();
-    if (key == 0 || name == NULL || value == NULL) {
+    ggml_account_note_for(ggml_account_current(), name, value);
+}
+
+void ggml_account_note_for(uint64_t key, const char * name, const char * value) {
+    if (key == 0 || !ggml_account_enabled() || name == NULL || value == NULL) {
         return;
     }
     account_state & st = account_get();
