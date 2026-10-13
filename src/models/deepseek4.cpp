@@ -1505,6 +1505,42 @@ void llama_model_deepseek4::graph::build_inp_dsv4_chunk(llm_graph_input_dsv4 * i
     inp_dch = (llm_graph_input_dsv4_chunk *) res->add_input(std::move(inp));
 }
 
+// ranma: the token key of the plan of inp_comp, one of the three compressed inputs of inp_dsv4
+static ggml_tensor * dsv4_chunk_plan_key(llm_graph_input_dsv4 * inp_dsv4, llm_graph_input_dsv4_chunk * inp_dch,
+                                         const llm_graph_input_dsv4::comp_input & inp_comp) {
+    if (&inp_comp == &inp_dsv4->get_csa()) {
+        return inp_dch->csa_key;
+    }
+    if (&inp_comp == &inp_dsv4->get_hca()) {
+        return inp_dch->hca_key;
+    }
+    GGML_ASSERT(&inp_comp == &inp_dsv4->get_lid() && "not a compressed input of this graph");
+    return inp_dch->lid_key;
+}
+
+ggml_tensor * llama_model_deepseek4::graph::build_comp_chunk_mask(
+        llm_graph_input_dsv4 * inp_dsv4,
+        const llm_graph_input_dsv4::comp_input & inp_comp,
+        int64_t i0,
+        int64_t n,
+        ggml_type type) const {
+    GGML_ASSERT(inp_cm != nullptr && inp_dch != nullptr && inp_comp.kq_mask != nullptr);
+
+    ggml_tensor * key = dsv4_chunk_plan_key(inp_dsv4, inp_dch, inp_comp);
+
+    return inp_dch->mask(ctx0, *inp_cm, key, inp_comp.kq_mask->ne[0], i0, n, type);
+}
+
+ggml_tensor * llama_model_deepseek4::graph::build_comp_chunk_key(
+        llm_graph_input_dsv4 * inp_dsv4,
+        const llm_graph_input_dsv4::comp_input & inp_comp,
+        int64_t i0,
+        int64_t n) const {
+    GGML_ASSERT(inp_cm != nullptr && inp_dch != nullptr);
+
+    return inp_cm->rows.get(ctx0, dsv4_chunk_plan_key(inp_dsv4, inp_dch, inp_comp), 1, i0, n, false);
+}
+
 ggml_tensor * llama_model_deepseek4::graph::build_attention_chunked(
         const llama_model & model,
         llm_graph_input_dsv4 * inp_dsv4,
