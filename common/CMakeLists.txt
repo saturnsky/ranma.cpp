@@ -80,6 +80,8 @@ add_library(${TARGET}
     expert.h
     fit.cpp
     fit.h
+    layer-mode.cpp
+    layer-mode.h
     hf-cache.cpp
     hf-cache.h
     http.h

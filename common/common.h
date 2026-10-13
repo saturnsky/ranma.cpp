@@ -498,6 +498,8 @@ struct common_params {
     int32_t n_ctx                 =     0; // context size, 0 == context the model was trained with
     int32_t n_batch               =  2048; // logical batch size for prompt processing (must be >=32 to use BLAS)
     int32_t n_ubatch              =   512; // physical batch size for prompt processing (must be >=32 to use BLAS)
+    bool    n_batch_explicit      = false; // ranma: -b was given (the layer mode sizes it otherwise)
+    bool    n_ubatch_explicit     = false; // ranma: -ub was given (the layer mode sizes it otherwise)
     int32_t n_keep                =     0; // number of tokens to keep from initial prompt
     int32_t n_chunks              =    -1; // max number of chunks to process (-1 = unlimited)
     int32_t n_parallel            =     1; // number of parallel sequences to decode
@@ -690,6 +692,11 @@ struct common_params {
     bool    cache_prompt        = true;  // whether to enable prompt caching
     bool    cache_idle_slots    = true;  // save and clear idle slots upon starting a new task
     int32_t slot0_priority      = 1;     // ranma: 0 = off, 1 = prefill, 2 = strict (docs/ranma/slot0-priority.md)
+    // ranma layer mode (docs/ranma/layer-mode.md): 0 = off (upstream), 1 = on: one wide ubatch per prompt step computed
+    // layer by layer, its width, attention chunk and buffers sized automatically before the model loads
+    int32_t layer_mode               = 0;
+    int32_t layer_mode_preempt_ms    = 0;     // set by the layer mode: target time of a prompt batch of a slot other than 0
+    int32_t layer_mode_l1_carve_mib  = 0;     // set by the layer mode: part of --expert-l1-mib its buffers take
     int32_t n_ctx_checkpoints   = 32;    // max number of context checkpoints per slot
     int32_t kv_unified_per_slot = 0;     // max context per parallel slot; 0 = unset
     int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints

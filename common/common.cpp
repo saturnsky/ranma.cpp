@@ -9,6 +9,7 @@
 
 #include "expert.h"
 #include "fit.h"
+#include "layer-mode.h"
 #include "log.h"
 #include "llama.h"
 #include "sampling.h"
@@ -1240,6 +1241,9 @@ common_gguf_info common_get_gguf_info(const std::string & fname) {
 
 common_init_result::common_init_result(common_params & params, bool model_only) :
     pimpl(new impl{}) {
+    // ranma layer mode: sizes n_ubatch/n_batch and its switches before the params are converted (docs/ranma/layer-mode.md)
+    common_layer_mode_apply(params);
+
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
 
