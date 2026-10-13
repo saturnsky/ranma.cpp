@@ -641,26 +641,31 @@ ggml_tensor * llama_model_deepseek41::graph::build_indexer_top_k(
             idx_w->ne[0], idx_w->ne[1]/n_stream, idx_w->ne[2], n_stream,
             idx_w->nb[1], idx_w->nb[2]/n_stream, idx_w->nb[3]/n_stream, 0);
 
-    idx_q = ggml_permute(ctx0, idx_q, 0, 2, 1, 3);
-    idx_k = ggml_permute(ctx0, idx_k, 0, 2, 1, 3);
-
-    ggml_tensor * score = ggml_mul_mat(ctx0, idx_k, idx_q);
-    score = ggml_cont(ctx0, ggml_permute(ctx0, score, 2, 1, 0, 3));
-
-    score = ggml_relu(ctx0, score);
-    score = ggml_mul(ctx0, score, idx_w);
-    score = ggml_sum_rows(ctx0, score);
-    score = ggml_cont(ctx0, ggml_permute(ctx0, score, 2, 1, 0, 3));
-
-    // the attention mask is F16 when flash attention is on, and this score is F32. the mask only
-    // ever holds 0 or -inf, so widening it is exact.
+    // the attention mask is F16 when flash attention is on and F32 otherwise. it only ever holds
+    // 0 or -inf, so converting it either way is exact.
     ggml_tensor * mask = inp_comp.kq_mask;
-    if (mask->type != score->type) {
-        mask = ggml_cast(ctx0, mask, score->type);
-    }
 
-    score = ggml_add(ctx0, score, mask);
-    cb(score, "idx_score", il);
+    ggml_tensor * score = nullptr;
+    if (cparams.fused_lid) {
+        ggml_tensor * mask_f16 = mask->type == GGML_TYPE_F16 ? mask : ggml_cast(ctx0, mask, GGML_TYPE_F16);
+        score = ggml_lightning_indexer(ctx0, idx_q, idx_k, idx_w, mask_f16);
+        cb(score, "idx_score", il);
+        res->add_fused_node({LLM_FUSED_OP_LIGHTNING_INDEXER, score, il});
+    } else {
+        idx_q = ggml_permute(ctx0, idx_q, 0, 2, 1, 3);
+        idx_k = ggml_permute(ctx0, idx_k, 0, 2, 1, 3);
+
+        score = ggml_mul_mat(ctx0, idx_k, idx_q);
+        score = ggml_cont(ctx0, ggml_permute(ctx0, score, 2, 1, 0, 3));
+
+        score = ggml_relu(ctx0, score);
+        score = ggml_mul(ctx0, score, idx_w);
+        score = ggml_sum_rows(ctx0, score);
+        score = ggml_cont(ctx0, ggml_permute(ctx0, score, 2, 1, 0, 3));
+
+        score = ggml_add(ctx0, score, mask->type == GGML_TYPE_F32 ? mask : ggml_cast(ctx0, mask, GGML_TYPE_F32));
+        cb(score, "idx_score", il);
+    }
 
     // Level two: a source after the candidate source ranks only the positions inside its blocks.
     // The candidate source itself ranks everything, so its mask never touches its own top-k.
@@ -684,7 +689,8 @@ ggml_tensor * llama_model_deepseek41::graph::build_indexer_top_k(
     cb(top_k, "idx_top_k", il);
 
     if (il == hparams.candidate_source_layer) {
-        top_k_carry.cand_keep = build_candidate_keep(score, mask, il);
+        top_k_carry.cand_keep = build_candidate_keep(score,
+                mask->type == GGML_TYPE_F32 ? mask : ggml_cast(ctx0, mask, GGML_TYPE_F32), il);
     }
 
     return top_k;
