@@ -435,6 +435,16 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
         return (w->type == GGML_TYPE_F32 || w->type == GGML_TYPE_F16 || ggml_is_exl3(w->type)) && src1->type == GGML_TYPE_F32 &&
             (w->buffer == nullptr || !ggml_backend_cpu_is_extra_buffer_type(w->buffer->buft));
     }
+    if (op->op == GGML_OP_MOE_FFN_HAD) {
+        for (int i = 3; i <= 5; i++) {
+            const ggml_tensor * w = op->src[i]->src[0];
+            if ((w->type != GGML_TYPE_F32 && w->type != GGML_TYPE_F16 && !ggml_is_exl3(w->type)) ||
+                    (w->buffer != nullptr && ggml_backend_cpu_is_extra_buffer_type(w->buffer->buft))) {
+                return false;
+            }
+        }
+        return true;
+    }
     if (ggml_is_exl3(op->type) || ggml_is_row_gather_only(op->type)) {
         return false;
     }

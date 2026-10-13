@@ -1241,6 +1241,18 @@ struct llm_graph_context {
              ggml_tensor * gate_up_exps,
                      int   il) const;
 
+    // With the layer mode (llama_layer_mode_config::expert_major): the routed experts of a prompt batch as one GGML_OP_MOE_FFN_HAD (expert by expert, the
+    // intermediates do not grow with the batch); nullptr when the layer does not qualify, then the ops are built as usual
+    ggml_tensor * build_moe_ffn_expert_major(
+             ggml_tensor * cur,
+             ggml_tensor * selected_experts,
+             ggml_tensor * weights,
+             ggml_tensor * up_exps,
+             ggml_tensor * gate_exps,
+             ggml_tensor * down_exps,
+         llm_ffn_op_type   type_op,
+                     int   il) const;
+
     //
     // inputs
     //

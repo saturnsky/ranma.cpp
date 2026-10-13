@@ -1,5 +1,6 @@
 #include "llama-graph.h"
 
+#include "llama-ext.h"
 #include "llama-impl.h"
 #include "llama-model.h"
 #include "llama-moe-cache.h"
@@ -17,6 +18,7 @@
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-recurrent.h"
 
+#include <algorithm>
 #include <cassert>
 #include <cstdlib>
 #include <cmath>
@@ -2330,6 +2332,15 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     //call early so that topk-moe can be used
     ggml_build_forward_expand(gf, weights);
 
+    if (!weight_before_ffn && !gate_up_exps && !up_exps_b && !gate_exps_b && !down_exps_b && !up_exps_s && !gate_exps_s &&
+            !down_exps_s && arch != LLM_ARCH_MISTRAL4) {
+        if (ggml_tensor * moe_out = build_moe_ffn_expert_major(cur, selected_experts, weights, up_exps, gate_exps, down_exps,
+                type_op, il)) {
+            cb(moe_out, "ffn_moe_out", il);
+            return moe_out;
+        }
+    }
+
     // the experts of host-resident layers may be read from the MoE cache
     ggml_tensor * slots = build_moe_cache_slots(selected_experts, up_exps, gate_exps, down_exps, gate_up_exps, il);
 
@@ -2578,6 +2589,79 @@ ggml_tensor * llm_graph_context::build_moe_cache_slots(
     ggml_build_forward_expand(gf, slots);
 
     return ggml_reshape_2d(ctx0, slots, selected_experts->ne[0], selected_experts->ne[1]); // [n_expert_used, n_tokens]
+}
+
+ggml_tensor * llm_graph_context::build_moe_ffn_expert_major(
+         ggml_tensor * cur,
+         ggml_tensor * selected_experts,
+         ggml_tensor * weights,
+         ggml_tensor * up_exps,
+         ggml_tensor * gate_exps,
+         ggml_tensor * down_exps,
+     llm_ffn_op_type   type_op,
+                 int   il) const {
+    const llama_layer_mode_config lm_cfg = llama_layer_mode_get_config();
+    const bool    enabled    = lm_cfg.expert_major;
+    const int64_t min_tokens = std::max<int64_t>(1, lm_cfg.expert_major_min_tokens);
+
+    const int64_t n_tokens = cur->ne[1];
+    if (!enabled || n_tokens < min_tokens || waux == nullptr || moe_cache != nullptr || type_op != LLM_FFN_SILU ||
+            !up_exps || !gate_exps || !down_exps || cur->ne[2] != 1 || cur->nb[0] != sizeof(float)) {
+        return nullptr;
+    }
+
+    // the GLU of build_moe_ffn: swiglu, or swiglu_clamp for the architectures that use it
+    ggml_glu_op glu   = GGML_GLU_OP_SWIGLU;
+    float       limit = 0.0f;
+    if (il >= 0 && hparams.swiglu_clamp_exp[il] > 1e-6f) {
+        if (arch != LLM_ARCH_MAPLE && arch != LLM_ARCH_DEEPSEEK4 && arch != LLM_ARCH_GLM5_NEXT && arch != LLM_ARCH_DEEPSEEK41 &&
+                !(arch == LLM_ARCH_DFLASH && hparams.dsv4_hc_mult > 0) && arch != LLM_ARCH_HY_V4) {
+            return nullptr;
+        }
+        glu   = GGML_GLU_OP_SWIGLU_CLAMP;
+        limit = hparams.swiglu_clamp_exp[il];
+    }
+
+    // each weight: EXL3 with its rotations, unpadded, no LoRA; named by an empty MUL_MAT_HAD (no tokens)
+    ggml_tensor * desc[3];
+    ggml_tensor * ws[3] = { up_exps, gate_exps, down_exps };
+    for (int i = 0; i < 3; ++i) {
+        ggml_tensor * w = ws[i];
+        const auto it = waux->find(w);
+        if (!ggml_is_exl3(w->type) || w->view_src != nullptr || it == waux->end() || it->second.k != w->ne[0] ||
+                it->second.n != w->ne[1] || (hdmd && hdmd->rot.count(w) > 0)) {
+            return nullptr;
+        }
+        for (const auto & lora : *loras) {
+            if (lora.first->get_weight(w) != nullptr) {
+                return nullptr;
+            }
+        }
+        ggml_tensor * b    = ggml_view_3d(ctx0, cur, w->ne[0], 1, 0, cur->nb[1], cur->nb[1], 0);
+        ggml_tensor * ids0 = ggml_view_2d(ctx0, selected_experts, selected_experts->ne[0], 0, selected_experts->nb[1], 0);
+        desc[i] = ggml_mul_mat_had(ctx0, w, b, it->second.rot_in, it->second.rot_out, ids0, 128);
+        if (prec_policy) {
+            prec_policy->apply(desc[i]);
+        }
+    }
+
+    ggml_tensor * res = ggml_moe_ffn_had(ctx0, cur, selected_experts, weights, desc[0], desc[1], desc[2], glu, limit,
+            (int) std::clamp<int64_t>(lm_cfg.expert_major_rows, 0, INT32_MAX));
+
+    // only on a GPU backend that computes it (the CPU reference is far too slow), with the weight names on the same one
+    for (int i = 0; i < ggml_backend_sched_get_n_backends(sched); ++i) {
+        ggml_backend_t backend = ggml_backend_sched_get_backend(sched, i);
+        ggml_backend_dev_t dev = ggml_backend_get_device(backend);
+        if (dev == nullptr || ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU || !ggml_backend_supports_op(backend, res)) {
+            continue;
+        }
+        for (ggml_tensor * d : desc) {
+            ggml_backend_sched_set_tensor_backend(sched, d, backend);
+        }
+        ggml_backend_sched_set_tensor_backend(sched, res, backend);
+        return res;
+    }
+    return nullptr;
 }
 
 // input embeddings with optional lora

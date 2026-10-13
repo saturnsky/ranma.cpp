@@ -564,6 +564,7 @@ extern "C" {
         GGML_OP_MUL_MAT,
         GGML_OP_MUL_MAT_ID,
         GGML_OP_MUL_MAT_HAD,
+        GGML_OP_MOE_FFN_HAD,
         GGML_OP_OUT_PROD,
 
         GGML_OP_SCALE,
@@ -1571,6 +1572,25 @@ extern "C" {
             struct ggml_tensor  * rot_out,
             struct ggml_tensor  * ids,
             int                   had);
+
+    // routed MoE FFN of one layer, computed expert by expert (prompt batches): for token t and slot k, e = ids[k, t],
+    //   result[:, t] = sum_k weights[0, k, t] * down_e(glu(gate_e(x_t), up_e(x_t)))
+    // up, gate, down: each a ggml_mul_mat_had with ids of no tokens (an empty node, never computed) that names the expert
+    // weight [K, N, E] and its rot_in / rot_out
+    // x: F32 [n_embd, n_tokens], ids: I32 [n_expert_used, n_tokens], weights: F32 [1, n_expert_used, n_tokens]
+    // glu: GGML_GLU_OP_SWIGLU or GGML_GLU_OP_SWIGLU_CLAMP (limit); n_rows: rows (token, slot) per pass of the
+    // backend, 0 = its default; the order of the sum over k is unspecified
+    GGML_API struct ggml_tensor * ggml_moe_ffn_had(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * ids,
+            struct ggml_tensor  * weights,
+            struct ggml_tensor  * up,
+            struct ggml_tensor  * gate,
+            struct ggml_tensor  * down,
+            enum ggml_glu_op      glu,
+            float                 limit,
+            int                   n_rows);
 
     // A: m columns, n rows,
     // B: p columns, n rows,

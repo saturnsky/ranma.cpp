@@ -1876,3 +1876,503 @@ void ggml_cuda_mul_mat_had(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
             GGML_ABORT("unsupported MUL_MAT_HAD weight type %s", ggml_type_name(w->type));
     }
 }
+
+// ---- GGML_OP_MOE_FFN_HAD: the routed experts of one layer, expert by expert (ggml_moe_ffn_had) ----------------------
+//
+// The rows (token t, slot k) of the op are sorted by expert and cut into chunks of at most R rows at expert boundaries;
+// an expert of more than R rows takes chunks of its own. Per chunk: up and gate (a prologue and the WMMA GEMM of
+// MUL_MAT_HAD, with the same expert cache lookup), the GLU in place, down, then every token adds its weighted down rows
+// of the chunk in slot order. The intermediates scale with R instead of the token count. A token's rows are summed in
+// chunk order (the expert order) and inside a chunk in slot order; which rows of a split expert land in which of its
+// chunks does not change that order, so the result does not depend on the order the routing pass ranks rows in.
+
+#define MMH_MOE_ROWS 4096 // default rows per chunk
+#define MMH_MOE_MAX_USED 64 // most experts per token
+
+struct mmh_moe_route {
+    int * rows_sorted; // N: row g = k + n_used*t, sorted by expert
+    int * pos;         // N: index of row g in rows_sorted
+    int * eid;         // N: expert of row g
+    int * offs;        // n_exp: first index of the expert in rows_sorted
+    int * cnt;         // n_exp: rows of the expert
+    int * chunks;      // 2*c_max: first index, row count
+    int * n_chunks;
+};
+
+static __device__ __forceinline__ int mmh_moe_expert(const int32_t * ids, const int64_t nb0, const int64_t nb1,
+        const int n_used, const int g, const int n_exp) {
+    const int e = *(const int32_t *) ((const char *) ids + (g % n_used)*nb0 + (g / n_used)*nb1);
+    return e < 0 ? 0 : (e >= n_exp ? n_exp - 1 : e);
+}
+
+// one block: rows sorted by expert, and the chunk table
+static __global__ void __launch_bounds__(1024) mmh_moe_route_kernel(const int32_t * __restrict__ ids, const int64_t ids_nb0,
+        const int64_t ids_nb1, const int n_used, const int n_rows, const int n_exp, const int chunk_rows, const int c_max,
+        const mmh_moe_route rt) {
+    __shared__ int s_count[MMH_MAX_EXPERTS];
+    __shared__ int s_offs[MMH_MAX_EXPERTS];
+    __shared__ int s_scan[1024];
+
+    const int tid = threadIdx.x;
+    const int nth = blockDim.x;
+
+    for (int e = tid; e < n_exp; e += nth) {
+        s_count[e] = 0;
+    }
+    __syncthreads();
+    for (int g = tid; g < n_rows; g += nth) {
+        const int e = mmh_moe_expert(ids, ids_nb0, ids_nb1, n_used, g, n_exp);
+        rt.eid[g] = e;
+        rt.pos[g] = atomicAdd(&s_count[e], 1);
+    }
+    __syncthreads();
+
+    const int per = (n_exp + nth - 1)/nth;
+    const int e0  = min(n_exp, tid*per);
+    const int e1  = min(n_exp, e0 + per);
+    int sum = 0;
+    for (int e = e0; e < e1; ++e) {
+        sum += s_count[e];
+    }
+    s_scan[tid] = sum;
+    __syncthreads();
+    for (int h = 1; h < nth; h *= 2) {
+        const int a = tid >= h ? s_scan[tid - h] : 0;
+        __syncthreads();
+        s_scan[tid] += a;
+        __syncthreads();
+    }
+    int row = s_scan[tid] - sum;
+    for (int e = e0; e < e1; ++e) {
+        s_offs[e]  = row;
+        rt.offs[e] = row;
+        rt.cnt[e]  = s_count[e];
+        row += s_count[e];
+    }
+    __syncthreads();
+    for (int g = tid; g < n_rows; g += nth) {
+        const int p = s_offs[rt.eid[g]] + rt.pos[g];
+        rt.pos[g] = p;
+        rt.rows_sorted[p] = g;
+    }
+
+    // chunks: whole experts packed in order up to chunk_rows rows; an expert of more rows takes chunks of its own
+    if (tid == 0) {
+        int nc    = 0;
+        int cur_b = 0;
+        int cur_n = 0;
+        auto emit = [&](const int b, const int n) {
+            if (n > 0 && nc < c_max) {
+                rt.chunks[2*nc + 0] = b;
+                rt.chunks[2*nc + 1] = n;
+                ++nc;
+            }
+        };
+        for (int e = 0; e < n_exp; ++e) {
+            const int c = s_count[e];
+            if (c == 0) {
+                continue;
+            }
+            if (c > chunk_rows) {
+                emit(cur_b, cur_n);
+                cur_n = 0;
+                for (int i = 0; i < c; i += chunk_rows) {
+                    emit(s_offs[e] + i, min(chunk_rows, c - i));
+                }
+                continue;
+            }
+            if (cur_n + c > chunk_rows) {
+                emit(cur_b, cur_n);
+                cur_n = 0;
+            }
+            if (cur_n == 0) {
+                cur_b = s_offs[e];
+            }
+            cur_n += c;
+        }
+        emit(cur_b, cur_n);
+        *rt.n_chunks = nc;
+    }
+}
+
+// one block: the GEMM items (expert, first local row, rows <= mt) of chunk c
+static __global__ void __launch_bounds__(1024) mmh_moe_items_kernel(const mmh_moe_route rt, const int c, const int n_exp,
+        const int mt, int * __restrict__ items, int * __restrict__ n_items) {
+    __shared__ int s_scan[1024];
+
+    const int tid  = threadIdx.x;
+    const int nth  = blockDim.x;
+    const bool live = c < *rt.n_chunks;
+    const int b    = live ? rt.chunks[2*c + 0] : 0;
+    const int nr   = live ? rt.chunks[2*c + 1] : 0;
+
+    const int per = (n_exp + nth - 1)/nth;
+    const int e0  = min(n_exp, tid*per);
+    const int e1  = min(n_exp, e0 + per);
+    int sum = 0;
+    for (int e = e0; e < e1; ++e) {
+        const int lo = max(rt.offs[e], b);
+        const int hi = min(rt.offs[e] + rt.cnt[e], b + nr);
+        sum += hi > lo ? (hi - lo + mt - 1)/mt : 0;
+    }
+    s_scan[tid] = sum;
+    __syncthreads();
+    for (int h = 1; h < nth; h *= 2) {
+        const int a = tid >= h ? s_scan[tid - h] : 0;
+        __syncthreads();
+        s_scan[tid] += a;
+        __syncthreads();
+    }
+    int item = s_scan[tid] - sum;
+    for (int e = e0; e < e1; ++e) {
+        const int lo = max(rt.offs[e], b);
+        const int hi = min(rt.offs[e] + rt.cnt[e], b + nr);
+        for (int i = lo; i < hi; i += mt) {
+            items[3*item + 0] = e;
+            items[3*item + 1] = i - b;
+            items[3*item + 2] = min(mt, hi - i);
+            ++item;
+        }
+    }
+    if (tid == nth - 1) {
+        *n_items = s_scan[tid];
+    }
+}
+
+static __global__ void mmh_moe_iota(int * __restrict__ v, const int n) {
+    const int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i < n) {
+        v[i] = i;
+    }
+}
+
+// the plain fp16 prologue of the GEMM (as mmh_prologue<false, true>) for the local rows of chunk c: the input row is
+// the row of the token in x (local = false) or the local row of x (local = true)
+static __global__ void __launch_bounds__(256) mmh_moe_prologue(const mmh_params p, const mmh_moe_route rt, const int c,
+        const int32_t * __restrict__ ids, const int64_t ids_nb0, const int64_t ids_nb1, const int n_used,
+        const float * __restrict__ x, const int64_t x_nb1, const bool local, half * __restrict__ xh,
+        float * __restrict__ rscale) {
+    __shared__ float s_red[8];
+
+    const int r = blockIdx.x;
+    if (c >= *rt.n_chunks || r >= rt.chunks[2*c + 1]) {
+        return;
+    }
+    const int lane = threadIdx.x % 32;
+    const int wave = threadIdx.x / 32;
+
+    const int g = rt.rows_sorted[rt.chunks[2*c + 0] + r];
+    const int e = mmh_moe_expert(ids, ids_nb0, ids_nb1, n_used, g, (int) p.n_exp);
+    const float * src = (const float *) ((const char *) x + (int64_t) (local ? r : g / n_used)*x_nb1);
+    const char  * rin = mmh_rot_row(p, p.rot_in, p.rin_cache, p.rin_nb1, e);
+
+    float amax = 0.0f;
+    for (int64_t i = threadIdx.x; i < p.k; i += blockDim.x) {
+        amax = fmaxf(amax, fabsf(src[i]*mmh_rot(rin, p.rin_f16, i)));
+    }
+    amax = mmh_block_max(amax, s_red);
+    float s = 1.0f;
+    const float bound = amax*sqrtf((float) p.had);
+    if (bound > 0.0f && bound <= FLT_MAX) {
+        int ex;
+        frexpf(bound, &ex);
+        s = ldexpf(1.0f, max(-100, min(100, 14 - ex)));
+    }
+    if (threadIdx.x == 0) {
+        rscale[r] = 1.0f/s;
+    }
+    for (int64_t c0 = 128*wave; c0 < p.k; c0 += 128*(blockDim.x/32)) {
+        float v[4];
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const int64_t col = c0 + 32*j + lane;
+            v[j] = src[col]*mmh_rot(rin, p.rin_f16, col)*s;
+        }
+        mmh_fwht(v, lane, p.had, p.hscale);
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            xh[p.k*r + c0 + 32*j + lane] = __float2half_rn(v[j]);
+        }
+    }
+}
+
+// up = glu(gate, up) for the local rows of chunk c
+static __global__ void mmh_moe_glu(const mmh_moe_route rt, const int c, float * __restrict__ up,
+        const float * __restrict__ gate, const int64_t n_ff, const bool clamp, const float limit) {
+    if (c >= *rt.n_chunks) {
+        return;
+    }
+    const int64_t i = (int64_t) blockIdx.x*blockDim.x + threadIdx.x;
+    if (i >= rt.chunks[2*c + 1]*n_ff) {
+        return;
+    }
+    float g = gate[i];
+    float u = up[i];
+    if (clamp) {
+        g = fminf(g, limit);
+        u = fmaxf(fminf(u, limit), -limit);
+    }
+    up[i] = g/(1.0f + expf(-g))*u;
+}
+
+// out[:, t] += the sum, in slot order, of weights[k, t] * y[row] over the slots k of t whose row is in chunk c; one block
+// per token, which leaves at once when none of its rows is in the chunk
+static __global__ void __launch_bounds__(256) mmh_moe_scatter(const mmh_moe_route rt, const int c, const float * __restrict__ y,
+        const float * __restrict__ weights, const int64_t w_nb1, const int64_t w_nb2, const int n_used,
+        float * __restrict__ out, const int64_t out_nb1, const int n_embd) {
+    if (c >= *rt.n_chunks) {
+        return;
+    }
+    __shared__ int   s_p[MMH_MOE_MAX_USED];
+    __shared__ float s_w[MMH_MOE_MAX_USED];
+    __shared__ int   s_any;
+    const int t  = blockIdx.x;
+    const int b  = rt.chunks[2*c + 0];
+    const int nr = rt.chunks[2*c + 1];
+    if (threadIdx.x == 0) {
+        s_any = 0;
+    }
+    __syncthreads();
+    for (int k = threadIdx.x; k < n_used; k += blockDim.x) {
+        const int p = rt.pos[k + n_used*t] - b;
+        const bool in = p >= 0 && p < nr;
+        s_p[k] = in ? p : -1;
+        s_w[k] = in ? *(const float *) ((const char *) weights + k*w_nb1 + t*w_nb2) : 0.0f;
+        if (in) {
+            s_any = 1;
+        }
+    }
+    __syncthreads();
+    if (!s_any) {
+        return;
+    }
+    float * o = (float *) ((char *) out + t*out_nb1);
+    for (int col = threadIdx.x; col < n_embd; col += blockDim.x) {
+        float acc = 0.0f;
+        for (int k = 0; k < n_used; ++k) {
+            if (s_p[k] >= 0) {
+                acc += s_w[k]*y[(int64_t) s_p[k]*n_embd + col];
+            }
+        }
+        o[col] += acc;
+    }
+}
+
+template <ggml_type type>
+static void mmh_moe_gemm_t(const int mt, const dim3 grid, cudaStream_t stream, const mmh_params & p, const char * w,
+        const half * xh, const float * rscale, const int * items, const int * n_items, const int * iota) {
+    switch (mt) {
+        case 16:  mmh_gemm<type,  16><<<grid, 256, 0, stream>>>(p, w, xh, rscale, items, n_items, iota, nullptr, nullptr); break;
+        case 32:  mmh_gemm<type,  32><<<grid, 256, 0, stream>>>(p, w, xh, rscale, items, n_items, iota, nullptr, nullptr); break;
+        case 64:  mmh_gemm<type,  64><<<grid, 256, 0, stream>>>(p, w, xh, rscale, items, n_items, iota, nullptr, nullptr); break;
+        default:  mmh_gemm<type, 128><<<grid, 256, 0, stream>>>(p, w, xh, rscale, items, n_items, iota, nullptr, nullptr); break;
+    }
+}
+
+static void mmh_moe_gemm(const ggml_type type, const int mt, const dim3 grid, cudaStream_t stream, const mmh_params & p,
+        const char * w, const half * xh, const float * rscale, const int * items, const int * n_items, const int * iota) {
+    switch (type) {
+#define MMH_MOE_CASE(T) case T: mmh_moe_gemm_t<T>(mt, grid, stream, p, w, xh, rscale, items, n_items, iota); break;
+        MMH_MOE_CASE(GGML_TYPE_EXL3_M1)  MMH_MOE_CASE(GGML_TYPE_EXL3_M2)  MMH_MOE_CASE(GGML_TYPE_EXL3_M3)
+        MMH_MOE_CASE(GGML_TYPE_EXL3_M4)  MMH_MOE_CASE(GGML_TYPE_EXL3_M5)  MMH_MOE_CASE(GGML_TYPE_EXL3_M6)
+        MMH_MOE_CASE(GGML_TYPE_EXL3_M7)  MMH_MOE_CASE(GGML_TYPE_EXL3_M8)  MMH_MOE_CASE(GGML_TYPE_EXL3_M1H)
+        MMH_MOE_CASE(GGML_TYPE_EXL3_M2H) MMH_MOE_CASE(GGML_TYPE_EXL3_M3H) MMH_MOE_CASE(GGML_TYPE_EXL3_G1)
+        MMH_MOE_CASE(GGML_TYPE_EXL3_G2)  MMH_MOE_CASE(GGML_TYPE_EXL3_G3)  MMH_MOE_CASE(GGML_TYPE_EXL3_G4)
+        MMH_MOE_CASE(GGML_TYPE_EXL3_G5)  MMH_MOE_CASE(GGML_TYPE_EXL3_G6)  MMH_MOE_CASE(GGML_TYPE_EXL3_G7)
+        MMH_MOE_CASE(GGML_TYPE_EXL3_G8)  MMH_MOE_CASE(GGML_TYPE_EXL3_T1)  MMH_MOE_CASE(GGML_TYPE_EXL3_T2)
+        MMH_MOE_CASE(GGML_TYPE_EXL3_T3)  MMH_MOE_CASE(GGML_TYPE_EXL3_T4)  MMH_MOE_CASE(GGML_TYPE_EXL3_T5)
+        MMH_MOE_CASE(GGML_TYPE_EXL3_T6)  MMH_MOE_CASE(GGML_TYPE_EXL3_T7)  MMH_MOE_CASE(GGML_TYPE_EXL3_T8)
+#undef MMH_MOE_CASE
+        default:
+            GGML_ABORT("unsupported MOE_FFN_HAD weight type %s", ggml_type_name(type));
+    }
+}
+
+// the rows of a pass come from the op (the graph builder passes the layer mode's value after its no_alloc measurements,
+// 0 before), else the default
+static int mmh_moe_chunk_rows(const ggml_tensor * op) {
+    const int r = ggml_get_op_params_i32(op, 2);
+    return r > 0 ? r : MMH_MOE_ROWS;
+}
+
+// rows per GEMM item: three times the mean rows of an expert, the rule MMQ follows for host weights
+static int mmh_moe_mt(const int64_t n_rows, const int64_t n_exp) {
+    static const int env = [] {
+        const char * v = getenv("RANMA_EXPERT_MAJOR_MT");
+        return v ? atoi(v) : 0;
+    }();
+    if (env == 16 || env == 32 || env == 64 || env == 128) {
+        return env;
+    }
+    const int64_t used = std::max<int64_t>(1, std::min(n_rows, n_exp));
+    const int64_t want = 3*((n_rows + used - 1)/used);
+    return want <= 16 ? 16 : want <= 32 ? 32 : want <= 64 ? 64 : 128;
+}
+
+static int64_t mmh_moe_max_items(const int64_t chunk_rows, const int64_t n_exp, const int mt) {
+    return std::min(n_exp, chunk_rows) + chunk_rows/mt + 1;
+}
+
+bool ggml_cuda_moe_ffn_had_supported(const int device, const ggml_tensor * op) {
+    const int cc = ggml_cuda_info().devices[device].cc;
+    if (!GGML_CUDA_CC_IS_RDNA4(cc) || ggml_cuda_info().devices[device].warp_size != 32) {
+        return false;
+    }
+    const ggml_tensor * x       = op->src[0];
+    const ggml_tensor * ids     = op->src[1];
+    const ggml_tensor * weights = op->src[2];
+    if (x->type != GGML_TYPE_F32 || x->nb[0] != sizeof(float) || ids->type != GGML_TYPE_I32 ||
+            weights->type != GGML_TYPE_F32 || !ggml_is_contiguous(op)) {
+        return false;
+    }
+    const int64_t n_rows = ggml_nelements(ids);
+    if (n_rows >= (1 << 30) || ids->ne[0] > MMH_MOE_MAX_USED) {
+        return false;
+    }
+    for (int i = 3; i <= 5; ++i) {
+        const ggml_tensor * d = op->src[i];
+        const ggml_tensor * w = d->src[0];
+        if (!ggml_is_exl3(w->type) || ggml_get_op_params_i32(d, 0) != MMH_NG || !ggml_cuda_mul_mat_had_supported(device, d) ||
+                !mmh_input_f16(d) || w->view_src != nullptr) {
+            return false;
+        }
+    }
+    const int64_t n_exp = op->src[3]->src[0]->ne[2];
+    const int     mt    = mmh_moe_mt(n_rows, n_exp);
+    return mmh_moe_max_items(std::min<int64_t>(mmh_moe_chunk_rows(op), n_rows), n_exp, mt) <= 65535;
+}
+
+void ggml_cuda_moe_ffn_had(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * x       = dst->src[0];
+    const ggml_tensor * ids     = dst->src[1];
+    const ggml_tensor * weights = dst->src[2];
+    const ggml_tensor * desc[3] = { dst->src[3], dst->src[4], dst->src[5] }; // up, gate, down
+
+    const ggml_glu_op glu   = (ggml_glu_op) ggml_get_op_params_i32(dst, 0);
+    const float       limit = ggml_get_op_params_f32(dst, 1);
+
+    const int64_t n_embd   = dst->ne[0];
+    const int64_t n_tokens = dst->ne[1];
+    const int     n_used   = (int) ids->ne[0];
+    const int64_t n_rows   = (int64_t) n_used*n_tokens;
+    const int64_t n_ff     = desc[0]->src[0]->ne[1];
+    const int64_t n_exp    = desc[0]->src[0]->ne[2];
+
+    cudaStream_t stream = ctx.stream();
+
+    CUDA_CHECK(cudaMemsetAsync(dst->data, 0, ggml_nbytes(dst), stream));
+
+#if defined(GGML_USE_HIP)
+    // expert cache: the SSD tier may reuse the ring slots of the layer once every chunk has read them
+    struct done_guard {
+        ggml_backend_cuda_context & ctx;
+        const ggml_tensor * const * desc;
+        ~done_guard() {
+            for (int i = 0; i < 3; ++i) {
+                ggml_cuda_expert_layer_done(ctx, desc[i]->src[0]);
+            }
+        }
+    } done{ctx, desc};
+#endif // defined(GGML_USE_HIP)
+
+    if (n_rows == 0) {
+        return;
+    }
+
+    const int64_t R         = std::min<int64_t>(mmh_moe_chunk_rows(dst), n_rows);
+    const int     mt        = mmh_moe_mt(n_rows, n_exp);
+    const int64_t c_max     = 3*((n_rows + R - 1)/R) + 1;
+    const int64_t max_items = mmh_moe_max_items(R, n_exp, mt);
+    GGML_ASSERT(max_items <= 65535);
+
+    // the three GEMMs: local row r of a chunk is output row r of an [n, 1, R] buffer
+    mmh_params   p[3];
+    const char * wd[3];
+    for (int i = 0; i < 3; ++i) {
+        const ggml_tensor * w       = desc[i]->src[0];
+        const ggml_tensor * rot_in  = desc[i]->src[3];
+        const ggml_tensor * rot_out = desc[i]->src[4];
+        mmh_params & q = p[i];
+        memset(&q, 0, sizeof(q));
+        q.k        = w->ne[0];
+        q.n_exp    = w->ne[2];
+        q.nb01     = w->nb[1];
+        q.nb02     = w->nb[2];
+        q.n_rows   = R;
+        q.ne1      = 1;
+        q.ne2      = (int) R;
+        q.nb1      = w->ne[1]*sizeof(float);
+        q.nb2      = w->ne[1]*sizeof(float);
+        q.nb3      = 0;
+        q.rot_in   = mmh_data(rot_in);
+        q.rin_nb1  = rot_in->nb[1];
+        q.rot_out  = mmh_data(rot_out);
+        q.rout_nb0 = rot_out->nb[0];
+        q.rout_nb1 = rot_out->nb[1];
+        q.rin_f16  = rot_in->type == GGML_TYPE_F16;
+        q.rout_f16 = rot_out->type == GGML_TYPE_F16;
+        q.had      = MMH_NG;
+        q.hscale   = 1.0f/sqrtf((float) MMH_NG);
+        // the expert cache lookup; with the staged SSD tier also the wait for this kind (all three before the chunks)
+        wd[i] = mmh_weight_data(ctx, w, ids, q);
+    }
+
+    ggml_cuda_pool_alloc<int>   route(ctx.pool(), 3*n_rows + 2*n_exp + 2*c_max + 1);
+    ggml_cuda_pool_alloc<int>   items(ctx.pool(), 3*max_items + 1);
+    ggml_cuda_pool_alloc<int>   iota(ctx.pool(), R);
+    ggml_cuda_pool_alloc<half>  xh(ctx.pool(), R*std::max(n_embd, n_ff));
+    ggml_cuda_pool_alloc<float> rscale(ctx.pool(), R);
+    ggml_cuda_pool_alloc<float> vu(ctx.pool(), R*n_ff);
+    ggml_cuda_pool_alloc<float> vg(ctx.pool(), R*n_ff);
+    ggml_cuda_pool_alloc<float> vy(ctx.pool(), R*n_embd);
+
+    mmh_moe_route rt;
+    rt.rows_sorted = route.get();
+    rt.pos         = rt.rows_sorted + n_rows;
+    rt.eid         = rt.pos + n_rows;
+    rt.offs        = rt.eid + n_rows;
+    rt.cnt         = rt.offs + n_exp;
+    rt.chunks      = rt.cnt + n_exp;
+    rt.n_chunks    = rt.chunks + 2*c_max;
+    int * n_items  = items.get() + 3*max_items;
+
+    const int32_t * ids_d   = (const int32_t *) ids->data;
+    const int64_t   ids_nb0 = ids->nb[0];
+    const int64_t   ids_nb1 = ids->nb[1];
+
+    mmh_moe_route_kernel<<<1, 1024, 0, stream>>>(ids_d, ids_nb0, ids_nb1, n_used, (int) n_rows, (int) n_exp, (int) R,
+        (int) c_max, rt);
+    CUDA_CHECK(cudaGetLastError());
+    mmh_moe_iota<<<(unsigned) ((R + 255)/256), 256, 0, stream>>>(iota.get(), (int) R);
+    CUDA_CHECK(cudaGetLastError());
+
+    float * outs[3] = { vu.get(), vg.get(), vy.get() };
+    const dim3 grid_glu((unsigned) ((R*n_ff + 255)/256));
+    const dim3 grid_scatter((unsigned) n_tokens);
+
+    for (int c = 0; c < (int) c_max; ++c) {
+        mmh_moe_items_kernel<<<1, 1024, 0, stream>>>(rt, c, (int) n_exp, mt, items.get(), n_items);
+        CUDA_CHECK(cudaGetLastError());
+        for (int i = 0; i < 3; ++i) {
+            const bool local = i == 2;
+            mmh_moe_prologue<<<(unsigned) R, 256, 0, stream>>>(p[i], rt, c, ids_d, ids_nb0, ids_nb1, n_used,
+                local ? vu.get() : (const float *) x->data, local ? n_ff*(int64_t) sizeof(float) : (int64_t) x->nb[1], local,
+                xh.get(), rscale.get());
+            CUDA_CHECK(cudaGetLastError());
+            mmh_params q = p[i];
+            q.dst = outs[i];
+            const dim3 grid((unsigned) (desc[i]->src[0]->ne[1]/MMH_NG), (unsigned) max_items, 1);
+            mmh_moe_gemm(desc[i]->src[0]->type, mt, grid, stream, q, wd[i], xh.get(), rscale.get(), items.get(), n_items,
+                iota.get());
+            CUDA_CHECK(cudaGetLastError());
+            if (i == 1) {
+                mmh_moe_glu<<<grid_glu, 256, 0, stream>>>(rt, c, vu.get(), vg.get(), n_ff,
+                    glu == GGML_GLU_OP_SWIGLU_CLAMP, limit);
+                CUDA_CHECK(cudaGetLastError());
+            }
+        }
+        mmh_moe_scatter<<<grid_scatter, 256, 0, stream>>>(rt, c, vy.get(), (const float *) weights->data, weights->nb[1],
+            weights->nb[2], n_used, (float *) dst->data, dst->nb[1], (int) n_embd);
+        CUDA_CHECK(cudaGetLastError());
+    }
+}
