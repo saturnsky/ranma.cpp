@@ -24,6 +24,8 @@
 #include "expert-controller.cuh"
 #include "moe-ffn-had-layout.h"
 
+#include "ggml-account.h"
+
 #include <cfloat>
 #include <map>
 #include <mutex>
@@ -3020,8 +3022,18 @@ void ggml_cuda_moe_ffn_had(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         CUDA_CHECK(cudaStreamWaitEvent(sd->side, sd->ev_plan, 0));
         mmh_moe_stage_plan_kernel<<<1, 256, 0, stream>>>(rt, stage_cap, ss, sd->plan_dev);
         CUDA_CHECK(cudaGetLastError());
+        const int64_t t_sync = ggml_account_enabled() ? ggml_time_us() : 0;
         CUDA_CHECK(cudaStreamSynchronize(stream));
         n_loop = sd->plan_host->n_chunks;
+        if (t_sync != 0) {
+            // the plan holds the staged experts per chunk; the sync is the existing one
+            int64_t n_staged = 0;
+            for (int c = 0; c < n_loop; ++c) {
+                n_staged += sd->plan_host->stage_n[c];
+            }
+            ggml_account_add(GGML_ACCOUNT_HOST_SYNC_MS, (ggml_time_us() - t_sync)/1000.0);
+            ggml_account_add(GGML_ACCOUNT_OP_STAGE_BYTES, (double) (n_staged*(ss.nb02[0] + ss.nb02[1] + ss.nb02[2])));
+        }
         enqueue_copies(0);
         enqueue_copies(1);
     } else if (sd) {

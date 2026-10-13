@@ -491,6 +491,10 @@ private:
     size_t  graph_last_extent   = 0;  // how far the last graph reached into the compute buffer of the expert backend
     int32_t graph_last_pos      = -1; // the highest position of the last ubatch
 
+    // prefill accounting (RANMA_PREFILL_ACCOUNT, ggml-account.h): the id of this context, the ubatches it has processed
+    uint64_t account_ctx = 0;
+    uint64_t account_ub  = 0;
+
     // drop every stored graph (they are rebuilt on their next use)
     void graph_reuse_invalidate();
 

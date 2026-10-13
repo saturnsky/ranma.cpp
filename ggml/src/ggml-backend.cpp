@@ -8,6 +8,7 @@
 #include <windows.h>
 #endif
 
+#include "ggml-account.h"
 #include "ggml-backend.h"
 #include "ggml-backend-impl.h"
 #include "ggml-alloc.h"
@@ -20,6 +21,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <algorithm>
+#include <atomic>
+#include <map>
+#include <string>
 #include <mutex>
 #include <unordered_map>
 #include <vector>
@@ -3637,4 +3641,318 @@ void ggml_backend_shared_buft_release(ggml_backend_buffer_type_t buft) {
 bool ggml_backend_buft_is_shared(ggml_backend_buffer_type_t buft) {
     std::lock_guard<std::mutex> lock(ggml_backend_shared_mutex());
     return ggml_backend_shared_states().count(buft) != 0;
+}
+
+// ---- prefill ubatch accounting (ggml-account.h) ----
+
+namespace {
+
+struct account_rec {
+    uint64_t ctx = 0, ub = 0;
+    int32_t  tokens = 0;
+    int64_t  t_open_us = 0, t_end_us = 0;
+    double   v[GGML_ACCOUNT_FIELDS] = {};
+    bool     set[GGML_ACCOUNT_FIELDS] = {};
+    std::map<const void *, std::pair<int64_t, int64_t>> spans;
+    std::vector<std::pair<std::string, std::string>> notes;
+    int      outstanding = 0;
+    bool     ended = false;
+    bool     ok = false;
+};
+
+struct account_state {
+    std::mutex mutex;
+    std::map<uint64_t, account_rec> recs;
+    uint64_t next_key = 0;
+    uint64_t next_ctx = 0;
+    uint64_t last_ctx = 0, last_ub = 0;
+    std::atomic<uint64_t> current { 0 };
+};
+
+account_state & account_get() {
+    static account_state * st = new account_state;   // never destroyed: a worker thread may print at exit
+    return *st;
+}
+
+void account_field(std::string & out, const char * name, const account_rec & r, int f, const char * fmt) {
+    char buf[128];
+    if (r.set[f]) {
+        snprintf(buf, sizeof(buf), fmt, name, r.v[f]);
+    } else {
+        snprintf(buf, sizeof(buf), ",\"%s\":null", name);
+    }
+    out += buf;
+}
+
+// the sum of the three kinds of a field, null when none was touched
+void account_sum(std::string & out, const char * name, const account_rec & r, int f, const char * fmt) {
+    char buf[128];
+    double sum = 0;
+    bool any = false;
+    for (int k = 0; k < 3; ++k) {
+        sum += r.v[f + k];
+        any = any || r.set[f + k];
+    }
+    if (any) {
+        snprintf(buf, sizeof(buf), fmt, name, sum);
+    } else {
+        snprintf(buf, sizeof(buf), ",\"%s\":null", name);
+    }
+    out += buf;
+}
+
+void account_array(std::string & out, const char * name, const account_rec & r, int f, const char * fmt) {
+    char buf[64];
+    out += std::string("\"") + name + "\":[";
+    for (int k = 0; k < 3; ++k) {
+        snprintf(buf, sizeof(buf), fmt, r.v[f + k]);
+        out += (k ? "," : "");
+        out += buf;
+    }
+    out += ']';
+}
+
+// prints and erases the record; the caller holds the mutex
+void account_print_locked(account_state & st, std::map<uint64_t, account_rec>::iterator it) {
+    static const char * ms_fmt    = ",\"%s\":%.3f";
+    static const char * bytes_fmt = ",\"%s\":%.0f";
+    const account_rec & r = it->second;
+    std::string out;
+    char buf[192];
+    snprintf(buf, sizeof(buf), "{\"kind\":\"prefill_account\",\"v\":1,\"ctx\":%llu,\"ub\":%llu,\"tokens\":%d",
+        (unsigned long long) r.ctx, (unsigned long long) r.ub, (int) r.tokens);
+    out += buf;
+    for (const auto & n : r.notes) {
+        const bool digits = !n.second.empty() && n.second.find_first_not_of("0123456789") == std::string::npos;
+        out += ",\"" + n.first + "\":" + (digits ? n.second : "\"" + n.second + "\"");
+    }
+    snprintf(buf, sizeof(buf), ",\"complete\":%s,\"ssd_complete\":%s,\"wall_ms\":null,\"host_total_ms\":%.3f",
+        r.ok ? "true" : "false", r.outstanding <= 0 ? "true" : "false", (r.t_end_us - r.t_open_us)/1000.0);
+    out += buf;
+    account_field(out, "begin_ms",           r, GGML_ACCOUNT_BEGIN_MS,           ms_fmt);
+    account_field(out, "host_submit_ms",     r, GGML_ACCOUNT_SUBMIT_MS,          ms_fmt);
+    account_field(out, "graph_build_ms",     r, GGML_ACCOUNT_GRAPH_BUILD_MS,     ms_fmt);
+    account_field(out, "input_ms",           r, GGML_ACCOUNT_INPUT_MS,           ms_fmt);
+    account_field(out, "engram_hash_ms",     r, GGML_ACCOUNT_ENGRAM_HASH_MS,     ms_fmt);
+    account_field(out, "engram_prefetch_ms", r, GGML_ACCOUNT_ENGRAM_PREFETCH_MS, ms_fmt);
+    if (r.spans.empty()) {
+        out += ",\"engram_cpu_ms\":null";
+    } else {
+        double ms = 0;
+        for (const auto & s : r.spans) {
+            ms += (s.second.second - s.second.first)/1000.0;
+        }
+        snprintf(buf, sizeof(buf), ms_fmt, "engram_cpu_ms", ms);
+        out += buf;
+    }
+    account_field(out, "engram_logical_bytes", r, GGML_ACCOUNT_ENGRAM_LOGICAL_BYTES, bytes_fmt);
+    out += ",\"process_fault_delta\":null,\"gpu_stream_ms\":null,\"gpu_moe_interval_ms\":null,"
+           "\"gpu_attn_interval_ms\":null,\"gpu_other_interval_ms\":null";
+    account_sum(out, "ssd_payload_bytes",  r, GGML_ACCOUNT_SSD_PAYLOAD_BYTES, bytes_fmt);
+    account_sum(out, "ssd_io_bytes",       r, GGML_ACCOUNT_SSD_IO_BYTES,      bytes_fmt);
+    account_sum(out, "ssd_worker_wait_ms", r, GGML_ACCOUNT_SSD_WORKER_MS,     ms_fmt);
+    account_sum(out, "ssd_gpu_wait_ms",    r, GGML_ACCOUNT_SSD_GPU_MS,        ms_fmt);
+    bool kinds = false;
+    for (int f = GGML_ACCOUNT_SSD_PAYLOAD_BYTES; f < GGML_ACCOUNT_FIELDS; ++f) {
+        kinds = kinds || r.set[f];
+    }
+    if (kinds) {
+        out += ",\"ssd_kind\":{";
+        account_array(out, "payload_bytes", r, GGML_ACCOUNT_SSD_PAYLOAD_BYTES, "%.0f");
+        out += ',';
+        account_array(out, "io_bytes", r, GGML_ACCOUNT_SSD_IO_BYTES, "%.0f");
+        out += ',';
+        account_array(out, "worker_wait_ms", r, GGML_ACCOUNT_SSD_WORKER_MS, "%.3f");
+        out += ',';
+        account_array(out, "gpu_wait_ms", r, GGML_ACCOUNT_SSD_GPU_MS, "%.3f");
+        out += '}';
+    }
+    out += ",\"l2_vram_bytes\":null,\"l2_vram_wait_ms\":null";
+    account_field(out, "op_stage_bytes",  r, GGML_ACCOUNT_OP_STAGE_BYTES,  bytes_fmt);
+    account_field(out, "ctrl_stage_bytes", r, GGML_ACCOUNT_CTRL_STAGE_BYTES, bytes_fmt);
+    account_field(out, "host_sync_ms",    r, GGML_ACCOUNT_HOST_SYNC_MS,    ms_fmt);
+    out += ",\"checkpoint_ms\":null,\"residual_ms\":null,\"timing\":\"cpu_only\"}\n";
+    fputs(out.c_str(), stderr);
+    fflush(stderr);
+    st.recs.erase(it);
+}
+
+} // namespace
+
+bool ggml_account_enabled(void) {
+    static const bool on = [] {
+        const char * v = getenv("RANMA_PREFILL_ACCOUNT");
+        return v != NULL && strcmp(v, "1") == 0;
+    }();
+    return on;
+}
+
+uint64_t ggml_account_next_ctx(void) {
+    if (!ggml_account_enabled()) {
+        return 0;
+    }
+    account_state & st = account_get();
+    std::lock_guard<std::mutex> lock(st.mutex);
+    return ++st.next_ctx;
+}
+
+uint64_t ggml_account_begin(uint64_t ctx, uint64_t ub, int32_t tokens) {
+    if (!ggml_account_enabled()) {
+        return 0;
+    }
+    account_state & st = account_get();
+    std::lock_guard<std::mutex> lock(st.mutex);
+    // a record that still owes contributions a few ubatches later never gets them (a skipped generation): print it as is
+    for (auto it = st.recs.begin(); it != st.recs.end() && it->first + 4 < st.next_key + 1; ) {
+        auto cur = it++;
+        if (cur->second.ended) {
+            account_print_locked(st, cur);
+        }
+    }
+    const uint64_t key = ++st.next_key;
+    account_rec & r = st.recs[key];
+    r.ctx = ctx;
+    r.ub = ub;
+    r.tokens = tokens;
+    r.t_open_us = ggml_time_us();
+    st.last_ctx = ctx;
+    st.last_ub = ub;
+    st.current.store(key);
+    return key;
+}
+
+uint64_t ggml_account_current(void) {
+    return ggml_account_enabled() ? account_get().current.load() : 0;
+}
+
+void ggml_account_add_for(uint64_t key, enum ggml_account_field field, double value) {
+    if (key == 0 || !ggml_account_enabled()) {
+        return;
+    }
+    account_state & st = account_get();
+    std::lock_guard<std::mutex> lock(st.mutex);
+    auto it = st.recs.find(key);
+    if (it == st.recs.end()) {
+        return;
+    }
+    it->second.v[field] += value;
+    it->second.set[field] = true;
+}
+
+void ggml_account_add(enum ggml_account_field field, double value) {
+    ggml_account_add_for(ggml_account_current(), field, value);
+}
+
+void ggml_account_node_span(const void * node, int64_t t0_us, int64_t t1_us) {
+    const uint64_t key = ggml_account_current();
+    if (key == 0) {
+        return;
+    }
+    account_state & st = account_get();
+    std::lock_guard<std::mutex> lock(st.mutex);
+    auto it = st.recs.find(key);
+    if (it == st.recs.end()) {
+        return;
+    }
+    auto s = it->second.spans.emplace(node, std::make_pair(t0_us, t1_us));
+    if (!s.second) {
+        s.first->second.first  = std::min(s.first->second.first,  t0_us);
+        s.first->second.second = std::max(s.first->second.second, t1_us);
+    }
+}
+
+void ggml_account_note(const char * name, const char * value) {
+    const uint64_t key = ggml_account_current();
+    if (key == 0 || name == NULL || value == NULL) {
+        return;
+    }
+    account_state & st = account_get();
+    std::lock_guard<std::mutex> lock(st.mutex);
+    auto it = st.recs.find(key);
+    if (it != st.recs.end()) {
+        it->second.notes.emplace_back(name, value);
+    }
+}
+
+bool ggml_account_expect(uint64_t key, int n) {
+    if (key == 0 || !ggml_account_enabled()) {
+        return false;
+    }
+    account_state & st = account_get();
+    std::lock_guard<std::mutex> lock(st.mutex);
+    auto it = st.recs.find(key);
+    if (it == st.recs.end()) {
+        return false;
+    }
+    it->second.outstanding += n;
+    return true;
+}
+
+void ggml_account_settle(uint64_t key, int n) {
+    if (key == 0 || !ggml_account_enabled()) {
+        return;
+    }
+    account_state & st = account_get();
+    std::lock_guard<std::mutex> lock(st.mutex);
+    auto it = st.recs.find(key);
+    if (it == st.recs.end()) {
+        return;
+    }
+    it->second.outstanding = std::max(0, it->second.outstanding - n);
+    if (it->second.ended && it->second.outstanding == 0) {
+        account_print_locked(st, it);
+    }
+}
+
+void ggml_account_end(uint64_t key, bool ok) {
+    if (key == 0 || !ggml_account_enabled()) {
+        return;
+    }
+    account_state & st = account_get();
+    std::lock_guard<std::mutex> lock(st.mutex);
+    uint64_t cur = key;
+    st.current.compare_exchange_strong(cur, 0);
+    auto it = st.recs.find(key);
+    if (it == st.recs.end()) {
+        return;
+    }
+    it->second.ended = true;
+    it->second.ok = ok;
+    it->second.t_end_us = ggml_time_us();
+    if (it->second.outstanding == 0) {
+        account_print_locked(st, it);
+    }
+}
+
+void ggml_account_flush(int keep_newest) {
+    if (!ggml_account_enabled()) {
+        return;
+    }
+    account_state & st = account_get();
+    std::lock_guard<std::mutex> lock(st.mutex);
+    std::vector<uint64_t> keys;
+    for (const auto & kv : st.recs) {
+        keys.push_back(kv.first);
+    }
+    const size_t n = keys.size() > (size_t) std::max(0, keep_newest) ? keys.size() - (size_t) std::max(0, keep_newest) : 0;
+    for (size_t i = 0; i < n; ++i) {
+        auto it = st.recs.find(keys[i]);
+        if (it != st.recs.end() && it->second.ended) {
+            account_print_locked(st, it);
+        }
+    }
+}
+
+void ggml_account_boundary(const char * what, double ms, int64_t n_tokens, int64_t bytes) {
+    if (!ggml_account_enabled()) {
+        return;
+    }
+    account_state & st = account_get();
+    std::lock_guard<std::mutex> lock(st.mutex);
+    char buf[256];
+    snprintf(buf, sizeof(buf), "{\"kind\":\"prefill_account\",\"v\":1,\"event\":\"%s\",\"after_ctx\":%llu,\"after_ub\":%llu,"
+        "\"ms\":%.3f,\"n_tokens\":%lld,\"bytes\":%lld}\n", what, (unsigned long long) st.last_ctx,
+        (unsigned long long) st.last_ub, ms, (long long) n_tokens, (long long) bytes);
+    fputs(buf, stderr);
+    fflush(stderr);
 }

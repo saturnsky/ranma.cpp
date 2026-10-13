@@ -14,6 +14,7 @@
 #include "../../src/llama-ext.h" // staging API: llama_model_n_devices / llama_model_get_device (used by the GPU heartbeat)
 #include "common.h"
 #include "fit.h"
+#include "ggml-account.h"
 #include "llama.h"
 #include "log.h"
 #include "sampling.h"
@@ -4574,7 +4575,12 @@ private:
                     // note: we create the checkpoint before calling llama_decode(), so the current batch is not
                     //       yet processed and therefore it is not part of the checkpoint.
                     if (do_checkpoint) {
+                        const int64_t t_ckpt = ggml_account_enabled() ? ggml_time_us() : 0;
                         create_checkpoint(slot, n_tokens_cur, pos_min, pos_max);
+                        if (t_ckpt != 0) {
+                            ggml_account_boundary("checkpoint", (ggml_time_us() - t_ckpt) / 1000.0, slot.prompt.n_tokens(),
+                                    slot.prompt.checkpoints.empty() ? 0 : (int64_t) slot.prompt.checkpoints.back().size());
+                        }
                     }
 
                     // the batch built above is decoded before this slot is visited again, so a restored

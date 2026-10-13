@@ -1,6 +1,7 @@
 #include "llama-context.h"
 
 #include "ggml.h"
+#include "ggml-account.h"
 #include "llama-arch.h"
 #include "llama-graph.h"
 #include "llama-graph-chunk.h"
@@ -622,6 +623,10 @@ llama_context::llama_context(
 llama_context::~llama_context() {
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
+
+    if (account_ctx != 0) {
+        ggml_account_flush(0);
+    }
 
     if (graph_reuse_shapes > 0) {
         LLAMA_LOG_INFO("%s: graph reuse across batch shapes: %lld built, %lld made current again, %lld rebuilt after a "
@@ -1620,6 +1625,32 @@ bool llama_context::set_adapter_cvec(
 }
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+    // prefill accounting (RANMA_PREFILL_ACCOUNT): the record is closed on every way out of this function
+    struct account_scope {
+        uint64_t key = 0;
+        bool     ok  = false;
+        ~account_scope() {
+            if (key != 0) {
+                ggml_account_end(key, ok);
+            }
+        }
+    } acct;
+    const bool account = ggml_account_enabled();
+    int64_t t_acct = 0;
+    double  build_ms = 0.0;
+    if (account) {
+        if (account_ctx == 0) {
+            account_ctx = ggml_account_next_ctx();
+        }
+        acct.key = ggml_account_begin(account_ctx, ++account_ub, (int32_t) ubatch.n_tokens);
+        const llama_layer_mode_config lm_cfg = llama_layer_mode_get_config();
+        ggml_account_note("mode", lm_cfg.expert_major ? "em" : "off");
+        if (lm_cfg.attn_chunk > 0) {
+            ggml_account_note("attn_chunk", std::to_string(lm_cfg.attn_chunk).c_str());
+        }
+        t_acct = ggml_time_us();
+    }
+
     // ranma expert cache: the token-routed layers' experts are known now, before the graph is built
     if (expert_hint_state >= 0 && ubatch.token != nullptr && ubatch.embd == nullptr &&
             (gtype == LLM_GRAPH_TYPE_DEFAULT || gtype == LLM_GRAPH_TYPE_DECODER)) {
@@ -1770,8 +1801,14 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         n_graph_builds++;
         t_graph_build_us += ggml_time_us() - t_build_us;
+        if (account) {
+            build_ms = (ggml_time_us() - t_build_us)/1000.0;
+            ggml_account_add(GGML_ACCOUNT_GRAPH_BUILD_MS, build_ms);
+        }
         graph_build_last_nt = (int32_t) ubatch.n_tokens;
     }
+
+    const int64_t t_input = account ? ggml_time_us() : 0;
 
     // set the input data for the input tensors
     {
@@ -1781,6 +1818,12 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         res->set_inputs(&ubatch);
 
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
+    }
+
+    const int64_t t_submit = account ? ggml_time_us() : 0;
+    if (account) {
+        ggml_account_add(GGML_ACCOUNT_BEGIN_MS, (t_input - t_acct)/1000.0 - build_ms);
+        ggml_account_add(GGML_ACCOUNT_INPUT_MS, (t_submit - t_input)/1000.0);
     }
 
     // ranma expert cache: tell the profiler which rows of this ubatch belong to the profiled
@@ -1812,6 +1855,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
         return nullptr;
+    }
+
+    if (account) {
+        ggml_account_add(GGML_ACCOUNT_SUBMIT_MS, (ggml_time_us() - t_submit)/1000.0);
+        acct.ok = true;
     }
 
     ret = GGML_STATUS_SUCCESS;
