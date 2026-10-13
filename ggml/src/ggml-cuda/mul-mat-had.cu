@@ -89,6 +89,7 @@ struct mmh_params {
     const int32_t  * w_slots;
     const int32_t  * w_host_slots;
     const uint64_t * w_host_addresses;
+    bool w_remote;   // routed weights come over the host link (mapped host buffer or expert cache), not from VRAM
     const char     * rin_cache;
     const char     * rout_cache;
 };
@@ -394,12 +395,16 @@ static __global__ void __launch_bounds__(256) mmh_prologue(const mmh_params p, h
 
 // rows grouped by weight matrix: rows_sorted, and items (expert, first row, row count <= mt)
 // one block, counts in LDS by atomics, so the order inside one expert is arbitrary; each row is computed alone
-static __global__ void __launch_bounds__(1024) mmh_route(const mmh_params p, const int mt, int * __restrict__ eid,
-        int * __restrict__ rank, int * __restrict__ rows_sorted, int * __restrict__ items, int * __restrict__ n_items) {
+// With items_r, the GEMM items go to two lists: the experts read from VRAM (an expert cache slot, tile mt) and the
+// others (tile mt_r); without it all go to items.
+static __global__ void __launch_bounds__(1024) mmh_route(const mmh_params p, const int mt, const int mt_r,
+        int * __restrict__ eid, int * __restrict__ rank, int * __restrict__ rows_sorted, int * __restrict__ items,
+        int * __restrict__ n_items, int * __restrict__ items_r, int * __restrict__ n_items_r) {
     __shared__ int s_count[MMH_MAX_EXPERTS];
     __shared__ int s_offs[MMH_MAX_EXPERTS];
     __shared__ int s_rows[1024];
     __shared__ int s_items[1024];
+    __shared__ int s_items_r[1024];
 
     const int tid = threadIdx.x;
     const int nth = blockDim.x;
@@ -421,39 +426,58 @@ static __global__ void __launch_bounds__(1024) mmh_route(const mmh_params p, con
     const int64_t per = (p.n_exp + nth - 1)/nth;
     const int64_t e0  = std::min<int64_t>(p.n_exp, tid*per);
     const int64_t e1  = std::min<int64_t>(p.n_exp, e0 + per);
-    int sum_rows  = 0;
-    int sum_items = 0;
+    auto remote = [&](const int64_t e) {
+        return items_r != nullptr && (p.w_slots == nullptr || p.w_slots[e] < 0);
+    };
+    int sum_rows    = 0;
+    int sum_items   = 0;
+    int sum_items_r = 0;
     for (int64_t e = e0; e < e1; ++e) {
         const int c = s_count[e];
-        sum_rows  += c;
-        sum_items += (c + mt - 1)/mt;
+        sum_rows += c;
+        if (remote(e)) {
+            sum_items_r += (c + mt_r - 1)/mt_r;
+        } else {
+            sum_items   += (c + mt - 1)/mt;
+        }
     }
-    s_rows[tid]  = sum_rows;
-    s_items[tid] = sum_items;
+    s_rows[tid]    = sum_rows;
+    s_items[tid]   = sum_items;
+    s_items_r[tid] = sum_items_r;
     __syncthreads();
     for (int h = 1; h < nth; h *= 2) {
-        const int a = tid >= h ? s_rows[tid - h]  : 0;
-        const int b = tid >= h ? s_items[tid - h] : 0;
+        const int a = tid >= h ? s_rows[tid - h]    : 0;
+        const int b = tid >= h ? s_items[tid - h]   : 0;
+        const int d = tid >= h ? s_items_r[tid - h] : 0;
         __syncthreads();
-        s_rows[tid]  += a;
-        s_items[tid] += b;
+        s_rows[tid]    += a;
+        s_items[tid]   += b;
+        s_items_r[tid] += d;
         __syncthreads();
     }
-    int row  = s_rows[tid]  - sum_rows;
-    int item = s_items[tid] - sum_items;
+    int row    = s_rows[tid]    - sum_rows;
+    int item   = s_items[tid]   - sum_items;
+    int item_r = s_items_r[tid] - sum_items_r;
     for (int64_t e = e0; e < e1; ++e) {
         const int c = s_count[e];
         s_offs[e] = row;
-        for (int i = 0; i < c; i += mt) {
-            items[3*item + 0] = (int) e;
-            items[3*item + 1] = row + i;
-            items[3*item + 2] = min(mt, c - i);
-            ++item;
+        const bool r_list = remote(e);
+        const int  m      = r_list ? mt_r : mt;
+        int * list = r_list ? items_r : items;
+        int & k    = r_list ? item_r  : item;
+        for (int i = 0; i < c; i += m) {
+            list[3*k + 0] = (int) e;
+            list[3*k + 1] = row + i;
+            list[3*k + 2] = min(m, c - i);
+            ++k;
         }
         row += c;
     }
     if (tid == nth - 1) {
         *n_items = s_items[tid];
+        if (items_r != nullptr) {
+            *n_items_r = s_items_r[tid];
+        }
     }
     __syncthreads();
 
@@ -1539,11 +1563,17 @@ static void mmh_launch(ggml_backend_cuda_context & ctx, const mmh_params & p, co
         const size_t  lds    = (size_t) rows_t*nks*16*sizeof(float);
         const size_t  lds_static = (size_t) (2*MMH_GEMV_LIST + 33)*sizeof(int) + (size_t) 4*rows_t*MMH_NG*sizeof(float);
         bool fused = lds + lds_static <= MMH_FUSED_LDS && n_groups*used*kblocks <= MMH_FUSED_MAX_BLOCKS;
-        // the fp16 input: 2 bytes per value, and for mul1 the F32 sums of each 16 values (the fused choice is the same).
+        // the fp16 input: 2 bytes per value, and for mul1 the F32 sums of each 16 values (the fused choice is the same, but see below).
         // Not for a dense op of one row, where it measured slower for the larger types
         const bool    h16    = f16 && mmh_is_exl3(type) && (p.ids || per_exp > 1) && kslices*sizeof(float) <= MMH_FUSED_LDS;
         const bool    sums   = h16 && mmh_exl3_codebook(type) == 0;
         const size_t  lds16  = (size_t) rows_t*nks*(16*sizeof(half) + (sums ? sizeof(float) : 0));
+        // routed weights over the host link: the fp16 input also decides the fused choice (2 rows of the gate/up of
+        // DeepSeek V4.1 stage 28.8 KB instead of 49.3 KB and skip the prologue: 0.95 ms per call of 40 layers). In VRAM
+        // it measured 0.3 ms slower, so the F32 size decides there
+        if (h16 && p.w_remote && !fused) {
+            fused = lds16 + lds_static <= MMH_FUSED_LDS && n_groups*used*kblocks <= MMH_FUSED_MAX_BLOCKS;
+        }
         int * fused_tickets = nullptr;
         if (fused && kblocks > 1) {
             fused_tickets = mmh_fused_tickets(ctx.device, stream, n_tickets);
@@ -1592,8 +1622,22 @@ static void mmh_launch(ggml_backend_cuda_context & ctx, const mmh_params & p, co
     xh.alloc((wmma ? 1 : 2)*p.n_rows*p.k);
     rscale.alloc(p.n_rows);
 
-    const int mt = !wmma ? 8 : per_exp <= 16 ? 16 : per_exp <= 32 ? 32 : per_exp <= 64 ? 64 : 128;
-    const int64_t max_items = used + p.n_rows/mt + 1;
+    // Popular experts get several times the mean number of rows, and an expert with more rows than the tile width reads
+    // its weights once per tile (over the link when they sit in host memory). Like MMQ, size the tile against a multiple
+    // of the mean for the experts read from host memory. Experts read from VRAM (weights in VRAM, or an expert cache
+    // slot) are not re-read over a link and the wider tile is slower there: they keep the tile of the mean, and with the
+    // expert cache the two kinds of experts run as two GEMM launches. The multiple is 3.
+    const int64_t mt_scale = GGML_CUDA_CC_IS_RDNA4(cc) && p.w_remote ? 3 : 1;
+    auto tile = [&](const int64_t scale) {
+        const int64_t rows_opt = std::min<int64_t>(p.n_rows, per_exp*scale);
+        return !wmma ? 8 : rows_opt <= 16 ? 16 : rows_opt <= 32 ? 32 : rows_opt <= 64 ? 64 : 128;
+    };
+    const int  mt_r  = tile(mt_scale);
+    // without cache slots every routed expert is read from host memory: one list of the wide tile
+    const bool split = p.ids && p.w_slots != nullptr && tile(1) != mt_r;
+    const int  mt    = split ? tile(1) : mt_r;
+    const int64_t max_items   = used + p.n_rows/mt + 1;
+    const int64_t max_items_r = split ? used + p.n_rows/mt_r + 1 : 0;
 
     GGML_ASSERT(max_items <= 65535);
 
@@ -1605,7 +1649,8 @@ static void mmh_launch(ggml_backend_cuda_context & ctx, const mmh_params & p, co
     }
     ggml_cuda_pool_alloc<float> part(ctx.pool());
     ggml_cuda_pool_alloc<int>   tickets(ctx.pool());
-    const int n_tickets = kblocks > 1 ? (int) (max_items*n_groups) : 0;
+    // the two launches count their k splits in tickets of their own
+    const int n_tickets = kblocks > 1 ? (int) ((max_items + max_items_r)*n_groups) : 0;
     if (kblocks > 1) {
         part.alloc(p.n_rows*n_groups*kblocks*MMH_NG);
         tickets.alloc(n_tickets);
@@ -1618,31 +1663,41 @@ static void mmh_launch(ggml_backend_cuda_context & ctx, const mmh_params & p, co
     }
     CUDA_CHECK(cudaGetLastError());
 
-    ggml_cuda_pool_alloc<int> route(ctx.pool(), 3*p.n_rows + 3*max_items + 1);
+    ggml_cuda_pool_alloc<int> route(ctx.pool(), 3*p.n_rows + 3*(max_items + max_items_r) + 2);
     int * eid         = route.get();
     int * rank        = eid + p.n_rows;
     int * rows_sorted = rank + p.n_rows;
     int * items       = rows_sorted + p.n_rows;
     int * n_items     = items + 3*max_items;
+    int * items_r     = split ? n_items + 1 : nullptr;
+    int * n_items_r   = split ? items_r + 3*max_items_r : nullptr;
 
-    mmh_route<<<1, 1024, 0, stream>>>(p, mt, eid, rank, rows_sorted, items, n_items);
+    mmh_route<<<1, 1024, 0, stream>>>(p, mt, mt_r, eid, rank, rows_sorted, items, n_items, items_r, n_items_r);
     CUDA_CHECK(cudaGetLastError());
 
-    const dim3 grid(n_groups, max_items, kblocks);
     if (wmma) {
         if constexpr (type != GGML_TYPE_F32) {
-            if (mt == 16) {
-                mmh_gemm<type, 16><<<grid, 256, 0, stream>>>(p, w, xh.get(), rscale.get(), items, n_items, rows_sorted, part.ptr, tickets.ptr);
-            } else if (mt == 32) {
-                mmh_gemm<type, 32><<<grid, 256, 0, stream>>>(p, w, xh.get(), rscale.get(), items, n_items, rows_sorted, part.ptr, tickets.ptr);
-            } else if (mt == 64) {
-                mmh_gemm<type, 64><<<grid, 256, 0, stream>>>(p, w, xh.get(), rscale.get(), items, n_items, rows_sorted, part.ptr, tickets.ptr);
-            } else {
-                mmh_gemm<type, 128><<<grid, 256, 0, stream>>>(p, w, xh.get(), rscale.get(), items, n_items, rows_sorted, part.ptr, tickets.ptr);
+            auto gemm = [&](const int m, const int64_t n_max, const int * it, const int * n_it, int * tk) {
+                const dim3 grid(n_groups, n_max, kblocks);
+                if (m == 16) {
+                    mmh_gemm<type, 16><<<grid, 256, 0, stream>>>(p, w, xh.get(), rscale.get(), it, n_it, rows_sorted, part.ptr, tk);
+                } else if (m == 32) {
+                    mmh_gemm<type, 32><<<grid, 256, 0, stream>>>(p, w, xh.get(), rscale.get(), it, n_it, rows_sorted, part.ptr, tk);
+                } else if (m == 64) {
+                    mmh_gemm<type, 64><<<grid, 256, 0, stream>>>(p, w, xh.get(), rscale.get(), it, n_it, rows_sorted, part.ptr, tk);
+                } else {
+                    mmh_gemm<type, 128><<<grid, 256, 0, stream>>>(p, w, xh.get(), rscale.get(), it, n_it, rows_sorted, part.ptr, tk);
+                }
+                CUDA_CHECK(cudaGetLastError());
+            };
+            gemm(mt, max_items, items, n_items, tickets.ptr);
+            if (split) {
+                gemm(mt_r, max_items_r, items_r, n_items_r, tickets.ptr ? tickets.ptr + max_items*n_groups : nullptr);
             }
         }
     } else {
         // the waves split k also for precision: a lane then sums at most a quarter of k
+        const dim3 grid(n_groups, max_items, kblocks);
         const int ksplit = p.k/16 >= 64 ? 4 : p.k/16 >= 32 ? 2 : 1;
         mmh_gemv<type, 8, false, false><<<grid, 256*ksplit, 0, stream>>>(p, w, xh.get(), nullptr, rscale.get(), items, n_items, rows_sorted, ksplit, nullptr, nullptr, 1);
     }
@@ -1686,6 +1741,7 @@ static const char * mmh_weight_data(ggml_backend_cuda_context & ctx, const ggml_
     p.w_slots          = nullptr;
     p.w_host_slots     = nullptr;
     p.w_host_addresses = nullptr;
+    p.w_remote         = false;
     p.rin_cache        = nullptr;
     p.rout_cache       = nullptr;
 #if defined(GGML_USE_HIP)
@@ -1695,6 +1751,7 @@ static const char * mmh_weight_data(ggml_backend_cuda_context & ctx, const ggml_
     if (ids && (exclusive || (w->buffer && ggml_backend_buffer_is_host(w->buffer)))) {
         const ggml_cuda_expert_lookup cached = ggml_cuda_expert_lookup_tensor(w);
         ggml_cuda_expert_before_read(ctx, w);
+        p.w_remote         = true;
         p.w_cache          = cached.data;
         p.w_slots          = cached.slots;
         p.w_host_slots     = cached.host_slots;
