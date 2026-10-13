@@ -30,6 +30,13 @@ void ggml_cuda_expert_profile_ids(ggml_backend_cuda_context & ctx, const ggml_te
 // predicted router scores, [n_experts, n_rows]) for the expert prefetch (RANMA_EXPERT_PREFETCH). No-op unless on.
 void ggml_cuda_expert_prefetch_publish(ggml_backend_cuda_context & ctx, const ggml_tensor * order);
 
+// Before a graph on `ctx` with n_op MOE_FFN_HAD nodes is launched or captured: takes the op's scratch block back from
+// the decode pool (in stream order). No-op without the block.
+void ggml_cuda_expert_graph_begin(ggml_backend_cuda_context & ctx, int n_op);
+
+// The op's scratch block for a launch that needs `bytes` on `ctx`, or null (the op then uses the pool).
+void * ggml_cuda_expert_op_scratch(ggml_backend_cuda_context & ctx, size_t bytes);
+
 // The GPU has read the last kind of a routed layer, so the SSD tier may reuse that layer's ring
 // slots. No-op unless the tier is built.
 void ggml_cuda_expert_layer_done(ggml_backend_cuda_context & ctx, const ggml_tensor * src0);

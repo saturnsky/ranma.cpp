@@ -161,6 +161,8 @@ ggml_expert_config expert_config_from_params(const common_params & params) {
             params.layer_mode_l1_carve_mib, cfg.l1_bytes/(1024*1024));
     }
     cfg.mode     = params.expert_cache_mode == "exclusive" ? GGML_EXPERT_MODE_EXCLUSIVE : GGML_EXPERT_MODE_INCLUSIVE;
+    // the scratch block of the expert-major op, which the decode pool borrows between prompt graphs
+    cfg.op_scratch_bytes = (size_t) std::max(0, params.layer_mode_scratch_mib) * 1024 * 1024;
 
     const size_t mib = 1024*1024;
     const int32_t prefill_mib = params.expert_l2_prefill_ring_mib >= 0 ?

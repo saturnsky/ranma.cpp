@@ -89,6 +89,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <cstdarg>
 #include <cstdio>
 #include <cstdlib>
@@ -6166,6 +6167,31 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
     ggml_cuda_set_device(cuda_ctx->device);
+
+#if defined(GGML_USE_HIP)
+    // ranma: the expert-major MoE op (MOE_FFN_HAD) takes its scratch block back from the decode pool before the graph
+    // runs or is captured; the first graph of each op count and width is logged (the layers that took the op)
+    {
+        int n_op = 0;
+        int64_t n_tok = 0;
+        for (int i = 0; i < cgraph->n_nodes; i++) {
+            if (cgraph->nodes[i]->op == GGML_OP_MOE_FFN_HAD) {
+                n_op++;
+                n_tok = cgraph->nodes[i]->ne[1];
+            }
+        }
+        if (n_op > 0) {
+            static std::mutex mutex;
+            static std::set<std::pair<int, int64_t>> seen;
+            std::lock_guard<std::mutex> lock(mutex);
+            if (seen.size() < 64 && seen.insert({ n_op, n_tok }).second) {
+                GGML_LOG_INFO("%s: expert-major MoE: %d MOE_FFN_HAD nodes in a graph of %lld tokens\n", __func__, n_op,
+                    (long long) n_tok);
+            }
+        }
+        ggml_cuda_expert_graph_begin(*cuda_ctx, n_op);
+    }
+#endif // defined(GGML_USE_HIP)
 
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;

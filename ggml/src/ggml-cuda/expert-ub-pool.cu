@@ -1014,33 +1014,49 @@ bool ub_pool::allocate(int device, const std::vector<ub_pool_layer> & layers,
     return true;
 }
 
-int ub_pool::lend(void * base, size_t bytes, cudaStream_t stream) {
+int ub_pool::lend(void * base, size_t bytes, cudaStream_t stream, void * base2, size_t bytes2) {
     GGML_ASSERT(r_ == 0);
     size_t per_round = 0;
     for (int l = 0; l < n_layers_; ++l) {
         per_round += pos_bytes_[l];
     }
-    // the region starts 256-aligned
-    const uintptr_t start = ((uintptr_t) base + 255) & ~uintptr_t(255);
-    const size_t usable = bytes > size_t(start - (uintptr_t) base) ? bytes - size_t(start - (uintptr_t) base) : 0;
-    const int r = per_round == 0 ? 0 : (int) std::min<size_t>(usable/per_round, (size_t) r_cap_);
+    // each region starts 256-aligned and holds whole rounds (one position of every layer)
+    auto rounds = [per_round](void * b, size_t n) -> size_t {
+        if (b == nullptr || per_round == 0) {
+            return 0;
+        }
+        const uintptr_t start = ((uintptr_t) b + 255) & ~uintptr_t(255);
+        return n > size_t(start - (uintptr_t) b) ? (n - size_t(start - (uintptr_t) b))/per_round : 0;
+    };
+    const int r1 = (int) std::min<size_t>(rounds(base, bytes), (size_t) r_cap_);
+    const int r2 = (int) std::min<size_t>(rounds(base2, bytes2), (size_t) (r_cap_ - r1));
+    const int r  = r1 + r2;
     if (r <= 0) {
         return 0;
     }
-    uintptr_t at = start;
-    for (int l = 0; l < n_layers_; ++l) {
-        if (!layers_[l].enabled) {
-            continue;
-        }
-        for (int p = 0; p < r; ++p) {
-            const size_t q = size_t(l)*r_cap_ + p;
-            for (int k = 0; k < 3; ++k) {
-                h_addr_[q*3 + k] = (uint64_t) at;
-                at += (kind_bytes_[l][k] + kind_tails_[l][k] + 255) & ~size_t(255);
+    // positions [0, r1) of every layer in the first region, [r1, r) in the second, each region layer-major
+    auto lay = [&](void * b, size_t n, int p0, int p1) {
+        uintptr_t at = ((uintptr_t) b + 255) & ~uintptr_t(255);
+        for (int l = 0; l < n_layers_; ++l) {
+            if (!layers_[l].enabled) {
+                continue;
+            }
+            for (int p = p0; p < p1; ++p) {
+                const size_t q = size_t(l)*r_cap_ + p;
+                for (int k = 0; k < 3; ++k) {
+                    h_addr_[q*3 + k] = (uint64_t) at;
+                    at += (kind_bytes_[l][k] + kind_tails_[l][k] + 255) & ~size_t(255);
+                }
             }
         }
+        GGML_ASSERT(at <= (uintptr_t) b + n);
+    };
+    if (r1 > 0) {
+        lay(base, bytes, 0, r1);
     }
-    GGML_ASSERT(at <= (uintptr_t) base + bytes);
+    if (r2 > 0) {
+        lay(base2, bytes2, r1, r);
+    }
     ggml_cuda_set_device(device_);
     const size_t P = size_t(n_layers_)*r_cap_;
     CUDA_CHECK(cudaMemcpyAsync(d_addr_, h_addr_, P*3*sizeof(uint64_t), cudaMemcpyHostToDevice, stream));
@@ -1063,9 +1079,30 @@ int ub_pool::lend(void * base, size_t bytes, cudaStream_t stream) {
     // the staging must stay untouched until the uploads ran (the lend kernel itself is short)
     CUDA_CHECK(cudaStreamSynchronize(stream));
     r_ = r;
-    base_ = base;
-    lent_bytes_ = bytes;
+    r2_ = r2;
+    base_ = r1 > 0 ? base : base2;
+    lent_bytes_ = (r1 > 0 ? bytes : 0) + (r2 > 0 ? bytes2 : 0);
     return r;
+}
+
+long ub_pool::owned_in_second() const {
+    if (r_ == 0 || r2_ == 0) {
+        return 0;
+    }
+    const size_t P = size_t(n_layers_)*r_cap_;
+    std::vector<int32_t> owner(P);
+    ggml_cuda_set_device(device_);
+    CUDA_CHECK(cudaMemcpy(owner.data(), d_owner_, P*sizeof(int32_t), cudaMemcpyDeviceToHost));
+    long n = 0;
+    for (int l = 0; l < n_layers_; ++l) {
+        if (!layers_[l].enabled) {
+            continue;
+        }
+        for (int p = r_ - r2_; p < r_; ++p) {
+            n += owner[size_t(l)*r_cap_ + p] >= 0 ? 1 : 0;
+        }
+    }
+    return n;
 }
 
 void ub_pool::reclaim(cudaStream_t stream) {
@@ -1078,6 +1115,7 @@ void ub_pool::reclaim(cudaStream_t stream) {
         d_owner_, d_pos_of_, n_experts_, pf_.inplace ? pf_.pdown : (uint32_t *) nullptr, d_ringpos_, d_ringbits_,
         d_ringbits_host_, (int) ring_words());
     r_ = 0;
+    r2_ = 0;
     base_ = nullptr;
     lent_bytes_ = 0;
 }

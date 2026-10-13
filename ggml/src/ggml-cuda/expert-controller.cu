@@ -595,6 +595,7 @@ public:
                 report_tier_plan_locked("at model load");
             }
             log_members_locked("at model load");
+            allocate_op_scratch_locked();
             allocate_ub_pool_locked();
             return true;
         }
@@ -664,6 +665,7 @@ public:
             (table_bytes + (profiler_ ? profiler_->device_bytes() : 0))/1024, models_text_locked().c_str());
         log_aux_locked("at model load");
         log_members_locked("at model load");
+        allocate_op_scratch_locked();
         allocate_ub_pool_locked();
         return true;
     }
@@ -699,6 +701,7 @@ public:
         banks_.clear();
         n_banks_.store(0, std::memory_order_release);
         free_ub_pool_locked();
+        free_op_scratch_locked();
         // the worker must stop before the arenas it reads into go away
         tier_.reset();
         free_stage_locked();
@@ -1277,11 +1280,24 @@ public:
             return true;
         }
         const size_t align = size_t(2) << 20;
-        const size_t begin = (ub_hwm_ + std::max(ub_cfg_.margin, ub_hwm_/4) + align - 1)/align*align;
-        if (size < ub_max_size_ || begin >= size || size - begin < ub_cfg_.min_bytes) {
+        size_t begin = (ub_hwm_ + std::max(ub_cfg_.margin, ub_hwm_/4) + align - 1)/align*align;
+        if (size < ub_max_size_) {
             return true;
         }
-        const int r = ub_->lend((char *) base + begin, size - begin, stream);
+        if (begin >= size || size - begin < ub_cfg_.min_bytes) {
+            begin = size;   // no part of the compute buffer; the op's scratch block may still be lent
+        }
+        // the expert-major op's scratch block: only between graphs that do not run the op (graph_begin takes it back)
+        void * const s_base  = op_scratch_;
+        const size_t s_bytes = op_scratch_ != nullptr ? op_scratch_bytes_ : 0;
+        if (begin >= size && s_bytes == 0) {
+            return true;
+        }
+        if (s_bytes > 0 && op_scratch_stream_ != nullptr && op_scratch_stream_ != stream) {
+            CUDA_CHECK(cudaStreamSynchronize(op_scratch_stream_));   // the last op that used the block ran elsewhere
+        }
+        const int r = ub_->lend(begin < size ? (char *) base + begin : nullptr, size - begin, stream,
+            s_bytes > 0 ? s_base : nullptr, s_bytes);
         if (r > 0) {
             xp_resume_locked();
             ub_owner_     = cctx;
@@ -1289,14 +1305,115 @@ public:
             ub_begin_     = begin;
             ub_lent_base_ = base;
             ++ub_lends_;
-            if (ub_cfg_.log || ub_lends_ == 1) {
+            if (ub_->r2() > 0) {
+                ub_scratch_lent_.store(true, std::memory_order_release);
+                ++op_scratch_lends_;
+            }
+            if (ub_cfg_.log || ub_lends_ == 1 || (ub_->r2() > 0 && op_scratch_lends_ == 1)) {
                 GGML_LOG_INFO("expert cache: decode pool lent %.1f MiB above %.1f MiB of a %.1f MiB compute buffer (decode "
-                              "graphs reach %.1f MiB): %d positions per layer, %d layers (lend %llu)\n",
-                    (size - begin)/1048576.0, begin/1048576.0, size/1048576.0, ub_hwm_/1048576.0, r, ub_n_layers_,
-                    (unsigned long long) ub_lends_);
+                              "graphs reach %.1f MiB) and %.1f MiB of the expert-major op's scratch: %d positions per layer "
+                              "(%d in the scratch), %d layers (lend %llu)\n",
+                    (size - begin)/1048576.0, begin/1048576.0, size/1048576.0, ub_hwm_/1048576.0,
+                    ub_->r2() > 0 ? s_bytes/1048576.0 : 0.0, r, ub_->r2(), ub_n_layers_, (unsigned long long) ub_lends_);
             }
         }
         return true;
+    }
+
+    // ---- the expert-major op's scratch block (ggml_expert_config::op_scratch_bytes) ----------------------------------
+    //
+    // One fixed VRAM block that MOE_FFN_HAD takes its device buffers from (moe-ffn-had-layout.h). The layer mode's
+    // sizing carves it out of the L1 budget. While the graphs do not run the op (decode), compute_spare lends it to the
+    // decode pool together with the spare part of the compute buffer: its positions hold copies of host experts only,
+    // never an L1 resident, so taking it back loses only recently missed experts and copies nothing (each pooled
+    // expert's table entries return to its home). A graph with the op takes it back in graph_begin, before the graph
+    // is launched or captured:
+    //   - stream order: the decode graphs that read the pooled positions, and the step/copy kernels that fill them, run
+    //     on the lending context's stream; the reclaim kernel is queued on the stream of the graph with the op. Same
+    //     context: the reclaim and then the op's writes come after every earlier decode kernel of that stream. Another
+    //     context: its stream is synchronized first (as compute_spare does for the compute buffer).
+    //   - the inplace prefetch copies into positions on its own stream: xp_pause_locked makes the compute stream wait
+    //     for them, and the reclaim empties pending positions.
+    //   - a plan install (the prefill/decode profile swap, LLM_EXPERT_PREFILL_SWAP) reclaims the pool synchronously
+    //     while nothing computes (ub_reclaim_sync_locked) and touches neither the block nor the op.
+    //   - only a graph that contains the op takes the block back: a prompt too short for the op (RANMA_EXPERT_MAJOR_
+    //     MIN_TOKENS) keeps the decode pool's positions in it. With -np 2, every graph that runs a wide prompt batch of
+    //     one slot takes it back and the next decode-only graph lends it again, empty (the same cycle as the compute
+    //     buffer's part of the pool).
+    // The op uses the block only on the stream that last took it (else it falls back to the pool).
+    void allocate_op_scratch_locked() {
+        if (op_scratch_ != nullptr || cfg_.op_scratch_bytes == 0) {
+            return;
+        }
+        ggml_cuda_set_device(device_);
+        if (cudaMalloc(&op_scratch_, cfg_.op_scratch_bytes) != cudaSuccess) {
+            (void) cudaGetLastError();
+            op_scratch_ = nullptr;
+            GGML_LOG_WARN("expert cache: the expert-major op's scratch block (%.1f MiB) was not allocated; the op uses the "
+                          "pool\n", cfg_.op_scratch_bytes/1048576.0);
+            return;
+        }
+        op_scratch_bytes_ = cfg_.op_scratch_bytes;
+        GGML_LOG_INFO("expert cache: expert-major op scratch block %.1f MiB, lent to the decode pool between prompt "
+                      "graphs\n", op_scratch_bytes_/1048576.0);
+    }
+
+    void free_op_scratch_locked() {
+        if (op_scratch_ != nullptr) {
+            ggml_cuda_set_device(device_ >= 0 ? device_ : 0);
+            CUDA_CHECK(cudaDeviceSynchronize());
+            (void) cudaFree(op_scratch_);
+        }
+        op_scratch_ = nullptr;
+        op_scratch_bytes_ = 0;
+        op_scratch_stream_ = nullptr;
+        ub_scratch_lent_.store(false, std::memory_order_release);
+    }
+
+    // Before a graph on `cctx` that contains n_op MOE_FFN_HAD nodes (ggml-cuda.cu, before launch or capture).
+    void graph_begin(ggml_backend_cuda_context * cctx, int n_op) {
+        if (n_op == 0 || op_scratch_ == nullptr || cctx->device != device_) {
+            return;
+        }
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (op_scratch_ == nullptr) {
+            return;
+        }
+        cudaStream_t stream = cctx->stream();
+        if (ub_ && ub_->lent() && ub_->r2() > 0) {
+            if ((const void *) cctx != ub_owner_) {
+                CUDA_CHECK(cudaStreamSynchronize(ub_stream_));
+            }
+            long invalidated = -1;
+            if (ub_cfg_.log) {
+                CUDA_CHECK(cudaStreamSynchronize(ub_stream_));
+                invalidated = ub_->owned_in_second();
+                op_scratch_invalidated_ += (uint64_t) std::max(0L, invalidated);
+            }
+            xp_pause_locked(stream);
+            ub_reclaim_locked(stream, "the expert-major op takes its scratch");
+            ++op_scratch_reclaims_;
+            if (ub_cfg_.log) {
+                GGML_LOG_INFO("expert cache: expert-major op scratch taken back from the decode pool (%d op nodes): %ld pooled "
+                              "experts in it dropped; lends %llu, takebacks %llu, dropped %llu in all\n", n_op, invalidated,
+                    (unsigned long long) op_scratch_lends_, (unsigned long long) op_scratch_reclaims_,
+                    (unsigned long long) op_scratch_invalidated_);
+            }
+        }
+        if (op_scratch_stream_ != nullptr && op_scratch_stream_ != stream) {
+            CUDA_CHECK(cudaStreamSynchronize(op_scratch_stream_));   // the block's last user ran on another stream
+        }
+        op_scratch_stream_ = stream;
+    }
+
+    // The block for an op of `bytes` on `cctx`, or null (then the op uses the pool).
+    void * op_scratch(ggml_backend_cuda_context * cctx, size_t bytes) {
+        if (op_scratch_ == nullptr || bytes > op_scratch_bytes_ || cctx->device != device_ ||
+                ub_scratch_lent_.load(std::memory_order_acquire)) {
+            return nullptr;
+        }
+        std::lock_guard<std::mutex> lock(mutex_);
+        return op_scratch_stream_ == cctx->stream() ? op_scratch_ : nullptr;
     }
 
     // Ring admission: a step copies from a ring slot that only the stream order protects
@@ -1366,6 +1483,7 @@ public:
 
     void ub_reclaim_locked(cudaStream_t stream, const char * why) {
         ub_->reclaim(stream);
+        ub_scratch_lent_.store(false, std::memory_order_release);
         ++ub_reclaims_;
         if (ub_cfg_.log) {
             CUDA_CHECK(cudaStreamSynchronize(stream));
@@ -1392,6 +1510,7 @@ public:
         }
         ub_->reclaim(ub_stream_);
         CUDA_CHECK(cudaStreamSynchronize(ub_stream_));
+        ub_scratch_lent_.store(false, std::memory_order_release);
         ++ub_reclaims_;
         if (ub_cfg_.log) {
             ub_log_counters_locked(why);
@@ -1408,9 +1527,10 @@ public:
         if (ub_->ring_enabled()) {
             snprintf(ring_text, sizeof(ring_text), " ring_fills=%llu", (unsigned long long) c[ub_pool_ring_fills]);
         }
-        GGML_LOG_INFO("expert cache: decode pool counters (%s): lends=%llu reclaims=%llu steps=%llu hits=%llu fills=%llu "
+        GGML_LOG_INFO("expert cache: decode pool counters (%s): lends=%llu (scratch %llu, taken back by the op %llu) reclaims=%llu "
+                      "steps=%llu hits=%llu fills=%llu "
                       "(%.1f MiB) over=%llu evictions=%llu rejected=%llu prefetch_fills=%llu prefetch_arrived=%llu%s\n", why,
-            (unsigned long long) ub_lends_,
+            (unsigned long long) ub_lends_, (unsigned long long) op_scratch_lends_, (unsigned long long) op_scratch_reclaims_,
             (unsigned long long) ub_reclaims_, (unsigned long long) c[ub_pool_steps], (unsigned long long) c[ub_pool_hits],
             (unsigned long long) c[ub_pool_fills], c[ub_pool_fill_bytes]/1048576.0, (unsigned long long) c[ub_pool_over],
             (unsigned long long) c[ub_pool_evictions], (unsigned long long) c[ub_pool_rejected],
@@ -4545,6 +4665,12 @@ private:
     uint64_t ub_lends_ = 0, ub_reclaims_ = 0, ub_calls_ = 0;
     size_t   ub_max_size_ = 0;              // the largest compute buffer (view) seen
     std::map<const void *, size_t> ub_hwm_of_;   // decode high-water mark per compute buffer base
+    // the expert-major op's scratch block
+    void * op_scratch_ = nullptr;
+    size_t op_scratch_bytes_ = 0;
+    cudaStream_t op_scratch_stream_ = nullptr;     // the stream of the last graph that took it (under mutex_)
+    std::atomic<bool> ub_scratch_lent_{ false };   // the decode pool holds positions in it
+    uint64_t op_scratch_lends_ = 0, op_scratch_reclaims_ = 0, op_scratch_invalidated_ = 0;
     // the expert prefetch (RANMA_EXPERT_PREFETCH)
     xp_config xp_cfg_;
     std::atomic<bool> xp_on_{ false };      // read by xp_publish without the mutex
@@ -4773,6 +4899,14 @@ void ggml_cuda_expert_profile_ids(ggml_backend_cuda_context & ctx, const ggml_te
 
 void ggml_cuda_expert_prefetch_publish(ggml_backend_cuda_context & ctx, const ggml_tensor * order) {
     instance().xp_publish(ctx, order);
+}
+
+void ggml_cuda_expert_graph_begin(ggml_backend_cuda_context & ctx, int n_op) {
+    instance().graph_begin(&ctx, n_op);
+}
+
+void * ggml_cuda_expert_op_scratch(ggml_backend_cuda_context & ctx, size_t bytes) {
+    return instance().op_scratch(&ctx, bytes);
 }
 
 void ggml_cuda_expert_layer_done(ggml_backend_cuda_context & ctx, const ggml_tensor * src0) {

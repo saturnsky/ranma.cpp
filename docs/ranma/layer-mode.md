@@ -24,6 +24,7 @@ Before the model loads, from the GGUF metadata and the free memory:
 | staging buffer | none in one pass (no earlier pass to hide the copies behind); with the expert-major rows below the width, two buffers of `min(64, rows/129)` experts when a mean expert gets at least 129 rows |
 | host-direct token limit | the width |
 | L1 budget | the staging buffer and the op's scratch come out of `--expert-l1-mib` when it is at least twice as large |
+| op scratch block | the op's scratch is one fixed VRAM block of the expert cache (`ggml_expert_config::op_scratch_bytes`); between prompt graphs the decode pool borrows it (below) |
 | other slots' prompt batches | see below |
 
 The plan fits when, on the GPU, model + KV + compute buffer (measured with a no_alloc load of the model and the
@@ -37,6 +38,23 @@ Given values win: `-ub` fixes the width (the chunk is still chosen), `-b` bounds
 the setting is restored when the mode stays off. A prompt batch
 `GGML_CUDA_HOST_DIRECT_MAX_BATCH` keep their values when set. The reserves can be changed for development:
 `RANMA_LAYER_MODE_RESERVE_MIB` (4096), `RANMA_LAYER_MODE_HOST_MIB` (from the available memory),
+
+## The op's scratch during generation
+
+The scratch is only used by graphs that run the expert-major op, so the decode pool
+([expert-cache-ub-pool.md](expert-cache-ub-pool.md)) lends it as extra positions between them, next to the spare part
+of the compute buffer. The positions hold copies of host experts only, never an L1 resident, so the L1 plan is not
+touched; taking the block back copies nothing (the pooled experts' table entries return to their homes).
+
+- A graph that contains `MOE_FFN_HAD` takes the block back before it is launched or captured (in stream order: the
+  reclaim kernel runs on that graph's stream after the earlier decode kernels; another context's stream is synchronized
+  first; the inplace prefetch's copies are waited for). A prompt too short for the op (under 64 tokens) does not take it back.
+- The next graph of decode rows lends it again, empty. With `-np 2` that is one take-back and one lend per wide prompt
+  batch of either slot, the same cycle the compute buffer's part of the pool has.
+- A plan install (also the prefill/decode profile swap) reclaims the pool while nothing computes, as before.
+- The log: one line at the first lend that includes the block, the first graph of each op count and width
+  (`expert-major MoE: N MOE_FFN_HAD nodes in a graph of T tokens`), and with `RANMA_EXPERT_UB_POOL_LOG=1` one line per
+  take-back with the pooled experts it dropped and the running counts of lends, take-backs and dropped experts.
 
 ## Slot 0 priority
 

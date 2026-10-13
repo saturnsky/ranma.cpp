@@ -697,6 +697,7 @@ struct common_params {
     int32_t layer_mode               = 0;
     int32_t layer_mode_preempt_ms    = 0;     // set by the layer mode: target time of a prompt batch of a slot other than 0
     int32_t layer_mode_l1_carve_mib  = 0;     // set by the layer mode: part of --expert-l1-mib its buffers take
+    int32_t layer_mode_scratch_mib   = 0;     // set by the layer mode: the expert-major op's scratch block (lent to decode)
     int32_t n_ctx_checkpoints   = 32;    // max number of context checkpoints per slot
     int32_t kv_unified_per_slot = 0;     // max context per parallel slot; 0 = unset
     int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints
