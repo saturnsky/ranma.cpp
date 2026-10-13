@@ -68,7 +68,8 @@ cache or the first batch (the 500 tokens/s assumption) the wait of slot 0 can ex
 
 ## Supported setups
 
-The expert cache must be on (`--expert-l1-mib` or `--expert-l2-mib`), the model must be GLM-5.3 (`glm5-next`) with
+The expert cache must be on (`--expert-l1-mib` or `--expert-l2-mib`), the model must be GLM-5.3 (`glm5-next`) , Qwen3.8 (`qwen4exp`), DeepSeek-V4.1-Flash (`deepseek41`) or DeepSeek-V4-Flash
+(`deepseek4`) with
 EXL3 routed experts (separate gate and up). Anything else logs `layer mode: ...; prompt processing runs as with
 --layer-mode off` and runs as `off`. So does a setup with a context the memory check does not build yet: a draft
 model or an MTP context (`-md`, `--spec-type`), or a multimodal projector (`--mmproj`).

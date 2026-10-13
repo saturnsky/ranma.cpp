@@ -1744,7 +1744,8 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "ranma: layer compute mode for prompt processing with the expert cache: 'on' computes a prompt step as one wide "
         "ubatch layer by layer (routed experts expert by expert, attention in chunks) and sizes the ubatch, the attention "
         "chunk and the staging buffers from the model and the free memory; -ub/-b keep their given values. Supported "
-        "models only (GLM-5.3 EXL3 now); others run as with 'off' after a warning (default: 'off')",
+        "models only (EXL3 GLM-5.3, Qwen3.8, DeepSeek-V4.1-Flash, DeepSeek-V4-Flash); others run as with 'off' after a "
+        "warning (default: 'off')",
         [](common_params & params, const std::string & value) {
             if (value == "off") {
                 params.layer_mode = 0;
