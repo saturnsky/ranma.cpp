@@ -307,6 +307,8 @@ if (GGML_METAL AND NOT GGML_BACKEND_DL)
 endif()
 
 llama_build(test-backend-ops.cpp LINK ggml)
+# ranma diagnostic: DS4F chunked attention op replay (model-free, needs a GPU backend)
+llama_build(test-ds4-chunk-replay.cpp LINK ggml)
 
 llama_build_and_test(test-tiled-mulmat.cpp LINK ggml)
 llama_build_and_test(test-model-load-cancel.cpp LABEL "model")
