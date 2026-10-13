@@ -198,6 +198,8 @@ public:
     // Whether the current plan leaves any expert in the file. Recomputed with every plan; the
     // mailbox kernels run either way and cost nothing when no routed expert needs the worker.
     bool any_ssd() const { return any_ssd_; }
+    // Whether the last route of `layer` was staged: its file slices arrive while the ops of the layer run.
+    bool layer_staged(int layer) const;
     const expert_locations & locations() const { return homes_; }
     // The payload address of a slice of `layer` at a host or lent location.
     void * host_address(int layer, int kind, int expert) const;

@@ -301,6 +301,11 @@ void common_layer_mode_apply(common_params & params) {
 
     // ---- development overrides --------------------------------------------------------------------------------------
     const bool env_stage = lm_env_set("RANMA_EXPERT_MAJOR_STAGE_MIB");
+    // the streamed op (RANMA_EXPERT_MAJOR_STREAM=1, mul-mat-had.cu): a ring of expert slots in the op's scratch block
+    const bool    stream       = lm_env_set("RANMA_EXPERT_MAJOR_STREAM") && atoi(getenv("RANMA_EXPERT_MAJOR_STREAM")) != 0;
+    const int64_t stream_group = stream ? std::max(1, lm_env_set("RANMA_EXPERT_MAJOR_STREAM_GROUP") ?
+        atoi(getenv("RANMA_EXPERT_MAJOR_STREAM_GROUP")) : 16) : 0;
+    const bool    env_ring     = lm_env_set("RANMA_EXPERT_MAJOR_STREAM_MIB");
     const int64_t stage_min = lm_env_set("RANMA_EXPERT_MAJOR_STAGE_MIN") ? std::max(1, atoi(getenv("RANMA_EXPERT_MAJOR_STAGE_MIN"))) : 129;
 
     const int64_t reserve = (int64_t) lm_env_f("RANMA_LAYER_MODE_RESERVE_MIB", LM_RESERVE_MIB)*(int64_t) MiB;
@@ -334,12 +339,33 @@ void common_layer_mode_apply(common_params & params) {
     auto rows_of = [=](int64_t w) { return w*m.n_used; };
     // scratch: every device buffer of one launch of the width (moe-ffn-had-layout.h, the op's own layout), with the
     // rank rows of the LoRA deltas
-    auto scratch_bytes = [&](int64_t w) -> int64_t {
-        return (int64_t) ggml_moe_ffn_had_scratch_bytes(w, m.n_used, rows_of(w), m.n_expert, m.n_embd, m.n_ff_exp,
-            rows_of(w) < w*m.n_used ? LM_STAGE_SLOTS : 0, max_rank);
+    // the ring of the streamed op (one chunk, no LoRA): two groups of slots (or RANMA_EXPERT_MAJOR_STREAM_MIB), at most the
+    // experts that can have more rows than the host tile the op picks for the width (rows / (tile + 1))
+    auto ring_bytes = [&](int64_t w) -> int64_t {
+        if (!stream || rows_of(w) < w*m.n_used || max_rank > 0) {
+            return 0;
+        }
+        if (env_ring) {
+            return (int64_t) std::max(0, atoi(getenv("RANMA_EXPERT_MAJOR_STREAM_MIB")))*(int64_t) MiB;
+        }
+        const int64_t rows = w*m.n_used;
+        const int64_t used = std::max<int64_t>(1, std::min<int64_t>(rows, m.n_expert));
+        const int64_t want = 3*((rows + used - 1)/used);
+        const int64_t tile = want <= 16 ? 16 : want <= 32 ? 32 : want <= 64 ? 64 : 128;
+        const int64_t slots = std::min<int64_t>({ 2*stream_group, (int64_t) m.n_expert, rows/(tile + 1) });
+        return slots > 0 ? (slots*(int64_t) m.expert_bytes + MiB - 1)/MiB*MiB : 0;
     };
-    // staging (two buffers): only experts with at least stage_min rows of a chunk are staged, at most R/stage_min of them
+    auto scratch_bytes = [&](int64_t w) -> int64_t {
+        const int64_t ring = ring_bytes(w);
+        return (int64_t) ggml_moe_ffn_had_scratch_bytes(w, m.n_used, rows_of(w), m.n_expert, m.n_embd, m.n_ff_exp,
+            rows_of(w) < w*m.n_used ? LM_STAGE_SLOTS : 0, max_rank, ring > 0 ? stream_group : 0, ring);
+    };
+    // staging (two buffers): only experts with at least stage_min rows of a chunk are staged, at most R/stage_min of them.
+    // The streamed op of one chunk does not stage: its ring is in the scratch block.
     auto stage_bytes = [&](int64_t w) -> int64_t {
+        if (stream && rows_of(w) >= w*m.n_used && max_rank == 0) {
+            return 0;
+        }
         if (env_stage) {
             return (int64_t) std::max(0, atoi(getenv("RANMA_EXPERT_MAJOR_STAGE_MIB")))*(int64_t) MiB;
         }
@@ -516,6 +542,10 @@ void common_layer_mode_apply(common_params & params) {
     if (!env_stage && stage > 0) {
         lm_setenv("RANMA_EXPERT_MAJOR_STAGE_MIB", std::to_string(stage/MiB));
     }
+    if (stream && !env_ring) {
+        // the op sizes its ring from this (0: no ring, the op keeps its other path)
+        lm_setenv("RANMA_EXPERT_MAJOR_STREAM_MIB", std::to_string(ring_bytes(ub)/MiB));
+    }
     params.layer_mode_l1_carve_mib = (int32_t) ((carve_bytes(ub) + MiB - 1)/MiB);
     // the op's scratch is one fixed block of the expert cache, lent to the decode pool between prompt graphs
     params.layer_mode_scratch_mib  = (int32_t) ((scratch_bytes(ub) + MiB - 1)/MiB);
@@ -525,9 +555,10 @@ void common_layer_mode_apply(common_params & params) {
     expert_host_direct_auto(params.n_ubatch);
 
     LOG_INF("layer mode: on: -ub %d -b %d, attention chunk %s, expert-major MoE %s (rows %lld), staging %lld MiB, scratch "
-        "%lld MiB, %d MiB of them from the L1 budget, host-direct up to %d tokens, other slots' prompt batches about %d ms\n",
+        "%lld MiB (stream ring %lld MiB), %d MiB of them from the L1 budget, host-direct up to %d tokens, other slots' prompt "
+        "batches about %d ms\n",
         params.n_ubatch, params.n_batch, c >= ub ? "off (whole width)" : std::to_string(c).c_str(),
         "on", (long long) std::min<int64_t>(rows_of(ub), ub*m.n_used),
-        (long long) (stage/MiB), (long long) (scratch_bytes(ub)/MiB), params.layer_mode_l1_carve_mib, params.n_ubatch,
-        params.layer_mode_preempt_ms);
+        (long long) (stage/MiB), (long long) (scratch_bytes(ub)/MiB), (long long) (ring_bytes(ub)/MiB),
+        params.layer_mode_l1_carve_mib, params.n_ubatch, params.layer_mode_preempt_ms);
 }

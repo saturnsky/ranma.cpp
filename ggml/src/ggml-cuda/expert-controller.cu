@@ -2331,6 +2331,12 @@ public:
         }
     }
 
+    bool tier_layer_staged(const ggml_tensor * src0) {
+        int layer = -1;
+        int kind  = -1;
+        return tier_ && state_ == state_t::installed && src0 != nullptr && resolve(src0, layer, kind) && tier_->layer_staged(layer);
+    }
+
     void tier_layer_done(ggml_backend_cuda_context & ctx, const ggml_tensor * src0) {
         if (!tier_ || state_ != state_t::installed || src0 == nullptr || ctx.device != device_) {
             return;
@@ -4918,6 +4924,10 @@ void ggml_cuda_expert_layer_done(ggml_backend_cuda_context & ctx, const ggml_ten
 
 void ggml_cuda_expert_before_read(ggml_backend_cuda_context & ctx, const ggml_tensor * src0) {
     instance().before_read(ctx, src0);
+}
+
+bool ggml_cuda_expert_layer_staged(const ggml_tensor * src0) {
+    return instance().tier_layer_staged(src0);
 }
 
 bool ggml_cuda_expert_is_exclusive_buffer_type(ggml_backend_buffer_type_t buft) {

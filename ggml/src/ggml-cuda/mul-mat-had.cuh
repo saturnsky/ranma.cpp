@@ -16,5 +16,6 @@ void ggml_cuda_moe_ffn_had(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 bool ggml_cuda_moe_ffn_had_graph_ok(void);
 
 // stage-falsify probe U (diagnostic): op 0 sets the experts per group of the one-chunk MOE_FFN_HAD (0 = off), op 1 turns the
-// phase stamps on or off, op 2 reads the phase times (ms) of the last stamped op into out[12]
+// phase stamps on or off, op 2 reads the phase times (ms) of the last stamped op into out[20], op 3 sets the group of the
+// streamed op (RANMA_EXPERT_MAJOR_STREAM; 0 = off, -1 = the environment), op 4 its ring slots (0 = the environment)
 bool ggml_cuda_moe_group_diag(int op, int a, double * out);

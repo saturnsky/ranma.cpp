@@ -1599,6 +1599,10 @@ void l2_tier::publish_and_wait(int layer, const ggml_tensor * ids, cudaStream_t 
     ggml_cuda_kernel_launch(l2_wait_kernel, launch, static_cast<l2_mailbox *>(mail_device_) + layer, acct);
 }
 
+bool l2_tier::layer_staged(int layer) const {
+    return staged() && any_ssd_ && layer >= 0 && layer < (int) staged_layer_.size() && staged_layer_[(size_t) layer] != 0;
+}
+
 void l2_tier::wait_kind(int layer, int kind, cudaStream_t stream) {
     if (!staged() || !mailbox_active_ || mail_device_ == nullptr || layer < 0 || layer >= geo_.n_layers ||
             kind <= 0 || kind >= geometry::n_kinds || !staged_layer_[(size_t) layer]) {
