@@ -12835,6 +12835,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_moe_ffn_had(GGML_TYPE_EXL3_T3, 256, 256, 32, 8, 200, true,  100));
     test_cases.emplace_back(new test_moe_ffn_had(GGML_TYPE_EXL3_M2, 512, 256, 64, 6, 128, true,  512));
     test_cases.emplace_back(new test_moe_ffn_had(GGML_TYPE_EXL3_M4, 256, 512, 64, 6, 128, true,  256));
+    // one pass whose skewed routing gives experts over and under the host tile (with --host-weights and
+    // RANMA_EXPERT_MAJOR_STREAM=1 the ones over it are copied; a small RANMA_EXPERT_MAJOR_STREAM_MIB reuses ring slots)
+    test_cases.emplace_back(new test_moe_ffn_had(GGML_TYPE_EXL3_M3, 256, 256, 32, 4, 1024, true,    0));
+    test_cases.emplace_back(new test_moe_ffn_had(GGML_TYPE_EXL3_M3, 256, 384, 64, 6, 1024, true, 6144));
     // routed FFN shapes of the layer-mode models, few experts, one pass (all rows) and experts split over passes:
     // Qwen3.8 (qwen4exp: 2560 / 640, top 10, SwiGLU)
     test_cases.emplace_back(new test_moe_ffn_had(GGML_TYPE_EXL3_M3, 2560,  640, 16, 10, 129, false,    0));
@@ -15559,7 +15563,7 @@ static void show_test_coverage() {
 struct sf_opts {
     std::vector<std::string> shapes   = { "glm:8192", "ds4f:8192", "ds41:12288", "ds41:2048" };
     std::vector<std::string> routes   = { "uniform", "u2" };
-    std::vector<std::string> variants = { "V", "A", "B", "C", "D", "X", "R", "Y", "Z", "U", "UP" };
+    std::vector<std::string> variants = { "V", "A", "B", "C", "D", "X", "R", "Y", "Z", "U", "UP", "S", "SP" };
     int      reps       = 9;
     int      warm       = 2;
     double   l1         = 0.0;   // fraction of the experts resident in L1
@@ -15573,6 +15577,8 @@ struct sf_opts {
     bool     check      = true;
     int      z_group    = 8;     // probe Z: experts per copy group
     int      u_group    = 16;    // probe U: used experts per group of the single-op consumption
+    int      s_group    = 16;    // variant S: copied experts per group of the streamed op
+    int      s_ring     = 0;     // variant S: ring slots, 0 = the default of the op (two groups)
     int      z_ahead    = 2;     // probe Z: copy groups issued ahead of the compute group, 0 = all copies first
     bool     y_alt      = false; // probe Y: the copied set Q takes every second used expert, else the upper half of the ids
 };
@@ -15596,10 +15602,12 @@ struct sf_api {
     bool (*wait)(ggml_backend_t) = nullptr;
     bool (*sync)(ggml_backend_t) = nullptr;
     bool (*ev)(ggml_backend_t, int, int, int, float *) = nullptr; // timing events: op 0 record (a slot, b stream), 1 wait (a), 2 elapsed a->b
-    bool (*diag)(ggml_backend_t, int, int, double *) = nullptr;   // probe U: op 0 group size, 1 phase stamps on or off, 2 read 12 phase values
+    bool (*diag)(ggml_backend_t, int, int, double *) = nullptr;   // probe U: op 0 group size, 1 phase stamps on or off, 2 read SF_DIAG_N
+                                                                  // values; S: op 3 stream group, 4 ring slots, 5 poison the ring once
 };
 
 #define SF_EV_SLOTS 512
+#define SF_DIAG_N 20 // the values of the group diagnostic (MMH_MOE_DIAG_N)
 
 // the weights of a shape: host copy (host buffer), VRAM copy (same bytes), rotations
 struct sf_wset {
@@ -15654,8 +15662,9 @@ struct sf_variant {
     sf_meas           m;
     std::vector<double> ms;
     int               u_group = 0;   // probe U: experts per group
+    int               s_group = 0;   // variant S: copied experts per group of the streamed op
     bool              u_phase = false;
-    std::vector<double> ph;     // probe U: 12 phase values per repetition
+    std::vector<double> ph;     // probes U, S: SF_DIAG_N values per repetition
     std::string       check = "n/a";
 };
 
@@ -15766,6 +15775,8 @@ static void sf_exec(ggml_backend_t backend, const sf_api & api, const sf_variant
             GGML_ASSERT(api.ev(backend, 1, s.cs, 0, nullptr));
         } else if (s.kind == 7 || s.kind == 8) {
             GGML_ASSERT(api.diag(backend, s.kind == 7 ? 0 : 1, s.cs, nullptr)); // probe U: group size, phase stamps
+        } else if (s.kind == 9 || s.kind == 10) {
+            GGML_ASSERT(api.diag(backend, s.kind == 9 ? 3 : 4, s.cs, nullptr)); // variant S: stream group, ring slots
         } else {
             GGML_ASSERT(api.sync(backend));
         }
@@ -16119,6 +16130,44 @@ static bool sf_run_case(ggml_backend_t backend, const sf_api & api, sf_wset & ws
             uv.u_phase = ph;
         }
     }
+    // variant S: the op of A (host experts, L1 from VRAM) with the streamed op on: the experts over the host tile are copied
+    // into a ring by the copy engine and computed group by group as their copies arrive (inside one op); SP also stamps
+    for (const char * sn : { "S", "SP" }) {
+        if (!wanted(sn)) {
+            continue;
+        }
+        if (api.diag == nullptr) {
+            fprintf(stderr, "stage-falsify: the backend has no group diagnostic, variant %s skipped\n", sn);
+            continue;
+        }
+        const size_t before = variants.size();
+        add_variant(sn, -1, { { { get_op(true, B_ONCE | B_RE), get_op(false, B_L1) }, false } }, bytes_once + csets[cs_re].total, false);
+        if (variants.size() == before + 1) {
+            sf_variant & sv = variants.back();
+            const bool ph = strcmp(sn, "SP") == 0;
+            auto st = [](int kind, int cs) {
+                sf_step x;
+                x.kind = kind;
+                x.cs = cs;
+                return x;
+            };
+            std::vector<sf_step> steps = { st(9, sf_o.s_group), st(10, sf_o.s_ring) };
+            if (ph) {
+                steps.push_back(st(8, 1));
+            }
+            for (const sf_step & s : sv.steps) {
+                steps.push_back(s);
+            }
+            if (ph) {
+                steps.push_back(st(8, 0));
+            }
+            steps.push_back(st(9, 0));
+            steps.push_back(st(10, 0));
+            sv.steps = steps;
+            sv.s_group = sf_o.s_group;
+            sv.u_phase = ph;
+        }
+    }
     if (wanted("A")) {
         add_variant("A", -1, { { { get_op(true, B_ONCE | B_RE), get_op(false, B_L1) }, false } }, bytes_a, false);
     }
@@ -16448,6 +16497,9 @@ static bool sf_run_case(ggml_backend_t backend, const sf_api & api, sf_wset & ws
                 }
             }
         }
+        if (sf_o.check && v.s_group > 0) {
+            GGML_ASSERT(api.diag(backend, 5, 1, nullptr)); // the ring of the next streamed op is poisoned before its copies
+        }
         sf_exec(backend, api, v, csets);
         if (v.out == nullptr) {
             continue;
@@ -16482,10 +16534,10 @@ static bool sf_run_case(ggml_backend_t backend, const sf_api & api, sf_wset & ws
             if (r >= 0) {
                 v.ms.push_back((t1 - t0)/1000.0);
                 sf_collect(backend, api, v);
-                if (v.u_phase) {
-                    double ph[12] = {};
+                if (v.u_phase || v.s_group > 0) {
+                    double ph[SF_DIAG_N] = {};
                     GGML_ASSERT(api.diag(backend, 2, 0, ph));
-                    v.ph.insert(v.ph.end(), ph, ph + 12);
+                    v.ph.insert(v.ph.end(), ph, ph + SF_DIAG_N);
                 }
             }
         }
@@ -16532,17 +16584,41 @@ static bool sf_run_case(ggml_backend_t backend, const sf_api & api, sf_wset & ws
                 }
             }
             tail += ",\"u_group\":" + std::to_string(v.u_group) + ",\"u_minus_v_ms\":" + num(sf_median(v.ms) - v_med, "%.3f");
-            if (v.u_phase && !v.ph.empty()) {
-                static const char * names[12] = { "route", "plan", "items", "prologue", "gemm", "glu", "scatter", "total", "groups",
-                    "launches", "experts", "rows" };
-                const size_t nrep = v.ph.size()/12;
-                for (int i = 0; i < 12; ++i) {
-                    std::vector<double> col(nrep);
-                    for (size_t r = 0; r < nrep; ++r) {
-                        col[r] = v.ph[r*12 + i];
+        }
+        if (v.s_group > 0) {
+            // variant S: against V, A and C of the same process
+            auto med = [&](const char * n) {
+                for (const sf_variant & b : variants) {
+                    if (b.name == n) {
+                        return sf_median(b.ms);
                     }
-                    tail += std::string(",\"ph_") + names[i] + (i < 8 ? "_ms\":" : "\":") + num(sf_median(col), i < 8 ? "%.3f" : "%.0f");
                 }
+                return -1.0;
+            };
+            tail += ",\"s_group\":" + std::to_string(v.s_group) + ",\"s_ring_arg\":" + std::to_string(sf_o.s_ring) +
+                ",\"s_minus_v_ms\":" + num(sf_median(v.ms) - med("V"), "%.3f") +
+                ",\"s_minus_a_ms\":" + (med("A") > 0 ? num(sf_median(v.ms) - med("A"), "%.3f") : std::string("null")) +
+                ",\"s_minus_c_ms\":" + (med("C") > 0 ? num(sf_median(v.ms) - med("C"), "%.3f") : std::string("null"));
+        }
+        if ((v.u_group > 0 || v.s_group > 0) && !v.ph.empty()) {
+            // phases (UP, SP): the time since the previous stamp; stats of the streamed op (S, SP): copied experts, copy
+            // groups, ring slots, slot reuse events, copy commands, copied MiB, error code (median over the repetitions)
+            static const char * names[SF_DIAG_N] = { "route", "plan", "items", "prologue", "gemm", "glu", "scatter", "total",
+                "groups", "launches", "experts", "rows", "wait", "copied", "copy_groups", "ring", "events", "cmds", "copy_mib", "err" };
+            const size_t nrep = v.ph.size()/SF_DIAG_N;
+            for (int i = 0; i < SF_DIAG_N; ++i) {
+                const bool phase = i < 8 || i == 12;
+                if (i < 13 && !v.u_phase) {
+                    continue; // the phases and counts of a stamped run only
+                }
+                if (i >= 12 && v.s_group == 0) {
+                    continue;
+                }
+                std::vector<double> col(nrep);
+                for (size_t r = 0; r < nrep; ++r) {
+                    col[r] = v.ph[r*SF_DIAG_N + i];
+                }
+                tail += std::string(",\"ph_") + names[i] + (phase ? "_ms\":" : "\":") + num(sf_median(col), phase || i == 18 ? "%.3f" : "%.0f");
             }
         }
         printf("{\"type\":\"result\",\"shape\":\"%s\",\"W\":%" PRId64 ",\"route\":\"%s\",\"variant\":\"%s\",\"median_ms\":%.3f,"
@@ -16584,6 +16660,9 @@ static int sf_main(const char * backend_filter) {
     if (!api.copy || !api.wait || !api.sync || !api.ev) {
         fprintf(stderr, "stage-falsify: the backend has no stage bench entry points\n");
         return 1;
+    }
+    if (api.diag != nullptr) {
+        api.diag(backend.get(), 3, 0, nullptr); // the streamed op only where variant S turns it on
     }
     {
         size_t fr = 0, tot = 0;
@@ -16759,6 +16838,8 @@ int main(int argc, char ** argv) {
             else if (strcmp(o, "--sf-no-check") == 0)   { sf_o.check = false; }
             else if (strcmp(o, "--sf-z-group") == 0)    { sf_o.z_group = std::max(1, atoi(v)); }
             else if (strcmp(o, "--sf-u-group") == 0)    { sf_o.u_group = std::max(1, atoi(v)); }
+            else if (strcmp(o, "--sf-s-group") == 0)    { sf_o.s_group = std::max(1, atoi(v)); }
+            else if (strcmp(o, "--sf-s-ring") == 0)     { sf_o.s_ring = std::max(0, atoi(v)); }
             else if (strcmp(o, "--sf-z-ahead") == 0)    { sf_o.z_ahead = std::max(0, atoi(v)); }
             else if (strcmp(o, "--sf-y-split") == 0)    { sf_o.y_alt = strcmp(v, "alt") == 0; }
             else {

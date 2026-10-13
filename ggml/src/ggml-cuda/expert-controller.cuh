@@ -47,6 +47,10 @@ void ggml_cuda_expert_layer_done(ggml_backend_cuda_context & ctx, const ggml_ten
 // with enough rows to be staged.
 void ggml_cuda_expert_before_read(ggml_backend_cuda_context & ctx, const ggml_tensor * src0);
 
+// Whether the last route of the layer of `src0` was staged by the SSD tier (the addresses of its file slices fill in while
+// the ops of the layer run); false without the tier.
+bool ggml_cuda_expert_layer_staged(const ggml_tensor * src0);
+
 // True for the buffer type that exclusive mode allocates the routed expert weights on. Its tensors
 // carry logical addresses only: their bytes live in the VRAM arena or in the host arena, so every
 // kernel that reads them must resolve them through ggml_cuda_expert_lookup_tensor.
