@@ -1735,8 +1735,11 @@ static const char * mmh_rot_cache(const ggml_cuda_expert_lookup & cached, const 
 // the weight base for the kernels; with ids, a routed expert weight of the expert cache also fills the cache fields
 // of p (MUL_MAT_ID rule: a weight in a mapped host buffer or in the exclusive buffer, whose tensor has logical
 // addresses only and is read through the lookup alone)
+// With defer_wait the staged SSD tier's wait for this kind is not enqueued here; the caller enqueues it with
+// ggml_cuda_expert_before_read before the first kernel that reads the kind's addresses (the table pointers are
+// final, only their contents fill in as the kind is published).
 static const char * mmh_weight_data(ggml_backend_cuda_context & ctx, const ggml_tensor * w, const ggml_tensor * ids,
-        mmh_params & p) {
+        mmh_params & p, bool defer_wait = false) {
     p.w_cache          = nullptr;
     p.w_slots          = nullptr;
     p.w_host_slots     = nullptr;
@@ -1750,7 +1753,9 @@ static const char * mmh_weight_data(ggml_backend_cuda_context & ctx, const ggml_
     const char * data = mmh_data(w);
     if (ids && (exclusive || (w->buffer && ggml_backend_buffer_is_host(w->buffer)))) {
         const ggml_cuda_expert_lookup cached = ggml_cuda_expert_lookup_tensor(w);
-        ggml_cuda_expert_before_read(ctx, w);
+        if (!defer_wait) {
+            ggml_cuda_expert_before_read(ctx, w);
+        }
         p.w_remote         = true;
         p.w_cache          = cached.data;
         p.w_slots          = cached.slots;
@@ -1766,7 +1771,7 @@ static const char * mmh_weight_data(ggml_backend_cuda_context & ctx, const ggml_
     }
     return data;
 #else
-    GGML_UNUSED_VARS(ctx, ids);
+    GGML_UNUSED_VARS(ctx, ids, defer_wait);
     return mmh_data(w);
 #endif // defined(GGML_USE_HIP)
 }
@@ -1885,9 +1890,34 @@ void ggml_cuda_mul_mat_had(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 // of the chunk in slot order. The intermediates scale with R instead of the token count. A token's rows are summed in
 // chunk order (the expert order) and inside a chunk in slot order; which rows of a split expert land in which of its
 // chunks does not change that order, so the result does not depend on the order the routing pass ranks rows in.
+//
+// Rows per GEMM item (mt): an expert whose weights are in VRAM (the VRAM arena, a VRAM weight, a staged copy) takes the
+// tile of the mean rows per expert, as MUL_MAT_HAD; an expert read from host memory takes three times that (fewer reads
+// of the weight over the link, the rule of MMQ and of MUL_MAT_HAD for remote weights). Each chunk runs one GEMM per
+// kind for each of the two tiles.
+//
+// Staging (RANMA_EXPERT_MAJOR_STAGE_MIB > 0): the experts of a chunk with at least `stage_min` rows that are not in VRAM
+// are copied into one of two VRAM buffers (chunk c uses buffer c % 2) by a resident copy kernel on a side stream while
+// the previous chunk computes (docs/hip-copy-api-overheads.ko.md 2.13: the resident side-stream copy kernel with device
+// flags, launched once and flushed). Signals are device flags: ready[c] (copier -> compute) and done = the number of
+// chunks whose GEMMs finished (compute -> copier, which reuses a buffer only for chunk c + 2). Before the GEMMs of chunk c
+// a one-block wait kernel points the entries of its staged experts in the op's address tables at the buffer; after the
+// down GEMM a release kernel restores them and counts the chunk done.
+// RANMA_EXPERT_MAJOR_STAGE_ENGINE=sdma (the default) copies with the copy engine instead: after the routing pass the host
+// reads the plan (one synchronize per op), issues one hipMemcpyAsync per expert and kind on the side stream in chunk
+// order, and events order the copies of chunk c after the GEMMs of chunk c - 2 and the GEMMs of chunk c after its copies
+// (the copy kernel slowed the GEMMs it ran beside, as in docs/hip-copy-api-overheads.ko.md 2.13 4b). The tables take the
+// place of the SSD tier's address
+// table (ggml_cuda_expert_cache_select), so the GEMM kernels are unchanged. Every wait is bounded only to detect a hang:
+// a wait over MMH_MOE_STAGE_TIMEOUT (or a staged source that is not 16-byte aligned) records an error in mapped host
+// memory and stops the copier and the waits; a host function after the op reports it and aborts. The legitimate waits are
+// bounded by one chunk of compute and one chunk of copies, far below the limit.
 
 #define MMH_MOE_ROWS 4096 // default rows per chunk
 #define MMH_MOE_MAX_USED 64 // most experts per token
+#define MMH_MOE_STAGE_MAX_CHUNKS 1024
+#define MMH_MOE_STAGE_MAX_SLOTS 64
+#define MMH_MOE_STAGE_TIMEOUT 500000000ull // 5 s of the 100 MHz wall clock
 
 struct mmh_moe_route {
     int * rows_sorted; // N: row g = k + n_used*t, sorted by expert
@@ -1897,6 +1927,55 @@ struct mmh_moe_route {
     int * cnt;         // n_exp: rows of the expert
     int * chunks;      // 2*c_max: first index, row count
     int * n_chunks;
+    int * stage_list;  // c_max*stage_cap: the staged experts of each chunk
+    int * stage_n;     // c_max
+};
+
+struct mmh_moe_stage_flags {
+    int ready[MMH_MOE_STAGE_MAX_CHUNKS];
+    int arrive[MMH_MOE_STAGE_MAX_CHUNKS];
+    int done;
+    int abort;
+    int staged;
+};
+
+// the first error of an op (mapped host memory, written by the device with system scope)
+struct mmh_moe_stage_error {
+    int      code;   // 1 copier waited for a free buffer, 2 compute waited for a copy, 3 unaligned source
+    int      layer;
+    int      chunk;
+    int      value;  // done (1), ready (2), expert (3)
+    uint64_t ticks;  // wall clock ticks (100 MHz) waited
+};
+
+// the copies of an op for the copy engine (mapped host memory, written by the device after the routing pass)
+struct mmh_moe_stage_plan {
+    int      n_chunks;
+    int      stage_n[MMH_MOE_STAGE_MAX_CHUNKS];
+    uint64_t src[MMH_MOE_STAGE_MAX_CHUNKS*MMH_MOE_STAGE_MAX_SLOTS*3];
+};
+
+static __device__ void mmh_moe_stage_fail(mmh_moe_stage_flags * f, mmh_moe_stage_error * err, const int code, const int layer,
+        const int chunk, const int value, const uint64_t ticks) {
+    if (atomicCAS(&f->abort, 0, 1) == 0) {
+        err->layer = layer;
+        err->chunk = chunk;
+        err->value = value;
+        err->ticks = ticks;
+        __threadfence_system();
+        __hip_atomic_store(&err->code, code, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
+    }
+}
+
+// where the copier reads an expert: the cache's selection of the op (VRAM slots never reach it)
+struct mmh_moe_stage_src {
+    const char     * data[3];
+    const void     * arena[3];
+    const int32_t  * slots[3];
+    const int32_t  * host_slots[3];
+    const uint64_t * host_addresses[3];
+    int64_t          nb02[3];
+    int64_t          koff[4]; // byte offset of each kind in a staging slot, koff[3] = slot bytes
 };
 
 static __device__ __forceinline__ int mmh_moe_expert(const int32_t * ids, const int64_t nb0, const int64_t nb1,
@@ -1905,13 +1984,18 @@ static __device__ __forceinline__ int mmh_moe_expert(const int32_t * ids, const 
     return e < 0 ? 0 : (e >= n_exp ? n_exp - 1 : e);
 }
 
-// one block: rows sorted by expert, and the chunk table
+// one block: rows sorted by expert, the chunk table and the staged experts of each chunk. The experts are ordered by
+// class, then by id: those read from VRAM first (they do not use the link, so the copies of the staged experts fill it
+// meanwhile), then the others by id, so that the in-place reads of host experts are spread between the staged ones
+// (RANMA_EXPERT_MAJOR_ORDER=last: the staged experts first, the in-place ones last).
 static __global__ void __launch_bounds__(1024) mmh_moe_route_kernel(const int32_t * __restrict__ ids, const int64_t ids_nb0,
         const int64_t ids_nb1, const int n_used, const int n_rows, const int n_exp, const int chunk_rows, const int c_max,
+        const int32_t * __restrict__ slots, const bool all_local, const int stage_cap, const int stage_min, const bool host_last,
         const mmh_moe_route rt) {
-    __shared__ int s_count[MMH_MAX_EXPERTS];
-    __shared__ int s_offs[MMH_MAX_EXPERTS];
-    __shared__ int s_scan[1024];
+    __shared__ int  s_count[MMH_MAX_EXPERTS];
+    __shared__ int  s_offs[MMH_MAX_EXPERTS];
+    __shared__ int  s_scan[1024];
+    __shared__ char s_class[MMH_MAX_EXPERTS];
 
     const int tid = threadIdx.x;
     const int nth = blockDim.x;
@@ -1927,27 +2011,41 @@ static __global__ void __launch_bounds__(1024) mmh_moe_route_kernel(const int32_
     }
     __syncthreads();
 
+    auto stageable = [&](const int e, const int r) {
+        return stage_cap > 0 && r >= stage_min && !all_local && (slots == nullptr || slots[e] < 0);
+    };
     const int per = (n_exp + nth - 1)/nth;
     const int e0  = min(n_exp, tid*per);
     const int e1  = min(n_exp, e0 + per);
-    int sum = 0;
     for (int e = e0; e < e1; ++e) {
-        sum += s_count[e];
+        const int c = s_count[e];
+        s_class[e] = all_local || (slots != nullptr && slots[e] >= 0) ? 0 : stageable(e, min(c, chunk_rows)) || !host_last ? 1 : 2;
     }
-    s_scan[tid] = sum;
-    __syncthreads();
-    for (int h = 1; h < nth; h *= 2) {
-        const int a = tid >= h ? s_scan[tid - h] : 0;
+    int base = 0;
+    for (int cls = 0; cls < 3; ++cls) {
+        int sum = 0;
+        for (int e = e0; e < e1; ++e) {
+            sum += s_class[e] == cls ? s_count[e] : 0;
+        }
         __syncthreads();
-        s_scan[tid] += a;
+        s_scan[tid] = sum;
         __syncthreads();
-    }
-    int row = s_scan[tid] - sum;
-    for (int e = e0; e < e1; ++e) {
-        s_offs[e]  = row;
-        rt.offs[e] = row;
-        rt.cnt[e]  = s_count[e];
-        row += s_count[e];
+        for (int h = 1; h < nth; h *= 2) {
+            const int a = tid >= h ? s_scan[tid - h] : 0;
+            __syncthreads();
+            s_scan[tid] += a;
+            __syncthreads();
+        }
+        int row = base + s_scan[tid] - sum;
+        for (int e = e0; e < e1; ++e) {
+            if (s_class[e] == cls) {
+                s_offs[e]  = row;
+                rt.offs[e] = row;
+                rt.cnt[e]  = s_count[e];
+                row += s_count[e];
+            }
+        }
+        base += s_scan[nth - 1];
     }
     __syncthreads();
     for (int g = tid; g < n_rows; g += nth) {
@@ -1956,86 +2054,130 @@ static __global__ void __launch_bounds__(1024) mmh_moe_route_kernel(const int32_
         rt.rows_sorted[p] = g;
     }
 
-    // chunks: whole experts packed in order up to chunk_rows rows; an expert of more rows takes chunks of its own
+    // chunks: whole experts packed in order up to chunk_rows rows and stage_cap staged experts; an expert of more rows
+    // takes chunks of its own
     if (tid == 0) {
         int nc    = 0;
         int cur_b = 0;
         int cur_n = 0;
-        auto emit = [&](const int b, const int n) {
+        int cur_s = 0;
+        auto emit = [&](const int b, const int n, const int s) {
             if (n > 0 && nc < c_max) {
                 rt.chunks[2*nc + 0] = b;
                 rt.chunks[2*nc + 1] = n;
+                rt.stage_n[nc] = s;
                 ++nc;
             }
         };
-        for (int e = 0; e < n_exp; ++e) {
+        for (int i = 0; i < 3*n_exp; ++i) {
+            const int e = i % n_exp;
             const int c = s_count[e];
-            if (c == 0) {
+            if (c == 0 || s_class[e] != i / n_exp) {
                 continue;
             }
             if (c > chunk_rows) {
-                emit(cur_b, cur_n);
+                emit(cur_b, cur_n, cur_s);
                 cur_n = 0;
+                cur_s = 0;
                 for (int i = 0; i < c; i += chunk_rows) {
-                    emit(s_offs[e] + i, min(chunk_rows, c - i));
+                    const int r = min(chunk_rows, c - i);
+                    const int s = stageable(e, r) && nc < c_max;
+                    if (s) {
+                        rt.stage_list[nc*stage_cap] = e;
+                    }
+                    emit(s_offs[e] + i, r, s);
                 }
                 continue;
             }
-            if (cur_n + c > chunk_rows) {
-                emit(cur_b, cur_n);
+            const bool st = stageable(e, c);
+            if (cur_n + c > chunk_rows || (st && cur_s == stage_cap)) {
+                emit(cur_b, cur_n, cur_s);
                 cur_n = 0;
+                cur_s = 0;
             }
             if (cur_n == 0) {
                 cur_b = s_offs[e];
             }
+            if (st && nc < c_max) {
+                rt.stage_list[nc*stage_cap + cur_s++] = e;
+            }
             cur_n += c;
         }
-        emit(cur_b, cur_n);
+        emit(cur_b, cur_n, cur_s);
         *rt.n_chunks = nc;
     }
 }
 
-// one block: the GEMM items (expert, first local row, rows <= mt) of chunk c
+// one block: the GEMM items (expert, first local row, rows <= mt) of chunk c, in two lists: the experts read from VRAM
+// (tile mt_v) and the others (tile mt_r)
 static __global__ void __launch_bounds__(1024) mmh_moe_items_kernel(const mmh_moe_route rt, const int c, const int n_exp,
-        const int mt, int * __restrict__ items, int * __restrict__ n_items) {
-    __shared__ int s_scan[1024];
+        const int32_t * __restrict__ slots, const bool all_local, const int stage_cap, const int mt_v, const int mt_r,
+        int * __restrict__ items_v, int * __restrict__ n_items_v, int * __restrict__ items_r, int * __restrict__ n_items_r) {
+    __shared__ int s_scan[2][1024];
 
     const int tid  = threadIdx.x;
     const int nth  = blockDim.x;
     const bool live = c < *rt.n_chunks;
     const int b    = live ? rt.chunks[2*c + 0] : 0;
     const int nr   = live ? rt.chunks[2*c + 1] : 0;
+    const int ns   = live && stage_cap > 0 ? rt.stage_n[c] : 0;
+
+    auto local = [&](const int e) {
+        if (all_local || (slots != nullptr && slots[e] >= 0)) {
+            return true;
+        }
+        for (int j = 0; j < ns; ++j) {
+            if (rt.stage_list[c*stage_cap + j] == e) {
+                return true;
+            }
+        }
+        return false;
+    };
 
     const int per = (n_exp + nth - 1)/nth;
     const int e0  = min(n_exp, tid*per);
     const int e1  = min(n_exp, e0 + per);
-    int sum = 0;
+    int sum[2] = {0, 0};
     for (int e = e0; e < e1; ++e) {
         const int lo = max(rt.offs[e], b);
         const int hi = min(rt.offs[e] + rt.cnt[e], b + nr);
-        sum += hi > lo ? (hi - lo + mt - 1)/mt : 0;
+        if (hi > lo) {
+            const int l  = local(e) ? 0 : 1;
+            const int mt = l == 0 ? mt_v : mt_r;
+            sum[l] += (hi - lo + mt - 1)/mt;
+        }
     }
-    s_scan[tid] = sum;
+    s_scan[0][tid] = sum[0];
+    s_scan[1][tid] = sum[1];
     __syncthreads();
     for (int h = 1; h < nth; h *= 2) {
-        const int a = tid >= h ? s_scan[tid - h] : 0;
+        const int a0 = tid >= h ? s_scan[0][tid - h] : 0;
+        const int a1 = tid >= h ? s_scan[1][tid - h] : 0;
         __syncthreads();
-        s_scan[tid] += a;
+        s_scan[0][tid] += a0;
+        s_scan[1][tid] += a1;
         __syncthreads();
     }
-    int item = s_scan[tid] - sum;
+    int item[2] = { s_scan[0][tid] - sum[0], s_scan[1][tid] - sum[1] };
     for (int e = e0; e < e1; ++e) {
         const int lo = max(rt.offs[e], b);
         const int hi = min(rt.offs[e] + rt.cnt[e], b + nr);
+        if (hi <= lo) {
+            continue;
+        }
+        const int l  = local(e) ? 0 : 1;
+        const int mt = l == 0 ? mt_v : mt_r;
+        int * items = l == 0 ? items_v : items_r;
         for (int i = lo; i < hi; i += mt) {
-            items[3*item + 0] = e;
-            items[3*item + 1] = i - b;
-            items[3*item + 2] = min(mt, hi - i);
-            ++item;
+            items[3*item[l] + 0] = e;
+            items[3*item[l] + 1] = i - b;
+            items[3*item[l] + 2] = min(mt, hi - i);
+            ++item[l];
         }
     }
     if (tid == nth - 1) {
-        *n_items = s_scan[tid];
+        *n_items_v = s_scan[0][tid];
+        *n_items_r = s_scan[1][tid];
     }
 }
 
@@ -2158,6 +2300,147 @@ static __global__ void __launch_bounds__(256) mmh_moe_scatter(const mmh_moe_rout
     }
 }
 
+static __global__ void mmh_moe_table_init(uint64_t * __restrict__ tab, const uint64_t * __restrict__ src, const int n) {
+    const int i = blockIdx.x*blockDim.x + threadIdx.x;
+    if (i < n) {
+        tab[i] = src ? src[i] : 0;
+    }
+}
+
+static __device__ __forceinline__ uint64_t mmh_moe_src_address(const mmh_moe_stage_src & s, const int kind, const int e) {
+    const ggml_cuda_expert_source src = ggml_cuda_expert_cache_select(s.data[kind], s.arena[kind], s.slots[kind], e,
+        s.host_slots[kind], s.host_addresses[kind]);
+    return (uint64_t) (uintptr_t) src.data + (uint64_t) src.channel*s.nb02[kind];
+}
+
+// the resident copier (side stream): the staged experts of every chunk, in chunk order, into buffer c % 2
+static __global__ void __launch_bounds__(256) mmh_moe_stage_copy(const mmh_moe_route rt, const int stage_cap,
+        const mmh_moe_stage_src s, char * __restrict__ buf0, char * __restrict__ buf1, mmh_moe_stage_flags * f,
+        mmh_moe_stage_error * err, const int layer) {
+    const int n_chunks = *rt.n_chunks;
+    const int64_t units_slot = s.koff[3]/16;
+    for (int c = 0; c < n_chunks; ++c) {
+        if (c >= 2) {
+            const uint64_t t0 = wall_clock64();
+            int d;
+            while ((d = __hip_atomic_load(&f->done, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT)) < c - 1) {
+                if (__hip_atomic_load(&f->abort, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT)) {
+                    return;
+                }
+                if (wall_clock64() - t0 > MMH_MOE_STAGE_TIMEOUT) {
+                    mmh_moe_stage_fail(f, err, 1, layer, c, d, wall_clock64() - t0);
+                    return;
+                }
+                __builtin_amdgcn_s_sleep(2);
+            }
+        }
+        char * buf = (c & 1) ? buf1 : buf0;
+        const int n = rt.stage_n[c];
+        for (int64_t u = (int64_t) blockIdx.x*blockDim.x + threadIdx.x; u < n*units_slot; u += (int64_t) gridDim.x*blockDim.x) {
+            const int     j    = (int) (u / units_slot);
+            const int64_t off  = (u % units_slot)*16;
+            const int     kind = off < s.koff[1] ? 0 : off < s.koff[2] ? 1 : 2;
+            if (off - s.koff[kind] >= s.nb02[kind]) {
+                continue; // padding between kinds
+            }
+            const int      e = rt.stage_list[c*stage_cap + j];
+            const uint64_t a = mmh_moe_src_address(s, kind, e);
+            if (a % 16 != 0) {
+                mmh_moe_stage_fail(f, err, 3, layer, c, e, 0);
+                return;
+            }
+            const uint4 v = *(const uint4 *) (uintptr_t) (a + (off - s.koff[kind]));
+            *(uint4 *) (buf + j*s.koff[3] + off) = v;
+        }
+        __threadfence();
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            if (atomicAdd(&f->arrive[c], 1) == (int) gridDim.x - 1) {
+                __threadfence();
+                __hip_atomic_store(&f->ready[c], 1, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
+            }
+        }
+    }
+}
+
+// compute stream, before the GEMMs of chunk c: wait for its copies, then point its staged experts at the buffer
+static __global__ void mmh_moe_stage_wait(const mmh_moe_route rt, const int c, const int stage_cap, const mmh_moe_stage_src s,
+        char * buf0, char * buf1, uint64_t * __restrict__ tab0, uint64_t * __restrict__ tab1, uint64_t * __restrict__ tab2,
+        mmh_moe_stage_flags * f, mmh_moe_stage_error * err, const int layer, const bool spin) {
+    if (c >= *rt.n_chunks || rt.stage_n[c] == 0) {
+        return;
+    }
+    __shared__ int s_ready;
+    if (threadIdx.x == 0 && !spin) {
+        s_ready = 1;
+    } else if (threadIdx.x == 0) {
+        const uint64_t t0 = wall_clock64();
+        int r = 0;
+        while (!(r = __hip_atomic_load(&f->ready[c], __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_AGENT))) {
+            if (__hip_atomic_load(&f->abort, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT)) {
+                break;
+            }
+            if (wall_clock64() - t0 > MMH_MOE_STAGE_TIMEOUT) {
+                mmh_moe_stage_fail(f, err, 2, layer, c, r, wall_clock64() - t0);
+                break;
+            }
+            __builtin_amdgcn_s_sleep(2);
+        }
+        s_ready = r;
+    }
+    __syncthreads();
+    if (!s_ready) {
+        return;
+    }
+    char * buf = (c & 1) ? buf1 : buf0;
+    for (int j = threadIdx.x; j < rt.stage_n[c]; j += blockDim.x) {
+        const int e = rt.stage_list[c*stage_cap + j];
+        const uint64_t base = (uint64_t) (uintptr_t) (buf + j*s.koff[3]);
+        tab0[e] = base + s.koff[0];
+        tab1[e] = base + s.koff[1];
+        tab2[e] = base + s.koff[2];
+        atomicAdd(&f->staged, 1);
+    }
+}
+
+// one block after the routing pass: the chunk count, the staged experts per chunk and their sources, for the host
+static __global__ void mmh_moe_stage_plan_kernel(const mmh_moe_route rt, const int stage_cap, const mmh_moe_stage_src s,
+        mmh_moe_stage_plan * plan) {
+    const int n = *rt.n_chunks;
+    if (threadIdx.x == 0) {
+        plan->n_chunks = n;
+    }
+    for (int c = 0; c < n; ++c) {
+        const int ns = rt.stage_n[c];
+        if (threadIdx.x == 0) {
+            plan->stage_n[c] = ns;
+        }
+        for (int i = threadIdx.x; i < 3*ns; i += blockDim.x) {
+            plan->src[3*(c*stage_cap) + i] = mmh_moe_src_address(s, i % 3, rt.stage_list[c*stage_cap + i/3]);
+        }
+    }
+    __threadfence_system();
+}
+
+// compute stream, after the down GEMM of chunk c: restore the entries of its staged experts, then count the chunk done
+static __global__ void mmh_moe_stage_release(const mmh_moe_route rt, const int c, const int stage_cap, const mmh_moe_stage_src s,
+        uint64_t * __restrict__ tab0, uint64_t * __restrict__ tab1, uint64_t * __restrict__ tab2, mmh_moe_stage_flags * f) {
+    if (c >= *rt.n_chunks) {
+        return;
+    }
+    for (int j = threadIdx.x; j < rt.stage_n[c]; j += blockDim.x) {
+        const int e = rt.stage_list[c*stage_cap + j];
+        tab0[e] = s.host_addresses[0] ? s.host_addresses[0][e] : 0;
+        tab1[e] = s.host_addresses[1] ? s.host_addresses[1][e] : 0;
+        tab2[e] = s.host_addresses[2] ? s.host_addresses[2][e] : 0;
+    }
+    __threadfence();
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        __hip_atomic_store(&f->done, c + 1, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
+    }
+}
+
 template <ggml_type type>
 static void mmh_moe_gemm_t(const int mt, const dim3 grid, cudaStream_t stream, const mmh_params & p, const char * w,
         const half * xh, const float * rscale, const int * items, const int * n_items, const int * iota) {
@@ -2188,6 +2471,11 @@ static void mmh_moe_gemm(const ggml_type type, const int mt, const dim3 grid, cu
     }
 }
 
+static int mmh_moe_env_int(const char * name, const int def) {
+    const char * v = getenv(name);
+    return v ? atoi(v) : def;
+}
+
 // the rows of a pass come from the op (the graph builder passes the layer mode's value after its no_alloc measurements,
 // 0 before), else the default
 static int mmh_moe_chunk_rows(const ggml_tensor * op) {
@@ -2195,22 +2483,91 @@ static int mmh_moe_chunk_rows(const ggml_tensor * op) {
     return r > 0 ? r : MMH_MOE_ROWS;
 }
 
-// rows per GEMM item: three times the mean rows of an expert, the rule MMQ follows for host weights
-static int mmh_moe_mt(const int64_t n_rows, const int64_t n_exp) {
-    static const int env = [] {
-        const char * v = getenv("RANMA_EXPERT_MAJOR_MT");
-        return v ? atoi(v) : 0;
-    }();
+// rows per GEMM item from the mean rows of an expert: the tile that holds them (VRAM weights, as MUL_MAT_HAD), or for
+// host weights the one that holds three times as many; RANMA_EXPERT_MAJOR_MT forces one tile for both
+static int mmh_moe_mt(const int64_t n_rows, const int64_t n_exp, const bool remote) {
+    static const int env = mmh_moe_env_int("RANMA_EXPERT_MAJOR_MT", 0);
     if (env == 16 || env == 32 || env == 64 || env == 128) {
         return env;
     }
     const int64_t used = std::max<int64_t>(1, std::min(n_rows, n_exp));
-    const int64_t want = 3*((n_rows + used - 1)/used);
+    const int64_t want = (remote ? 3 : 1)*((n_rows + used - 1)/used);
     return want <= 16 ? 16 : want <= 32 ? 32 : want <= 64 ? 64 : 128;
 }
 
 static int64_t mmh_moe_max_items(const int64_t chunk_rows, const int64_t n_exp, const int mt) {
     return std::min(n_exp, chunk_rows) + chunk_rows/mt + 1;
+}
+
+// the staging state of a device: two buffers, the flags and the op's three address tables (kept, a captured graph never
+// holds them: graphs with this op are not captured while staging is on)
+struct mmh_moe_stage_dev {
+    char                * buf         = nullptr;
+    size_t                bytes       = 0;
+    mmh_moe_stage_flags * flags       = nullptr;
+    uint64_t            * tabs        = nullptr; // 3*MMH_MAX_EXPERTS
+    int32_t             * no_slots    = nullptr; // MMH_MAX_EXPERTS of -1
+    cudaStream_t          side        = nullptr;
+    cudaEvent_t           ev_plan     = nullptr;
+    cudaEvent_t           ev_done     = nullptr;
+    mmh_moe_stage_error * err_host    = nullptr; // mapped
+    mmh_moe_stage_error * err_dev     = nullptr;
+    mmh_moe_stage_plan  * plan_host   = nullptr; // mapped
+    mmh_moe_stage_plan  * plan_dev    = nullptr;
+    cudaEvent_t           ev_ready[MMH_MOE_STAGE_MAX_CHUNKS] = {};
+    cudaEvent_t           ev_cdone[MMH_MOE_STAGE_MAX_CHUNKS] = {};
+};
+
+// host function after a staged op: report and abort on a recorded error
+static void mmh_moe_stage_check(void * data) {
+    const mmh_moe_stage_error * e = (const mmh_moe_stage_error *) data;
+    const int code = __atomic_load_n(&e->code, __ATOMIC_ACQUIRE);
+    if (code != 0) {
+        static const char * what[] = { "", "the copier waited for a free buffer (done)", "a chunk waited for its copies (ready)",
+            "a staged source is not 16-byte aligned (expert)" };
+        GGML_LOG_ERROR("expert-major staging failed: %s; layer %d, chunk %d, value %d, waited %.3f s\n",
+            code >= 1 && code <= 3 ? what[code] : "?", e->layer, e->chunk, e->value, e->ticks/1e8);
+        GGML_ABORT("expert-major staging failed");
+    }
+}
+
+static size_t mmh_moe_stage_bytes() {
+    const size_t mib = (size_t) std::max(0, mmh_moe_env_int("RANMA_EXPERT_MAJOR_STAGE_MIB", 0)); // per call, see mmh_moe_chunk_rows
+    return mib << 20;
+}
+
+bool ggml_cuda_moe_ffn_had_graph_ok(void) {
+    return mmh_moe_stage_bytes() == 0;
+}
+
+static mmh_moe_stage_dev * mmh_moe_stage_get(const int device) {
+    static std::mutex mutex;
+    static std::map<int, mmh_moe_stage_dev> devs;
+    std::lock_guard<std::mutex> lock(mutex);
+    mmh_moe_stage_dev & d = devs[device];
+    if (d.buf == nullptr) {
+        d.bytes = mmh_moe_stage_bytes();
+        CUDA_CHECK(cudaMalloc((void **) &d.buf, d.bytes));
+        CUDA_CHECK(cudaMalloc((void **) &d.flags, sizeof(mmh_moe_stage_flags)));
+        CUDA_CHECK(cudaMalloc((void **) &d.tabs, 3*MMH_MAX_EXPERTS*sizeof(uint64_t)));
+        CUDA_CHECK(cudaMalloc((void **) &d.no_slots, MMH_MAX_EXPERTS*sizeof(int32_t)));
+        CUDA_CHECK(cudaMemset(d.no_slots, 0xff, MMH_MAX_EXPERTS*sizeof(int32_t)));
+        CUDA_CHECK(cudaStreamCreateWithFlags(&d.side, cudaStreamNonBlocking));
+        CUDA_CHECK(cudaEventCreateWithFlags(&d.ev_plan, cudaEventDisableTiming));
+        CUDA_CHECK(cudaEventCreateWithFlags(&d.ev_done, cudaEventDisableTiming));
+        CUDA_CHECK(cudaHostAlloc((void **) &d.err_host, sizeof(mmh_moe_stage_error), cudaHostAllocMapped));
+        memset(d.err_host, 0, sizeof(mmh_moe_stage_error));
+        CUDA_CHECK(cudaHostGetDevicePointer((void **) &d.err_dev, d.err_host, 0));
+        CUDA_CHECK(cudaHostAlloc((void **) &d.plan_host, sizeof(mmh_moe_stage_plan), cudaHostAllocMapped));
+        CUDA_CHECK(cudaHostGetDevicePointer((void **) &d.plan_dev, d.plan_host, 0));
+        for (int i = 0; i < MMH_MOE_STAGE_MAX_CHUNKS; ++i) {
+            CUDA_CHECK(cudaEventCreateWithFlags(&d.ev_ready[i], cudaEventDisableTiming));
+            CUDA_CHECK(cudaEventCreateWithFlags(&d.ev_cdone[i], cudaEventDisableTiming));
+        }
+        CUDA_CHECK(cudaDeviceSynchronize());
+        GGML_LOG_INFO("%s: expert-major staging: %.0f MiB of VRAM on device %d\n", __func__, d.bytes/1048576.0, device);
+    }
+    return &d;
 }
 
 bool ggml_cuda_moe_ffn_had_supported(const int device, const ggml_tensor * op) {
@@ -2238,8 +2595,8 @@ bool ggml_cuda_moe_ffn_had_supported(const int device, const ggml_tensor * op) {
         }
     }
     const int64_t n_exp = op->src[3]->src[0]->ne[2];
-    const int     mt    = mmh_moe_mt(n_rows, n_exp);
-    return mmh_moe_max_items(std::min<int64_t>(mmh_moe_chunk_rows(op), n_rows), n_exp, mt) <= 65535;
+    const int64_t R     = std::min<int64_t>(mmh_moe_chunk_rows(op), n_rows);
+    return mmh_moe_max_items(R, n_exp, mmh_moe_mt(n_rows, n_exp, false)) <= 65535;
 }
 
 void ggml_cuda_moe_ffn_had(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -2279,15 +2636,17 @@ void ggml_cuda_moe_ffn_had(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         return;
     }
 
-    const int64_t R         = std::min<int64_t>(mmh_moe_chunk_rows(dst), n_rows);
-    const int     mt        = mmh_moe_mt(n_rows, n_exp);
-    const int64_t c_max     = 3*((n_rows + R - 1)/R) + 1;
-    const int64_t max_items = mmh_moe_max_items(R, n_exp, mt);
-    GGML_ASSERT(max_items <= 65535);
-
     // the three GEMMs: local row r of a chunk is output row r of an [n, 1, R] buffer
+    // RANMA_EXPERT_MAJOR_KIND_WAIT: lazy (default) puts the staged SSD tier's wait for the gate and down kinds right
+    // before the first GEMM of that kind, so the file reads of a later kind overlap the earlier kinds' GEMMs (as the
+    // per-kind ops do); "all" waits for the three kinds before the first chunk
+    static const bool kind_lazy = [] {
+        const char * v = getenv("RANMA_EXPERT_MAJOR_KIND_WAIT");
+        return v == nullptr || strcmp(v, "all") != 0;
+    }();
     mmh_params   p[3];
     const char * wd[3];
+    bool remote = false; // some weight is read from host memory (a mapped host buffer, the exclusive buffer)
     for (int i = 0; i < 3; ++i) {
         const ggml_tensor * w       = desc[i]->src[0];
         const ggml_tensor * rot_in  = desc[i]->src[3];
@@ -2298,9 +2657,9 @@ void ggml_cuda_moe_ffn_had(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         q.n_exp    = w->ne[2];
         q.nb01     = w->nb[1];
         q.nb02     = w->nb[2];
-        q.n_rows   = R;
+        q.n_rows   = n_rows;
         q.ne1      = 1;
-        q.ne2      = (int) R;
+        q.ne2      = (int) std::min<int64_t>(n_rows, INT_MAX);
         q.nb1      = w->ne[1]*sizeof(float);
         q.nb2      = w->ne[1]*sizeof(float);
         q.nb3      = 0;
@@ -2313,12 +2672,59 @@ void ggml_cuda_moe_ffn_had(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         q.rout_f16 = rot_out->type == GGML_TYPE_F16;
         q.had      = MMH_NG;
         q.hscale   = 1.0f/sqrtf((float) MMH_NG);
-        // the expert cache lookup; with the staged SSD tier also the wait for this kind (all three before the chunks)
-        wd[i] = mmh_weight_data(ctx, w, ids, q);
+        // the expert cache lookup; the staged SSD tier's wait for the gate and down kinds is placed below (up was waited
+        // for by the top-k publish)
+        wd[i] = mmh_weight_data(ctx, w, ids, q, kind_lazy && i > 0);
+        remote = remote || (w->buffer && (ggml_backend_buffer_is_host(w->buffer) ||
+            ggml_cuda_expert_is_exclusive_buffer_type(ggml_backend_buffer_get_type(w->buffer))));
+    }
+    const bool all_local = !remote;
+
+    const int64_t R     = std::min<int64_t>(mmh_moe_chunk_rows(dst), n_rows);
+    const int     mt_v  = mmh_moe_mt(n_rows, n_exp, false);
+    const int     mt_r  = mmh_moe_mt(n_rows, n_exp, true);
+    const int64_t max_items_v = mmh_moe_max_items(R, n_exp, mt_v);
+    const int64_t max_items_r = mmh_moe_max_items(R, n_exp, mt_r);
+    GGML_ASSERT(max_items_v <= 65535 && max_items_r <= 65535);
+
+    // staging: slots of whole experts (all three kinds) in each of the two buffers
+    static const int stage_min_env = mmh_moe_env_int("RANMA_EXPERT_MAJOR_STAGE_MIN", 0);
+    static const int stage_blocks  = std::max(32, mmh_moe_env_int("RANMA_EXPERT_MAJOR_STAGE_BLOCKS", 64));
+    static const bool stage_log    = mmh_moe_env_int("RANMA_EXPERT_MAJOR_STAGE_LOG", 0) != 0;
+    static const bool host_last    = [] {
+        const char * v = getenv("RANMA_EXPERT_MAJOR_ORDER");
+        return v != nullptr && strcmp(v, "last") == 0;
+    }();
+    static const bool stage_sdma   = [] {
+        const char * v = getenv("RANMA_EXPERT_MAJOR_STAGE_ENGINE");
+        return v == nullptr || strcmp(v, "kernel") != 0;
+    }();
+    mmh_moe_stage_src ss;
+    memset(&ss, 0, sizeof(ss));
+    int64_t koff = 0;
+    for (int i = 0; i < 3; ++i) {
+        ss.koff[i] = koff;
+        koff += GGML_PAD(p[i].nb02, 256);
+    }
+    ss.koff[3] = koff;
+    const int stage_min = stage_min_env > 0 ? stage_min_env : mt_r + 1;
+    int stage_cap = 0;
+    int64_t c_max = 3*((n_rows + R - 1)/R) + 1;
+    if (remote && mmh_moe_stage_bytes() > 0) {
+        stage_cap = (int) std::min<int64_t>(MMH_MOE_STAGE_MAX_SLOTS, (int64_t) (mmh_moe_stage_bytes()/2)/ss.koff[3]);
+        if (stage_cap > 0) {
+            c_max += n_rows/((int64_t) stage_cap*std::max(1, stage_min)) + 1;
+        }
+        if (c_max > MMH_MOE_STAGE_MAX_CHUNKS) {
+            stage_cap = 0;
+        }
+    }
+    if (stage_cap == 0) {
+        c_max = 3*((n_rows + R - 1)/R) + 1;
     }
 
-    ggml_cuda_pool_alloc<int>   route(ctx.pool(), 3*n_rows + 2*n_exp + 2*c_max + 1);
-    ggml_cuda_pool_alloc<int>   items(ctx.pool(), 3*max_items + 1);
+    ggml_cuda_pool_alloc<int>   route(ctx.pool(), 3*n_rows + 2*n_exp + 2*c_max + 1 + c_max*(stage_cap + 1));
+    ggml_cuda_pool_alloc<int>   items(ctx.pool(), 3*(max_items_v + max_items_r) + 2);
     ggml_cuda_pool_alloc<int>   iota(ctx.pool(), R);
     ggml_cuda_pool_alloc<half>  xh(ctx.pool(), R*std::max(n_embd, n_ff));
     ggml_cuda_pool_alloc<float> rscale(ctx.pool(), R);
@@ -2334,25 +2740,132 @@ void ggml_cuda_moe_ffn_had(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     rt.cnt         = rt.offs + n_exp;
     rt.chunks      = rt.cnt + n_exp;
     rt.n_chunks    = rt.chunks + 2*c_max;
-    int * n_items  = items.get() + 3*max_items;
+    rt.stage_n     = rt.n_chunks + 1;
+    rt.stage_list  = rt.stage_n + c_max;
+    int * items_v   = items.get();
+    int * items_r   = items_v + 3*max_items_v;
+    int * n_items_v = items_r + 3*max_items_r;
+    int * n_items_r = n_items_v + 1;
 
     const int32_t * ids_d   = (const int32_t *) ids->data;
     const int64_t   ids_nb0 = ids->nb[0];
     const int64_t   ids_nb1 = ids->nb[1];
+    const int32_t * slots   = p[0].w_slots; // one table per layer, for all kinds
+
+    mmh_moe_stage_dev * sd = stage_cap > 0 ? mmh_moe_stage_get(ctx.device) : nullptr;
+    // gate and down waits still to enqueue (lazy mode). The staging plan and table init read the host addresses of
+    // every kind before the first chunk, so with staging they are enqueued now, as before.
+    bool kind_wait[3] = { false, kind_lazy, kind_lazy };
+#if defined(GGML_USE_HIP)
+    auto enqueue_kind_wait = [&](int i) {
+        if (kind_wait[i]) {
+            kind_wait[i] = false;
+            const ggml_tensor * w = desc[i]->src[0];
+            if (w->buffer && (ggml_backend_buffer_is_host(w->buffer) ||
+                    ggml_cuda_expert_is_exclusive_buffer_type(ggml_backend_buffer_get_type(w->buffer)))) {
+                ggml_cuda_expert_before_read(ctx, w);
+            }
+        }
+    };
+    if (sd) {
+        enqueue_kind_wait(1);
+        enqueue_kind_wait(2);
+    }
+#else
+    GGML_UNUSED(kind_wait);
+    auto enqueue_kind_wait = [&](int) {};
+#endif // defined(GGML_USE_HIP)
+    const int layer = atoi(desc[0]->src[0]->name + (strncmp(desc[0]->src[0]->name, "blk.", 4) == 0 ? 4 : 0));
+    uint64_t * tab[3] = { nullptr, nullptr, nullptr };
+    if (sd) {
+        for (int i = 0; i < 3; ++i) {
+            ss.data[i]           = wd[i];
+            ss.arena[i]          = p[i].w_cache;
+            ss.slots[i]          = p[i].w_slots;
+            ss.host_slots[i]     = p[i].w_host_slots;
+            ss.host_addresses[i] = p[i].w_host_addresses;
+            ss.nb02[i]           = p[i].nb02;
+            tab[i] = sd->tabs + (size_t) i*MMH_MAX_EXPERTS;
+            mmh_moe_table_init<<<(unsigned) ((n_exp + 255)/256), 256, 0, stream>>>(tab[i], p[i].w_host_addresses, (int) n_exp);
+            CUDA_CHECK(cudaGetLastError());
+            // the GEMMs take the op's table where the tier's would be; without the cache a table of no VRAM slots
+            if (p[i].w_cache == nullptr || p[i].w_slots == nullptr) {
+                p[i].w_cache = sd->buf;
+                p[i].w_slots = sd->no_slots;
+            }
+            p[i].w_host_addresses = tab[i];
+        }
+        CUDA_CHECK(cudaMemsetAsync(sd->flags, 0, sizeof(mmh_moe_stage_flags), stream));
+    }
 
     mmh_moe_route_kernel<<<1, 1024, 0, stream>>>(ids_d, ids_nb0, ids_nb1, n_used, (int) n_rows, (int) n_exp, (int) R,
-        (int) c_max, rt);
+        (int) c_max, slots, all_local, stage_cap, stage_min, host_last, rt);
     CUDA_CHECK(cudaGetLastError());
     mmh_moe_iota<<<(unsigned) ((R + 255)/256), 256, 0, stream>>>(iota.get(), (int) R);
     CUDA_CHECK(cudaGetLastError());
+
+    char * buf0 = sd ? sd->buf : nullptr;
+    char * buf1 = sd ? sd->buf + (sd->bytes/2)/256*256 : nullptr;
+    int n_loop = (int) c_max;
+    auto flush_side = [&]() {
+#if defined(GGML_USE_HIP)
+        (void) hipStreamQuery(sd->side);
+#else
+        (void) cudaStreamQuery(sd->side);
+#endif // defined(GGML_USE_HIP)
+    };
+    // copy engine: the copies of chunk c on the side stream, after the GEMMs of chunk c - 2 (which used the same buffer)
+    auto enqueue_copies = [&](const int c) {
+        if (c >= n_loop) {
+            return;
+        }
+        if (c >= 2) {
+            CUDA_CHECK(cudaStreamWaitEvent(sd->side, sd->ev_cdone[c - 2], 0));
+        }
+        char * buf = (c & 1) ? buf1 : buf0;
+        for (int j = 0; j < sd->plan_host->stage_n[c]; ++j) {
+            for (int k = 0; k < 3; ++k) {
+                const void * src = (const void *) (uintptr_t) sd->plan_host->src[3*(c*stage_cap + j) + k];
+                CUDA_CHECK(cudaMemcpyAsync(buf + j*ss.koff[3] + ss.koff[k], src, ss.nb02[k], cudaMemcpyDeviceToDevice, sd->side));
+            }
+        }
+        CUDA_CHECK(cudaEventRecord(sd->ev_ready[c], sd->side));
+        flush_side();
+    };
+    if (sd && stage_sdma) {
+        CUDA_CHECK(cudaEventRecord(sd->ev_plan, stream));
+        CUDA_CHECK(cudaStreamWaitEvent(sd->side, sd->ev_plan, 0));
+        mmh_moe_stage_plan_kernel<<<1, 256, 0, stream>>>(rt, stage_cap, ss, sd->plan_dev);
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        n_loop = sd->plan_host->n_chunks;
+        enqueue_copies(0);
+        enqueue_copies(1);
+    } else if (sd) {
+        // the copier starts after the routing pass; flush the side stream so that it is resident before the GEMMs
+        CUDA_CHECK(cudaEventRecord(sd->ev_plan, stream));
+        CUDA_CHECK(cudaStreamWaitEvent(sd->side, sd->ev_plan, 0));
+        mmh_moe_stage_copy<<<stage_blocks, 256, 0, sd->side>>>(rt, stage_cap, ss, buf0, buf1, sd->flags, sd->err_dev, layer);
+        CUDA_CHECK(cudaGetLastError());
+        flush_side();
+    }
 
     float * outs[3] = { vu.get(), vg.get(), vy.get() };
     const dim3 grid_glu((unsigned) ((R*n_ff + 255)/256));
     const dim3 grid_scatter((unsigned) n_tokens);
 
-    for (int c = 0; c < (int) c_max; ++c) {
-        mmh_moe_items_kernel<<<1, 1024, 0, stream>>>(rt, c, (int) n_exp, mt, items.get(), n_items);
+    for (int c = 0; c < n_loop; ++c) {
+        mmh_moe_items_kernel<<<1, 1024, 0, stream>>>(rt, c, (int) n_exp, slots, all_local, stage_cap, mt_v, mt_r,
+            items_v, n_items_v, items_r, n_items_r);
         CUDA_CHECK(cudaGetLastError());
+        if (sd) {
+            if (stage_sdma) {
+                CUDA_CHECK(cudaStreamWaitEvent(stream, sd->ev_ready[c], 0));
+            }
+            mmh_moe_stage_wait<<<1, 64, 0, stream>>>(rt, c, stage_cap, ss, buf0, buf1, tab[0], tab[1], tab[2], sd->flags,
+                sd->err_dev, layer, !stage_sdma);
+            CUDA_CHECK(cudaGetLastError());
+        }
         for (int i = 0; i < 3; ++i) {
             const bool local = i == 2;
             mmh_moe_prologue<<<(unsigned) R, 256, 0, stream>>>(p[i], rt, c, ids_d, ids_nb0, ids_nb1, n_used,
@@ -2361,18 +2874,72 @@ void ggml_cuda_moe_ffn_had(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
             CUDA_CHECK(cudaGetLastError());
             mmh_params q = p[i];
             q.dst = outs[i];
-            const dim3 grid((unsigned) (desc[i]->src[0]->ne[1]/MMH_NG), (unsigned) max_items, 1);
-            mmh_moe_gemm(desc[i]->src[0]->type, mt, grid, stream, q, wd[i], xh.get(), rscale.get(), items.get(), n_items,
-                iota.get());
+            const unsigned groups = (unsigned) (desc[i]->src[0]->ne[1]/MMH_NG);
+            mmh_moe_gemm(desc[i]->src[0]->type, mt_v, dim3(groups, (unsigned) max_items_v, 1), stream, q, wd[i], xh.get(),
+                rscale.get(), items_v, n_items_v, iota.get());
+            enqueue_kind_wait(i); // first chunk only; later chunks run after it in stream order
             CUDA_CHECK(cudaGetLastError());
+            if (!all_local) {
+                mmh_moe_gemm(desc[i]->src[0]->type, mt_r, dim3(groups, (unsigned) max_items_r, 1), stream, q, wd[i], xh.get(),
+                    rscale.get(), items_r, n_items_r, iota.get());
+                CUDA_CHECK(cudaGetLastError());
+            }
             if (i == 1) {
                 mmh_moe_glu<<<grid_glu, 256, 0, stream>>>(rt, c, vu.get(), vg.get(), n_ff,
                     glu == GGML_GLU_OP_SWIGLU_CLAMP, limit);
                 CUDA_CHECK(cudaGetLastError());
             }
         }
+        if (sd) {
+            mmh_moe_stage_release<<<1, 64, 0, stream>>>(rt, c, stage_cap, ss, tab[0], tab[1], tab[2], sd->flags);
+            CUDA_CHECK(cudaGetLastError());
+            if (stage_sdma) {
+                CUDA_CHECK(cudaEventRecord(sd->ev_cdone[c], stream));
+                enqueue_copies(c + 2);
+            }
+        }
         mmh_moe_scatter<<<grid_scatter, 256, 0, stream>>>(rt, c, vy.get(), (const float *) weights->data, weights->nb[1],
             weights->nb[2], n_used, (float *) dst->data, dst->nb[1], (int) n_embd);
         CUDA_CHECK(cudaGetLastError());
+    }
+
+    if (sd) {
+        // the next op reuses the buffers, tables and flags
+        CUDA_CHECK(cudaEventRecord(sd->ev_done, sd->side));
+        CUDA_CHECK(cudaStreamWaitEvent(stream, sd->ev_done, 0));
+        CUDA_CHECK(cudaLaunchHostFunc(stream, mmh_moe_stage_check, sd->err_host));
+        if (stage_log) {
+            mmh_moe_stage_flags f;
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            CUDA_CHECK(cudaMemcpy(&f, sd->flags, sizeof(f), cudaMemcpyDeviceToHost));
+            int n_chunks = 0;
+            CUDA_CHECK(cudaMemcpy(&n_chunks, rt.n_chunks, sizeof(int), cudaMemcpyDeviceToHost));
+            // link bytes: the staged copies, and the in-place reads of the other host experts (one per item of mt_r rows)
+            std::vector<int> cnt(n_exp), sl(n_exp, -1), sn(n_chunks), list((size_t) n_chunks*stage_cap);
+            CUDA_CHECK(cudaMemcpy(cnt.data(), rt.cnt, n_exp*sizeof(int), cudaMemcpyDeviceToHost));
+            if (slots) {
+                CUDA_CHECK(cudaMemcpy(sl.data(), slots, n_exp*sizeof(int), cudaMemcpyDeviceToHost));
+            }
+            CUDA_CHECK(cudaMemcpy(sn.data(), rt.stage_n, n_chunks*sizeof(int), cudaMemcpyDeviceToHost));
+            CUDA_CHECK(cudaMemcpy(list.data(), rt.stage_list, list.size()*sizeof(int), cudaMemcpyDeviceToHost));
+            std::vector<char> staged(n_exp, 0);
+            int64_t n_staged = 0;
+            for (int c = 0; c < n_chunks; ++c) {
+                for (int j = 0; j < sn[c]; ++j) {
+                    staged[list[(size_t) c*stage_cap + j]] = 1;
+                    ++n_staged;
+                }
+            }
+            const int64_t eb = p[0].nb02 + p[1].nb02 + p[2].nb02;
+            int64_t reads = 0;
+            for (int e = 0; e < n_exp; ++e) {
+                if (cnt[e] > 0 && !all_local && sl[e] < 0 && !staged[e]) {
+                    reads += (cnt[e] + mt_r - 1)/mt_r;
+                }
+            }
+            GGML_LOG_INFO("%s: %s: %d chunks, %d experts staged, abort %d (cap %d, min %d, %s); link %.1f MiB staged + %.1f MiB read in place\n",
+                __func__, desc[0]->src[0]->name, n_chunks, f.staged, f.abort, stage_cap, stage_min, stage_sdma ? "sdma" : "kernel",
+                n_staged*eb/1048576.0, reads*eb/1048576.0);
+        }
     }
 }

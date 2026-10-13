@@ -11,3 +11,6 @@ void ggml_cuda_mul_mat_had(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 bool ggml_cuda_moe_ffn_had_supported(int device, const ggml_tensor * op);
 
 void ggml_cuda_moe_ffn_had(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+
+// false while the expert-major staging (RANMA_EXPERT_MAJOR_STAGE_MIB) is on: its side stream is not captured
+bool ggml_cuda_moe_ffn_had_graph_ok(void);

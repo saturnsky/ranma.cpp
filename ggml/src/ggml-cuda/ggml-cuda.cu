@@ -3297,6 +3297,11 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
             continue;
         }
 
+        // the expert-major MoE stages experts on a side stream of its own
+        if (node->op == GGML_OP_MOE_FFN_HAD && !ggml_cuda_moe_ffn_had_graph_ok()) {
+            use_cuda_graph = false;
+        }
+
         // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
         if (node->op == GGML_OP_MUL_MAT_ID) {
             const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
