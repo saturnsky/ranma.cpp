@@ -52,6 +52,9 @@ Starting settings by model and hardware are in [recipes.md](recipes.md).
   model, build and cache settings. On by default with `draft-mtp`; `--no-spec-smart`, or giving
   `--spec-draft-p-min` or `--spec-draft-p-continue`, returns to the single-argument rule.
   [spec-smart.md](spec-smart.md)
+- **Slot 0 priority (llama-server)** - with several slots, the prompts of the other slots wait while slot 0 works
+  on a request; their generation still shares slot 0's batches (`--slot0-priority strict` holds it too while slot 0
+  generates). On by default, `--slot0-priority off` restores the upstream batching. [slot0-priority.md](slot0-priority.md)
 - **Reuse of a just-restored context checkpoint (llama-server)** - when the first prompt batch after a checkpoint
   restore starts at that checkpoint, the server keeps the restored entry instead of serializing the unchanged
   state again.
