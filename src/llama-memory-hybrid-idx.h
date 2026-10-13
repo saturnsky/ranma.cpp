@@ -199,9 +199,10 @@ public:
                          ggml_tensor * sel_mask, ggml_tensor * new_pool_idxs, ggml_tensor * new_pool_rep,
                          const llama_ubatch * ubatch, ggml_tensor * new_pool_pos = nullptr) const;
     // ranma: F32 [n_pool, n_seqs_unq], -(end position) of each pool of each unique sequence of the ubatch, -inf for the pools
-    // of other sequences and the padding: the device-side pool_mask of a chunked graph (llm_graph_chunk_mask), positional
-    // pools only; set_input_kpool then takes a null pool_mask
-    void set_input_kpool_pos(ggml_tensor * dst, const llama_ubatch * ubatch) const;
+    // of other sequences and the padding: the device-side pool_mask of a chunked graph (llm_graph_chunk_mask), with which
+    // set_input_kpool takes a null pool_mask. Pools in cache order (get_kpool_by_order) end at a rank instead, and
+    // tok_rank (F32 [1, n_tokens], -(rank + 0.5)) gets the token keys; null otherwise.
+    void set_input_kpool_pos(ggml_tensor * dst, ggml_tensor * tok_rank, const llama_ubatch * ubatch) const;
 
 private:
     llama_memory_hybrid_idx * mem = nullptr;
