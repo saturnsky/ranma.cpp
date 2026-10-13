@@ -37,6 +37,16 @@ struct llama_graph_counts {
 
 LLAMA_API bool llama_get_graph_counts(const struct llama_context * ctx, struct llama_graph_counts * out);
 
+// ranma: what the layer mode (common/layer-mode.cpp) decides for the graphs of the process: the chunk of query rows of
+// the attention (0 = one chunk). Process-wide and read at every graph build, so a measurement context sees the value
+// set before it; the defaults are those of a process without the layer mode.
+struct llama_layer_mode_config {
+    int64_t attn_chunk              = 0;
+};
+
+LLAMA_API llama_layer_mode_config llama_layer_mode_get_config();
+LLAMA_API void                    llama_layer_mode_set_config(const llama_layer_mode_config & cfg);
+
 // Get the default ggml_type for a given ftype.
 LLAMA_API ggml_type llama_ftype_get_default_type(llama_ftype ftype);
 
