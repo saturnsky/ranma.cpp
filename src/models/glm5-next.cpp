@@ -236,6 +236,12 @@ static ggml_tensor * glm5_conv1d(ggml_cgraph * gf, ggml_context * ctx0,
 }
 
 
+// ranma: a chunked graph makes the causal and pool masks of each chunk on the device (llm_graph_chunk_mask) when the
+// host masks hold only what that reproduces
+static bool glm5_next_chunk_mask(const llama_cparams & cparams, const llama_hparams & hparams, const llama_ubatch & ubatch) {
+    return llm_graph_chunk_mask_usable(cparams, hparams, ubatch) && !hparams.indexer_kpool_by_order;
+}
+
 // K-pool indexer inputs
 class llama_model_glm5_next::llm_graph_input_kpool : public llm_graph_input_i {
 public:
@@ -245,6 +251,22 @@ public:
     void set_input(const llama_ubatch * ubatch) override {
         mctx->get_idx()->set_input_k_idxs(k_idxs, ubatch);
         mctx->set_input_kpool(pool_cells, pool_idxs, pool_mask, tail_idxs, sel_mask, new_pool_idxs, new_pool_rep, ubatch);
+        if (dev_mask) {
+            mctx->get_attn()->set_input_kq_pos(kv_pos, ubatch);
+            mctx->set_input_kpool_pos(pool_pos, nullptr, ubatch);
+            chunk_pos.set_input(ubatch);
+
+            if (llm_graph_chunk_mask_check_enabled()) {
+                llm_graph_host_tensor kq(GGML_TYPE_F32, kv_pos->ne[0], ubatch->n_tokens);
+                mctx->get_attn()->set_input_kq_mask(kq.t, ubatch, true);
+                llm_graph_chunk_mask_compare("kq_mask", kq.t, kv_pos, chunk_pos.tok_pos, chunk_pos.tok_seq);
+
+                // fills the other inputs again with the same values
+                llm_graph_host_tensor pm(GGML_TYPE_F32, pool_pos->ne[0], ubatch->n_tokens);
+                mctx->set_input_kpool(pool_cells, pool_idxs, pm.t, tail_idxs, sel_mask, new_pool_idxs, new_pool_rep, ubatch);
+                llm_graph_chunk_mask_compare("pool_mask", pm.t, pool_pos, chunk_pos.tok_pos, chunk_pos.tok_seq);
+            }
+        }
     }
 
     bool can_reuse(const llm_graph_params & params) override {
@@ -259,7 +281,16 @@ public:
 
         res &= k_idxs->ne[0]     == params.ubatch.n_tokens;
         res &= pool_cells->ne[0] == mctx->get_n_kpool();
-        res &= pool_mask->ne[1]  == params.ubatch.n_tokens;
+        res &= dev_mask == glm5_next_chunk_mask(params.cparams, params.hparams, params.ubatch);
+        if (dev_mask) {
+            res &= kv_pos->ne[0]   == mctx->get_attn()->get_n_kv();
+            res &= kv_pos->ne[1]   == params.ubatch.n_seqs_unq;
+            res &= pool_pos->ne[0] == mctx->get_n_kpool();
+            res &= pool_pos->ne[1] == params.ubatch.n_seqs_unq;
+            res &= chunk_pos.tok_pos->ne[1] == params.ubatch.n_tokens;
+        } else {
+            res &= pool_mask->ne[1] == params.ubatch.n_tokens;
+        }
         res &= tail_idxs->ne[1]  == params.ubatch.n_tokens;
         // The scatter mask shape follows n_kv.
         res &= n_kv              == idx->get_n_kv();
@@ -271,7 +302,7 @@ public:
     ggml_tensor * k_idxs        = nullptr; // I64     [n_tokens]
     ggml_tensor * pool_cells    = nullptr; // I32     [n_pool]         cell caching each pool's pooled key
     ggml_tensor * pool_idxs     = nullptr; // I32     [kpool, n_pool]  member cells per pool, n_kv sentinel for the padded pools
-    ggml_tensor * pool_mask     = nullptr; // F32/F16 [n_pool, n_tokens]
+    ggml_tensor * pool_mask     = nullptr; // F32/F16 [n_pool, n_tokens], null with dev_mask
     ggml_tensor * tail_idxs     = nullptr; // I32     [kpool - 1, n_tokens]
     ggml_tensor * sel_mask      = nullptr; // F32     [n_sel, 1, 1, n_tokens] 0 for live selection slots, -inf for dead ones
     // n_new is never below 1, see build_inp_kpool
@@ -286,6 +317,14 @@ public:
 
     // the row views of the chunked attention, shared by all layers (see llm_graph_rows_cache)
     llm_graph_rows_cache rows;
+
+    // ranma: chunk masks made on the device (glm5_next_chunk_mask): no pool_mask, and the attention's kq_mask stays out of
+    // the graph; every chunk expands both masks from these
+    bool          dev_mask  = false;
+    ggml_type     type_mask = GGML_TYPE_F32;
+    ggml_tensor * kv_pos    = nullptr; // F32 [n_kv, n_seqs_unq]   see llama_kv_cache::set_input_kq_pos
+    ggml_tensor * pool_pos  = nullptr; // F32 [n_pool, n_seqs_unq] see set_input_kpool_pos
+    llm_graph_chunk_pos chunk_pos;
 };
 
 llama_model_glm5_next::llm_graph_input_kpool * llama_model_glm5_next::graph::build_inp_kpool(const llama_memory_hybrid_idx_context * mctx_hyb) {
@@ -307,16 +346,36 @@ llama_model_glm5_next::llm_graph_input_kpool * llama_model_glm5_next::graph::bui
     inp->k_idxs     = mctx_idx->build_input_k_idxs(ctx0, ubatch);
     inp->pool_cells = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_pool);
     inp->pool_idxs  = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, kpool, n_pool);
-    inp->pool_mask  = ggml_new_tensor_2d(ctx0, type_mask, n_pool, n_tokens);
     inp->tail_idxs  = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, kpool - 1, n_tokens);
     ggml_set_input(inp->pool_cells);
     ggml_set_input(inp->pool_idxs);
-    ggml_set_input(inp->pool_mask);
     ggml_set_input(inp->tail_idxs);
+
+    inp->type_mask = type_mask;
+    inp->dev_mask  = glm5_next_chunk_mask(cparams, hparams, ubatch);
+    if (inp->dev_mask) {
+        const int64_t n_seqs = ubatch.n_seqs_unq;
+        inp->kv_pos   = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, mctx_hyb->get_attn()->get_n_kv(), n_seqs);
+        inp->pool_pos = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, n_pool, n_seqs);
+        ggml_set_input(inp->kv_pos);
+        ggml_set_input(inp->pool_pos);
+        inp->chunk_pos.build(ctx0, n_tokens);
+    } else {
+        inp->pool_mask = ggml_new_tensor_2d(ctx0, type_mask, n_pool, n_tokens);
+        ggml_set_input(inp->pool_mask);
+    }
 
     ggml_build_forward_expand(gf, inp->pool_cells);
     ggml_build_forward_expand(gf, inp->pool_idxs);
-    ggml_build_forward_expand(gf, inp->pool_mask);
+    if (inp->dev_mask) {
+        // set_input fills these, so they stay allocated in every graph
+        ggml_build_forward_expand(gf, inp->kv_pos);
+        ggml_build_forward_expand(gf, inp->pool_pos);
+        ggml_build_forward_expand(gf, inp->chunk_pos.tok_pos);
+        ggml_build_forward_expand(gf, inp->chunk_pos.tok_seq);
+    } else {
+        ggml_build_forward_expand(gf, inp->pool_mask);
+    }
     ggml_build_forward_expand(gf, inp->tail_idxs);
 
     inp->n_kv = n_kv;
@@ -1024,7 +1083,9 @@ ggml_tensor * llama_model_glm5_next::graph::build_kpool_top(
 
     cur = llm_graph_rows(ctx0, cur, 1, i0, n);
     qr  = llm_graph_rows(ctx0, qr,  1, i0, n);
-    ggml_tensor * pool_mask = inp_kpool->rows.get(ctx0, inp_kpool->pool_mask, 1, i0, n, false);
+    ggml_tensor * pool_mask = inp_kpool->dev_mask ?
+        llm_graph_chunk_mask(ctx0, inp_kpool->rows, inp_kpool->chunk_pos, inp_kpool->pool_pos, i0, n, inp_kpool->type_mask) :
+        inp_kpool->rows.get(ctx0, inp_kpool->pool_mask, 1, i0, n, false);
 
     ggml_tensor * iq = build_mm(layer.indexer_attn_q_b, qr);
     iq = ggml_reshape_3d(ctx0, iq, n_embd_indexer, n_indexer_head, n);
@@ -1116,7 +1177,10 @@ ggml_tensor * llama_model_glm5_next::graph::build_kpool_mask(
     sel = ggml_view_2d(ctx0, sel, n_kv, n, sel->nb[2], 0);
 
     // Fold causal visibility before shared-indexer reuse.
-    sel = ggml_add(ctx0, sel, inp_kpool->rows.get(ctx0, kq_mask, 1, i0, n, true));
+    ggml_tensor * causal = inp_kpool->dev_mask ?
+        llm_graph_chunk_mask(ctx0, inp_kpool->rows, inp_kpool->chunk_pos, inp_kpool->kv_pos, i0, n, kq_mask->type) :
+        inp_kpool->rows.get(ctx0, kq_mask, 1, i0, n, true);
+    sel = ggml_add(ctx0, sel, causal);
     cb(sel, "indexer_sel", il);
 
     return sel;

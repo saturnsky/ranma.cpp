@@ -192,11 +192,16 @@ public:
     uint32_t get_n_kpool    () const; // Padded pool count, where the last pool is always unused.
     uint32_t get_n_kpool_new() const; // Pools to re-pool this ubatch, padded to a stable bound, never below 1.
     kpool_access get_kpool_access(ggml_context * ctx, int32_t il, int64_t n_embd) const;
+    // pool_mask can be null (see set_input_kpool_pos)
     // sel_mask (F32 [n_sel, 1, 1, n_tokens], can be null): 0 for the live selection slots, -inf for the dead ones
     // new_pool_pos (I32 [4*n_new]): M-RoPE position of each new pool's first member, for pooled keys rotated at pooling time
     void set_input_kpool(ggml_tensor * pool_cells, ggml_tensor * pool_idxs, ggml_tensor * pool_mask, ggml_tensor * tail_idxs,
                          ggml_tensor * sel_mask, ggml_tensor * new_pool_idxs, ggml_tensor * new_pool_rep,
                          const llama_ubatch * ubatch, ggml_tensor * new_pool_pos = nullptr) const;
+    // ranma: F32 [n_pool, n_seqs_unq], -(end position) of each pool of each unique sequence of the ubatch, -inf for the pools
+    // of other sequences and the padding: the device-side pool_mask of a chunked graph (llm_graph_chunk_mask), positional
+    // pools only; set_input_kpool then takes a null pool_mask
+    void set_input_kpool_pos(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
 private:
     llama_memory_hybrid_idx * mem = nullptr;
