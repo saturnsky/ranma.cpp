@@ -7,6 +7,7 @@
 #include "ggml-impl.h"
 #include "vec.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 
@@ -183,6 +184,128 @@ void ggml_compute_forward_mul_mat_had(const ggml_compute_params * params, ggml_t
             float * out = geo.output(r) + blk*had;
             for (int64_t j = 0; j < had; ++j) {
                 out[j] = acc[j] * mmh_load(rot_out, rout + j*rot_out->nb[0]);
+            }
+        }
+    }
+}
+
+// GGML_OP_MOE_FFN_HAD: reference implementation, one token at a time (see ggml_moe_ffn_had())
+
+// y = rot_out * H(W_e^T H(rot_in * x)) for one row, with the weight and rotations of the MUL_MAT_HAD node d
+static void mmh_moe_row(const ggml_tensor * d, int64_t e, const float * x, float * y, float * xh, float * wblk,
+        ggml_fp16_t * wraw, float * acc) {
+    const ggml_tensor * w       = d->src[0];
+    const ggml_tensor * rot_in  = d->src[3];
+    const ggml_tensor * rot_out = d->src[4];
+    const int64_t had = ggml_get_op_params_i32(d, 0);
+    const int64_t k   = w->ne[0];
+    const int64_t n   = w->ne[1];
+
+    const char * rin = (const char *) rot_in->data + e*rot_in->nb[1];
+    for (int64_t i = 0; i < k; ++i) {
+        xh[i] = x[i] * mmh_load(rot_in, rin + i*rot_in->nb[0]);
+    }
+    for (int64_t i = 0; i < k; i += had) {
+        mmh_hadamard(xh + i, had);
+    }
+    const char * rout = (const char *) rot_out->data + e*rot_out->nb[1];
+    for (int64_t blk = 0; blk < n/had; ++blk) {
+        const char * wsrc = (const char *) w->data + e*w->nb[2] + blk*had*w->nb[1];
+        if (ggml_is_exl3(w->type)) {
+            ggml_exl3_decode_group(w->type, wsrc, k, wraw);
+            ggml_cpu_fp16_to_fp32(wraw, wblk, had*k);
+        } else {
+            for (int64_t j = 0; j < had; ++j) {
+                const char * row = wsrc + j*w->nb[1];
+                if (w->type == GGML_TYPE_F16) {
+                    ggml_cpu_fp16_to_fp32((const ggml_fp16_t *) row, wblk + j*k, k);
+                } else {
+                    memcpy(wblk + j*k, row, k*sizeof(float));
+                }
+            }
+        }
+        for (int64_t j = 0; j < had; ++j) {
+            ggml_vec_dot_f32((int) k, acc + j, 0, wblk + j*k, 0, xh, 0, 1);
+        }
+        mmh_hadamard(acc, had);
+        for (int64_t j = 0; j < had; ++j) {
+            y[blk*had + j] = acc[j] * mmh_load(rot_out, rout + (blk*had + j)*rot_out->nb[0]);
+        }
+    }
+}
+
+// per thread: xh, the decoded weight block (F32 and raw F16), acc, up, gate, down output
+static size_t mmh_moe_thread_size(const ggml_tensor * node) {
+    const int64_t n_embd = node->ne[0];
+    const int64_t n_ff   = node->src[3]->src[0]->ne[1];
+    const int64_t kmax   = std::max(n_embd, n_ff);
+    int64_t had = 0;
+    for (int i = 3; i <= 5; ++i) {
+        had = std::max<int64_t>(had, ggml_get_op_params_i32(node->src[i], 0));
+    }
+    return GGML_PAD((kmax + had*kmax + had + 2*n_ff + n_embd)*sizeof(float) + had*kmax*sizeof(ggml_fp16_t), CACHE_LINE_SIZE);
+}
+
+size_t ggml_cpu_moe_ffn_had_wsize(const struct ggml_tensor * node, int n_tasks) {
+    return n_tasks*mmh_moe_thread_size(node) + CACHE_LINE_SIZE;
+}
+
+void ggml_compute_forward_moe_ffn_had(const ggml_compute_params * params, ggml_tensor * dst) {
+    const ggml_tensor * x       = dst->src[0];
+    const ggml_tensor * ids     = dst->src[1];
+    const ggml_tensor * weights = dst->src[2];
+    const ggml_tensor * up      = dst->src[3];
+    const ggml_tensor * gate    = dst->src[4];
+    const ggml_tensor * down    = dst->src[5];
+
+    const ggml_glu_op glu   = (ggml_glu_op) ggml_get_op_params_i32(dst, 0);
+    const float       limit = ggml_get_op_params_f32(dst, 1);
+
+    const int64_t n_embd   = dst->ne[0];
+    const int64_t n_tokens = dst->ne[1];
+    const int64_t n_used   = ids->ne[0];
+    const int64_t n_ff     = up->src[0]->ne[1];
+    const int64_t n_exp    = up->src[0]->ne[2];
+    const int64_t kmax     = std::max(n_embd, n_ff);
+    int64_t had = 0;
+    for (int i = 3; i <= 5; ++i) {
+        had = std::max<int64_t>(had, ggml_get_op_params_i32(dst->src[i], 0));
+    }
+
+    GGML_ASSERT(params->wsize >= ggml_cpu_moe_ffn_had_wsize(dst, params->nth) - CACHE_LINE_SIZE);
+    char  * scratch = (char *) params->wdata + params->ith*mmh_moe_thread_size(dst);
+    float * xh   = (float *) scratch;
+    float * wblk = xh + kmax;
+    float * acc  = wblk + had*kmax;
+    float * vu   = acc + had;
+    float * vg   = vu + n_ff;
+    float * vy   = vg + n_ff;
+    ggml_fp16_t * wraw = (ggml_fp16_t *) (vy + n_embd);
+
+    for (int64_t t = params->ith; t < n_tokens; t += params->nth) {
+        const float * xt  = (const float *) ((const char *) x->data + t*x->nb[1]);
+        float       * out = (float *) ((char *) dst->data + t*dst->nb[1]);
+        for (int64_t i = 0; i < n_embd; ++i) {
+            out[i] = 0.0f;
+        }
+        for (int64_t k = 0; k < n_used; ++k) {
+            const int32_t e = *(const int32_t *) ((const char *) ids->data + k*ids->nb[0] + t*ids->nb[1]);
+            GGML_ASSERT(e >= 0 && e < n_exp);
+            const float w = *(const float *) ((const char *) weights->data + k*weights->nb[1] + t*weights->nb[2]);
+            mmh_moe_row(up,   e, xt, vu, xh, wblk, wraw, acc);
+            mmh_moe_row(gate, e, xt, vg, xh, wblk, wraw, acc);
+            for (int64_t i = 0; i < n_ff; ++i) {
+                float g = vg[i];
+                float u = vu[i];
+                if (glu == GGML_GLU_OP_SWIGLU_CLAMP) {
+                    g = std::min(g, limit);
+                    u = std::max(std::min(u, limit), -limit);
+                }
+                vu[i] = g/(1.0f + expf(-g)) * u;
+            }
+            mmh_moe_row(down, e, vu, vy, xh, wblk, wraw, acc);
+            for (int64_t i = 0; i < n_embd; ++i) {
+                out[i] += w*vy[i];
             }
         }
     }

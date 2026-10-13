@@ -2892,6 +2892,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_MUL_MAT_HAD:
             ggml_cuda_mul_mat_had(ctx, dst);
             break;
+        case GGML_OP_MOE_FFN_HAD:
+            ggml_cuda_moe_ffn_had(ctx, dst);
+            break;
         case GGML_OP_OUT_PROD:
             ggml_cuda_out_prod(ctx, dst);
             break;
@@ -7053,6 +7056,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 return false;
             }
             return ggml_cuda_mul_mat_had_supported(dev_ctx->device, op);
+        case GGML_OP_MOE_FFN_HAD:
+            return ggml_cuda_moe_ffn_had_supported(dev_ctx->device, op);
         case GGML_OP_MUL_MAT:
         case GGML_OP_MUL_MAT_ID:
             {

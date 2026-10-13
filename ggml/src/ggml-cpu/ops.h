@@ -120,6 +120,8 @@ void ggml_compute_forward_opt_step_adamw(const struct ggml_compute_params * para
 void ggml_compute_forward_mul_mat(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_mul_mat_had(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 size_t ggml_cpu_mul_mat_had_wsize(const struct ggml_tensor * node, int n_tasks);
+void ggml_compute_forward_moe_ffn_had(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+size_t ggml_cpu_moe_ffn_had_wsize(const struct ggml_tensor * node, int n_tasks);
 void ggml_compute_forward_fwht(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 void ggml_compute_forward_opt_step_sgd(const struct ggml_compute_params * params, struct ggml_tensor * dst);
 #ifdef __cplusplus

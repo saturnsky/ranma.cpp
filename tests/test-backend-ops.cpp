@@ -7165,6 +7165,164 @@ struct test_mul_mat_had : public test_case {
     }
 };
 
+// GGML_OP_MOE_FFN_HAD: the fused op of a layer of routed EXL3 experts against the MUL_MAT_HAD ops it replaces
+// (variant 0, both in one graph as test_mul_mat_had does; 1 = the fused op only, 2 = the MUL_MAT_HAD ops only, for perf)
+struct test_moe_ffn_had : public test_case {
+    const ggml_type type;
+    const int64_t n_embd;
+    const int64_t n_ff;
+    const int n_exp;
+    const int n_used;
+    const int64_t n_tokens;
+    const bool clamp;
+    const int n_rows;   // rows per chunk of the backend, 0 = its default
+    const int variant;
+
+    std::string vars() override {
+        return VARS_TO_STR9(type, n_embd, n_ff, n_exp, n_used, n_tokens, clamp, n_rows, variant);
+    }
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return ggml_op_name(GGML_OP_MOE_FFN_HAD);
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    double max_nmse_err() override {
+        return 2e-5;
+    }
+
+    double err(const float * a, const float * b, size_t n_all) override {
+        if (variant != 0) {
+            return nmse(a, b, n_all);
+        }
+        const size_t half = n_all/2;
+        return std::max(nmse(a, b + half, half), nmse(a, b, half));
+    }
+
+    uint64_t op_flops(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return 2*3*n_embd*n_ff*n_used*n_tokens;
+    }
+
+    bool use_host_weight_buffer() override { return host_weights && ggml_is_quantized(type); }
+    bool use_weight_context()     override { return use_host_weight_buffer(); }
+
+    test_moe_ffn_had(ggml_type type = GGML_TYPE_EXL3_M3, int64_t n_embd = 256, int64_t n_ff = 256, int n_exp = 8,
+            int n_used = 4, int64_t n_tokens = 64, bool clamp = true, int n_rows = 0, int variant = 0)
+        : type(type), n_embd(n_embd), n_ff(n_ff), n_exp(n_exp), n_used(n_used), n_tokens(n_tokens), clamp(clamp),
+            n_rows(n_rows), variant(variant) {
+            GGML_ASSERT(n_used <= n_exp);
+        }
+
+    ggml_context * ctx_weights = nullptr;
+
+    ggml_tensor * build_graph(ggml_context * ctx, ggml_context * ctx_w) override {
+        ctx_weights = ctx_w;
+        ggml_tensor * out = build_graph(ctx);
+        ctx_weights = nullptr;
+        return out;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_context * cw = ctx_weights ? ctx_weights : ctx;
+        const float limit = 1.0f;
+
+        ggml_tensor * x = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+        ggml_set_name(x, "x");
+        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, n_tokens);
+        ggml_set_name(ids, "ids");
+        ggml_tensor * wts = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, n_used, n_tokens);
+        ggml_set_name(wts, "wts");
+
+        const int64_t k[3] = { n_embd, n_embd, n_ff };
+        const int64_t n[3] = { n_ff, n_ff, n_embd };
+        const char * names[3] = { "w_up", "w_gate", "w_down" };
+        ggml_tensor * w[3];
+        ggml_tensor * rin[3];
+        ggml_tensor * rout[3];
+        for (int i = 0; i < 3; ++i) {
+            w[i] = ggml_new_tensor_3d(cw, type, k[i], n[i], n_exp);
+            ggml_set_name(w[i], names[i]);
+            rin[i]  = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, k[i], n_exp);
+            rout[i] = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, n[i], n_exp);
+        }
+
+        ggml_tensor * fused = nullptr;
+        if (variant != 2) {
+            ggml_tensor * desc[3];
+            ggml_tensor * ids0 = ggml_view_2d(ctx, ids, n_used, 0, ids->nb[1], 0);
+            for (int i = 0; i < 3; ++i) {
+                ggml_tensor * b = ggml_view_3d(ctx, x, k[i], 1, 0, x->nb[1], x->nb[1], 0);
+                desc[i] = ggml_mul_mat_had(ctx, w[i], b, rin[i], rout[i], ids0, 128);
+            }
+            fused = ggml_moe_ffn_had(ctx, x, ids, wts, desc[0], desc[1], desc[2],
+                clamp ? GGML_GLU_OP_SWIGLU_CLAMP : GGML_GLU_OP_SWIGLU, clamp ? limit : 0.0f, n_rows);
+            ggml_set_name(fused, "out_fused");
+            if (variant == 1) {
+                return fused;
+            }
+        }
+
+        ggml_tensor * x3   = ggml_reshape_3d(ctx, x, n_embd, 1, n_tokens);
+        ggml_tensor * up   = ggml_mul_mat_had(ctx, w[0], x3, rin[0], rout[0], ids, 128);
+        ggml_tensor * gate = ggml_mul_mat_had(ctx, w[1], x3, rin[1], rout[1], ids, 128);
+        ggml_tensor * act  = clamp ? ggml_swiglu_clamp(ctx, gate, up, limit) : ggml_swiglu_split(ctx, gate, up);
+        ggml_tensor * down = ggml_mul_mat_had(ctx, w[2], act, rin[2], rout[2], ids, 128);
+        down = ggml_mul(ctx, down, wts);
+        ggml_tensor * ref = ggml_view_2d(ctx, down, n_embd, n_tokens, down->nb[2], 0);
+        for (int i = 1; i < n_used; ++i) {
+            ref = ggml_add(ctx, ref, ggml_view_2d(ctx, down, n_embd, n_tokens, down->nb[2], i*down->nb[1]));
+        }
+        ref = ggml_cont(ctx, ref);
+        ggml_set_name(ref, "out_ref");
+        if (variant == 2) {
+            return ref;
+        }
+
+        ggml_tensor * out = ggml_concat(ctx, fused, ref, 3);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::default_random_engine rng(std::random_device{}());
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->op != GGML_OP_NONE || t->type == GGML_TYPE_I32 || t->view_src != nullptr) {
+                continue;
+            }
+            if (ggml_is_exl3(t->type)) {
+                std::vector<uint8_t> bytes(ggml_nbytes(t));
+                for (auto & v : bytes) {
+                    v = (uint8_t) rng();
+                }
+                ggml_backend_tensor_set(t, bytes.data(), 0, bytes.size());
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+        // distinct experts per token, skewed to the low ids (u^2) so that experts differ widely in their row counts
+        if (ggml_tensor * ids = ggml_get_tensor(ctx, "ids")) {
+            std::uniform_real_distribution<float> u(0.0f, 1.0f);
+            std::vector<int32_t> data(n_used*n_tokens);
+            for (int64_t t = 0; t < n_tokens; ++t) {
+                for (int k = 0; k < n_used; ++k) {
+                    int32_t e;
+                    bool dup;
+                    do {
+                        const float v = u(rng);
+                        e = std::min(n_exp - 1, (int) (v*v*n_exp));
+                        dup = std::find(data.begin() + t*n_used, data.begin() + t*n_used + k, e) != data.begin() + t*n_used + k;
+                    } while (dup);
+                    data[t*n_used + k] = e;
+                }
+            }
+            ggml_backend_tensor_set(ids, data.data(), 0, data.size()*sizeof(int32_t));
+        }
+    }
+};
+
 // GGML_OP_OUT_PROD
 struct test_out_prod : public test_case {
     const ggml_type type_a;
@@ -12412,6 +12570,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_had(GGML_TYPE_F16, GGML_TYPE_F32, 512, 256, 40, 1, 0, false, 64, 0, 0, prec));
         test_cases.emplace_back(new test_mul_mat_had(GGML_TYPE_F32, GGML_TYPE_F16, 512, 256, 40, 1, 0, false, 128, 0, 0, prec));
     }
+    // MOE_FFN_HAD: one chunk, experts split over chunks, packed chunks, empty experts, 128-row items, other types and sizes
+    test_cases.emplace_back(new test_moe_ffn_had(GGML_TYPE_EXL3_M3, 256, 256,  8, 4,  64, true,    0));
+    test_cases.emplace_back(new test_moe_ffn_had(GGML_TYPE_EXL3_M3, 256, 256,  8, 4,  64, true,   16));
+    test_cases.emplace_back(new test_moe_ffn_had(GGML_TYPE_EXL3_M3, 256, 256,  8, 4,  64, true,   48));
+    test_cases.emplace_back(new test_moe_ffn_had(GGML_TYPE_EXL3_M3, 256, 384, 16, 2,   5, true,    4));
+    test_cases.emplace_back(new test_moe_ffn_had(GGML_TYPE_EXL3_M3, 384, 256, 16, 8, 256, false,   0));
+    test_cases.emplace_back(new test_moe_ffn_had(GGML_TYPE_EXL3_M3, 384, 256, 16, 8, 256, true,  300));
+    test_cases.emplace_back(new test_moe_ffn_had(GGML_TYPE_EXL3_G3, 256, 256, 32, 8, 200, false, 300));
+    test_cases.emplace_back(new test_moe_ffn_had(GGML_TYPE_EXL3_T3, 256, 256, 32, 8, 200, true,  100));
+    test_cases.emplace_back(new test_moe_ffn_had(GGML_TYPE_EXL3_M2, 512, 256, 64, 6, 128, true,  512));
+    test_cases.emplace_back(new test_moe_ffn_had(GGML_TYPE_EXL3_M4, 256, 512, 64, 6, 128, true,  256));
+
     // backend default precision (not set; F16 on HIP)
     test_cases.emplace_back(new test_mul_mat_had(GGML_TYPE_EXL3_M3, GGML_TYPE_F16, 1024, 256, 1, 1, 0, false, 128, 0, 0, GGML_PREC_UNDEFINED));
     test_cases.emplace_back(new test_mul_mat_had(GGML_TYPE_EXL3_M3, GGML_TYPE_F16, 512, 256, 40, 1, 0, false, 128, 0, 0, GGML_PREC_UNDEFINED));
@@ -14260,6 +14430,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
 
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 16416, 1, 128, {8,  1}, {4, 1}, {0, 2, 1, 3}));
     test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 128, 1, 16416, {8,  1}, {4, 1}, {0, 1, 2, 3}, 2*16416));
+
+    // MOE_FFN_HAD: a GLM-5.3 layer of routed experts (288 x [4096, 2048], top 8), the fused op (variant 1) against the
+    // MUL_MAT_HAD ops it replaces (variant 2), with the backend's default chunk and with one chunk
+    for (int64_t tokens : { 2048, 8192 }) {
+        test_cases.emplace_back(new test_moe_ffn_had(GGML_TYPE_EXL3_M3, 4096, 2048, 288, 8, tokens, true, 0, 2));
+        test_cases.emplace_back(new test_moe_ffn_had(GGML_TYPE_EXL3_M3, 4096, 2048, 288, 8, tokens, true, 0, 1));
+        test_cases.emplace_back(new test_moe_ffn_had(GGML_TYPE_EXL3_M3, 4096, 2048, 288, 8, tokens, true, (int) (8*tokens), 1));
+    }
 
     // FWHT tests
     test_cases.emplace_back(new test_mul_mat_hadamard(GGML_TYPE_F32, GGML_TYPE_F32, 128, 1, 128));

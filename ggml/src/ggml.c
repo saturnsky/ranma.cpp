@@ -1262,6 +1262,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "MUL_MAT",
     "MUL_MAT_ID",
     "MUL_MAT_HAD",
+    "MOE_FFN_HAD",
     "OUT_PROD",
 
     "SCALE",
@@ -1343,7 +1344,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
+static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1380,6 +1381,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "X*Y",
     "X[i]*Y",
     "rot(X*rot(Y))",
+    "moe_ffn(x)",
     "X*Y",
 
     "x*v",
@@ -1461,7 +1463,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
+static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -3727,6 +3729,58 @@ struct ggml_tensor * ggml_mul_mat_had(
     result->src[2] = ids;
     result->src[3] = rot_in;
     result->src[4] = rot_out;
+
+    return result;
+}
+
+// ggml_moe_ffn_had
+
+static bool ggml_moe_ffn_had_desc(const struct ggml_tensor * d) {
+    return d->op == GGML_OP_MUL_MAT_HAD && d->src[2] != NULL && ggml_is_empty(d);
+}
+
+struct ggml_tensor * ggml_moe_ffn_had(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * ids,
+        struct ggml_tensor  * weights,
+        struct ggml_tensor  * up,
+        struct ggml_tensor  * gate,
+        struct ggml_tensor  * down,
+        enum ggml_glu_op      glu,
+        float                 limit,
+        int                   n_rows) {
+    GGML_ASSERT(ggml_moe_ffn_had_desc(up) && ggml_moe_ffn_had_desc(gate) && ggml_moe_ffn_had_desc(down));
+    const struct ggml_tensor * wu = up->src[0];
+    const struct ggml_tensor * wg = gate->src[0];
+    const struct ggml_tensor * wd = down->src[0];
+    const int64_t n_embd   = x->ne[0];
+    const int64_t n_tokens = x->ne[1];
+    const int64_t n_ff     = wu->ne[1];
+    const int64_t n_exp    = wu->ne[2];
+
+    GGML_ASSERT(x->type == GGML_TYPE_F32 && x->nb[0] == sizeof(float) && x->ne[2] == 1 && x->ne[3] == 1);
+    GGML_ASSERT(wu->ne[0] == n_embd && wg->ne[0] == n_embd && wg->ne[1] == n_ff && wd->ne[0] == n_ff && wd->ne[1] == n_embd);
+    GGML_ASSERT(wg->ne[2] == n_exp && wd->ne[2] == n_exp);
+    GGML_ASSERT(ids->type == GGML_TYPE_I32 && ids->ne[1] == n_tokens && ids->ne[2] == 1 && ids->ne[3] == 1);
+    GGML_ASSERT(weights->type == GGML_TYPE_F32 && weights->ne[0] == 1 && weights->ne[1] == ids->ne[0] &&
+        weights->ne[2] == n_tokens && weights->ne[3] == 1);
+    GGML_ASSERT(glu == GGML_GLU_OP_SWIGLU || glu == GGML_GLU_OP_SWIGLU_CLAMP);
+    GGML_ASSERT(n_rows >= 0);
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, n_embd, n_tokens);
+
+    ggml_set_op_params_i32(result, 0, (int32_t) glu);
+    ggml_set_op_params_f32(result, 1, limit);
+    ggml_set_op_params_i32(result, 2, n_rows);
+
+    result->op     = GGML_OP_MOE_FFN_HAD;
+    result->src[0] = x;
+    result->src[1] = ids;
+    result->src[2] = weights;
+    result->src[3] = up;
+    result->src[4] = gate;
+    result->src[5] = down;
 
     return result;
 }
