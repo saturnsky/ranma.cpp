@@ -12585,6 +12585,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_moe_ffn_had(GGML_TYPE_EXL3_T3, 256, 256, 32, 8, 200, true,  100));
     test_cases.emplace_back(new test_moe_ffn_had(GGML_TYPE_EXL3_M2, 512, 256, 64, 6, 128, true,  512));
     test_cases.emplace_back(new test_moe_ffn_had(GGML_TYPE_EXL3_M4, 256, 512, 64, 6, 128, true,  256));
+    // routed FFN shapes of the layer-mode models, few experts, one pass (all rows) and experts split over passes:
+    // Qwen3.8 (qwen4exp: 2560 / 640, top 10, SwiGLU)
+    test_cases.emplace_back(new test_moe_ffn_had(GGML_TYPE_EXL3_M3, 2560,  640, 16, 10, 129, false,    0));
+    test_cases.emplace_back(new test_moe_ffn_had(GGML_TYPE_EXL3_M3, 2560,  640, 16, 10, 129, false,  400));
+    // DS4.1F (deepseek41: 5120 / 2304, top 6, clamped SwiGLU)
+    test_cases.emplace_back(new test_moe_ffn_had(GGML_TYPE_EXL3_M3, 5120, 2304, 12,  6, 129, true,     0));
+    test_cases.emplace_back(new test_moe_ffn_had(GGML_TYPE_EXL3_M3, 5120, 2304, 12,  6,  64, true,   200));
+    // DS4F (deepseek4: 4096 / 2048, top 6, clamped SwiGLU)
+    test_cases.emplace_back(new test_moe_ffn_had(GGML_TYPE_EXL3_M3, 4096, 2048, 16,  6, 129, true,     0));
+    test_cases.emplace_back(new test_moe_ffn_had(GGML_TYPE_EXL3_M3, 4096, 2048, 16,  6, 129, true,   300));
     // MOE_FFN_HAD with LoRA deltas (mask: 1 up, 2 gate, 4 down): down only (heretic: rank 2 F32), all, scale != 1,
     // two adapters, F16 rank 8 over split experts; scale 0 equals no LoRA (variant 3)
     test_cases.emplace_back(new test_moe_ffn_had(GGML_TYPE_EXL3_M3, 256, 256,  8, 4,  64, true,    0, 0, 4, 1, 2, GGML_TYPE_F32,  1.0f));

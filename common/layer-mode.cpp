@@ -252,9 +252,11 @@ void common_layer_mode_apply(common_params & params) {
         off(why);
         return;
     }
-    // the expert-major MoE op takes EXL3 experts; the attention chunks exist for GLM-5.3 (glm5-next)
-    if (m.arch != "glm5-next") {
-        off("model architecture '" + m.arch + "' is not supported yet (glm5-next only)");
+    // the expert-major MoE op takes EXL3 experts (build_moe_ffn of these models, separate gate/up, SwiGLU); the
+    // attention chunks exist for each of them
+    static const char * const archs[] = { "glm5-next", "qwen4exp", "deepseek41", "deepseek4" };
+    if (std::none_of(std::begin(archs), std::end(archs), [&](const char * a) { return m.arch == a; })) {
+        off("model architecture '" + m.arch + "' is not supported yet (glm5-next, qwen4exp, deepseek41, deepseek4)");
         return;
     }
     if (!m.exl3 || m.merged) {
