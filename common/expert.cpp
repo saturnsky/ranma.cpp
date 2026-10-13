@@ -154,6 +154,12 @@ ggml_expert_config expert_config_from_params(const common_params & params) {
     cfg.abi_version = GGML_EXPERT_ABI_VERSION;
 
     cfg.l1_bytes = (size_t) params.expert_l1_mib * 1024 * 1024;
+    // the layer mode's staging and scratch buffers are part of the L1 budget (common/layer-mode.cpp)
+    if (params.layer_mode_l1_carve_mib > 0 && params.layer_mode_l1_carve_mib < params.expert_l1_mib) {
+        cfg.l1_bytes -= (size_t) params.layer_mode_l1_carve_mib * 1024 * 1024;
+        COM_INF("expert cache: %d MiB of the L1 budget go to the layer mode's buffers, %zu MiB to expert slices\n",
+            params.layer_mode_l1_carve_mib, cfg.l1_bytes/(1024*1024));
+    }
     cfg.mode     = params.expert_cache_mode == "exclusive" ? GGML_EXPERT_MODE_EXCLUSIVE : GGML_EXPERT_MODE_INCLUSIVE;
 
     const size_t mib = 1024*1024;
