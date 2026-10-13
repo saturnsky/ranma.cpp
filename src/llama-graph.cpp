@@ -1122,6 +1122,8 @@ bool llm_graph_input_dsv4::can_reuse(const llm_graph_params & params) {
     if (inp_raw->self_kq_mask && inp_raw->self_kq_mask->buffer) {
         res &= dsv4_can_reuse_raw_kq_mask(inp_raw->self_kq_mask, raw_ctx, params.ubatch, n_stream);
     }
+    // the raw K views start at k_lo, a window of the same width elsewhere in the cache needs a new graph
+    res &= inp_raw->k_lo == raw_ctx->get_k_lo();
 
     res &= dsv4_can_reuse_comp_input(inp_csa, plan_csa, params.ubatch.n_tokens, n_stream);
     res &= dsv4_can_reuse_comp_input(inp_hca, plan_hca, params.ubatch.n_tokens, n_stream);
@@ -3973,6 +3975,7 @@ llm_graph_input_dsv4 * llm_graph_context::build_inp_dsv4() const {
     inp_raw->self_kq_mask_cnv = inp_raw->self_kq_mask;
 
     inp_raw->self_k_rot = raw_ctx->build_input_k_rot(ctx0);
+    inp_raw->k_lo = raw_ctx->get_k_lo();
     auto inp = std::make_unique<llm_graph_input_dsv4>(cparams, std::move(inp_raw), mctx_cur);
 
     dsv4_build_comp_inputs(ctx0, inp->inp_csa, mctx_cur->get_csa_plan(ubatch), "csa", cparams, n_stream);

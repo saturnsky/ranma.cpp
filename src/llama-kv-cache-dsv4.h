@@ -156,6 +156,9 @@ public:
     const std::vector<uint32_t> & get_rs_idx() const;
     void reset_rs_idx_for_ubatches(const std::vector<llama_ubatch> & ubatches);
 
+    // ranma: the smallest ubatch that reads the narrow raw window; a smaller one reads the whole raw cache
+    uint32_t get_raw_nkv_min_tokens() const;
+
 private:
     // joint raw + compressed K storage, allocated before the sub-caches so that they can view it
     struct kall_layer {
@@ -168,6 +171,8 @@ private:
     };
 
     uint32_t kall_raw_size = 0;
+
+    uint32_t raw_nkv_min_tokens = 0;
 
     void init_kall(
             const llama_model & model,
@@ -221,7 +226,8 @@ public:
             slot_info_vec_t sinfos_swa_write,
             slot_info_vec_t sinfos_swa_read,
             std::vector<llama_ubatch> ubatches,
-            std::vector<llama_ubatch> ubatches_write);
+            std::vector<llama_ubatch> ubatches_write,
+            uint32_t n_min_tokens_window);
 
     bool next() override;
     bool apply() override;
@@ -229,7 +235,9 @@ public:
     llama_memory_status get_status() const override;
     const llama_ubatch & get_ubatch() const override;
 
+    // the raw cells attention reads are [get_k_lo(), get_k_lo() + get_n_kv()): get_k, the masks and the joint view
     uint32_t get_n_kv() const;
+    uint32_t get_k_lo() const;
     uint32_t get_n_write() const;
 
     ggml_tensor * get_k(ggml_context * ctx, int32_t il) const;
@@ -260,6 +268,9 @@ private:
     const llama_memory_context_ptr ctx_swa_mem;
 
     uint32_t n_kv = 0;
+    uint32_t k_lo = 0; // ranma: first raw cell attention reads (the visible raw cells)
+
+    const uint32_t n_min_tokens_window = 0;
 
     const llama_memory_status status;
 };
@@ -284,9 +295,10 @@ public:
     ggml_tensor * get_k(ggml_context * ctx, int32_t il) const;
     ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const;
 
-    // view of [n_raw + n_comp] cells of the joint raw/compressed K storage of the layer
-    // returns nullptr when the layer has no joint storage (then the caller has to concat)
-    ggml_tensor * get_k_joint(ggml_context * ctx, int32_t il, uint32_t n_raw, uint32_t n_comp) const;
+    // view of the raw cells [raw_lo, raw_lo + n_raw) followed by the first n_comp compressed cells of the joint
+    // raw/compressed K storage of the layer. returns nullptr when the layer has no joint storage or when the raw cells
+    // do not end where the compressed ones start (then the caller has to concat)
+    ggml_tensor * get_k_joint(ggml_context * ctx, int32_t il, uint32_t raw_lo, uint32_t n_raw, uint32_t n_comp) const;
 
     ggml_tensor * build_input_k_rot(ggml_context * ctx) const;
     void set_input_k_rot(ggml_tensor * dst) const;

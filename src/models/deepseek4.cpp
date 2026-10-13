@@ -850,8 +850,9 @@ ggml_tensor * llama_model_deepseek4::graph::build_csa_lid_attention(
 
     // when the raw and the compressed K of the layer share one allocation, [raw | compressed] is a
     // plain view of that allocation and the per-token copy of the whole compressed cache disappears
+    // (a raw window that ends before the end of the raw cache is concatenated, see llama_kv_cache_dsv4::init_kall)
     ggml_tensor * k_all = raw_k->ne[3] == 1 ?
-        inp_dsv4->mctx->get_csa()->get_k_joint(ctx0, il, (uint32_t) raw_k->ne[2], (uint32_t) n_csa) : nullptr;
+        inp_dsv4->mctx->get_csa()->get_k_joint(ctx0, il, mctx_raw->get_k_lo(), (uint32_t) raw_k->ne[2], (uint32_t) n_csa) : nullptr;
     if (k_all == nullptr) {
         k_all = ggml_concat(ctx0, raw_k, csa_k, 2);
     }
@@ -911,7 +912,7 @@ ggml_tensor * llama_model_deepseek4::graph::build_hca_attention(
     cb(hca_k, "hca_comp_k", il);
 
     ggml_tensor * k_all = raw_k->ne[3] == 1 ?
-        inp_dsv4->mctx->get_hca()->get_k_joint(ctx0, il, (uint32_t) raw_k->ne[2], (uint32_t) n_hca) : nullptr;
+        inp_dsv4->mctx->get_hca()->get_k_joint(ctx0, il, mctx_raw->get_k_lo(), (uint32_t) raw_k->ne[2], (uint32_t) n_hca) : nullptr;
     if (k_all == nullptr) {
         k_all = ggml_concat(ctx0, raw_k, hca_k, 2);
     }
@@ -1596,7 +1597,7 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention_chunked(
                 comp_k->nb[1], comp_k->nb[2], comp_k->nb[3], 0);
 
         // once for the whole ubatch, as in build_csa_lid_attention / build_hca_attention
-        k_all = raw_k->ne[3] == 1 ? comp_ctx->get_k_joint(ctx0, il, (uint32_t) raw_k->ne[2], (uint32_t) n_comp) : nullptr;
+        k_all = raw_k->ne[3] == 1 ? comp_ctx->get_k_joint(ctx0, il, mctx_raw->get_k_lo(), (uint32_t) raw_k->ne[2], (uint32_t) n_comp) : nullptr;
         if (k_all == nullptr) {
             k_all = ggml_concat(ctx0, raw_k, comp_k, 2);
         }
