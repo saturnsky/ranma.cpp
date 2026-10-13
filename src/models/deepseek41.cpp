@@ -1226,13 +1226,19 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention_v41_chunked(
     const int64_t   n_raw     = inp_attn->self_kq_mask->ne[0];
     const ggml_type type_mask = inp_attn->self_kq_mask->type;
 
+    // raw chunk: every chunk reads only its raw window [j0, j0 + nj) of the raw cells (inp_cm->window), so
+    // its K is concatenated per chunk. The compressed width stays that of the ubatch: the top-k of an index source is
+    // carried to its reader layers at one width. The reserve graph has whole windows: it is the widest.
+    const bool win = !inp_cm->windows.empty();
+
     ggml_tensor * k_all   = raw_k;
+    ggml_tensor * comp_k  = nullptr;
     ggml_tensor * raw_idx = nullptr;
     ggml_tensor * ninf    = nullptr;
     int64_t       n_comp  = 0;
 
     if (inp_comp != nullptr) {
-        ggml_tensor * comp_k = inp_dsv4->mctx->get_csa()->get_k(ctx0, il);
+        comp_k = inp_dsv4->mctx->get_csa()->get_k(ctx0, il);
 
         n_comp = inp_comp->kq_mask->ne[0];
         GGML_ASSERT(n_comp > 0);
@@ -1244,9 +1250,11 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention_v41_chunked(
         cb(comp_k, "comp_k", il);
 
         // once for the whole ubatch
-        k_all = ggml_concat(ctx0, raw_k, comp_k, 2);
-        cb(k_all, "k_all", il);
-        ggml_build_forward_expand(gf, k_all);
+        if (!win) {
+            k_all = ggml_concat(ctx0, raw_k, comp_k, 2);
+            cb(k_all, "k_all", il);
+            ggml_build_forward_expand(gf, k_all);
+        }
 
         raw_idx = ggml_cast(ctx0, ggml_arange(ctx0, 0.0f, (float) n_raw, 1.0f), GGML_TYPE_I32);
         ninf    = ggml_fill(ctx0, ggml_new_tensor_4d(ctx0, type_mask, 1, 1, 1, 1), -INFINITY);
@@ -1256,7 +1264,7 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention_v41_chunked(
     // candidate blocks pool it (build_indexer_top_k converts what it is handed)
     const ggml_type type_idx = cparams.fused_lid && !cand_source ? GGML_TYPE_F16 : GGML_TYPE_F32;
 
-    const llm_graph_chunks chunks(nt);
+    const llm_graph_chunks chunks = inp_cm->chunks(nt);
     GGML_ASSERT(chunks.n > 1 || (inp_cm->one && inp_cm->windows.empty()));
 
     std::vector<ggml_tensor *> outs;
@@ -1269,6 +1277,20 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention_v41_chunked(
 
         ggml_tensor * mask     = nullptr;
         int64_t       n_kv_max = 0;
+
+        // the raw window of the chunk (all raw cells without the raw chunk)
+        int64_t j0 = 0;
+        int64_t nj = 0;
+        inp_cm->window(i0, n, j0, nj);
+
+        ggml_tensor * k_cur = k_all;
+        if (win) {
+            k_cur = llm_graph_rows(ctx0, raw_k, 2, j0, nj);
+            if (inp_comp != nullptr) {
+                k_cur = ggml_concat(ctx0, k_cur, comp_k, 2);
+                cb(k_cur, "k_all", il);
+            }
+        }
 
         if (inp_comp == nullptr) {
             // no compressed stream, so this layer sees only its own window
@@ -1292,12 +1314,12 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention_v41_chunked(
             }
 
             mask = build_chunk_kq_mask(inp_cm->mask(ctx0, i0, n, GGML_TYPE_F32), top_k,
-                    build_comp_chunk_key(inp_dsv4, *inp_comp, i0, n), raw_idx, ninf, n_comp, il);
+                    build_comp_chunk_key(inp_dsv4, *inp_comp, i0, n), llm_graph_rows(ctx0, raw_idx, 0, 0, nj), ninf, n_comp, il);
 
-            n_kv_max = std::min<int64_t>(n_raw, hparams.n_swa) + top_k->ne[0];
+            n_kv_max = std::min<int64_t>(nj, hparams.n_swa) + top_k->ne[0];
         }
 
-        ggml_tensor * out = build_attn_mha(llm_graph_rows(ctx0, q, 2, i0, n), k_all, k_all, nullptr, mask,
+        ggml_tensor * out = build_attn_mha(llm_graph_rows(ctx0, q, 2, i0, n), k_cur, k_cur, nullptr, mask,
                 layer.attn_sinks, nullptr, n_kv_max, kq_scale, il);
 
         // finish this chunk before the next one starts, so the allocator reuses its intermediates

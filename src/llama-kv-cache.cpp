@@ -1346,7 +1346,8 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
     return result;
 }
 
-bool llama_kv_cache::get_visible_range(const slot_info & sinfo, const llama_ubatch & ubatch, uint32_t & lo, uint32_t & hi) const {
+bool llama_kv_cache::get_visible_range(const slot_info & sinfo, const llama_ubatch & ubatch, uint32_t & lo, uint32_t & hi,
+                                       uint32_t t0, uint32_t t1, bool causal) const {
     // a chunked or symmetric window is not bounded by the smallest position of the ubatch alone
     if (sinfo.n_stream() != 1 || (swa_type != LLAMA_SWA_TYPE_NONE && swa_type != LLAMA_SWA_TYPE_STANDARD)) {
         return false;
@@ -1354,11 +1355,19 @@ bool llama_kv_cache::get_visible_range(const slot_info & sinfo, const llama_ubat
 
     const uint32_t strm = sinfo.strm[0];
 
-    // the min position in the batch for each sequence, by the first sequence of a token as set_input_kq_mask uses it
-    llama_pos seq_pos_min[LLAMA_MAX_SEQ];
-    std::fill(seq_pos_min, seq_pos_min + LLAMA_MAX_SEQ, INT32_MAX);
+    t1 = std::min(t1, ubatch.n_tokens);
+    if (t0 >= t1) {
+        return false;
+    }
 
-    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+    // the min (and max) position of the tokens [t0, t1) for each sequence, by the first sequence of a token as
+    // set_input_kq_mask uses it
+    llama_pos seq_pos_min[LLAMA_MAX_SEQ];
+    llama_pos seq_pos_max[LLAMA_MAX_SEQ];
+    std::fill(seq_pos_min, seq_pos_min + LLAMA_MAX_SEQ, INT32_MAX);
+    std::fill(seq_pos_max, seq_pos_max + LLAMA_MAX_SEQ, INT32_MIN);
+
+    for (uint32_t i = t0; i < t1; ++i) {
         const llama_seq_id seq_id = ubatch.seq_id[i][0];
 
         if (seq_to_stream[seq_id] != strm) {
@@ -1366,6 +1375,7 @@ bool llama_kv_cache::get_visible_range(const slot_info & sinfo, const llama_ubat
         }
 
         seq_pos_min[seq_id] = std::min(seq_pos_min[seq_id], ubatch.pos[i]);
+        seq_pos_max[seq_id] = std::max(seq_pos_max[seq_id], ubatch.pos[i]);
     }
 
     const auto & cells = v_cells[strm];
@@ -1374,7 +1384,8 @@ bool llama_kv_cache::get_visible_range(const slot_info & sinfo, const llama_ubat
     // !is_masked_swa(p0, p1). For the standard window p1 - p0 < n_swa is weakest for the smallest p1 of the
     // sequence, and a cell after it is never cut by the window, so a cell that fails this for every sequence of the
     // ubatch is masked for every token, with or without the causal mask. Without a window every cell of a sequence
-    // of the ubatch is kept.
+    // of the ubatch is kept. With causal, a cell after the largest position of the sequence is masked for every token
+    // of it as well.
     uint32_t i_lo = UINT32_MAX;
     uint32_t i_hi = 0;
 
@@ -1393,7 +1404,8 @@ bool llama_kv_cache::get_visible_range(const slot_info & sinfo, const llama_ubat
                 continue;
             }
 
-            visible = !llama_hparams::is_masked_swa(n_swa, swa_type, p0, std::max(seq_pos_min[seq_id], 0));
+            visible = !llama_hparams::is_masked_swa(n_swa, swa_type, p0, std::max(seq_pos_min[seq_id], 0)) &&
+                (!causal || p0 <= seq_pos_max[seq_id]);
         }
 
         if (visible) {

@@ -32,8 +32,20 @@ int64_t llm_graph_chunk_tokens() {
     return v <= 0 ? (int64_t) 0 : std::max<int64_t>(v, LLM_GRAPH_CHUNK_MIN);
 }
 
-llm_graph_chunks::llm_graph_chunks(int64_t n_tokens) : n_tokens(n_tokens), c(n_tokens), n(1) {
-    const int64_t cc = llm_graph_chunk_tokens();
+int64_t llm_graph_chunk_tokens_dsv4_raw(const llama_hparams & hparams) {
+    const long long v = 4*(long long) hparams.indexer_top_k;
+    return v <= 0 ? (int64_t) 0 : std::max<int64_t>(v, LLM_GRAPH_CHUNK_MIN);
+}
+
+int64_t llm_graph_chunk_tokens_min(int64_t a, int64_t b) {
+    if (a <= 0) {
+        return std::max<int64_t>(b, 0);
+    }
+    return b <= 0 ? a : std::min(a, b);
+}
+
+llm_graph_chunks::llm_graph_chunks(int64_t n_tokens, int64_t c_req) : n_tokens(n_tokens), c(n_tokens), n(1) {
+    const int64_t cc = c_req;
     if (cc > 0 && cc < n_tokens) {
         c = cc;
         n = (int) ((n_tokens + cc - 1)/cc);
@@ -92,9 +104,12 @@ bool llm_graph_chunk_mask_enabled() {
 }
 
 bool llm_graph_chunk_mask_usable(const llama_cparams & cparams, const llama_hparams & hparams, const llama_ubatch & ubatch,
-                                 bool swa_ok) {
+                                 bool swa_ok, int64_t c_req) {
     const bool swa = hparams.swa_type == LLAMA_SWA_TYPE_NONE || (swa_ok && hparams.swa_type == LLAMA_SWA_TYPE_STANDARD);
-    return llm_graph_chunk_mask_enabled() && llm_graph_chunks(ubatch.n_tokens).n > 1 &&
+    if (c_req < 0) {
+        c_req = llm_graph_chunk_tokens();
+    }
+    return llm_graph_chunk_mask_enabled() && llm_graph_chunks(ubatch.n_tokens, c_req).n > 1 &&
         cparams.causal_attn && !hparams.use_alibi && swa &&
         (!ubatch.is_pos_2d() || ubatch.embd == nullptr) && (cparams.kv_unified || ubatch.n_seqs_unq == 1);
 }
@@ -205,9 +220,47 @@ void llm_graph_chunk_mask_compare(const char * name, const ggml_tensor * host, c
     GGML_ASSERT(n_bad == 0 && "device chunk mask differs from the host mask");
 }
 
+void llm_graph_input_chunk_mask::window(int64_t i0, int64_t n, int64_t & j0, int64_t & nj) const {
+    j0 = 0;
+    nj = kv_pos->ne[0];
+    for (const auto & w : windows) {
+        if (w.i0 == i0) {
+            GGML_ASSERT(w.n == n && w.j0 >= 0 && w.nj > 0 && w.j0 + w.nj <= kv_pos->ne[0]);
+            j0 = w.j0;
+            nj = w.nj;
+            return;
+        }
+    }
+}
+
+std::vector<llm_graph_chunk_window> llm_graph_input_chunk_mask::make_windows(int64_t n_tokens) const {
+    std::vector<llm_graph_chunk_window> res;
+    if (ops.window == nullptr) {
+        return res;
+    }
+
+    const int64_t n_kv = ops.n_kv(mctx);
+    const llm_graph_chunks ch = chunks(n_tokens);
+    for (int k = 0; k < ch.n; ++k) {
+        llm_graph_chunk_window w = { ch.i0(k), ch.nk(k), 0, n_kv };
+        ops.window(mctx, w.i0, w.n, w.j0, w.nj);
+        if (w.j0 < 0 || w.nj <= 0 || w.j0 + w.nj > n_kv) {
+            w.j0 = 0;
+            w.nj = n_kv;
+        }
+        res.push_back(w);
+    }
+
+    return res;
+}
+
 void llm_graph_input_chunk_mask::set_input(const llama_ubatch * ubatch) {
     ops.set_pos(mctx, kv_pos, ubatch);
     pos.set_input(ubatch);
+
+    if (ops.check != nullptr && !windows.empty()) {
+        ops.check(mctx, ubatch, windows);
+    }
 
     if (llm_graph_chunk_mask_check_enabled()) {
         llm_graph_host_tensor kq(GGML_TYPE_F32, kv_pos->ne[0], ubatch->n_tokens);
@@ -219,28 +272,37 @@ void llm_graph_input_chunk_mask::set_input(const llama_ubatch * ubatch) {
 bool llm_graph_input_chunk_mask::can_reuse(const llm_graph_params & params) {
     mctx = params.mctx;
 
-    bool res = llm_graph_chunk_mask_usable(params.cparams, params.hparams, params.ubatch, n_swa > 0);
+    bool res = llm_graph_chunk_mask_usable(params.cparams, params.hparams, params.ubatch, n_swa > 0, c_req);
 
     res &= kv_pos->ne[0] == ops.n_kv(mctx);
     res &= kv_pos->ne[1] == params.ubatch.n_seqs_unq;
     res &= pos.tok_pos->ne[1] == params.ubatch.n_tokens;
+
+    // the key views of every chunk are baked into the graph
+    if (res && ops.window != nullptr) {
+        res &= make_windows(params.ubatch.n_tokens) == windows;
+    }
 
     return res;
 }
 
 llm_graph_input_chunk_mask * llm_graph_build_inp_chunk_mask(llm_graph_result * res, ggml_context * ctx, ggml_cgraph * gf,
         const llama_cparams & cparams, const llama_hparams & hparams, const llama_ubatch & ubatch,
-        const llama_memory_context_i * mctx, llm_graph_chunk_kv_ops ops, uint32_t n_swa) {
-    if (!llm_graph_chunk_mask_usable(cparams, hparams, ubatch, n_swa > 0)) {
+        const llama_memory_context_i * mctx, llm_graph_chunk_kv_ops ops, uint32_t n_swa, int64_t c_req) {
+    if (c_req < 0) {
+        c_req = llm_graph_chunk_tokens();
+    }
+    if (!llm_graph_chunk_mask_usable(cparams, hparams, ubatch, n_swa > 0, c_req)) {
         return nullptr;
     }
 
-    auto inp = std::make_unique<llm_graph_input_chunk_mask>(mctx, ops, n_swa);
+    auto inp = std::make_unique<llm_graph_input_chunk_mask>(mctx, ops, n_swa, c_req);
 
     inp->kv_pos = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ops.n_kv(mctx), ubatch.n_seqs_unq);
     ggml_set_input(inp->kv_pos);
     ggml_set_name(inp->kv_pos, "chunk_kv_pos");
     inp->pos.build(ctx, ubatch.n_tokens);
+    inp->windows = inp->make_windows(ubatch.n_tokens);
 
     // set_input fills them, so they stay allocated in every graph
     ggml_build_forward_expand(gf, inp->kv_pos);

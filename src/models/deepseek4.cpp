@@ -1371,6 +1371,48 @@ static const llama_kv_cache_dsv4_raw_context * dsv4_raw_ctx(const llama_memory_c
     return static_cast<const llama_kv_cache_dsv4_context *>(mctx)->get_raw();
 }
 
+// ranma: the raw chunk - the raw window of a chunk as columns of the raw mask, which starts at cell get_k_lo()
+static void dsv4_raw_chunk_window(const llama_memory_context_i * mctx, int64_t i0, int64_t n, int64_t & j0, int64_t & nj) {
+    const llama_kv_cache_dsv4_raw_context * raw = dsv4_raw_ctx(mctx);
+
+    uint32_t lo = 0;
+    uint32_t nc = 0;
+    raw->get_chunk_window((uint32_t) i0, (uint32_t) n, lo, nc);
+
+    j0 = (int64_t) lo - (int64_t) raw->get_k_lo();
+    nj = nc;
+}
+
+static void dsv4_raw_chunk_check(const llama_memory_context_i * mctx, const llama_ubatch * ubatch,
+                                 const std::vector<llm_graph_chunk_window> & windows) {
+    if (!llama_kv_cache_dsv4_raw_context::check_enabled()) {
+        return;
+    }
+
+    const llama_kv_cache_dsv4_raw_context * raw = dsv4_raw_ctx(mctx);
+
+    std::vector<llama_kv_cache_dsv4_raw_context::chunk_window> cw;
+    for (const auto & w : windows) {
+        cw.push_back({ (uint32_t) w.i0, (uint32_t) w.n, raw->get_k_lo() + (uint32_t) w.j0, (uint32_t) w.nj });
+    }
+    raw->check_chunk_windows(ubatch, cw);
+}
+
+// ranma: the chunk ops of the raw cache; the raw chunk (llm_graph_chunk_tokens_dsv4_raw) adds the raw window of every chunk
+static llm_graph_chunk_kv_ops dsv4_chunk_kv_ops(const llama_hparams & hparams) {
+    llm_graph_chunk_kv_ops ops = llm_graph_chunk_kv_ops_of<llama_kv_cache_dsv4_raw_context, dsv4_raw_ctx>();
+    if (llm_graph_chunk_tokens_dsv4_raw(hparams) > 0) {
+        ops.window = dsv4_raw_chunk_window;
+        ops.check  = dsv4_raw_chunk_check;
+    }
+    return ops;
+}
+
+// ranma: the chunk size of a DSV4 graph: the attention chunk, the raw chunk, the smaller when both are set
+static int64_t dsv4_chunk_tokens(const llama_hparams & hparams) {
+    return llm_graph_chunk_tokens_min(llm_graph_chunk_tokens(), llm_graph_chunk_tokens_dsv4_raw(hparams));
+}
+
 // ranma: the compressed prefix masks of a chunked DSV4 graph. Compressed row j is visible to token t when j < n_visible(t)
 // of its plan (dsv4_set_kq_mask), so a table of -j and the token key -(n_visible - 0.5) give the mask of a chunk through
 // llm_graph_chunk_mask, with the sequence column 0 of the single sequence.
@@ -1389,6 +1431,10 @@ public:
         set_key(csa_key, mctx->get_csa_plan(*ubatch), ubatch);
         set_key(hca_key, mctx->get_hca_plan(*ubatch), ubatch);
         set_key(lid_key, mctx->get_lid_plan(*ubatch), ubatch);
+
+        // the compressed widths baked into the graph hold every visible row of their chunk (can_reuse compares them)
+        check_widths(csa_w, mctx->get_csa_plan(*ubatch));
+        check_widths(hca_w, mctx->get_hca_plan(*ubatch));
 
         if (llm_graph_chunk_mask_check_enabled()) {
             check("csa", csa_key, mctx->get_csa_plan(*ubatch), ubatch);
@@ -1436,7 +1482,52 @@ public:
         res &= csa_key->ne[1] == params.ubatch.n_tokens;
         res &= lid_as_csa == same_prefix(mctx, params.ubatch, same_type);
 
+        if (res && narrow) {
+            res &= csa_w == widths(mctx, mctx->get_csa_plan(params.ubatch), params.ubatch.n_tokens);
+            res &= hca_w == widths(mctx, mctx->get_hca_plan(params.ubatch), params.ubatch.n_tokens);
+        }
+
         return res;
+    }
+
+    // raw chunk: the compressed rows chunk k of cm reads, the visible prefix of its last token on 256 rows
+    // (n_visible grows with the position), at most the plan width. Empty (the whole plan width for every chunk) for the
+    // reserve graph, which is sized at the widest, and for a plan of another shape.
+    std::vector<int64_t> widths(const llama_kv_cache_dsv4_context * m, const llama_kv_cache_dsv4_context::comp_plan & plan,
+                                int64_t n_tokens) const {
+        std::vector<int64_t> res;
+        if (!m->get_raw()->has_ubatch() || plan.n_kv <= 0 || (int64_t) plan.n_visible.size() != n_tokens) {
+            return res;
+        }
+
+        const llm_graph_chunks ch = cm->chunks(n_tokens);
+        for (int k = 0; k < ch.n; ++k) {
+            int64_t v = 0;
+            for (int64_t t = ch.i0(k); t < ch.i0(k) + ch.nk(k); ++t) {
+                v = std::max<int64_t>(v, plan.n_visible[t]);
+            }
+            res.push_back(std::min<int64_t>(plan.n_kv, std::max<int64_t>(GGML_PAD(v, 256), 256)));
+        }
+
+        return res;
+    }
+
+    void check_widths(const std::vector<int64_t> & w, const llama_kv_cache_dsv4_context::comp_plan & plan) const {
+        if (w.empty()) {
+            return;
+        }
+        const llm_graph_chunks ch = cm->chunks((int64_t) plan.n_visible.size());
+        GGML_ASSERT((int) w.size() == ch.n);
+        for (int k = 0; k < ch.n; ++k) {
+            for (int64_t t = ch.i0(k); t < ch.i0(k) + ch.nk(k); ++t) {
+                GGML_ASSERT(plan.n_visible[t] <= w[k] && "a compressed chunk width cuts a visible row");
+            }
+        }
+    }
+
+    // the compressed width of chunk k: w[k], or the whole width without narrowing
+    static int64_t width(const std::vector<int64_t> & w, int k, int64_t full) {
+        return w.empty() ? full : w[k];
     }
 
     static void set_key(ggml_tensor * key, const llama_kv_cache_dsv4_context::comp_plan & plan, const llama_ubatch * ubatch) {
@@ -1462,6 +1553,12 @@ public:
     bool same_type  = false; // the LID and CSA masks have one type
     bool lid_as_csa = false; // see same_prefix
 
+    // raw chunk, DeepSeek V4 only (the V4.1 index sources carry their top-k to other layers at one width):
+    // the compressed widths per chunk (see widths); the CSA width serves the LID as well (lid_as_csa only)
+    bool narrow = false;
+    std::vector<int64_t> csa_w;
+    std::vector<int64_t> hca_w;
+
     ggml_tensor * iota    = nullptr; // F32 [n_max, 1]     -j
     ggml_tensor * csa_key = nullptr; // F32 [1, n_tokens]  -(n_visible - 0.5)
     ggml_tensor * hca_key = nullptr;
@@ -1477,7 +1574,7 @@ void llama_model_deepseek4::graph::build_inp_dsv4_chunk(llm_graph_input_dsv4 * i
     }
 
     inp_cm = llm_graph_build_inp_chunk_mask(res, ctx0, gf, cparams, hparams, ubatch, mctx,
-            llm_graph_chunk_kv_ops_of<llama_kv_cache_dsv4_raw_context, dsv4_raw_ctx>(), hparams.n_swa);
+            dsv4_chunk_kv_ops(hparams), hparams.n_swa, dsv4_chunk_tokens(hparams));
     if (inp_cm == nullptr) {
         return;
     }
@@ -1489,6 +1586,12 @@ void llama_model_deepseek4::graph::build_inp_dsv4_chunk(llm_graph_input_dsv4 * i
     const auto & inp_lid = inp_dsv4->get_lid();
     inp->same_type  = inp_csa.kq_mask && inp_lid.kq_mask && inp_csa.kq_mask->type == inp_lid.kq_mask->type;
     inp->lid_as_csa = llm_graph_input_dsv4_chunk::same_prefix(mctx_cur, ubatch, inp->same_type);
+
+    inp->narrow = !inp_cm->windows.empty() && arch == LLM_ARCH_DEEPSEEK4;
+    if (inp->narrow) {
+        inp->csa_w = inp->widths(mctx_cur, mctx_cur->get_csa_plan(ubatch), n_tokens);
+        inp->hca_w = inp->widths(mctx_cur, mctx_cur->get_hca_plan(ubatch), n_tokens);
+    }
 
     const int64_t n_max = std::max({ mctx_cur->get_csa_plan(ubatch).n_kv, mctx_cur->get_hca_plan(ubatch).n_kv,
                                      mctx_cur->get_lid_plan(ubatch).n_kv, (int64_t) 1 });
@@ -1585,29 +1688,41 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention_chunked(
     ggml_tensor * raw_k = mctx_raw->get_k(ctx0, il);
     ggml_tensor * k_all = raw_k;
 
+    // raw chunk: every chunk reads only its raw window [j0, j0 + nj) of the raw cells (inp_cm->window) and,
+    // without a joint view of that window, the compressed rows of its own width (inp_dch->csa_w / hca_w), so its K is
+    // concatenated per chunk. The reserve graph has whole windows and concatenates them as well: it is the widest.
+    const bool win = !inp_cm->windows.empty();
+
+    // the compressed rows come first in the K and mask of a chunk: the raw cells after the causal edge are then the
+    // end of every mask row, which the FA mask scan skips
+    const bool comp_first = win;
+
+    ggml_tensor * comp_k = nullptr;
+
     int64_t n_comp = 0;
     if (csa || hca) {
         const auto * comp_ctx = csa ? inp_dsv4->mctx->get_csa() : inp_dsv4->mctx->get_hca();
         n_comp = (csa ? inp_csa : inp_hca).kq_mask->ne[0];
 
-        ggml_tensor * comp_k = comp_ctx->get_k(ctx0, il);
+        comp_k = comp_ctx->get_k(ctx0, il);
         GGML_ASSERT(n_comp > 0 && n_comp <= comp_k->ne[2]);
         comp_k = ggml_view_4d(ctx0, comp_k,
                 comp_k->ne[0], comp_k->ne[1], n_comp, comp_k->ne[3],
                 comp_k->nb[1], comp_k->nb[2], comp_k->nb[3], 0);
 
         // once for the whole ubatch, as in build_csa_lid_attention / build_hca_attention
-        k_all = raw_k->ne[3] == 1 ? comp_ctx->get_k_joint(ctx0, il, mctx_raw->get_k_lo(), (uint32_t) raw_k->ne[2], (uint32_t) n_comp) : nullptr;
-        if (k_all == nullptr) {
-            k_all = ggml_concat(ctx0, raw_k, comp_k, 2);
+        if (!win) {
+            k_all = raw_k->ne[3] == 1 ? comp_ctx->get_k_joint(ctx0, il, mctx_raw->get_k_lo(), (uint32_t) raw_k->ne[2], (uint32_t) n_comp) : nullptr;
+            if (k_all == nullptr) {
+                k_all = ggml_concat(ctx0, raw_k, comp_k, 2);
+            }
+            cb(k_all, csa ? "csa_k_all" : "hca_k_all", il);
         }
-        cb(k_all, csa ? "csa_k_all" : "hca_k_all", il);
     }
 
     const ggml_type type_raw = inp_attn->self_kq_mask->type;
-    const int64_t   n_raw    = inp_attn->self_kq_mask->ne[0];
 
-    const llm_graph_chunks chunks(n_tokens);
+    const llm_graph_chunks chunks = inp_cm->chunks(n_tokens);
     GGML_ASSERT(chunks.n > 1);
 
     std::vector<ggml_tensor *> outs;
@@ -1623,31 +1738,51 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention_chunked(
             q = llama_mul_mat_hadamard(ctx0, q, k_rot);
         }
 
-        ggml_tensor * mask = ggml_reshape_4d(ctx0, inp_cm->mask(ctx0, i0, n, type_raw), n_raw, n, 1, 1);
+        // the raw window of the chunk (all raw cells without the raw chunk) and its compressed width; the LID
+        // reads the CSA width when one prefix mask serves both (lid_as_csa), its whole plan width otherwise
+        int64_t j0 = 0;
+        int64_t nj = 0;
+        inp_cm->window(i0, n, j0, nj);
+
+        const int64_t n_comp_c = csa ? (inp_dch->lid_as_csa ? llm_graph_input_dsv4_chunk::width(inp_dch->csa_w, ic, n_comp) : n_comp) :
+                                 hca ? llm_graph_input_dsv4_chunk::width(inp_dch->hca_w, ic, n_comp) : 0;
+        const int64_t n_lid_c  = csa && inp_dch->lid_as_csa ? n_comp_c : csa ? inp_lid.kq_mask->ne[0] : 0;
+
+        ggml_tensor * k_cur = k_all;
+        if (win) {
+            k_cur = llm_graph_rows(ctx0, raw_k, 2, j0, nj);
+            if (csa || hca) {
+                ggml_tensor * comp_c = llm_graph_rows(ctx0, comp_k, 2, 0, n_comp_c);
+                k_cur = comp_first ? ggml_concat(ctx0, comp_c, k_cur, 2) : ggml_concat(ctx0, k_cur, comp_c, 2);
+                cb(k_cur, csa ? "csa_k_all" : "hca_k_all", il);
+            }
+        }
+
+        ggml_tensor * mask = ggml_reshape_4d(ctx0, inp_cm->mask(ctx0, i0, n, type_raw), nj, n, 1, 1);
         int64_t n_kv_max = 0;
 
         if (csa) {
-            ggml_tensor * lid_mask = inp_dch->mask(ctx0, *inp_cm, inp_dch->lid_key, inp_lid.kq_mask->ne[0], i0, n,
-                                                   inp_lid.kq_mask->type);
+            ggml_tensor * lid_mask = inp_dch->mask(ctx0, *inp_cm, inp_dch->lid_key, n_lid_c, i0, n, inp_lid.kq_mask->type);
             ggml_tensor * top_k = build_lid_top_k(model, inp_dsv4, qr, cur, inp_pos, il, i0, n, lid_mask);
 
             // the CSA and LID plans usually agree (same ratio): then one prefix mask serves both
             ggml_tensor * csa_mask = inp_dch->lid_as_csa ? lid_mask :
-                inp_dch->mask(ctx0, *inp_cm, inp_dch->csa_key, n_comp, i0, n, inp_csa.kq_mask->type);
-            csa_mask = build_top_k_mask(ggml_reshape_4d(ctx0, csa_mask, n_comp, n, 1, 1), top_k, "csa_top_k_mask", il);
+                inp_dch->mask(ctx0, *inp_cm, inp_dch->csa_key, n_comp_c, i0, n, inp_csa.kq_mask->type);
+            csa_mask = build_top_k_mask(ggml_reshape_4d(ctx0, csa_mask, n_comp_c, n, 1, 1), top_k, "csa_top_k_mask", il);
 
-            mask = ggml_concat(ctx0, mask, csa_mask, 0);
+            mask = comp_first ? ggml_concat(ctx0, csa_mask, mask, 0) : ggml_concat(ctx0, mask, csa_mask, 0);
             cb(mask, "csa_lid_kq_mask", il);
 
-            n_kv_max = std::min<int64_t>(n_raw, hparams.n_swa) + top_k->ne[0];
+            n_kv_max = std::min<int64_t>(nj, hparams.n_swa) + top_k->ne[0];
         } else if (hca) {
-            ggml_tensor * hca_mask = inp_dch->mask(ctx0, *inp_cm, inp_dch->hca_key, n_comp, i0, n, inp_hca.kq_mask->type);
+            ggml_tensor * hca_mask = inp_dch->mask(ctx0, *inp_cm, inp_dch->hca_key, n_comp_c, i0, n, inp_hca.kq_mask->type);
 
-            mask = ggml_concat(ctx0, mask, ggml_reshape_4d(ctx0, hca_mask, n_comp, n, 1, 1), 0);
+            hca_mask = ggml_reshape_4d(ctx0, hca_mask, n_comp_c, n, 1, 1);
+            mask = comp_first ? ggml_concat(ctx0, hca_mask, mask, 0) : ggml_concat(ctx0, mask, hca_mask, 0);
             cb(mask, "hca_kq_mask", il);
         }
 
-        ggml_tensor * out = build_attn_mha(q, k_all, k_all, nullptr, mask, sinks, nullptr, n_kv_max, kq_scale, il);
+        ggml_tensor * out = build_attn_mha(q, k_cur, k_cur, nullptr, mask, sinks, nullptr, n_kv_max, kq_scale, il);
         if (k_rot) {
             out = llama_mul_mat_hadamard(ctx0, out, k_rot);
         }

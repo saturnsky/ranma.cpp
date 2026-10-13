@@ -2842,9 +2842,12 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
     }
 
     // ranma: chunked attention repeats the query side of every attention layer per chunk of rows;
-    // about 70 nodes per chunk and layer for the largest (DeepSeek V4 CSA with its output projection), with margin
+    // about 70 nodes per chunk and layer for the largest (DeepSeek V4 CSA with its output projection), with margin.
+    // DeepSeek V4 / V4.1 chunk by their raw chunk as well (a few more nodes per chunk for its raw window)
     {
-        const int64_t c = llm_graph_chunk_tokens();
+        const bool dsv4 = model.arch == LLM_ARCH_DEEPSEEK4 || model.arch == LLM_ARCH_DEEPSEEK41;
+        const int64_t c = llm_graph_chunk_tokens_min(llm_graph_chunk_tokens(),
+                                                     dsv4 ? llm_graph_chunk_tokens_dsv4_raw(model.hparams) : 0);
         if (c > 0 && (int64_t) n_tokens > c) {
             res += (uint32_t) (((n_tokens + c - 1)/c) * model.hparams.n_layer() * 96);
         }

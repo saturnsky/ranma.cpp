@@ -1457,6 +1457,37 @@ static void launch_fattn_tile_switch_ncols2(ggml_backend_cuda_context & ctx, ggm
     }
 #endif // GGML_USE_HIP
 
+#ifdef GGML_USE_HIP
+    // Diagnostic only (DS4F S2 probe): GGML_HIP_FATTN_TILE512=<ncols2>x<cols per block> forces one dense tile shape
+    // for DKQ = DV = 512. Read on every call so that one test process can interleave shapes; unset = normal dispatch.
+    if constexpr (DKQ == 512 && DV == 512) {
+        const char * diag = getenv("GGML_HIP_FATTN_TILE512");
+        int n2  = 0;
+        int cpb = 0;
+        if (diag && *diag && use_gqa_opt && sscanf(diag, "%dx%d", &n2, &cpb) == 2 && n2 > 0 && gqa_ratio % n2 == 0) {
+            const int id        = ggml_cuda_get_device();
+            const int cc        = ggml_cuda_info().devices[id].cc;
+            const int warp_size = 32;
+#define GGML_HIP_FATTN_TILE512_DIAG(N2, CPB)                                                                       \
+            if (n2 == N2 && cpb == CPB) {                                                                          \
+                const int nwarps    = ggml_cuda_fattn_tile_get_nthreads (DKQ, DV, CPB, cc) / warp_size;           \
+                const int nbatch_fa = ggml_cuda_fattn_tile_get_nbatch_fa(DKQ, DV, CPB, cc);                       \
+                fattn_kernel_t fattn_kernel = flash_attn_tile<DKQ, DV, CPB/N2, N2, use_logit_softcap>;            \
+                launch_fattn<DV, CPB/N2, N2>                                                                       \
+                    (ctx, dst, fattn_kernel, nwarps, 0, nbatch_fa, true, true, false, false, warp_size);           \
+                return;                                                                                            \
+            }
+            GGML_HIP_FATTN_TILE512_DIAG( 8,  8)
+            GGML_HIP_FATTN_TILE512_DIAG( 8, 16)
+            GGML_HIP_FATTN_TILE512_DIAG( 8, 32)
+            GGML_HIP_FATTN_TILE512_DIAG(16, 16)
+            GGML_HIP_FATTN_TILE512_DIAG(16, 32)
+            GGML_HIP_FATTN_TILE512_DIAG(32, 32)
+#undef GGML_HIP_FATTN_TILE512_DIAG
+        }
+    }
+#endif // GGML_USE_HIP
+
     if constexpr (DKQ == 320) {
         // This branch is only used for Mistral Small 4 which has a GQA ratio of 32.
         // On AMD, simply use that GQA ratio with 32 columns / block since we always have enough SRAM.

@@ -2280,6 +2280,34 @@ uint32_t llama_kv_cache_dsv4_raw_context::get_k_lo() const {
     return k_lo;
 }
 
+void llama_kv_cache_dsv4_raw_context::get_chunk_window(uint32_t t0, uint32_t n_tok, uint32_t & lo, uint32_t & n) const {
+    lo = k_lo;
+    n  = n_kv;
+
+    // only a context that applied a ubatch knows its cells (the reserve graph keeps the whole window, its upper bound)
+    if (!has_ubatch() || i_next >= ubatches.size() || i_next >= sinfos_read.size()) {
+        return;
+    }
+
+    uint32_t c_lo = 0;
+    uint32_t c_hi = 0;
+    if (!kv_swa->get_visible_range(sinfos_read[i_next], ubatches[i_next], c_lo, c_hi, t0, t0 + n_tok, true)) {
+        return;
+    }
+
+    // the 256-cell steps of the window of the ubatch (apply), inside it
+    const uint32_t n_align = 256;
+
+    c_lo = std::max(k_lo, c_lo/n_align*n_align);
+    c_hi = std::min(k_lo + n_kv, (uint32_t) GGML_PAD(c_hi, n_align));
+    if (c_lo >= c_hi) {
+        return;
+    }
+
+    lo = c_lo;
+    n  = c_hi - c_lo;
+}
+
 uint32_t llama_kv_cache_dsv4_raw_context::get_n_write() const {
     if (ubatches_write.empty()) {
         return 0;
@@ -2393,6 +2421,43 @@ static void dsv4_check_raw_window(const llama_kv_cache * kv, const ggml_tensor *
 
     LLAMA_LOG_DEBUG("%s: window [%u, %" PRId64 ") of %" PRId64 " raw cells, %" PRId64 " tokens, %" PRId64 " visible entries: ok\n",
             __func__, k_lo, k_lo + n_kv, n_cells, n_rows, n_visible);
+}
+
+bool llama_kv_cache_dsv4_raw_context::check_enabled() {
+    return dsv4_raw_nkv_check();
+}
+
+void llama_kv_cache_dsv4_raw_context::check_chunk_windows(const llama_ubatch * ubatch, const std::vector<chunk_window> & windows) const {
+    if (!dsv4_raw_nkv_check() || windows.empty()) {
+        return;
+    }
+
+    // the causal mask of the whole ubatch over the whole raw cache, once for all chunks (F16 holds 0 and -inf exactly)
+    const int64_t n_cells = kv_swa->get_size();
+
+    llm_graph_host_tensor full(GGML_TYPE_F16, n_cells, ubatch->n_tokens);
+    kv_swa->set_input_kq_mask(full.t, ubatch, true, 0);
+
+    for (const auto & w : windows) {
+        GGML_ASSERT(w.t0 + w.n_tok <= ubatch->n_tokens);
+        GGML_ASSERT(w.lo >= k_lo && w.lo + w.n <= k_lo + n_kv && "the chunk window lies outside the window of the ubatch");
+
+        int64_t n_visible = 0;
+        for (int64_t r = w.t0; r < (int64_t) (w.t0 + w.n_tok); ++r) {
+            for (int64_t c = 0; c < n_cells; ++c) {
+                const float v = dsv4_mask_value(full.t, r*n_cells + c);
+                if (c >= w.lo && c < w.lo + w.n) {
+                    n_visible += v != -INFINITY;
+                } else if (v != -INFINITY) {
+                    GGML_ABORT("RANMA_DSV4_RAW_NKV_CHECK: row %" PRId64 " of the chunk [%u, %u) sees cell %" PRId64 " (%f) outside its window [%u, %u) of %" PRId64 " cells",
+                            r, w.t0, w.t0 + w.n_tok, c, v, w.lo, w.lo + w.n, n_cells);
+                }
+            }
+        }
+
+        LLAMA_LOG_DEBUG("%s: chunk [%u, %u): window [%u, %u) of [%u, %u), %" PRId64 " raw cells, %" PRId64 " visible entries: ok\n",
+                __func__, w.t0, w.t0 + w.n_tok, w.lo, w.lo + w.n, k_lo, k_lo + n_kv, n_cells, n_visible);
+    }
 }
 
 void llama_kv_cache_dsv4_raw_context::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
