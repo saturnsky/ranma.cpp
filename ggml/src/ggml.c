@@ -1252,6 +1252,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "MUL_MAT_ID",
     "MUL_MAT_HAD",
     "MOE_FFN_HAD",
+    "MOE_FFN_LORA",
     "OUT_PROD",
 
     "SCALE",
@@ -1333,7 +1334,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
+static_assert(GGML_OP_COUNT == 106, "GGML_OP_COUNT != 106");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1371,6 +1372,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "X[i]*Y",
     "rot(X*rot(Y))",
     "moe_ffn(x)",
+    "lora(moe_ffn)",
     "X*Y",
 
     "x*v",
@@ -1452,7 +1454,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
+static_assert(GGML_OP_COUNT == 106, "GGML_OP_COUNT != 106");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -3728,6 +3730,20 @@ static bool ggml_moe_ffn_had_desc(const struct ggml_tensor * d) {
     return d->op == GGML_OP_MUL_MAT_HAD && d->src[2] != NULL && ggml_is_empty(d);
 }
 
+// the LoRA deltas of a descriptor (src[5]) match its weight [K, N, E]
+static bool ggml_moe_ffn_had_lora_ok(const struct ggml_tensor * d) {
+    const struct ggml_tensor * w = d->src[0];
+    for (const struct ggml_tensor * l = d->src[5]; l != NULL; l = l->src[2]) {
+        const struct ggml_tensor * a = l->src[0];
+        const struct ggml_tensor * b = l->src[1];
+        if (l->op != GGML_OP_MOE_FFN_LORA || a->ne[0] != w->ne[0] || a->ne[2] != w->ne[2] || b->ne[0] != a->ne[1] ||
+                b->ne[1] != w->ne[1] || b->ne[2] != w->ne[2]) {
+            return false;
+        }
+    }
+    return true;
+}
+
 struct ggml_tensor * ggml_moe_ffn_had(
         struct ggml_context * ctx,
         struct ggml_tensor  * x,
@@ -3740,6 +3756,7 @@ struct ggml_tensor * ggml_moe_ffn_had(
         float                 limit,
         int                   n_rows) {
     GGML_ASSERT(ggml_moe_ffn_had_desc(up) && ggml_moe_ffn_had_desc(gate) && ggml_moe_ffn_had_desc(down));
+    GGML_ASSERT(ggml_moe_ffn_had_lora_ok(up) && ggml_moe_ffn_had_lora_ok(gate) && ggml_moe_ffn_had_lora_ok(down));
     const struct ggml_tensor * wu = up->src[0];
     const struct ggml_tensor * wg = gate->src[0];
     const struct ggml_tensor * wd = down->src[0];
@@ -3772,6 +3789,42 @@ struct ggml_tensor * ggml_moe_ffn_had(
     result->src[5] = down;
 
     return result;
+}
+
+// ggml_moe_ffn_lora
+
+struct ggml_tensor * ggml_moe_ffn_lora(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * b,
+        struct ggml_tensor  * next,
+        float                 scale) {
+    GGML_ASSERT(a->type == GGML_TYPE_F32 || a->type == GGML_TYPE_F16);
+    GGML_ASSERT(b->type == GGML_TYPE_F32 || b->type == GGML_TYPE_F16);
+    GGML_ASSERT(a->nb[0] == ggml_type_size(a->type) && b->nb[0] == ggml_type_size(b->type));
+    GGML_ASSERT(a->ne[1] >= 1 && b->ne[0] == a->ne[1] && b->ne[2] == a->ne[2] && a->ne[3] == 1 && b->ne[3] == 1);
+    GGML_ASSERT(next == NULL || (next->op == GGML_OP_MOE_FFN_LORA && next->src[0]->ne[0] == a->ne[0] &&
+        next->src[1]->ne[1] == b->ne[1] && next->src[0]->ne[2] == a->ne[2]));
+
+    // no elements: never computed, nothing allocated
+    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 0);
+
+    ggml_set_op_params_f32(result, 0, scale);
+
+    result->op     = GGML_OP_MOE_FFN_LORA;
+    result->src[0] = a;
+    result->src[1] = b;
+    result->src[2] = next;
+
+    return result;
+}
+
+void ggml_moe_ffn_had_set_lora(
+        struct ggml_tensor  * desc,
+        struct ggml_tensor  * lora) {
+    GGML_ASSERT(ggml_moe_ffn_had_desc(desc) && desc->src[5] == NULL);
+    desc->src[5] = lora;
+    GGML_ASSERT(ggml_moe_ffn_had_lora_ok(desc));
 }
 
 // ggml_out_prod

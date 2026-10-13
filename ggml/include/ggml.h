@@ -565,6 +565,7 @@ extern "C" {
         GGML_OP_MUL_MAT_ID,
         GGML_OP_MUL_MAT_HAD,
         GGML_OP_MOE_FFN_HAD,
+        GGML_OP_MOE_FFN_LORA,
         GGML_OP_OUT_PROD,
 
         GGML_OP_SCALE,
@@ -1591,6 +1592,24 @@ extern "C" {
             enum ggml_glu_op      glu,
             float                 limit,
             int                   n_rows);
+
+    // a LoRA delta of one expert weight of ggml_moe_ffn_had (an empty node, never computed): for an input row v of
+    // expert e, y_e(v) += scale * B_e^T (A_e^T v), where y_e is the output of the weight before its GLU (up, gate) or
+    // before the weighted sum (down), and v is the input of that weight (x, or the GLU output for down)
+    // a: F32/F16 [K, r, E], b: F32/F16 [r, N, E] (the lora_a / lora_b of a routed weight [K, N, E]); next: the next
+    // delta of the same weight, added after this one, or NULL. A delta of scale 0 is skipped.
+    GGML_API struct ggml_tensor * ggml_moe_ffn_lora(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b,
+            struct ggml_tensor  * next,
+            float                 scale);
+
+    // attach the deltas `lora` (a chain of ggml_moe_ffn_lora) to the up, gate or down node `desc` of ggml_moe_ffn_had
+    // (its src[5]), before ggml_moe_ffn_had is built from it
+    GGML_API void ggml_moe_ffn_had_set_lora(
+            struct ggml_tensor  * desc,
+            struct ggml_tensor  * lora);
 
     // A: m columns, n rows,
     // B: p columns, n rows,

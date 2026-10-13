@@ -6929,6 +6929,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return ggml_cuda_mul_mat_had_supported(dev_ctx->device, op);
         case GGML_OP_MOE_FFN_HAD:
             return ggml_cuda_moe_ffn_had_supported(dev_ctx->device, op);
+        case GGML_OP_MOE_FFN_LORA:
+            return true; // a descriptor of no elements, read by MOE_FFN_HAD
         case GGML_OP_MUL_MAT:
         case GGML_OP_MUL_MAT_ID:
             {
