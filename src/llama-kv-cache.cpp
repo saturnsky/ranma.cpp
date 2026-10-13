@@ -1888,6 +1888,31 @@ void llama_kv_cache::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * u
     //LLAMA_LOG_ERROR("%s: kq mask time: %0.3f ms\n", __func__, (t_end - t_start)/1000.0);
 }
 
+void llama_kv_cache::set_input_kq_pos(ggml_tensor * dst, const llama_ubatch * ubatch) const {
+    GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(dst->ne[1] == (int64_t) ubatch->n_seqs_unq);
+    // a standard window is applied by the device-side mask (n_swa of llm_graph_chunk_mask), the table is the same
+    GGML_ASSERT((swa_type == LLAMA_SWA_TYPE_NONE || swa_type == LLAMA_SWA_TYPE_STANDARD) && !hparams.use_alibi);
+    // 2D positions (M-RoPE) hide a cell of the same position whose 2D position is greater. In a ubatch of tokens only
+    // (no embeddings, no image rows) a token's position is held by its own cell alone, which never hides itself, so the
+    // positions decide alone. An image ubatch needs the host mask.
+    GGML_ASSERT(!ubatch->is_pos_2d() || ubatch->embd == nullptr);
+
+    const int64_t n_kv = dst->ne[0];
+
+    float * data = (float *) dst->data;
+    for (uint32_t s = 0; s < ubatch->n_seqs_unq; ++s) {
+        const llama_seq_id seq_id = ubatch->seq_id_unq[s];
+        const auto & cells = v_cells.at(seq_to_stream[seq_id]);
+
+        float * row = data + n_kv*s;
+        for (int64_t j = 0; j < n_kv; ++j) {
+            row[j] = !cells.is_empty(j) && cells.seq_has(j, seq_id) ? -(float) cells.pos_get(j) : -INFINITY;
+        }
+    }
+}
+
 void llama_kv_cache::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {
     const int64_t n_tokens = ubatch->n_tokens;
 
@@ -3029,6 +3054,10 @@ void llama_kv_cache_context::set_input_v_idxs(ggml_tensor * dst, const llama_uba
 
 void llama_kv_cache_context::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
     kv->set_input_kq_mask(dst, ubatch, causal_attn);
+}
+
+void llama_kv_cache_context::set_input_kq_pos(ggml_tensor * dst, const llama_ubatch * ubatch) const {
+    kv->set_input_kq_pos(dst, ubatch);
 }
 
 void llama_kv_cache_context::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {

@@ -259,6 +259,12 @@ public:
     void set_input_k_shift(ggml_tensor * dst) const;
 
     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
+
+    // ranma: F32 [n_kv, n_seqs_unq], -pos of each cell for each unique sequence of the ubatch, -inf where the cell is empty
+    // or not in the sequence: the input of the device-side causal mask of a chunked graph (llm_graph_chunk_mask), which
+    // equals set_input_kq_mask for a causal single stream without SWA or ALiBi, and with 2D positions only for a ubatch
+    // of tokens
+    void set_input_kq_pos(ggml_tensor * dst, const llama_ubatch * ubatch) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
     void set_input_k_rot(ggml_tensor * dst) const;
@@ -461,6 +467,7 @@ public:
 
     void set_input_k_shift   (ggml_tensor * dst) const;
     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
+    void set_input_kq_pos    (ggml_tensor * dst, const llama_ubatch * ubatch) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
     void set_input_k_rot(ggml_tensor * dst) const;
