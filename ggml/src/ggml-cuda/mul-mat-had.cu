@@ -22,6 +22,7 @@
 #include "mul-mat-had.cuh"
 #include "mapped-host.cuh"
 #include "expert-controller.cuh"
+#include "moe-ffn-had-layout.h"
 
 #include <cfloat>
 #include <map>
@@ -2642,7 +2643,7 @@ static int mmh_moe_mt(const int64_t n_rows, const int64_t n_exp, const bool remo
 }
 
 static int64_t mmh_moe_max_items(const int64_t chunk_rows, const int64_t n_exp, const int mt) {
-    return std::min(n_exp, chunk_rows) + chunk_rows/mt + 1;
+    return ggml_moe_ffn_had_max_items(chunk_rows, n_exp, mt);
 }
 
 // the staging state of a device: two buffers, the flags and the op's three address tables (kept, a captured graph never
@@ -2745,7 +2746,7 @@ bool ggml_cuda_moe_ffn_had_supported(const int device, const ggml_tensor * op) {
     }
     const int64_t n_exp = op->src[3]->src[0]->ne[2];
     const int64_t R     = std::min<int64_t>(mmh_moe_chunk_rows(op), n_rows);
-    return mmh_moe_max_items(R, n_exp, mmh_moe_mt(n_rows, n_exp, false)) <= 65535;
+    return mmh_moe_max_items(R, n_exp, mmh_moe_mt(n_rows, n_exp, false)) <= GGML_MOE_FFN_HAD_MAX_ITEMS;
 }
 
 void ggml_cuda_moe_ffn_had(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -2853,7 +2854,7 @@ void ggml_cuda_moe_ffn_had(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int     mt_r  = mmh_moe_mt(n_rows, n_exp, true);
     const int64_t max_items_v = mmh_moe_max_items(R, n_exp, mt_v);
     const int64_t max_items_r = mmh_moe_max_items(R, n_exp, mt_r);
-    GGML_ASSERT(max_items_v <= 65535 && max_items_r <= 65535);
+    GGML_ASSERT(max_items_v <= GGML_MOE_FFN_HAD_MAX_ITEMS && max_items_r <= GGML_MOE_FFN_HAD_MAX_ITEMS);
 
     // staging: slots of whole experts (all three kinds) in each of the two buffers
     static const int stage_min_env = mmh_moe_env_int("RANMA_EXPERT_MAJOR_STAGE_MIN", 0);
@@ -2891,18 +2892,23 @@ void ggml_cuda_moe_ffn_had(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         c_max = 3*((n_rows + R - 1)/R) + 1;
     }
 
-    ggml_cuda_pool_alloc<int>   route(ctx.pool(), 3*n_rows + 2*n_exp + 2*c_max + 1 + c_max*(stage_cap + 1));
-    ggml_cuda_pool_alloc<int>   items(ctx.pool(), 3*(max_items_v + max_items_r) + 2);
-    ggml_cuda_pool_alloc<int>   iota(ctx.pool(), R);
-    ggml_cuda_pool_alloc<half>  xh(ctx.pool(), R*std::max(n_embd, n_ff));
-    ggml_cuda_pool_alloc<float> rscale(ctx.pool(), R);
-    ggml_cuda_pool_alloc<float> vu(ctx.pool(), R*n_ff);
-    ggml_cuda_pool_alloc<float> vg(ctx.pool(), R*n_ff);
-    ggml_cuda_pool_alloc<float> vy(ctx.pool(), R*n_embd);
-    ggml_cuda_pool_alloc<float> lz(ctx.pool(), max_rank > 0 ? R*max_rank : 1);
+    // every device buffer of the launch in one block (moe-ffn-had-layout.h, shared with the layer mode's sizing)
+    const ggml_moe_ffn_had_layout lay = ggml_moe_ffn_had_layout_of(n_rows, R, n_exp, n_embd, n_ff, max_items_v, max_items_r,
+        c_max, stage_cap, max_rank);
+    ggml_cuda_pool_alloc<char> block(ctx.pool(), lay.bytes);
+    char * blk = block.get();
+    int   * route  = (int   *) (blk + lay.route);
+    int   * items  = (int   *) (blk + lay.items);
+    int   * iota   = (int   *) (blk + lay.iota);
+    half  * xh     = (half  *) (blk + lay.xh);
+    float * rscale = (float *) (blk + lay.rscale);
+    float * vu     = (float *) (blk + lay.vu);
+    float * vg     = (float *) (blk + lay.vg);
+    float * vy     = (float *) (blk + lay.vy);
+    float * lz     = (float *) (blk + lay.lz);
 
     mmh_moe_route rt;
-    rt.rows_sorted = route.get();
+    rt.rows_sorted = route;
     rt.pos         = rt.rows_sorted + n_rows;
     rt.eid         = rt.pos + n_rows;
     rt.offs        = rt.eid + n_rows;
@@ -2911,7 +2917,7 @@ void ggml_cuda_moe_ffn_had(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     rt.n_chunks    = rt.chunks + 2*c_max;
     rt.stage_n     = rt.n_chunks + 1;
     rt.stage_list  = rt.stage_n + c_max;
-    int * items_v   = items.get();
+    int * items_v   = items;
     int * items_r   = items_v + 3*max_items_v;
     int * n_items_v = items_r + 3*max_items_r;
     int * n_items_r = n_items_v + 1;
@@ -2970,7 +2976,7 @@ void ggml_cuda_moe_ffn_had(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     mmh_moe_route_kernel<<<1, 1024, 0, stream>>>(ids_d, ids_nb0, ids_nb1, n_used, (int) n_rows, (int) n_exp, (int) R,
         (int) c_max, slots, all_local, stage_cap, stage_min, host_last, rt);
     CUDA_CHECK(cudaGetLastError());
-    mmh_moe_iota<<<(unsigned) ((R + 255)/256), 256, 0, stream>>>(iota.get(), (int) R);
+    mmh_moe_iota<<<(unsigned) ((R + 255)/256), 256, 0, stream>>>(iota, (int) R);
     CUDA_CHECK(cudaGetLastError());
 
     char * buf0 = sd ? sd->buf : nullptr;
@@ -3019,7 +3025,7 @@ void ggml_cuda_moe_ffn_had(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         flush_side();
     }
 
-    float * outs[3] = { vu.get(), vg.get(), vy.get() };
+    float * outs[3] = { vu, vg, vy };
     const dim3 grid_glu((unsigned) ((R*n_ff + 255)/256));
     const dim3 grid_scatter((unsigned) n_tokens);
 
@@ -3038,33 +3044,33 @@ void ggml_cuda_moe_ffn_had(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         for (int i = 0; i < 3; ++i) {
             const bool local = i == 2;
             mmh_moe_prologue<<<(unsigned) R, 256, 0, stream>>>(p[i], rt, c, ids_d, ids_nb0, ids_nb1, n_used,
-                local ? vu.get() : (const float *) x->data, local ? n_ff*(int64_t) sizeof(float) : (int64_t) x->nb[1], local,
-                xh.get(), rscale.get());
+                local ? vu : (const float *) x->data, local ? n_ff*(int64_t) sizeof(float) : (int64_t) x->nb[1], local,
+                xh, rscale);
             CUDA_CHECK(cudaGetLastError());
             mmh_params q = p[i];
             q.dst = outs[i];
             const unsigned groups = (unsigned) (desc[i]->src[0]->ne[1]/MMH_NG);
-            mmh_moe_gemm(desc[i]->src[0]->type, mt_v, dim3(groups, (unsigned) max_items_v, 1), stream, q, wd[i], xh.get(),
-                rscale.get(), items_v, n_items_v, iota.get());
             enqueue_kind_wait(i); // first chunk only; later chunks run after it in stream order
+            mmh_moe_gemm(desc[i]->src[0]->type, mt_v, dim3(groups, (unsigned) max_items_v, 1), stream, q, wd[i], xh,
+                rscale, items_v, n_items_v, iota);
             CUDA_CHECK(cudaGetLastError());
             if (!all_local) {
-                mmh_moe_gemm(desc[i]->src[0]->type, mt_r, dim3(groups, (unsigned) max_items_r, 1), stream, q, wd[i], xh.get(),
-                    rscale.get(), items_r, n_items_r, iota.get());
+                mmh_moe_gemm(desc[i]->src[0]->type, mt_r, dim3(groups, (unsigned) max_items_r, 1), stream, q, wd[i], xh,
+                    rscale, items_r, n_items_r, iota);
                 CUDA_CHECK(cudaGetLastError());
             }
             // LoRA: the F32 input of the weight (x, or the GLU output in vu for down)
             for (const mmh_moe_lora & l : lora[i]) {
                 mmh_moe_lora_a<<<(unsigned) R, 256, 0, stream>>>(rt, c, n_used, l,
-                    local ? vu.get() : (const float *) x->data, local ? n_ff*(int64_t) sizeof(float) : (int64_t) x->nb[1],
-                    local, lz.get());
+                    local ? vu : (const float *) x->data, local ? n_ff*(int64_t) sizeof(float) : (int64_t) x->nb[1],
+                    local, lz);
                 CUDA_CHECK(cudaGetLastError());
-                mmh_moe_lora_b<<<dim3((unsigned) R, (unsigned) ((l.n + 255)/256), 1), 256, 0, stream>>>(rt, c, l, lz.get(),
+                mmh_moe_lora_b<<<dim3((unsigned) R, (unsigned) ((l.n + 255)/256), 1), 256, 0, stream>>>(rt, c, l, lz,
                     outs[i]);
                 CUDA_CHECK(cudaGetLastError());
             }
             if (i == 1) {
-                mmh_moe_glu<<<grid_glu, 256, 0, stream>>>(rt, c, vu.get(), vg.get(), n_ff,
+                mmh_moe_glu<<<grid_glu, 256, 0, stream>>>(rt, c, vu, vg, n_ff,
                     glu == GGML_GLU_OP_SWIGLU_CLAMP, limit);
                 CUDA_CHECK(cudaGetLastError());
             }
@@ -3077,7 +3083,7 @@ void ggml_cuda_moe_ffn_had(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
                 enqueue_copies(c + 2);
             }
         }
-        mmh_moe_scatter<<<grid_scatter, 256, 0, stream>>>(rt, c, vy.get(), (const float *) weights->data, weights->nb[1],
+        mmh_moe_scatter<<<grid_scatter, 256, 0, stream>>>(rt, c, vy, (const float *) weights->data, weights->nb[1],
             weights->nb[2], n_used, (float *) dst->data, dst->nb[1], (int) n_embd);
         CUDA_CHECK(cudaGetLastError());
     }
