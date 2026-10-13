@@ -1284,6 +1284,9 @@ struct llama_model_dots3note : public llama_model_base {
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
 };
 
+class llm_graph_input_chunk_mask;
+class llm_graph_input_dsv4_chunk;
+
 struct llama_model_deepseek4 : public llama_model_base {
     llama_model_deepseek4(const struct llama_model_params & params) : llama_model_base(params) {}
     void load_arch_hparams(llama_model_loader & ml) override;
@@ -1384,12 +1387,42 @@ struct llama_model_deepseek4 : public llama_model_base {
                 const char * name,
                 int il) const;
 
+        // n < 0: the whole ubatch; otherwise the rows [i0, i0 + n) with the lid mask of that chunk
         ggml_tensor * build_lid_top_k(
                 const llama_model & model,
                 llm_graph_input_dsv4 * inp_dsv4,
                 ggml_tensor * qr,
                 ggml_tensor * cur,
                 ggml_tensor * inp_pos,
+                int il,
+                int64_t i0 = 0,
+                int64_t n = -1,
+                ggml_tensor * lid_mask = nullptr) const;
+
+        // ranma: a chunked graph (the attention chunk) whose masks are made on the device (llm_graph_chunk_mask): the raw
+        // SWA mask from inp_cm, the compressed prefix masks from inp_dch; null otherwise
+        llm_graph_input_chunk_mask * inp_cm  = nullptr;
+        llm_graph_input_dsv4_chunk * inp_dch = nullptr;
+
+        // creates both when the ubatch qualifies (one stream, one sequence, see llm_graph_chunk_mask_usable)
+        void build_inp_dsv4_chunk(llm_graph_input_dsv4 * inp_dsv4);
+
+        // ranma: the attention of a chunked graph: raw K written and the compressed K joined for the whole ubatch, then
+        // per chunk of query rows the query (build_q of the qr rows), masks, LID selection, attention and the output
+        // projection (build_tail); returns the joined [n_embd, n_tokens]
+        using dsv4_rows_fn = std::function<ggml_tensor * (ggml_tensor * x, ggml_tensor * pos)>;
+        ggml_tensor * build_attention_chunked(
+                const llama_model & model,
+                llm_graph_input_dsv4 * inp_dsv4,
+                llm_graph_input_dsv4_raw * inp_attn,
+                const dsv4_rows_fn & build_q,
+                const dsv4_rows_fn & build_tail,
+                ggml_tensor * kv,
+                ggml_tensor * qr,
+                ggml_tensor * cur,
+                ggml_tensor * inp_pos,
+                ggml_tensor * sinks,
+                float kq_scale,
                 int il) const;
 
         ggml_tensor * build_top_k_mask(

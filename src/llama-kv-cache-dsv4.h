@@ -240,6 +240,7 @@ public:
 
     void set_input_k_idxs(ggml_tensor * dst) const;
     void set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
+    void set_input_kq_pos (ggml_tensor * dst, const llama_ubatch * ubatch) const; // ranma: see llama_kv_cache::set_input_kq_pos
     void set_input_k_rot(ggml_tensor * dst) const;
 
     // see llama_kv_cache::get_prev_tokens(); the engram n-gram hash needs the preceding tokens
