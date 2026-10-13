@@ -970,11 +970,13 @@ struct ggml_backend_sched {
     int                 * hv_tensor_backend_ids; // [hash_set.size]
     struct ggml_tensor ** hv_tensor_copies;      // [hash_set.size][n_backends][n_copies]
 
-    int * node_backend_ids; // [graph_size]
-    int * leaf_backend_ids; // [graph_size]
+    // backend ids of the nodes and leafs of the graph copy, sized for the split graph [ggml_backend_sched_ids_reserve]
+    int * node_backend_ids; // [ids_capacity]
+    int * leaf_backend_ids; // [ids_capacity]
 
-    int * prev_node_backend_ids; // [graph_size]
-    int * prev_leaf_backend_ids; // [graph_size]
+    int * prev_node_backend_ids; // [ids_capacity]
+    int * prev_leaf_backend_ids; // [ids_capacity]
+    size_t ids_capacity;
 
     // copy of the graph with modified inputs
     struct ggml_cgraph graph;
@@ -1004,9 +1006,10 @@ struct ggml_backend_sched {
     ggml_backend_sched_realloc_callback callback_realloc;
     void * callback_realloc_user_data;
 
+    // the input copies of the current split live in ctx, which is created in this buffer; the buffer is sized for the
+    // graph when it is split, not for the worst case of graph_size [ggml_backend_sched_split_graph]
     char * context_buffer;
     size_t context_buffer_size;
-    size_t context_buffer_size_full; // the size without graph slots
 
     bool op_offload;
 
@@ -1055,7 +1058,7 @@ struct ggml_backend_sched {
                                                       // reserve or change size, which invalidates the stored slots
     size_t hash_size_full;                            // the hash set size for graph_size; a stored slot keeps the
                                                       // smaller tables of its graph [ggml_backend_sched_slot_fit]
-    // with graph slots on, the views of the graph copy live in their own context, sized when they are created
+    // the views of the graph copy live in their own context, sized when they are created
     struct ggml_context * ctx_views;
     char * views_buffer;
     size_t views_buffer_size;
@@ -1125,6 +1128,31 @@ static void ggml_backend_sched_graph_inputs_grow(ggml_backend_sched_t sched) {
     }
     sched->graph_inputs = pnew;
     sched->graph_inputs_capacity = new_cap;
+}
+
+// make the backend id arrays of the graph copy hold at least `size` entries; the entries that are kept are preserved
+// and new entries are zero, as if the arrays had been allocated for the worst case with calloc
+static void ggml_backend_sched_ids_reserve(ggml_backend_sched_t sched, size_t size) {
+    if (size <= sched->ids_capacity) {
+        return;
+    }
+    const size_t old_cap = sched->ids_capacity;
+    const size_t new_cap = std::max(size + size/4, 2*old_cap);
+
+    int ** arrays[4] = {
+        &sched->node_backend_ids, &sched->leaf_backend_ids, &sched->prev_node_backend_ids, &sched->prev_leaf_backend_ids,
+    };
+    for (int a = 0; a < 4; a++) {
+        int * pnew = (int *) realloc(*arrays[a], new_cap * sizeof(int));
+        if (pnew == NULL) {
+            GGML_LOG_ERROR("%s: failed to allocate %zu bytes\n", __func__, new_cap * sizeof(int));
+            GGML_ABORT("failed to grow the backend id arrays");
+        }
+        memset(pnew + old_cap, 0, (new_cap - old_cap) * sizeof(int));
+        *arrays[a] = pnew;
+    }
+    GGML_LOG_DEBUG("%s: backend id capacity %zu -> %zu (4 x %zu bytes)\n", __func__, old_cap, new_cap, new_cap * sizeof(int));
+    sched->ids_capacity = new_cap;
 }
 
 // returns the priority of the backend, lower id is higher priority
@@ -1359,35 +1387,6 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
     if (sched->n_graph_slots > 0) {
         // the slot is split again, its previous allocation is gone
         sched->gstates[sched->gstate_cur].valid = false;
-
-        // the context of a slot holds only the input copies, at most one per source of a node (n_copies is 1
-        // with graph slots), so a slot does not need the worst-case buffer of the scheduler
-        size_t n_src = 0;
-        for (int i = 0; i < graph->n_nodes; i++) {
-            for (int j = 0; j < GGML_MAX_SRC; j++) {
-                n_src += graph->nodes[i]->src[j] != NULL;
-            }
-        }
-        const size_t need = (n_src*sched->n_copies + 16)*(ggml_tensor_overhead() + GGML_MEM_ALIGN);
-        // slot 0 adopts the worst-case buffer of the scheduler, which is given back here as well
-        if (sched->context_buffer_size < need ||
-                sched->context_buffer_size/4 > need) {
-            free(sched->context_buffer);
-            sched->context_buffer_size = need + need/4;
-            sched->context_buffer = (char *) malloc(sched->context_buffer_size);
-            GGML_ASSERT(sched->context_buffer != NULL);
-        }
-    }
-
-    struct ggml_init_params params = {
-        /* .mem_size =   */ sched->context_buffer_size,
-        /* .mem_buffer = */ sched->context_buffer,
-        /* .no_alloc =   */ true
-    };
-
-    sched->ctx = ggml_init(params);
-    if (sched->ctx == NULL) {
-        GGML_ABORT("%s: failed to initialize context\n", __func__);
     }
 
     graph->uid = ggml_graph_next_uid();
@@ -1602,6 +1601,64 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         GGML_ASSERT(*cur_backend_id != -1);
     }
 
+    // pass 5 creates the input copies in sched->ctx, which is sized here for this graph instead of for the worst case
+    // of graph_size (one split per node with GGML_SCHED_MAX_SPLIT_INPUTS inputs each, about 20 KiB per node).
+    // A copy is made at most n_copies times per source of a non-view node on another backend (the backend of the
+    // split is the backend of the node), and with pipeline parallelism n_copies - 1 times per input leaf (pass 6).
+    // The views of the graph copy have their own context, sized after the split.
+    // No tensor of the previous split is referenced any more (its context was freed above and the hash set and its
+    // copies are cleared by the reset), so the buffer can be replaced here without moving a live tensor.
+    {
+        size_t n_cross = 0;
+        for (int i = 0; i < graph->n_nodes; i++) {
+            struct ggml_tensor * node = graph->nodes[i];
+            if (ggml_is_view_op(node->op)) {
+                continue;
+            }
+            const int node_backend_id = tensor_backend_id(node);
+            for (int j = 0; j < GGML_MAX_SRC; j++) {
+                struct ggml_tensor * src = node->src[j];
+                if (src != NULL && tensor_backend_id(src) != node_backend_id) {
+                    n_cross++;
+                }
+            }
+        }
+        size_t n_input_leafs = 0;
+        if (sched->n_copies > 1) {
+            for (int i = 0; i < graph->n_leafs; i++) {
+                n_input_leafs += (graph->leafs[i]->flags & GGML_TENSOR_FLAG_INPUT) != 0;
+            }
+        }
+        const size_t n_tensors = n_cross*sched->n_copies + n_input_leafs*(sched->n_copies - 1) + 16;
+        const size_t need = n_tensors*(ggml_tensor_overhead() + GGML_MEM_ALIGN);
+        // a slot keeps the buffer of its own graph and gives back a much larger one; without slots the buffer only
+        // grows, so that alternating graphs (e.g. prompt and generation batches) do not reallocate it every time
+        const bool shrink = sched->n_graph_slots > 0 && sched->context_buffer_size/4 > need;
+        if (sched->context_buffer_size < need || shrink) {
+            free(sched->context_buffer);
+            sched->context_buffer_size = need + need/4;
+            sched->context_buffer = (char *) malloc(sched->context_buffer_size);
+            if (sched->context_buffer == NULL) {
+                GGML_LOG_ERROR("%s: failed to allocate the context buffer of %zu bytes (nodes = %d, leafs = %d, cross-backend srcs = %zu, copies = %d)\n",
+                        __func__, sched->context_buffer_size, graph->n_nodes, graph->n_leafs, n_cross, sched->n_copies);
+                GGML_ABORT("failed to allocate the scheduler context buffer");
+            }
+            GGML_LOG_DEBUG("%s: context buffer %zu bytes (nodes = %d, leafs = %d, cross-backend srcs = %zu, copies = %d)\n",
+                    __func__, sched->context_buffer_size, graph->n_nodes, graph->n_leafs, n_cross, sched->n_copies);
+        }
+
+        struct ggml_init_params params = {
+            /* .mem_size =   */ sched->context_buffer_size,
+            /* .mem_buffer = */ sched->context_buffer,
+            /* .no_alloc =   */ true
+        };
+
+        sched->ctx = ggml_init(params);
+        if (sched->ctx == NULL) {
+            GGML_ABORT("%s: failed to initialize context\n", __func__);
+        }
+    }
+
     // pass 5: split graph, find tensors that need to be copied
     {
         int i_split = 0;
@@ -1802,6 +1859,8 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
     sched->prev_graph_size = sched->graph_size;
     sched->graph_size = graph_size;
 
+    ggml_backend_sched_ids_reserve(sched, graph_size);
+
     if (sched->graph.size < graph_size) {
         sched->graph.size = graph_size;
         sched->graph.nodes = (ggml_tensor **) realloc(sched->graph.nodes, graph_size * sizeof(struct ggml_tensor *));
@@ -1814,10 +1873,10 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
 
     struct ggml_cgraph * graph_copy = &sched->graph;
 
-    // the views of the graph copy: in the context of the scheduler, or with graph slots in a context of the slot
-    // sized for exactly this graph
-    struct ggml_context * ctx_views = sched->ctx;
-    if (sched->n_graph_slots > 0) {
+    // the views of the graph copy (one per split input and one per dependency node) live in their own context, sized
+    // for exactly this graph; with graph slots each slot keeps its own
+    struct ggml_context * ctx_views = NULL;
+    {
         ggml_free(sched->ctx_views);
         sched->ctx_views = NULL;
 
@@ -1826,7 +1885,13 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
             free(sched->views_buffer);
             sched->views_buffer_size = need + need/4;
             sched->views_buffer = (char *) malloc(sched->views_buffer_size);
-            GGML_ASSERT(sched->views_buffer != NULL);
+            if (sched->views_buffer == NULL) {
+                GGML_LOG_ERROR("%s: failed to allocate the views buffer of %zu bytes (splits = %d, inputs = %d, deps = %d)\n",
+                        __func__, sched->views_buffer_size, sched->n_splits, total_inputs, n_dep_nodes);
+                GGML_ABORT("failed to allocate the scheduler views buffer");
+            }
+            GGML_LOG_DEBUG("%s: views buffer %zu bytes (splits = %d, inputs = %d, deps = %d, graph copy size = %d)\n",
+                    __func__, sched->views_buffer_size, sched->n_splits, total_inputs, n_dep_nodes, graph_size);
         }
 
         struct ggml_init_params params_views = {
@@ -2376,20 +2441,20 @@ ggml_backend_sched_t ggml_backend_sched_new(
     sched->hash_set    = ggml_hash_set_new(graph_size);
     sched->hv_tensor_backend_ids = (int *) malloc(sched->hash_set.size * sizeof(sched->hv_tensor_backend_ids[0]));
     sched->hv_tensor_copies      = (ggml_tensor **) malloc(sched->hash_set.size * sched->n_backends * sched->n_copies * sizeof(struct ggml_tensor *));
+    if (sched->hv_tensor_backend_ids == NULL || sched->hv_tensor_copies == NULL) {
+        GGML_LOG_ERROR("%s: failed to allocate the hash tables of %zu entries (graph_size = %zu)\n", __func__, sched->hash_set.size, graph_size);
+        GGML_ABORT("failed to allocate the scheduler hash tables");
+    }
 
-    const size_t ggml_sched_max_splits = graph_size; // at most there is one split for each node in the graph
-    const size_t nodes_size = graph_size + ggml_sched_max_splits*GGML_SCHED_MAX_SPLIT_INPUTS*2;
-    sched->node_backend_ids = (int *) calloc(nodes_size, sizeof(sched->node_backend_ids[0]));
-    sched->leaf_backend_ids = (int *) calloc(nodes_size, sizeof(sched->leaf_backend_ids[0]));
-    sched->prev_node_backend_ids = (int *) calloc(nodes_size, sizeof(sched->prev_node_backend_ids[0]));
-    sched->prev_leaf_backend_ids = (int *) calloc(nodes_size, sizeof(sched->prev_leaf_backend_ids[0]));
+    // the backend id arrays and the context buffers are sized for the graph when it is split, not here for the worst
+    // case of one split per node of graph_size [ggml_backend_sched_ids_reserve, ggml_backend_sched_split_graph]
+    sched->ids_capacity        = 0;
+    sched->context_buffer      = NULL;
+    sched->context_buffer_size = 0;
 
     sched->graph_size      = 0;
     sched->prev_graph_size = 0;
 
-    sched->context_buffer_size = ggml_sched_max_splits*GGML_SCHED_MAX_SPLIT_INPUTS*2*sizeof(struct ggml_tensor) + ggml_graph_overhead_custom(graph_size, false);
-    sched->context_buffer = (char *) malloc(sched->context_buffer_size);
-    sched->context_buffer_size_full = sched->context_buffer_size;
     sched->hash_size_full = sched->hash_set.size;
 
     const int initial_splits_capacity = 16;
@@ -2699,17 +2764,10 @@ bool ggml_backend_sched_set_graph_slots(ggml_backend_sched_t sched, int n_slots)
         sched->n_gstates  = 0;
         sched->gstate_cur = 0;
 
-        // without slots the hash tables and the context must hold the worst case again
+        // without slots the hash tables must hold the worst case again; the context buffers are sized at the next
+        // split [ggml_backend_sched_split_graph]
         if (sched->hash_set.size < sched->hash_size_full) {
             ggml_backend_sched_hash_resize(sched, sched->hash_size_full, true);
-        }
-        if (sched->context_buffer_size < sched->context_buffer_size_full) {
-            ggml_free(sched->ctx);
-            sched->ctx = NULL;
-            free(sched->context_buffer);
-            sched->context_buffer_size = sched->context_buffer_size_full;
-            sched->context_buffer = (char *) malloc(sched->context_buffer_size);
-            GGML_ASSERT(sched->context_buffer != NULL);
         }
     }
 
