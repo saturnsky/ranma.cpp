@@ -25,6 +25,7 @@
 #include "moe-ffn-had-layout.h"
 
 #include "ggml-account.h"
+#include "prefill-stamp.cuh"
 
 #include <algorithm>
 #include <cfloat>
@@ -3356,6 +3357,9 @@ void ggml_cuda_moe_ffn_had(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     mmh_moe_iota<<<(unsigned) ((R + 255)/256), 256, 0, stream>>>(iota, (int) R);
     CUDA_CHECK(cudaGetLastError());
     stamps.at(stream, mmh_moe_diag_stamps::PHASE_ROUTE);
+    // ranma: RANMA_PREFILL_GPU_STAMP records the rows and, from the device, the chunk count of the routing pass
+    ggml_cuda_pstamp_moe(stream, rt.n_chunks, n_tokens, n_used, n_rows, R, mt_v, mt_r, streamed ? 2 : sd != nullptr ? 1 : 0,
+        remote);
 
     char * buf0 = sd ? sd->buf : nullptr;
     char * buf1 = sd ? sd->buf + (sd->bytes/2)/256*256 : nullptr;

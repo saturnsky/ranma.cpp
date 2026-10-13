@@ -73,6 +73,8 @@
 #include "ggml-cuda/cumsum.cuh"
 #include "ggml-cuda/fill.cuh"
 #include "ggml-cuda/lightning-indexer.cuh"
+#define GGML_CUDA_PSTAMP_IMPL
+#include "ggml-cuda/prefill-stamp.cuh"
 #include "ggml.h"
 
 #include <algorithm>
@@ -3272,6 +3274,9 @@ static void ggml_backend_cuda_synchronize(ggml_backend_t backend) {
 
     CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
 
+    // ranma: RANMA_PREFILL_GPU_STAMP reads the stamps of the finished ubatches
+    ggml_cuda_pstamp::on_sync();
+
     GGML_UNUSED(backend);
 }
 
@@ -5984,9 +5989,12 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     continue;
                 }
 
+                ggml_cuda_pstamp::node(cuda_ctx, i, is_concurrent_event_active);
+
                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
 
                 if (nodes_to_skip != 0) {
+                    ggml_cuda_pstamp::fused(nodes_to_skip);
 #ifdef GGML_CUDA_DEBUG
                     const int last_fused = i + nodes_to_skip;
                     GGML_LOG_INFO("nodes_fused: %d, first: %s (%s), last: %s (%s)\n",
@@ -6193,6 +6201,9 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     }
 #endif // defined(GGML_USE_HIP)
 
+    // ranma: RANMA_PREFILL_GPU_STAMP stamps the nodes of this call, which then runs without CUDA graph capture
+    [[maybe_unused]] const bool pstamp = ggml_cuda_pstamp::begin(cuda_ctx, cgraph);
+
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;
     ggml_cuda_graph_key graph_key;
@@ -6259,6 +6270,11 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         }
     }
 
+    if (pstamp) {
+        use_cuda_graph             = false;
+        cuda_graph_update_required = false;
+    }
+
     if (use_cuda_graph && cuda_graph_update_required) {
         graph->pool_generation = ggml_cuda_pool_generation.load(std::memory_order_relaxed);
         cuda_ctx->graph_stats.captures++;
@@ -6293,6 +6309,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     }
 
     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
+    ggml_cuda_pstamp::end(cuda_ctx);
     if (!use_cuda_graph || cuda_graph_update_required) {
         ggml_cuda_graph_call_add(cuda_ctx, use_cuda_graph, ggml_time_us() - t_call_us);
     }

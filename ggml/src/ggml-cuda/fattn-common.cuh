@@ -2,6 +2,7 @@
 
 #include "common.cuh"
 #include "convert.cuh"
+#include "prefill-stamp.cuh"
 #include "vecdotq.cuh"
 
 #include <cstdint>
@@ -1248,6 +1249,10 @@ void launch_fattn(
 
     GGML_ASSERT(block_dim.x % warp_size == 0);
 
+    // ranma: RANMA_PREFILL_GPU_STAMP records the dispatch and stamps the start of the main kernel
+    ggml_cuda_pstamp_fa(main_stream, KQV, use_sparse, ncols1, ncols2, nbatch_fa, nwarps, blocks_num.x, blocks_num.y,
+        blocks_num.z, stream_k, n_kv);
+
     ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num, block_dim, nbytes_shared, main_stream);
     ggml_cuda_kernel_launch(fattn_kernel, launch_params,
         (const char *) Q->data,
@@ -1312,4 +1317,7 @@ void launch_fattn(
             dst_tmp.ptr, dst_tmp_meta.ptr, (float *) KQV->data, parallel_blocks);
     }
     CUDA_CHECK(cudaGetLastError());
+
+    // ranma: RANMA_PREFILL_FA_OVERLAP aggregates how much the query rows share their visible columns
+    ggml_cuda_pstamp_fa_overlap(ctx, main_stream, KQV);
 }

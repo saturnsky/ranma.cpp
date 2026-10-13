@@ -1676,6 +1676,7 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention_chunked(
     ggml_tensor * k_rot = inp_attn->self_k_rot;
     if (k_rot) {
         kv = llama_mul_mat_hadamard(ctx0, kv, k_rot);
+        cb(kv, "kv_rot", il);
     }
 
     ggml_build_forward_expand(gf, kv);
@@ -1736,6 +1737,7 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention_chunked(
         ggml_tensor * q = build_q(llm_graph_rows(ctx0, qr, 1, i0, n), pos);
         if (k_rot) {
             q = llama_mul_mat_hadamard(ctx0, q, k_rot);
+            cb(q, "q_rot", il);
         }
 
         // the raw window of the chunk (all raw cells without the raw chunk) and its compressed width; the LID
