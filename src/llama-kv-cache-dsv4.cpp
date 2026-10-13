@@ -3,12 +3,15 @@
 #include "ggml-backend.h"
 #include "llama-impl.h"
 #include "llama-batch.h"
+#include "llama-graph-chunk.h"
 #include "llama-io.h"
 #include "llama-model.h"
 
 #include <algorithm>
 #include <cassert>
+#include <cinttypes>
 #include <climits>
+#include <cmath>
 #include <cstdlib>
 #include <cstring>
 #include <map>
@@ -1250,6 +1253,17 @@ static bool dsv4_kall_view_enabled() {
     return res;
 }
 
+// With the joint layout, attention reads only the raw cells [lo, hi) that a token of the ubatch can see (the
+// window behind the smallest position of the ubatch and the ubatch itself, lo and hi on 256 cells); the cells
+// outside are masked for every token anyway, so the result is the same while the masks, the sparse lists and
+// the attention shrink to the window instead of the whole raw cache (pad(n_swa + n_ubatch) cells).
+//
+// A ubatch of at least 64 tokens (prefill) reads the narrow window [lo, hi) and, when hi is before the end of
+// the raw cache, concatenates the compressed cells behind it (a copy of hi - lo + n_comp rows per layer, small next
+// to the attention of that many tokens). A smaller ubatch (decode, a draft batch) reads the whole raw cache as before,
+// so its attention width and result stay the same.
+static constexpr uint32_t DSV4_RAW_NKV_MIN_TOKENS = 64;
+
 void llama_kv_cache_dsv4::init_kall(
         const llama_model & model,
                 ggml_type   type_k,
@@ -1258,6 +1272,8 @@ void llama_kv_cache_dsv4::init_kall(
                  uint32_t   kv_size,
                  uint32_t   n_seq_max,
                  uint32_t   n_ubatch) {
+    raw_nkv_min_tokens = DSV4_RAW_NKV_MIN_TOKENS;
+
     if (!dsv4_kall_view_enabled()) {
         LLAMA_LOG_INFO("%s: DSV4 joint raw+compressed K layout disabled (LLAMA_DSV4_KALL_VIEW=0)\n", __func__);
         return;
@@ -1415,6 +1431,8 @@ void llama_kv_cache_dsv4::init_kall(
 
     LLAMA_LOG_INFO("%s: DSV4 joint raw+compressed K layout enabled for %d layers, raw prefix = %u cells\n",
             __func__, (int) kall_layers.size(), kall_raw_size);
+    LLAMA_LOG_INFO("%s: DSV4 raw attention width: the visible raw cells, copy from %u tokens\n",
+            __func__, raw_nkv_min_tokens);
 }
 
 llama_kv_cache_dsv4::llama_kv_cache_dsv4(
@@ -2058,6 +2076,10 @@ uint32_t llama_kv_cache_dsv4::get_n_rs_seq() const {
     return n_rs_seq;
 }
 
+uint32_t llama_kv_cache_dsv4::get_raw_nkv_min_tokens() const {
+    return raw_nkv_min_tokens;
+}
+
 const std::vector<uint32_t> & llama_kv_cache_dsv4::get_rs_idx() const {
     return rs_idx;
 }
@@ -2160,7 +2182,8 @@ llama_kv_cache_dsv4_raw_context::llama_kv_cache_dsv4_raw_context(
         slot_info_vec_t sinfos_swa_write,
         slot_info_vec_t sinfos_swa_read,
         std::vector<llama_ubatch> ubatches,
-        std::vector<llama_ubatch> ubatches_write) :
+        std::vector<llama_ubatch> ubatches_write,
+        uint32_t n_min_tokens_window) :
     kv_swa(kv->get_swa()),
     sinfos_write(std::move(sinfos_swa_write)),
     sinfos_read(std::move(sinfos_swa_read)),
@@ -2170,6 +2193,7 @@ llama_kv_cache_dsv4_raw_context::llama_kv_cache_dsv4_raw_context(
                 kv->get_base(), std::move(sinfos_base_write), this->ubatches_write)),
     ctx_swa_mem(nullptr),
     n_kv(kv_swa->get_size()),
+    n_min_tokens_window(n_min_tokens_window),
     status(LLAMA_MEMORY_STATUS_SUCCESS) {
 }
 
@@ -2201,9 +2225,38 @@ bool llama_kv_cache_dsv4_raw_context::apply() {
     if (!ubatches_write.empty()) {
         kv_swa->apply_ubatch(sinfos_write[i_next], ubatches_write[i_next]);
 
-        // with joint raw/compressed K storage the compressed cells follow the whole raw cache, so the
-        // raw part of the attention input has a fixed size (the unused cells are masked out anyway)
-        n_kv = kv_swa->has_k_joint() ? kv_swa->get_size() : kv_swa->get_n_kv(sinfos_read[i_next]);
+        k_lo = 0;
+
+        if (!kv_swa->has_k_joint()) {
+            n_kv = kv_swa->get_n_kv(sinfos_read[i_next]);
+        } else {
+            // with joint raw/compressed K storage the compressed cells follow the whole raw cache, so a view of
+            // [raw | compressed] reads the raw cells up to the end of the raw cache
+            const uint32_t size = kv_swa->get_size();
+
+            n_kv = size;
+
+            uint32_t lo = 0;
+            uint32_t hi = 0;
+            if (kv_swa->get_visible_range(sinfos_read[i_next], ubatches[i_next], lo, hi)) {
+                // 256-cell steps like get_n_kv, so that a graph can be reused while the window stays in its bucket
+                const uint32_t n_align = 256;
+
+                if (ubatches[i_next].n_tokens < n_min_tokens_window) {
+                    // decode and draft batches keep the whole raw cache, as before the narrow window: the width of
+                    // the attention (and so its result) does not depend on where the window sits, and a graph is
+                    // reused for as long as the cache does not change
+                    lo = 0;
+                    hi = size;
+                }
+
+                lo = lo/n_align*n_align;
+                hi = std::min(size, GGML_PAD(hi, n_align));
+
+                k_lo = lo;
+                n_kv = hi - lo;
+            }
+        }
     }
 
     return res;
@@ -2223,6 +2276,10 @@ uint32_t llama_kv_cache_dsv4_raw_context::get_n_kv() const {
     return n_kv;
 }
 
+uint32_t llama_kv_cache_dsv4_raw_context::get_k_lo() const {
+    return k_lo;
+}
+
 uint32_t llama_kv_cache_dsv4_raw_context::get_n_write() const {
     if (ubatches_write.empty()) {
         return 0;
@@ -2232,7 +2289,12 @@ uint32_t llama_kv_cache_dsv4_raw_context::get_n_write() const {
 }
 
 ggml_tensor * llama_kv_cache_dsv4_raw_context::get_k(ggml_context * ctx, int32_t il) const {
-    return kv_swa->get_k(ctx, il, n_kv, sinfos_read[i_next]);
+    ggml_tensor * k = kv_swa->get_k(ctx, il, k_lo + n_kv, sinfos_read[i_next]);
+    if (k_lo == 0) {
+        return k;
+    }
+
+    return ggml_view_4d(ctx, k, k->ne[0], k->ne[1], n_kv, k->ne[3], k->nb[1], k->nb[2], k->nb[3], k->nb[2]*k_lo);
 }
 
 ggml_tensor * llama_kv_cache_dsv4_raw_context::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const {
@@ -2281,12 +2343,68 @@ void llama_kv_cache_dsv4_raw_context::set_input_k_idxs(ggml_tensor * dst) const 
     kv_swa->set_input_k_idxs(dst, &ubatches_write[i_next], sinfos_write[i_next]);
 }
 
+// env: RANMA_DSV4_RAW_NKV_CHECK (default 0)
+// 1 = every raw mask of a window narrower than the raw cache is compared with the mask over the whole raw cache: the
+//     columns of the window have to be equal and every column outside -inf, otherwise abort. Needs a host buffer of
+//     n_tokens x raw cache size values per ubatch; for correctness runs only.
+static bool dsv4_raw_nkv_check() {
+    static const bool res = []() {
+        const char * env = getenv("RANMA_DSV4_RAW_NKV_CHECK");
+        return env != nullptr && atoi(env) != 0;
+    }();
+
+    return res;
+}
+
+static float dsv4_mask_value(const ggml_tensor * t, int64_t i) {
+    return t->type == GGML_TYPE_F16 ? ggml_fp16_to_fp32(((const ggml_fp16_t *) t->data)[i]) : ((const float *) t->data)[i];
+}
+
+static void dsv4_check_raw_window(const llama_kv_cache * kv, const ggml_tensor * dst, const llama_ubatch * ubatch,
+        bool causal_attn, uint32_t k_lo) {
+    GGML_ASSERT(dst->ne[2] == 1 && dst->ne[3] == 1 && "the raw window is single-stream");
+    GGML_ASSERT(dst->type == GGML_TYPE_F16 || dst->type == GGML_TYPE_F32);
+
+    const int64_t n_cells = kv->get_size();
+    const int64_t n_kv    = dst->ne[0];
+    const int64_t n_rows  = dst->ne[1];
+
+    llm_graph_host_tensor full(dst->type, n_cells, n_rows);
+    kv->set_input_kq_mask(full.t, ubatch, causal_attn, 0);
+
+    int64_t n_visible = 0;
+    for (int64_t r = 0; r < n_rows; ++r) {
+        for (int64_t c = 0; c < n_cells; ++c) {
+            const float v_full = dsv4_mask_value(full.t, r*n_cells + c);
+
+            if (c >= k_lo && c < k_lo + n_kv) {
+                const float v_win = dsv4_mask_value(dst, r*n_kv + c - k_lo);
+                if (!(v_win == v_full || (std::isnan(v_win) && std::isnan(v_full)))) {
+                    GGML_ABORT("RANMA_DSV4_RAW_NKV_CHECK: row %" PRId64 " cell %" PRId64 " is %f in the window [%u, %" PRId64 ") but %f over the whole raw cache",
+                            r, c, v_win, k_lo, k_lo + n_kv, v_full);
+                }
+                n_visible += v_full != -INFINITY;
+            } else if (v_full != -INFINITY) {
+                GGML_ABORT("RANMA_DSV4_RAW_NKV_CHECK: row %" PRId64 " sees cell %" PRId64 " (%f) outside the window [%u, %" PRId64 ") of %" PRId64 " cells",
+                        r, c, v_full, k_lo, k_lo + n_kv, n_cells);
+            }
+        }
+    }
+
+    LLAMA_LOG_DEBUG("%s: window [%u, %" PRId64 ") of %" PRId64 " raw cells, %" PRId64 " tokens, %" PRId64 " visible entries: ok\n",
+            __func__, k_lo, k_lo + n_kv, n_cells, n_rows, n_visible);
+}
+
 void llama_kv_cache_dsv4_raw_context::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
-    kv_swa->set_input_kq_mask(dst, ubatch, causal_attn);
+    kv_swa->set_input_kq_mask(dst, ubatch, causal_attn, k_lo);
+
+    if (dsv4_raw_nkv_check() && (k_lo != 0 || n_kv != kv_swa->get_size())) {
+        dsv4_check_raw_window(kv_swa, dst, ubatch, causal_attn, k_lo);
+    }
 }
 
 void llama_kv_cache_dsv4_raw_context::set_input_kq_pos(ggml_tensor * dst, const llama_ubatch * ubatch) const {
-    kv_swa->set_input_kq_pos(dst, ubatch);
+    kv_swa->set_input_kq_pos(dst, ubatch, k_lo);
 }
 
 void llama_kv_cache_dsv4_raw_context::set_input_k_rot(ggml_tensor * dst) const {
@@ -2344,8 +2462,9 @@ ggml_tensor * llama_kv_cache_dsv4_comp_context::get_k(ggml_context * ctx, int32_
     return kv->get_k(ctx, il, n_kv, sinfos[i_cur]);
 }
 
-ggml_tensor * llama_kv_cache_dsv4_comp_context::get_k_joint(ggml_context * ctx, int32_t il, uint32_t n_raw, uint32_t n_comp) const {
-    return kv->get_k_joint(ctx, il, n_raw, n_raw + n_comp);
+ggml_tensor * llama_kv_cache_dsv4_comp_context::get_k_joint(ggml_context * ctx, int32_t il, uint32_t raw_lo, uint32_t n_raw, uint32_t n_comp) const {
+    // the compressed cells start right after the raw cache, so [raw_lo, raw_lo + n_raw) has to end there
+    return kv->get_k_joint(ctx, il, raw_lo + n_raw, n_raw + n_comp, raw_lo);
 }
 
 ggml_tensor * llama_kv_cache_dsv4_comp_context::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const {
@@ -2432,7 +2551,8 @@ llama_kv_cache_dsv4_context::llama_kv_cache_dsv4_context(
                 std::move(sinfos_raw_swa_write),
                 std::move(sinfos_raw_swa_read),
                 this->ubatches,
-                std::move(ubatches_raw))),
+                std::move(ubatches_raw),
+                kv->get_raw_nkv_min_tokens())),
     ctx_csa_mem(nullptr),
     ctx_hca_mem(nullptr),
     ctx_lid_mem(nullptr),

@@ -209,6 +209,12 @@ public:
 
     uint32_t get_n_kv(const slot_info & sinfo) const;
 
+    // ranma: the cells [lo, hi) of the single stream of sinfo that hold every cell a token of the ubatch can attend to
+    // under the mask of set_input_kq_mask (cells outside are masked for every token of the ubatch, causal or not).
+    // Returns false when this cannot be told cheaply (several streams, chunked or symmetric SWA, no visible cell); the
+    // caller then reads all cells.
+    bool get_visible_range(const slot_info & sinfo, const llama_ubatch & ubatch, uint32_t & lo, uint32_t & hi) const;
+
     // get views of the current state of the cache
     ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
     ggml_tensor * get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;
@@ -219,7 +225,9 @@ public:
     // view of [n_kv_all] cells of the joint K storage of the layer, starting at the first cell of the
     // tensor that holds this layer's K at row n_prefix. returns nullptr if the layer has no joint storage
     // or if the requested prefix does not match the one the storage was built with
-    ggml_tensor * get_k_joint(ggml_context * ctx, int32_t il, uint32_t n_prefix, uint32_t n_kv_all) const;
+    // ranma: n_skip moves the start of the view to row n_skip of the joint tensor (the first cells of this cache that
+    // the caller does not read), the view then covers rows [n_skip, n_skip + n_kv_all)
+    ggml_tensor * get_k_joint(ggml_context * ctx, int32_t il, uint32_t n_prefix, uint32_t n_kv_all, uint32_t n_skip = 0) const;
 
     // store k_cur and v_cur in the cache based on the provided head location
     ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const;
@@ -258,13 +266,14 @@ public:
 
     void set_input_k_shift(ggml_tensor * dst) const;
 
-    void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
+    // ranma: column j of dst is cell k_lo + j (k_lo = 0 is the upstream mask over the first dst->ne[0] cells)
+    void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn, uint32_t k_lo = 0) const;
 
     // ranma: F32 [n_kv, n_seqs_unq], -pos of each cell for each unique sequence of the ubatch, -inf where the cell is empty
     // or not in the sequence: the input of the device-side causal mask of a chunked graph (llm_graph_chunk_mask), which
     // equals set_input_kq_mask for a causal single stream without SWA or ALiBi, and with 2D positions only for a ubatch
     // of tokens
-    void set_input_kq_pos(ggml_tensor * dst, const llama_ubatch * ubatch) const;
+    void set_input_kq_pos(ggml_tensor * dst, const llama_ubatch * ubatch, uint32_t k_lo = 0) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
     void set_input_k_rot(ggml_tensor * dst) const;

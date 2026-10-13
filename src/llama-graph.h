@@ -607,6 +607,9 @@ public:
 
     ggml_tensor * self_k_rot = nullptr;
 
+    // ranma: the first raw cell the graph reads (llama_kv_cache_dsv4_raw_context::get_k_lo), baked into its K views
+    uint32_t k_lo = 0;
+
     const llama_cparams cparams;
 
     const llama_kv_cache_dsv4_raw_context * mctx;
