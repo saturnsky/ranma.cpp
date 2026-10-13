@@ -3,6 +3,7 @@
 #include "ggml.h"
 #include "llama-arch.h"
 #include "llama-graph.h"
+#include "llama-graph-chunk.h"
 #include "llama-impl.h"
 #include "llama-batch.h"
 #include "llama-io.h"
@@ -2790,6 +2791,15 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
     // every sampler builds n_outputs_max_per_seq chains, see llm_graph_context::build_sampling
     for (const auto & [seq_id, sampler] : sampling.samplers) {
         res += llama_sampler_backend_n_nodes(sampler) * cparams.n_outputs_max_per_seq;
+    }
+
+    // ranma: chunked attention repeats the query side of every attention layer per chunk of rows;
+    // about 70 nodes per chunk and layer for the largest (DeepSeek V4 CSA with its output projection), with margin
+    {
+        const int64_t c = llm_graph_chunk_tokens();
+        if (c > 0 && (int64_t) n_tokens > c) {
+            res += (uint32_t) (((n_tokens + c - 1)/c) * model.hparams.n_layer() * 96);
+        }
     }
 
     if (cparams.training) {

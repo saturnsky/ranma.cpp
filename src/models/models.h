@@ -3010,6 +3010,18 @@ struct llama_model_glm5_next : public llama_model_base {
         ggml_tensor * build_kpool_select(ggml_tensor * cur, ggml_tensor * qr, ggml_tensor * kq_mask, const llama_layer & layer,
                                          const llama_memory_hybrid_idx_context * mctx_hyb, llm_graph_input_kpool * inp_kpool, int il);
 
+        // the parts of build_kpool_select: the cache writes and pooled keys of the whole ubatch, the selection of the
+        // token rows [i0, i0 + n), and its additive mask
+        ggml_tensor * build_kpool_pooled(ggml_tensor * cur, const llama_layer & layer,
+                                         const llama_memory_hybrid_idx_context * mctx_hyb, llm_graph_input_kpool * inp_kpool, int il);
+
+        ggml_tensor * build_kpool_top(ggml_tensor * cur, ggml_tensor * qr, ggml_tensor * pooled, const llama_layer & layer,
+                                      llm_graph_input_kpool * inp_kpool, int64_t i0, int64_t n, int il);
+
+        ggml_tensor * build_kpool_mask(ggml_tensor * sel_idx, ggml_tensor * kq_mask,
+                                       const llama_memory_hybrid_idx_context * mctx_hyb, llm_graph_input_kpool * inp_kpool,
+                                       int64_t i0, int64_t n, int il);
+
         ggml_tensor * build_dsa_layer(ggml_tensor * cur, const llama_layer & layer,
                                       const llama_memory_hybrid_idx_context * mctx_hyb, llm_graph_input_attn_k * inp_attn,
                                       llm_graph_input_kpool * inp_kpool, ggml_tensor ** prev_sel, int il);
