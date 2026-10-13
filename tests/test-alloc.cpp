@@ -5,6 +5,7 @@
 #include "ggml.h"
 
 #include <algorithm>
+#include <cstring>
 #include <memory>
 #include <vector>
 
@@ -24,6 +25,9 @@ struct dummy_backend_context {
 
     bool custom_alloc_buffer_n_called   = false;
     bool custom_get_alloc_size_n_called = false;
+
+    // the device supports only GGML_OP_SCALE (and views), to force splits between two dummy backends
+    bool scale_only = false;
 
     size_t allocated_total() const {
         size_t n = 0;
@@ -118,8 +122,9 @@ static enum ggml_backend_dev_type dummy_backend_device_get_type(ggml_backend_dev
     return GGML_BACKEND_DEVICE_TYPE_CPU;
 }
 
-static bool dummy_backend_device_supports_op(ggml_backend_dev_t /*dev*/, const ggml_tensor * /*x*/) {
-    return true;
+static bool dummy_backend_device_supports_op(ggml_backend_dev_t dev, const ggml_tensor * x) {
+    const dummy_backend_context * ctx = (const dummy_backend_context *) dev->context;
+    return !ctx->scale_only || x->op == GGML_OP_SCALE || ggml_op_is_empty(x->op);
 }
 
 static bool dummy_backend_device_supports_buft(ggml_backend_dev_t device, ggml_backend_buffer_type_t buft) {
@@ -1102,6 +1107,114 @@ static void test_buft_get_alloc_size_n_does_not_allocate() {
     GGML_ASSERT(x[1]->data == nullptr);
 }
 
+// scheduler metadata sized for the split graph: a graph much smaller than the graph_size of the scheduler, split
+// into many parts with a cross-backend input each, allocated after a smaller and a larger graph (the context and the
+// backend id arrays grow), with pipeline copies and with graph slots
+struct sched_test_graph {
+    ggml_context_ptr ctx_ptr;
+    ggml_cgraph *    graph;
+    std::vector<ggml_tensor *> scales; // assigned to backend 0
+    std::vector<ggml_tensor *> adds;   // assigned to backend 1
+};
+
+// x -> scale (backend 0) -> add with x (backend 1) -> scale -> ..., every node takes an input of the other backend
+static sched_test_graph make_alternating_graph(int n_pairs) {
+    sched_test_graph g;
+    ggml_init_params params{};
+    params.mem_size = (4 * (size_t) n_pairs + 16) * ggml_tensor_overhead() + ggml_graph_overhead_custom(4 * n_pairs + 16, false);
+    params.no_alloc = true;
+    ggml_context * ctx = ggml_init(params);
+    g.ctx_ptr = ggml_context_ptr(ctx);
+    g.graph   = ggml_new_graph_custom(ctx, 4 * n_pairs + 16, false);
+
+    ggml_tensor * x = make_input_with_size(ctx, 64);
+    ggml_format_name(x, "in");
+    for (int i = 0; i < n_pairs; i++) {
+        ggml_tensor * s = ggml_scale(ctx, x, 0.5f);
+        ggml_format_name(s, "scale%d", i);
+        ggml_tensor * a = ggml_add(ctx, s, x);
+        ggml_format_name(a, "add%d", i);
+        g.scales.push_back(s);
+        g.adds.push_back(a);
+        x = a;
+    }
+    ggml_set_output(x);
+    ggml_build_forward_expand(g.graph, x);
+    return g;
+}
+
+static void sched_test_alloc(ggml_backend_sched_t sched, ggml_backend_t * backends, sched_test_graph & g) {
+    ggml_backend_sched_reset_graph(sched, g.graph);
+    for (ggml_tensor * t : g.scales) {
+        ggml_backend_sched_set_tensor_backend(sched, t, backends[0]);
+    }
+    for (ggml_tensor * t : g.adds) {
+        ggml_backend_sched_set_tensor_backend(sched, t, backends[1]);
+    }
+    GGML_ASSERT(ggml_backend_sched_alloc_graph(sched, g.graph));
+}
+
+static void sched_test_check(ggml_backend_sched_t sched, ggml_backend_t * backends, const sched_test_graph & g) {
+    const int n_pairs = (int) g.scales.size();
+    GGML_ASSERT(ggml_backend_sched_get_n_splits(sched) == 2 * n_pairs);
+    for (int i = 0; i < n_pairs; i++) {
+        ggml_tensor * s = g.scales[i];
+        ggml_tensor * a = g.adds[i];
+        GGML_ASSERT(s->data != nullptr && a->data != nullptr);
+        GGML_ASSERT(ggml_backend_sched_get_tensor_backend(sched, s) == backends[0]);
+        GGML_ASSERT(ggml_backend_sched_get_tensor_backend(sched, a) == backends[1]);
+        // the input of a scale (after the first) comes from backend 1 and the scale result goes to backend 1:
+        // both are copies made by the scheduler, allocated for the consumer
+        if (i > 0) {
+            GGML_ASSERT(strchr(s->src[0]->name, '#') != nullptr && s->src[0]->data != nullptr);
+            GGML_ASSERT(strstr(s->src[0]->name, g.adds[i - 1]->name) != nullptr);
+        }
+        GGML_ASSERT(strchr(a->src[0]->name, '#') != nullptr && a->src[0]->data != nullptr);
+        GGML_ASSERT(strstr(a->src[0]->name, s->name) != nullptr);
+        GGML_ASSERT(ggml_are_same_shape(a->src[0], s));
+    }
+}
+
+static void test_sched_meta_sized_for_graph(bool parallel, int n_slots) {
+    dummy_backend b0 = dummy_backend_init(SIZE_MAX);
+    dummy_backend b1 = dummy_backend_init(SIZE_MAX);
+    b0.context->scale_only = true;
+
+    ggml_backend_t             backends[2] = { &b0.context->backend, &b1.context->backend };
+    ggml_backend_buffer_type_t bufts[2]    = { &b0.buffer_type, &b1.buffer_type };
+
+    // a graph_size far above the graphs: the former worst-case metadata of this scheduler was about 1.3 GiB
+    const size_t graph_size = 1 << 16;
+    ggml_backend_sched_ptr sched(ggml_backend_sched_new(backends, bufts, 2, graph_size, parallel, false));
+    GGML_ASSERT((ggml_backend_sched_get_n_copies(sched.get()) > 1) == parallel);
+    if (n_slots > 0) {
+        GGML_ASSERT(ggml_backend_sched_set_graph_slots(sched.get(), n_slots));
+    }
+
+    // small, then large (the context buffer and the backend id arrays grow), then small and large again. Every
+    // allocation gets a newly built graph, as in llama and ggml-opt: the split replaces the sources of the nodes with
+    // the input copies of the scheduler, so a graph that was split once is not split again. The graphs are kept
+    // until the end, so that a graph slot (keyed by the graph) never sees a new graph at the address of a freed one
+    std::vector<sched_test_graph> graphs;
+    for (int rep = 0; rep < 2; rep++) {
+        graphs.push_back(make_alternating_graph(3));
+        graphs.push_back(make_alternating_graph(500));
+    }
+    for (sched_test_graph & g : graphs) {
+        sched_test_alloc(sched.get(), backends, g);
+        sched_test_check(sched.get(), backends, g);
+    }
+    sched_test_graph & small = graphs[2];
+
+    if (n_slots > 1) {
+        // the split of the small graph is kept in its own slot while the large graph was split: its copies must
+        // still be intact when the slot is resumed
+        if (ggml_backend_sched_resume_graph(sched.get(), small.graph)) {
+            sched_test_check(sched.get(), backends, small);
+        }
+    }
+}
+
 static void run(const char * name, void (*f)()) {
     printf("%s ", name);
     fflush(stdout);
@@ -1208,5 +1321,8 @@ int main() {
     run("test_buft_get_alloc_size_n_does_not_allocate", test_buft_get_alloc_size_n_does_not_allocate);
     run("test_alloc_extent", test_alloc_extent);
     run("test_shared_buft", test_shared_buft);
+    run("test_sched_meta_sized_for_graph", []() { test_sched_meta_sized_for_graph(false, 0); });
+    run("test_sched_meta_sized_for_graph(parallel)", []() { test_sched_meta_sized_for_graph(true, 0); });
+    run("test_sched_meta_sized_for_graph(slots)", []() { test_sched_meta_sized_for_graph(false, 2); });
     return 0;
 }
