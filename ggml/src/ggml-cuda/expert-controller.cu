@@ -16,6 +16,7 @@
 #include "expert-ub-pool.cuh"
 #include "mapped-host.cuh"
 
+#include "ggml-account.h"
 #include "ggml-alloc.h"
 #include "ggml-backend-impl.h"
 #include "ggml-cuda.h"
@@ -3916,6 +3917,7 @@ private:
         }
         ggml_cuda_set_device(device_);
         const cudaStream_t cs = ctx.stream();
+        const uint64_t stage_bytes_before = stage_bytes_;
         stage_targets targets;
         for (const work & w : works) {
             targets.index[targets.n] = w.idx;
@@ -3986,6 +3988,7 @@ private:
             verify_stage_locked();
         }
         stage_us_ += std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count();
+        ggml_account_add(GGML_ACCOUNT_CTRL_STAGE_BYTES, (double) (stage_bytes_ - stage_bytes_before));
     }
 
     // RANMA_EXPERT_VERIFY: after the staging is done, every staging slot the table names holds exactly

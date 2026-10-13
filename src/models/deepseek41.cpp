@@ -5,6 +5,8 @@
 #include "llama-graph-chunk.h"
 #include "llama-prefetch.h"
 
+#include "ggml-account.h"
+
 #include <algorithm>
 #include <cinttypes>
 #include <cmath>
@@ -352,6 +354,9 @@ public:
 void llm_graph_input_engram::set_input(const llama_ubatch * ubatch) {
     const auto & hp = pmodel.hparams;
 
+    const bool account = ggml_account_enabled();
+    const int64_t t_start = account ? ggml_time_us() : 0;
+
     const int64_t n_tokens = ubatch->n_tokens;
     const int64_t n_gram   = hp.engram_max_ngram_size;
     const int64_t n_heads  = hp.engram_n_head;
@@ -408,8 +413,16 @@ void llm_graph_input_engram::set_input(const llama_ubatch * ubatch) {
         }
     }
 
+    const int64_t t_hashed = account ? ggml_time_us() : 0;
     if (pmodel.can_prefetch.count(table->parts[0])) {
         llama_prefetch_table_pieces_rows(table->parts, table->part_rows, idx, prefetch);
+    }
+    if (account) {
+        // logical rows: one per index, whatever the number of pieces
+        ggml_account_add(GGML_ACCOUNT_ENGRAM_HASH_MS, (t_hashed - t_start)/1000.0);
+        ggml_account_add(GGML_ACCOUNT_ENGRAM_PREFETCH_MS, (ggml_time_us() - t_hashed)/1000.0);
+        ggml_account_add(GGML_ACCOUNT_ENGRAM_LOGICAL_BYTES,
+                (double) idx.size() * (double) ggml_row_size(table->parts[0]->type, table->parts[0]->ne[0]));
     }
 
     // global row numbers -> per piece local row numbers and the mask that keeps the piece which holds the row
@@ -454,6 +467,22 @@ ggml_tensor * llama_model_deepseek41::graph::build_inp_engram(
     // gather then flatten, laying the buckets out slowest, as the reference does
     // (the table is MXFP8 rows read in place from the mapping; the gather dequantizes to F32 on the CPU)
     ggml_tensor * emb = llama_weight_aux_get_rows_pieces(ctx0, table, nullptr, rows, mask, 1);
+
+    if (ggml_account_enabled()) {
+        // tag the gather nodes so that the CPU backend can time them (RANMA_PREFILL_ACCOUNT)
+        std::vector<ggml_tensor *> todo = { emb };
+        for (size_t i = 0; i < todo.size() && i < 64; ++i) {
+            ggml_tensor * t = todo[i];
+            if (t->op == GGML_OP_GET_ROWS) {
+                ggml_set_name(t, "engram_gather");
+            } else if (t->op == GGML_OP_ADD) {
+                todo.push_back(t->src[0]);
+                todo.push_back(t->src[1]);
+            } else if (t->op == GGML_OP_MUL) {
+                todo.push_back(t->src[0]);
+            }
+        }
+    }
     emb = ggml_reshape_2d(ctx0, emb, key_len * n_cols, n_tokens);
     cb(emb, "engram_embd", il);
 

@@ -104,6 +104,18 @@ struct l2_counters {
     uint64_t early_layer_wait_ticks = 0, early_layer_samples = 0;
 };
 
+// Prefill accounting (RANMA_PREFILL_ACCOUNT, ggml-account.h), one per layer, in coherent host memory that only exists
+// while the switch is on. The publish kernel stores the accounting key of its generation, the wait kernels store the
+// ticks they waited per kind; a seq field names the generation its value belongs to.
+struct alignas(64) l2_acct {
+    uint64_t key;
+    uint32_t key_seq;
+    uint32_t seq[3];
+    uint32_t pad;
+    uint64_t ticks[3];
+};
+static_assert(sizeof(l2_acct) == 64, "the accounting slot is one cache line");
+
 // One posted early demand: per layer the hinted expert ids and the layer's published counter when
 // the hint was made (a layer that published since then is already being served).
 struct l2_early_layer {
@@ -361,6 +373,11 @@ private:
     void   collect_wait(int layer);
     void   collect_stage(int layer);
     void   report_counters(const char * what);
+    // accounting of the generation being served in `layer` (io_mutex_): open when the publish kernel carried a key
+    void   acct_begin(int layer, uint32_t seq);
+    void   acct_reads(int layer, const std::vector<l2_read> & reads);
+    void   acct_deliver(int layer);
+    bool   acct_collect(int layer, bool force);
     struct sample {
         uint32_t seq = 0, rows = 0;
         uint64_t ubatch = 0;
@@ -440,6 +457,18 @@ private:
     bool inferred_prompt_ = true;
     std::atomic<int> phase_{-1}; // Without a profile, classify by the configured decode row bound.
     std::vector<sample> pending_, samples_;
+    struct acct_layer {
+        uint64_t key = 0;
+        uint32_t seq = 0;
+        uint8_t  mask = 0, got = 0;   // the kinds whose wait kernel is expected / already collected
+        bool     open = false;
+        uint64_t payload[3] = {}, io[3] = {};
+        double   worker_ms[3] = {};
+    };
+    bool account_ = false;               // RANMA_PREFILL_ACCOUNT
+    l2_acct * acct_host_ = nullptr, * acct_dev_ = nullptr;
+    std::vector<acct_layer> acct_;
+    int acct_open_ = 0;
     std::vector<uint32_t> wait_seen_;
     std::vector<uint8_t>  staged_layer_;   // compute thread: the last route of the layer was staged
     std::vector<uint32_t> stage_seen_;     // worker: the stage wait ticks of each layer already counted
