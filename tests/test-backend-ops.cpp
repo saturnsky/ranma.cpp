@@ -33,6 +33,7 @@
 #include <ctime>
 #include <future>
 #include <fstream>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <random>
@@ -15541,6 +15542,1086 @@ static void show_test_coverage() {
     printf("  Coverage: %.1f%%\n", (double)covered_ops.size() / all_ops.size() * 100.0);
 }
 
+// stage-falsify (bench only, not for release): is it worth copying the re-read experts of a MOE_FFN_HAD layer into VRAM?
+// One layer, EXL3 M3 weights without LoRA, one chunk (R = W*k rows). The variants run in one process, interleaved:
+//   V  all experts in VRAM (reference)
+//   A  every expert not in L1 is read in place from the host (the layer mode today)
+//   B  copy every used non-resident expert to VRAM, wait, compute all from VRAM (copy + compute in series)
+//   C  upper bound: the re-read experts (rows > tile) are assumed to be in VRAM already (no copy), the others host-direct
+//   D  probe without signals: the re-read experts are copied on a side stream while the host-direct experts (and L1) compute,
+//      then one event, then the copied experts compute from VRAM
+//   X  the copy of B alone, R the copy of D alone
+// A subset of the experts is computed by a filter on the op (src[6], I8 [n_exp], the experts to keep). The rows of the other
+// experts are dropped in the routing pass; the tile of the GEMM still follows the rows and experts of the whole op.
+// The weights of the host side sit in the host buffer (GGML_CUDA_HOST_DIRECT=1), the VRAM copy has its own full tensors,
+// so a copy always lands where the expert has its place in the full layer (no ring).
+
+struct sf_opts {
+    std::vector<std::string> shapes   = { "glm:8192", "ds4f:8192", "ds41:12288", "ds41:2048" };
+    std::vector<std::string> routes   = { "uniform", "u2" };
+    std::vector<std::string> variants = { "V", "A", "B", "C", "D", "X", "R", "Y", "Z", "U", "UP" };
+    int      reps       = 9;
+    int      warm       = 2;
+    double   l1         = 0.0;   // fraction of the experts resident in L1
+    bool     l1_hot     = false; // L1 takes the experts with the most rows, else random
+    bool     contig     = false; // number the experts so that the re-read ones are consecutive in the weights
+    bool     split_cmds = false; // one copy command per expert and kind, never one per run of consecutive experts
+    uint64_t seed       = 1;
+    int      reread_min = 0;     // rows over which an expert counts as re-read, 0 = the tile of host weights
+    int64_t  chunk_rows = 0;     // rows per chunk, 0 = W*k (one chunk)
+    int      copy_kind  = 0;     // 0 default, 1 host to device, 2 device to device
+    bool     check      = true;
+    int      z_group    = 8;     // probe Z: experts per copy group
+    int      u_group    = 16;    // probe U: used experts per group of the single-op consumption
+    int      z_ahead    = 2;     // probe Z: copy groups issued ahead of the compute group, 0 = all copies first
+    bool     y_alt      = false; // probe Y: the copied set Q takes every second used expert, else the upper half of the ids
+};
+static sf_opts sf_o;
+
+struct sf_shape {
+    const char * name;
+    int64_t d, f;
+    int e, k;
+};
+
+static const sf_shape sf_shapes[] = {
+    { "glm",  4096, 2048, 288, 8 },
+    { "ds4f", 4096, 2048, 256, 6 },
+    { "ds41", 5120, 2304, 384, 6 },
+    { "tiny",  256,  256,  16, 4 },
+};
+
+struct sf_api {
+    bool (*copy)(ggml_backend_t, int, const void * const *, void * const *, const size_t *, int) = nullptr;
+    bool (*wait)(ggml_backend_t) = nullptr;
+    bool (*sync)(ggml_backend_t) = nullptr;
+    bool (*ev)(ggml_backend_t, int, int, int, float *) = nullptr; // timing events: op 0 record (a slot, b stream), 1 wait (a), 2 elapsed a->b
+    bool (*diag)(ggml_backend_t, int, int, double *) = nullptr;   // probe U: op 0 group size, 1 phase stamps on or off, 2 read 12 phase values
+};
+
+#define SF_EV_SLOTS 512
+
+// the weights of a shape: host copy (host buffer), VRAM copy (same bytes), rotations
+struct sf_wset {
+    std::string name;
+    int64_t d = 0, f = 0;
+    int e = 0, k = 0;
+    ggml_context_ptr ctx_h, ctx_d, ctx_a;
+    ggml_backend_buffer_ptr buf_h, buf_d, buf_a;
+    ggml_tensor * wh[3] = {};
+    ggml_tensor * wd[3] = {};
+    ggml_tensor * rin[3] = {};
+    ggml_tensor * rout[3] = {};
+    int64_t nb02[3] = {};
+};
+
+struct sf_copyset {
+    std::vector<const void *> src;
+    std::vector<void *>       dst;
+    std::vector<size_t>       bytes;
+    struct range { ggml_tensor * t; size_t off; size_t size; };
+    std::vector<range>        ranges; // destination ranges, poisoned before the checked run
+    int64_t                   total = 0;
+};
+
+struct sf_step {
+    int           kind = 0; // 0 graph, 1 copy, 2 wait, 3 side sync, 4 mark compute stream (cs = slot), 5 mark side stream (cs = slot), 6 compute waits for slot cs
+    ggml_cgraph * g = nullptr;
+    int           cs = -1;
+};
+
+// measurement of the probes Y and Z: event pairs on the two streams (inside the variant only)
+struct sf_meas {
+    bool on = false;
+    int  s0 = -1, s1 = -1;                         // copy window on the side stream
+    int  c0 = -1, c1 = -1;                         // compute span, optional
+    std::vector<std::pair<int, int>> busy;         // compute graphs, begin and end marks
+    int64_t     copy_bytes = 0;
+    int         q_experts = -1;                    // probe Y: experts of the copied set
+    int         groups = -1;                       // probe Z: copy groups
+    std::string base;                              // variant with the same compute and no copy, for the slowdown
+    std::vector<double> copy_ms, busy_ms, span_ms;
+};
+
+struct sf_variant {
+    std::string       name;
+    std::vector<sf_step> steps;
+    ggml_tensor *     out = nullptr;
+    int64_t           link_bytes = 0;
+    int               n_cmds = 0;
+    int               own_copy = -1;
+    std::vector<int>  poison;     // more copy sets whose destinations are poisoned for the check
+    sf_meas           m;
+    std::vector<double> ms;
+    int               u_group = 0;   // probe U: experts per group
+    bool              u_phase = false;
+    std::vector<double> ph;     // probe U: 12 phase values per repetition
+    std::string       check = "n/a";
+};
+
+static void sf_fill_random(std::vector<uint8_t> & v, uint64_t seed) {
+    uint64_t s = seed*0x9E3779B97F4A7C15ull + 0x1234567ull;
+    uint64_t * p = (uint64_t *) v.data();
+    const size_t n = v.size()/8;
+    for (size_t i = 0; i < n; ++i) {
+        s ^= s << 13;
+        s ^= s >> 7;
+        s ^= s << 17;
+        p[i] = s;
+    }
+    for (size_t i = n*8; i < v.size(); ++i) {
+        v[i] = (uint8_t) (s >> (8*(i - n*8)));
+    }
+}
+
+static bool sf_make_wset(sf_wset & ws, const sf_shape & sh, ggml_backend_t backend) {
+    ws.name = sh.name;
+    ws.d = sh.d;
+    ws.f = sh.f;
+    ws.e = sh.e;
+    ws.k = sh.k;
+    ggml_init_params ip = { ggml_tensor_overhead()*16, NULL, true };
+    ws.ctx_h.reset(ggml_init(ip));
+    ws.ctx_d.reset(ggml_init(ip));
+    ws.ctx_a.reset(ggml_init(ip));
+    const int64_t kk[3] = { sh.d, sh.d, sh.f };
+    const int64_t nn[3] = { sh.f, sh.f, sh.d };
+    for (int i = 0; i < 3; ++i) {
+        ws.wh[i]   = ggml_new_tensor_3d(ws.ctx_h.get(), GGML_TYPE_EXL3_M3, kk[i], nn[i], sh.e);
+        ws.wd[i]   = ggml_new_tensor_3d(ws.ctx_d.get(), GGML_TYPE_EXL3_M3, kk[i], nn[i], sh.e);
+        ws.rin[i]  = ggml_new_tensor_2d(ws.ctx_a.get(), GGML_TYPE_F16, kk[i], sh.e);
+        ws.rout[i] = ggml_new_tensor_2d(ws.ctx_a.get(), GGML_TYPE_F16, nn[i], sh.e);
+        ws.nb02[i] = (int64_t) ws.wh[i]->nb[2];
+    }
+    ws.buf_h.reset(test_alloc_weight_tensors(ws.ctx_h.get(), backend, true));
+    ws.buf_d.reset(ggml_backend_alloc_ctx_tensors(ws.ctx_d.get(), backend));
+    ws.buf_a.reset(ggml_backend_alloc_ctx_tensors(ws.ctx_a.get(), backend));
+    if (!ws.buf_h || !ws.buf_d || !ws.buf_a) {
+        fprintf(stderr, "stage-falsify: cannot allocate the weights of %s\n", sh.name);
+        return false;
+    }
+    ggml_backend_buffer_set_usage(ws.buf_h.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+    for (int i = 0; i < 3; ++i) {
+        std::vector<uint8_t> bytes(ggml_nbytes(ws.wh[i]));
+        sf_fill_random(bytes, sf_o.seed*16 + i);
+        ggml_backend_tensor_set(ws.wh[i], bytes.data(), 0, bytes.size());
+        ggml_backend_tensor_set(ws.wd[i], bytes.data(), 0, bytes.size());
+        init_tensor_uniform(ws.rin[i]);
+        init_tensor_uniform(ws.rout[i]);
+    }
+    if (!test_finalize_host_weights(ws.buf_h.get(), backend)) {
+        fprintf(stderr, "stage-falsify: cannot finalize the host weight buffer\n");
+        return false;
+    }
+    return true;
+}
+
+// the k distinct experts of every token: uniform, or skewed to the low ids like the MOE_FFN_HAD perf cases (u^2)
+static std::vector<int32_t> sf_make_ids(const std::string & route, int e, int k, int64_t w, uint64_t seed) {
+    std::mt19937_64 rng(seed);
+    std::vector<int32_t> ids((size_t) k*w);
+    if (route == "uniform") {
+        std::vector<int32_t> pool(e);
+        for (int64_t t = 0; t < w; ++t) {
+            for (int i = 0; i < e; ++i) {
+                pool[i] = i;
+            }
+            for (int i = 0; i < k; ++i) {
+                std::uniform_int_distribution<int> pick(i, e - 1);
+                std::swap(pool[i], pool[pick(rng)]);
+                ids[t*k + i] = pool[i];
+            }
+        }
+    } else {
+        std::uniform_real_distribution<float> u(0.0f, 1.0f);
+        for (int64_t t = 0; t < w; ++t) {
+            for (int i = 0; i < k; ++i) {
+                int32_t x;
+                bool dup;
+                do {
+                    const float v = u(rng);
+                    x = std::min(e - 1, (int) (v*v*e));
+                    dup = std::find(ids.begin() + t*k, ids.begin() + t*k + i, x) != ids.begin() + t*k + i;
+                } while (dup);
+                ids[t*k + i] = x;
+            }
+        }
+    }
+    return ids;
+}
+
+static void sf_exec(ggml_backend_t backend, const sf_api & api, const sf_variant & v, const std::vector<sf_copyset> & cs) {
+    for (const sf_step & s : v.steps) {
+        if (s.kind == 0) {
+            const ggml_status st = ggml_backend_graph_compute_async(backend, s.g);
+            GGML_ASSERT(st == GGML_STATUS_SUCCESS);
+        } else if (s.kind == 1) {
+            const sf_copyset & c = cs[s.cs];
+            GGML_ASSERT(api.copy(backend, (int) c.src.size(), c.src.data(), c.dst.data(), c.bytes.data(), sf_o.copy_kind));
+        } else if (s.kind == 2) {
+            GGML_ASSERT(api.wait(backend));
+        } else if (s.kind == 4 || s.kind == 5) {
+            GGML_ASSERT(api.ev(backend, 0, s.cs, s.kind == 5 ? 1 : 0, nullptr));
+        } else if (s.kind == 6) {
+            GGML_ASSERT(api.ev(backend, 1, s.cs, 0, nullptr));
+        } else if (s.kind == 7 || s.kind == 8) {
+            GGML_ASSERT(api.diag(backend, s.kind == 7 ? 0 : 1, s.cs, nullptr)); // probe U: group size, phase stamps
+        } else {
+            GGML_ASSERT(api.sync(backend));
+        }
+    }
+    ggml_backend_synchronize(backend);
+}
+
+// reads the event pairs of a variant after its run (outside the timed region)
+static void sf_collect(ggml_backend_t backend, const sf_api & api, sf_variant & v) {
+    if (!v.m.on) {
+        return;
+    }
+    auto el = [&](int a, int b) {
+        float ms = 0.0f;
+        GGML_ASSERT(api.ev(backend, 2, a, b, &ms));
+        return (double) ms;
+    };
+    double busy = 0.0;
+    for (const auto & pr : v.m.busy) {
+        busy += el(pr.first, pr.second);
+    }
+    v.m.busy_ms.push_back(busy);
+    v.m.copy_ms.push_back(v.m.s0 >= 0 ? el(v.m.s0, v.m.s1) : -1.0);
+    v.m.span_ms.push_back(v.m.c0 >= 0 ? el(v.m.c0, v.m.c1) : busy);
+}
+
+static double sf_median(std::vector<double> v) {
+    std::sort(v.begin(), v.end());
+    return v.empty() ? 0.0 : (v.size() & 1) ? v[v.size()/2] : 0.5*(v[v.size()/2 - 1] + v[v.size()/2]);
+}
+
+static bool sf_run_case(ggml_backend_t backend, const sf_api & api, sf_wset & ws, const std::string & route, int64_t W) {
+    const int E = ws.e, K = ws.k;
+    const int64_t d = ws.d;
+    const int64_t n_rows = W*K;
+    const int64_t b_exp = ws.nb02[0] + ws.nb02[1] + ws.nb02[2];
+
+    // routing, the tile of host weights as the op chooses it, the classes: 0 L1, 1 read once, 2 re-read, 3 unused
+    std::vector<int32_t> ids = sf_make_ids(route, E, K, W, sf_o.seed*1000003ull + (uint64_t) W*131 + E);
+    std::vector<int> cnt(E, 0);
+    for (int32_t x : ids) {
+        cnt[x]++;
+    }
+    const int64_t used = std::max<int64_t>(1, std::min<int64_t>(n_rows, E));
+    const int64_t want_r = 3*((n_rows + used - 1)/used);
+    const int mt_r = want_r <= 16 ? 16 : want_r <= 32 ? 32 : want_r <= 64 ? 64 : 128;
+    const int64_t want_v = (n_rows + used - 1)/used;
+    const int mt_v = want_v <= 16 ? 16 : want_v <= 32 ? 32 : want_v <= 64 ? 64 : 128;
+    const int thr = sf_o.reread_min > 0 ? sf_o.reread_min : mt_r;
+    std::vector<char> is_l1(E, 0);
+    {
+        const int n_l1 = (int) (sf_o.l1*E + 0.5);
+        std::vector<int> order(E);
+        for (int i = 0; i < E; ++i) {
+            order[i] = i;
+        }
+        if (sf_o.l1_hot) {
+            std::stable_sort(order.begin(), order.end(), [&](int a, int b) { return cnt[a] > cnt[b]; });
+        } else {
+            std::mt19937_64 rng(sf_o.seed + 77);
+            std::shuffle(order.begin(), order.end(), rng);
+        }
+        for (int i = 0; i < n_l1; ++i) {
+            is_l1[order[i]] = 1;
+        }
+    }
+    std::vector<int> cls(E);
+    for (int x = 0; x < E; ++x) {
+        cls[x] = cnt[x] == 0 ? 3 : is_l1[x] ? 0 : cnt[x] > thr ? 2 : 1;
+    }
+    if (sf_o.contig) {
+        // new numbering: the re-read experts first, so that their weights are consecutive
+        std::vector<int> neu(E);
+        int next = 0;
+        for (int x = 0; x < E; ++x) {
+            if (cls[x] == 2) {
+                neu[x] = next++;
+            }
+        }
+        for (int x = 0; x < E; ++x) {
+            if (cls[x] != 2) {
+                neu[x] = next++;
+            }
+        }
+        std::vector<int> cnt2(E), cls2(E);
+        for (int x = 0; x < E; ++x) {
+            cnt2[neu[x]] = cnt[x];
+            cls2[neu[x]] = cls[x];
+        }
+        for (int32_t & x : ids) {
+            x = neu[x];
+        }
+        cnt = cnt2;
+        cls = cls2;
+    }
+    int present = 0;
+    int n_cls[4] = {};
+    int64_t rows_cls[4] = {};
+    int64_t q_sum_once = 0;
+    for (int x = 0; x < E; ++x) {
+        n_cls[cls[x]]++;
+        rows_cls[cls[x]] += cnt[x];
+        if (cls[x] < 3) {
+            present |= 1 << cls[x];
+        }
+        if (cls[x] == 1) {
+            q_sum_once += (cnt[x] + mt_r - 1)/mt_r;
+        }
+    }
+    const int64_t bytes_nonres = (int64_t) (n_cls[1] + n_cls[2])*b_exp;
+    const int64_t bytes_once   = q_sum_once*b_exp;
+    const int64_t bytes_reread = (int64_t) n_cls[2]*b_exp;
+    int64_t q_sum_re = 0;
+    for (int x = 0; x < E; ++x) {
+        if (cls[x] == 2) {
+            q_sum_re += (cnt[x] + mt_r - 1)/mt_r;
+        }
+    }
+    const int64_t bytes_a = bytes_once + q_sum_re*b_exp;
+
+    // graphs
+    ggml_init_params ip = {
+        /* .mem_size = */ ggml_tensor_overhead()*4096 + 96*ggml_graph_overhead_custom(256, false),
+        /* .mem_base = */ NULL,
+        /* .no_alloc = */ true,
+    };
+    ggml_context_ptr ctx_p(ggml_init(ip));
+    ggml_context * ctx = ctx_p.get();
+    ggml_tensor * x_t   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d, W);
+    ggml_tensor * ids_t = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, K, W);
+    ggml_tensor * wts_t = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, K, W);
+    ggml_tensor * zero_t = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d, W);
+    const int64_t kdim[3] = { ws.d, ws.d, ws.f };
+    const int rows_arg = (int) (sf_o.chunk_rows > 0 ? sf_o.chunk_rows : n_rows);
+
+    std::map<int, ggml_tensor *> masks;          // bits -> I8 [E]
+    std::map<std::pair<int, int>, ggml_tensor *> ops; // (host, bits) -> op
+    // the filter of a set of classes; null when it holds all present classes
+    auto get_op = [&](bool host, int bits) -> ggml_tensor * {
+        bits &= present;
+        if (bits == 0) {
+            return nullptr;
+        }
+        const int key_bits = bits == present ? 0 : bits;
+        auto it = ops.find({ host ? 1 : 0, key_bits });
+        if (it != ops.end()) {
+            return it->second;
+        }
+        ggml_tensor * ids0 = ggml_view_2d(ctx, ids_t, K, 0, ids_t->nb[1], 0);
+        ggml_tensor * desc[3];
+        for (int i = 0; i < 3; ++i) {
+            ggml_tensor * b = ggml_view_3d(ctx, x_t, kdim[i], 1, 0, x_t->nb[1], x_t->nb[1], 0);
+            desc[i] = ggml_mul_mat_had(ctx, host ? ws.wh[i] : ws.wd[i], b, ws.rin[i], ws.rout[i], ids0, 128);
+        }
+        ggml_tensor * op = ggml_moe_ffn_had(ctx, x_t, ids_t, wts_t, desc[0], desc[1], desc[2], GGML_GLU_OP_SWIGLU_CLAMP, 1.0f, rows_arg);
+        if (bits != present) {
+            auto m = masks.find(bits);
+            if (m == masks.end()) {
+                m = masks.emplace(bits, ggml_new_tensor_1d(ctx, GGML_TYPE_I8, E)).first;
+            }
+            op->src[6] = m->second;
+        }
+        ops[{ host ? 1 : 0, key_bits }] = op;
+        return op;
+    };
+
+    struct part_t { std::vector<ggml_tensor *> ops; bool wait_before = false; int wait_slot = -1; int mark0 = -1; int mark1 = -1; };
+    std::vector<sf_variant> variants;
+    std::vector<sf_copyset> csets;
+    std::map<std::string, int> cs_idx;
+    auto copy_of = [&](const std::string & key, const std::vector<char> & sel) -> int {
+        auto f = cs_idx.find(key);
+        if (f != cs_idx.end()) {
+            return f->second;
+        }
+        sf_copyset cs;
+        int x = 0;
+        while (x < E) {
+            if (!sel[x]) {
+                ++x;
+                continue;
+            }
+            int y = x;
+            while (y < E && sel[y] && (!sf_o.split_cmds || y == x)) {
+                ++y;
+            }
+            for (int i = 0; i < 3; ++i) {
+                const size_t off = (size_t) x*ws.nb02[i];
+                const size_t sz  = (size_t) (y - x)*ws.nb02[i];
+                cs.src.push_back((const char *) ws.wh[i]->data + off);
+                cs.dst.push_back((char *) ws.wd[i]->data + off);
+                cs.bytes.push_back(sz);
+                cs.ranges.push_back({ ws.wd[i], off, sz });
+                cs.total += (int64_t) sz;
+            }
+            x = y;
+        }
+        csets.push_back(std::move(cs));
+        cs_idx[key] = (int) csets.size() - 1;
+        return (int) csets.size() - 1;
+    };
+    std::vector<char> sel_nonres(E, 0), sel_re(E, 0);
+    for (int x = 0; x < E; ++x) {
+        sel_nonres[x] = cls[x] == 1 || cls[x] == 2;
+        sel_re[x]     = cls[x] == 2;
+    }
+
+    auto add_variant = [&](const std::string & name, int copy_idx, const std::vector<part_t> & parts_in, int64_t link, bool side_sync,
+            const std::vector<sf_step> & pre = {}) {
+        sf_variant v;
+        v.name = name;
+        v.link_bytes = link;
+        std::vector<part_t> parts;
+        for (const part_t & p : parts_in) {
+            part_t q;
+            q.wait_before = p.wait_before;
+            q.wait_slot   = p.wait_slot;
+            q.mark0       = p.mark0;
+            q.mark1       = p.mark1;
+            for (ggml_tensor * o : p.ops) {
+                if (o) {
+                    q.ops.push_back(o);
+                }
+            }
+            if (!q.ops.empty()) {
+                parts.push_back(q);
+            }
+        }
+        if (copy_idx >= 0) {
+            sf_step s;
+            s.kind = 1;
+            s.cs = copy_idx;
+            v.steps.push_back(s);
+            v.n_cmds = (int) csets[copy_idx].src.size();
+            v.own_copy = copy_idx;
+        }
+        for (const sf_step & s : pre) {
+            v.steps.push_back(s);
+        }
+        int n_ops = 0;
+        for (const part_t & p : parts) {
+            n_ops += (int) p.ops.size();
+        }
+        ggml_tensor * run = nullptr;
+        int done = 0;
+        for (size_t j = 0; j < parts.size(); ++j) {
+            std::vector<ggml_tensor *> adds;
+            ggml_cgraph * g = ggml_new_graph_custom(ctx, 256, false);
+            for (ggml_tensor * o : parts[j].ops) {
+                ggml_build_forward_expand(g, o);
+            }
+            for (ggml_tensor * o : parts[j].ops) {
+                ++done;
+                if (run == nullptr) {
+                    run = o;
+                } else {
+                    run = ggml_add(ctx, run, o);
+                    adds.push_back(run);
+                }
+            }
+            if (done == n_ops && adds.empty()) {
+                run = ggml_add(ctx, run, zero_t);
+                adds.push_back(run);
+            }
+            for (ggml_tensor * a : adds) {
+                a->flags |= GGML_TENSOR_FLAG_COMPUTE; // a node added by hand is skipped by the backends without it
+                ggml_graph_add_node(g, a);
+            }
+            if (parts[j].wait_slot >= 0) {
+                sf_step w;
+                w.kind = 6;
+                w.cs = parts[j].wait_slot;
+                v.steps.push_back(w);
+            } else if (parts[j].wait_before) {
+                sf_step w;
+                w.kind = 2;
+                v.steps.push_back(w);
+            }
+            if (parts[j].mark0 >= 0) {
+                sf_step m;
+                m.kind = 4;
+                m.cs = parts[j].mark0;
+                v.steps.push_back(m);
+            }
+            sf_step s;
+            s.kind = 0;
+            s.g = g;
+            v.steps.push_back(s);
+            if (parts[j].mark1 >= 0) {
+                sf_step m;
+                m.kind = 4;
+                m.cs = parts[j].mark1;
+                v.steps.push_back(m);
+            }
+        }
+        if (side_sync) {
+            sf_step s;
+            s.kind = 3;
+            v.steps.push_back(s);
+        }
+        v.out = run;
+        if (!v.steps.empty()) {
+            variants.push_back(std::move(v));
+        }
+    };
+
+    const int B_L1 = 1, B_ONCE = 2, B_RE = 4;
+    const int cs_nonres = copy_of("nonres", sel_nonres);
+    const int cs_re     = copy_of("re", sel_re);
+    auto wanted = [&](const char * n) { return std::find(sf_o.variants.begin(), sf_o.variants.end(), n) != sf_o.variants.end(); };
+    // V is always built: it is the reference of the checks
+    add_variant("V", -1, { { { get_op(false, 7) }, false } }, 0, false);
+    // probe U: V's op consumed in groups of u_group used experts inside one op (route once, exact grids, one scatter); the
+    // backend switch is set around the graph (steps 7), UP also stamps the phases (steps 8) and reports them
+    for (const char * un : { "U", "UP" }) {
+        if (!wanted(un)) {
+            continue;
+        }
+        if (api.diag == nullptr) {
+            fprintf(stderr, "stage-falsify: the backend has no group diagnostic, variant %s skipped\n", un);
+            continue;
+        }
+        const size_t before = variants.size();
+        add_variant(un, -1, { { { get_op(false, 7) }, false } }, 0, false);
+        if (variants.size() == before + 1) {
+            sf_variant & uv = variants.back();
+            const bool ph = strcmp(un, "UP") == 0;
+            sf_step on, off, pon, poff;
+            on.kind = 7;
+            on.cs = sf_o.u_group;
+            off.kind = 7;
+            off.cs = 0;
+            pon.kind = 8;
+            pon.cs = 1;
+            poff.kind = 8;
+            poff.cs = 0;
+            std::vector<sf_step> steps;
+            steps.push_back(on);
+            if (ph) {
+                steps.push_back(pon);
+            }
+            for (const sf_step & s : uv.steps) {
+                steps.push_back(s);
+                if (s.kind == 0 && ph) {
+                    steps.push_back(poff);
+                }
+            }
+            steps.push_back(off);
+            uv.steps = steps;
+            uv.u_group = sf_o.u_group;
+            uv.u_phase = ph;
+        }
+    }
+    if (wanted("A")) {
+        add_variant("A", -1, { { { get_op(true, B_ONCE | B_RE), get_op(false, B_L1) }, false } }, bytes_a, false);
+    }
+    if (wanted("B")) {
+        // L1 first (no wait), the copy runs beside it; then everything else from VRAM
+        add_variant("B", cs_nonres, { { { get_op(false, B_L1) }, false }, { { get_op(false, B_ONCE | B_RE) }, true } },
+            csets[cs_nonres].total, false);
+    }
+    if (wanted("C")) {
+        add_variant("C", -1, { { { get_op(true, B_ONCE), get_op(false, B_L1 | B_RE) }, false } }, bytes_once, false);
+    }
+    if (wanted("D")) {
+        add_variant("D", cs_re, { { { get_op(true, B_ONCE), get_op(false, B_L1) }, false }, { { get_op(false, B_RE) }, true } },
+            bytes_once + csets[cs_re].total, false);
+    }
+    if (wanted("X")) {
+        add_variant("X", cs_nonres, {}, csets[cs_nonres].total, true);
+    }
+    if (wanted("R")) {
+        add_variant("R", cs_re, {}, csets[cs_re].total, true);
+    }
+    (void) bytes_nonres;
+    (void) bytes_reread;
+    (void) mt_v;
+
+    // probes Y and Z (concurrent copy): the copy runs on the side stream while the experts that are in VRAM compute.
+    // Y: the used experts split in P (already in VRAM, includes L1) and Q (copied); P computes while Q is copied, Q computes after.
+    // Z: pipeline, the copied experts in groups of z_group, the copy of a group is ahead of its compute by z_ahead groups.
+    // The event pairs of the measurement are inside the variants; YP, ZP are the same compute without any copy (the baseline).
+    int slot_next = 0;
+    bool slots_ok = true;
+    auto new_slot = [&]() {
+        if (slot_next >= SF_EV_SLOTS) {
+            slots_ok = false;
+            return 0;
+        }
+        return slot_next++;
+    };
+    auto mk = [](int kind, int cs) {
+        sf_step st;
+        st.kind = kind;
+        st.cs = cs;
+        return st;
+    };
+    ggml_context_ptr ctx2_p;   // the graph nodes of probe Z that borrow the output buffers, never allocated (patched below)
+    ggml_tensor * shared_out = nullptr;
+    ggml_tensor * shared_acc = nullptr;
+    std::vector<ggml_tensor *> z_ops, z_adds;
+    std::vector<std::pair<ggml_tensor *, std::vector<int8_t>>> set_masks;
+    ggml_tensor * set_desc[2][3] = {};
+    auto make_set_op = [&](ggml_context * octx, bool host, const std::vector<char> & keep) -> ggml_tensor * {
+        if (std::find(keep.begin(), keep.end(), (char) 1) == keep.end()) {
+            return nullptr;
+        }
+        ggml_tensor ** dd = set_desc[host ? 1 : 0];
+        if (dd[0] == nullptr) {
+            ggml_tensor * ids0 = ggml_view_2d(ctx, ids_t, K, 0, ids_t->nb[1], 0);
+            for (int i = 0; i < 3; ++i) {
+                ggml_tensor * b = ggml_view_3d(ctx, x_t, kdim[i], 1, 0, x_t->nb[1], x_t->nb[1], 0);
+                dd[i] = ggml_mul_mat_had(ctx, host ? ws.wh[i] : ws.wd[i], b, ws.rin[i], ws.rout[i], ids0, 128);
+            }
+        }
+        ggml_tensor * op = ggml_moe_ffn_had(octx, x_t, ids_t, wts_t, dd[0], dd[1], dd[2], GGML_GLU_OP_SWIGLU_CLAMP, 1.0f, rows_arg);
+        ggml_tensor * m = ggml_new_tensor_1d(ctx, GGML_TYPE_I8, E);
+        std::vector<int8_t> k(E, 0);
+        for (int x = 0; x < E; ++x) {
+            k[x] = keep[x] && cls[x] < 3 ? 1 : 0;
+        }
+        set_masks.push_back({ m, k });
+        op->src[6] = m;
+        return op;
+    };
+    std::vector<int> nr_list; // the copied experts, ascending ids
+    for (int x = 0; x < E; ++x) {
+        if (cls[x] == 1 || cls[x] == 2) {
+            nr_list.push_back(x);
+        }
+    }
+    const int zn = (int) nr_list.size();
+    if (wanted("Y") && zn >= 2) {
+        std::vector<char> keepP(E, 0), keepQ(E, 0);
+        for (int x = 0; x < E; ++x) {
+            keepP[x] = cls[x] < 3;
+        }
+        for (int i = 0; i < zn; ++i) {
+            if (sf_o.y_alt ? (i & 1) != 0 : i >= zn/2) {
+                keepQ[nr_list[i]] = 1;
+                keepP[nr_list[i]] = 0;
+            }
+        }
+        int nq = 0;
+        for (int x = 0; x < E; ++x) {
+            nq += keepQ[x];
+        }
+        const int cs_q = copy_of("yq", keepQ);
+        ggml_tensor * opP = make_set_op(ctx, false, keepP);
+        ggml_tensor * opQ = make_set_op(ctx, false, keepQ);
+        const int sY0 = new_slot(), sY1 = new_slot(), sC0 = new_slot(), sC1 = new_slot();
+        const int bY0 = new_slot(), bY1 = new_slot(), bP0 = new_slot(), bP1 = new_slot();
+        if (slots_ok && opP != nullptr && opQ != nullptr) {
+            // YP: P then Q from VRAM, no copy (the baseline of the compute time of P)
+            add_variant("YP", -1, { { { opP }, false, -1, bP0, bP1 }, { { opQ }, false } }, 0, false);
+            variants.back().m.on = true;
+            variants.back().m.busy = { { bP0, bP1 } };
+            variants.back().m.q_experts = nq;
+            // YC: the copy of Q alone
+            add_variant("YC", -1, {}, csets[cs_q].total, true, { mk(5, sC0), mk(1, cs_q), mk(5, sC1) });
+            variants.back().own_copy = cs_q;
+            variants.back().n_cmds = (int) csets[cs_q].src.size();
+            variants.back().m.on = true;
+            variants.back().m.s0 = sC0;
+            variants.back().m.s1 = sC1;
+            variants.back().m.copy_bytes = csets[cs_q].total;
+            variants.back().m.q_experts = nq;
+            // Y: the copy of Q on the side stream beside the compute of P, then Q from VRAM
+            add_variant("Y", -1, { { { opP }, false, -1, bY0, bY1 }, { { opQ }, false, sY1 } }, csets[cs_q].total, false,
+                { mk(5, sY0), mk(1, cs_q), mk(5, sY1) });
+            variants.back().own_copy = cs_q;
+            variants.back().n_cmds = (int) csets[cs_q].src.size();
+            variants.back().m.on = true;
+            variants.back().m.s0 = sY0;
+            variants.back().m.s1 = sY1;
+            variants.back().m.busy = { { bY0, bY1 } };
+            variants.back().m.copy_bytes = csets[cs_q].total;
+            variants.back().m.q_experts = nq;
+            variants.back().m.base = "YP";
+        } else {
+            fprintf(stderr, "stage-falsify: probe Y skipped (event slots or empty sets)\n");
+        }
+    }
+    if (wanted("Z") && zn >= 1) {
+        const int zg = std::max(1, sf_o.z_group);
+        const int ng = (zn + zg - 1)/zg;
+        std::vector<char> keepL1(E, 0);
+        bool has_l1 = false;
+        for (int x = 0; x < E; ++x) {
+            keepL1[x] = cls[x] == 0;
+            has_l1 = has_l1 || cls[x] == 0;
+        }
+        if (ng + 1 > 60 || (4*(ng + 1) + 8) > SF_EV_SLOTS/2) {
+            fprintf(stderr, "stage-falsify: probe Z skipped, %d groups are too many (raise --sf-z-group)\n", ng);
+        } else {
+            ggml_init_params ip2 = { ggml_tensor_overhead()*(size_t) (4*ng + 32), NULL, true };
+            ctx2_p.reset(ggml_init(ip2));
+            ggml_context * ctx2 = ctx2_p.get();
+            shared_out = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d, W);
+            shared_acc = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d, W);
+            std::vector<int> gcs(ng);
+            std::vector<ggml_tensor *> gops(ng);
+            ggml_tensor * op_l1 = has_l1 ? make_set_op(ctx2, false, keepL1) : nullptr;
+            for (int j = 0; j < ng; ++j) {
+                std::vector<char> sel(E, 0);
+                for (int i = j*zg; i < std::min(zn, (j + 1)*zg); ++i) {
+                    sel[nr_list[i]] = 1;
+                }
+                gcs[j] = copy_of("z" + std::to_string(j), sel);
+                gops[j] = make_set_op(ctx2, false, sel);
+            }
+            // the compute order: L1 first (no wait), then the groups; every op writes shared_out, the adds sum into shared_acc
+            std::vector<ggml_tensor *> order;
+            if (op_l1 != nullptr) {
+                order.push_back(op_l1);
+            }
+            for (int j = 0; j < ng; ++j) {
+                order.push_back(gops[j]);
+            }
+            ggml_tensor * prev = nullptr;
+            std::vector<ggml_tensor *> adds;
+            for (ggml_tensor * o : order) {
+                z_ops.push_back(o);
+                ggml_tensor * a = ggml_add(ctx2, prev == nullptr ? o : prev, prev == nullptr ? zero_t : o);
+                a->flags |= GGML_TENSOR_FLAG_COMPUTE;
+                z_adds.push_back(a);
+                adds.push_back(a);
+                prev = a;
+            }
+            const int off = op_l1 != nullptr ? 1 : 0;
+            const int n_all = (int) order.size();
+            std::vector<ggml_cgraph *> graphs(n_all);
+            for (int i = 0; i < n_all; ++i) {
+                graphs[i] = ggml_new_graph_custom(ctx, 256, false);
+                ggml_build_forward_expand(graphs[i], order[i]);
+                ggml_graph_add_node(graphs[i], adds[i]);
+            }
+            for (int pass = 0; pass < 2; ++pass) {
+                const bool with_copy = pass == 1;
+                sf_variant v;
+                v.name = with_copy ? "Z" : "ZP";
+                v.out = prev;
+                const int c0 = new_slot(), c1 = new_slot();
+                const int s0 = with_copy ? new_slot() : -1;
+                std::vector<int> mg(ng, -1), b0(n_all), b1(n_all);
+                for (int j = 0; j < ng && with_copy; ++j) {
+                    mg[j] = new_slot();
+                }
+                for (int i = 0; i < n_all; ++i) {
+                    b0[i] = new_slot();
+                    b1[i] = new_slot();
+                }
+                if (!slots_ok) {
+                    fprintf(stderr, "stage-falsify: probe Z skipped (event slots)\n");
+                    break;
+                }
+                int issued = 0;
+                auto issue_copy = [&](int j) {
+                    v.steps.push_back(mk(1, gcs[j]));
+                    v.steps.push_back(mk(5, mg[j]));
+                    v.n_cmds += (int) csets[gcs[j]].src.size();
+                    v.poison.push_back(gcs[j]);
+                    v.link_bytes += csets[gcs[j]].total;
+                    ++issued;
+                };
+                if (with_copy) {
+                    v.steps.push_back(mk(5, s0));
+                    const int first = sf_o.z_ahead <= 0 ? ng : std::min(ng, sf_o.z_ahead);
+                    for (int j = 0; j < first; ++j) {
+                        issue_copy(j);
+                    }
+                }
+                v.steps.push_back(mk(4, c0));
+                for (int i = 0; i < n_all; ++i) {
+                    const int j = i - off; // group index, -1 for L1
+                    if (j >= 0 && with_copy) {
+                        v.steps.push_back(mk(6, mg[j]));
+                    }
+                    v.steps.push_back(mk(4, b0[i]));
+                    sf_step g;
+                    g.kind = 0;
+                    g.g = graphs[i];
+                    v.steps.push_back(g);
+                    v.steps.push_back(mk(4, b1[i]));
+                    if (j >= 0 && with_copy && sf_o.z_ahead > 0 && issued < ng) {
+                        issue_copy(issued);
+                    }
+                    v.m.busy.push_back({ b0[i], b1[i] });
+                }
+                v.steps.push_back(mk(4, c1));
+                v.m.on = true;
+                v.m.c0 = c0;
+                v.m.c1 = c1;
+                v.m.groups = ng;
+                if (with_copy) {
+                    v.m.s0 = s0;
+                    v.m.s1 = mg[ng - 1];
+                    v.m.copy_bytes = v.link_bytes;
+                    v.m.base = "ZP";
+                }
+                variants.push_back(std::move(v));
+            }
+        }
+    }
+
+    // allocate, fill
+    {
+        const size_t need = ggml_backend_alloc_ctx_tensors_from_buft_size(ctx, ggml_backend_get_default_buffer_type(backend));
+        size_t fr = 0, tot = 0;
+        ggml_backend_dev_memory(ggml_backend_get_device(backend), &fr, &tot);
+        fprintf(stderr, "stage-falsify: %s W%" PRId64 " %s: graph tensors %.2f GiB, device free %.2f GiB\n", ws.name.c_str(), W,
+            route.c_str(), need/1073741824.0, fr/1073741824.0);
+        if (need + (size_t) 6*1073741824ull > fr) {
+            fprintf(stderr, "stage-falsify: not enough device memory for the case, skipped\n");
+            return false;
+        }
+    }
+    ggml_backend_buffer_ptr buf(ggml_backend_alloc_ctx_tensors(ctx, backend));
+    if (!buf) {
+        fprintf(stderr, "stage-falsify: cannot allocate the tensors of the case\n");
+        return false;
+    }
+    for (ggml_tensor * t : z_ops) {
+        t->data   = shared_out->data;
+        t->buffer = shared_out->buffer;
+    }
+    for (ggml_tensor * t : z_adds) {
+        t->data   = shared_acc->data;
+        t->buffer = shared_acc->buffer;
+    }
+    for (auto & m : set_masks) {
+        ggml_backend_tensor_set(m.first, m.second.data(), 0, m.second.size());
+    }
+    init_tensor_uniform(x_t);
+    init_tensor_uniform(wts_t, 0.0f, 1.0f);
+    ggml_backend_tensor_memset(zero_t, 0, 0, ggml_nbytes(zero_t));
+    ggml_backend_tensor_set(ids_t, ids.data(), 0, ids.size()*sizeof(int32_t));
+    for (auto & m : masks) {
+        std::vector<int8_t> keep(E, 0);
+        for (int x = 0; x < E; ++x) {
+            keep[x] = cls[x] < 3 && ((m.first >> cls[x]) & 1) ? 1 : 0;
+        }
+        ggml_backend_tensor_set(m.second, keep.data(), 0, keep.size());
+    }
+    if (!ggml_backend_buffer_is_host(ws.wh[0]->buffer)) {
+        fprintf(stderr, "stage-falsify: the weights are not in a host buffer\n");
+        return false;
+    }
+    // the fused op needs the host weights admitted by the backend
+    for (const sf_variant & v : variants) {
+        for (const sf_step & s : v.steps) {
+            if (s.kind == 0 && !test_host_weights_admitted(s.g, ws.buf_h.get(), backend)) {
+                fprintf(stderr, "stage-falsify: host-direct weights not admitted for variant %s\n", v.name.c_str());
+                return false;
+            }
+        }
+    }
+
+    // case line
+    printf("{\"type\":\"case\",\"shape\":\"%s\",\"d\":%" PRId64 ",\"f\":%" PRId64 ",\"E\":%d,\"k\":%d,\"W\":%" PRId64
+        ",\"route\":\"%s\",\"l1_frac\":%.3f,\"layout\":\"%s\",\"split_cmds\":%d,\"mt_r\":%d,\"mt_v\":%d,\"reread_over\":%d,"
+        "\"experts_l1\":%d,\"experts_once\":%d,\"experts_reread\":%d,\"experts_unused\":%d,\"rows_once\":%" PRId64
+        ",\"rows_reread\":%" PRId64 ",\"expert_bytes\":%" PRId64 ",\"chunk_rows\":%d,\"reps\":%d}\n",
+        ws.name.c_str(), d, ws.f, E, K, W, route.c_str(), sf_o.l1, sf_o.contig ? "contig" : "scatter", sf_o.split_cmds ? 1 : 0,
+        mt_r, mt_v, thr, n_cls[0], n_cls[1], n_cls[2], n_cls[3], rows_cls[1], rows_cls[2], b_exp, rows_arg, sf_o.reps);
+    fflush(stdout);
+
+    // check: every variant against V, the destination of its copies poisoned first so that a missing copy shows
+    const size_t n_out = (size_t) (d*W);
+    std::vector<float> ref(n_out), cur(n_out);
+    for (sf_variant & v : variants) {
+        if (sf_o.check) {
+            std::vector<int> pz = v.poison;
+            if (v.own_copy >= 0) {
+                pz.push_back(v.own_copy);
+            }
+            for (int ci : pz) {
+                for (const auto & r : csets[ci].ranges) {
+                    ggml_backend_tensor_memset(r.t, 0x55, r.off, r.size);
+                }
+            }
+        }
+        sf_exec(backend, api, v, csets);
+        if (v.out == nullptr) {
+            continue;
+        }
+        if (!sf_o.check) {
+            v.check = "skipped";
+            continue;
+        }
+        ggml_backend_tensor_get(v.out, v.name == "V" ? ref.data() : cur.data(), 0, n_out*sizeof(float));
+        if (v.name == "V") {
+            v.check = "reference";
+            continue;
+        }
+        bool finite = true;
+        for (size_t i = 0; i < n_out; ++i) {
+            finite = finite && std::isfinite(cur[i]);
+        }
+        const double e = nmse(ref.data(), cur.data(), n_out);
+        char s[96];
+        snprintf(s, sizeof(s), "%s nmse=%.3g", finite && e <= 2e-5 ? "ok" : "FAIL", e);
+        v.check = s;
+    }
+
+    // time: all variants, interleaved, the start rotated every repetition
+    const int nv = (int) variants.size();
+    for (int r = -sf_o.warm; r < sf_o.reps; ++r) {
+        for (int j = 0; j < nv; ++j) {
+            sf_variant & v = variants[(j + std::max(r, 0)) % nv];
+            const int64_t t0 = ggml_time_us();
+            sf_exec(backend, api, v, csets);
+            const int64_t t1 = ggml_time_us();
+            if (r >= 0) {
+                v.ms.push_back((t1 - t0)/1000.0);
+                sf_collect(backend, api, v);
+                if (v.u_phase) {
+                    double ph[12] = {};
+                    GGML_ASSERT(api.diag(backend, 2, 0, ph));
+                    v.ph.insert(v.ph.end(), ph, ph + 12);
+                }
+            }
+        }
+    }
+    auto busy_of = [&](const std::string & name) -> double {
+        for (const sf_variant & b : variants) {
+            if (b.name == name) {
+                return sf_median(b.m.busy_ms);
+            }
+        }
+        return -1.0;
+    };
+    auto num = [](double x, const char * f) {
+        char b[64];
+        snprintf(b, sizeof(b), f, x);
+        return std::string(b);
+    };
+    for (const sf_variant & v : variants) {
+        // the probes Y and Z append fields: copy window on the side stream (ms, GB/s decimal), the compute busy time (sum of
+        // the graph spans between the marks), the compute span, the slowdown of the busy time against the same compute without
+        // a copy (variant "base"); null where a field does not apply
+        std::string tail;
+        if (v.m.on) {
+            const double copy_ms = v.m.s0 >= 0 ? sf_median(v.m.copy_ms) : -1.0;
+            const double busy_ms = sf_median(v.m.busy_ms);
+            const double base_ms = v.m.base.empty() ? -1.0 : busy_of(v.m.base);
+            tail = ",\"copy_ms\":" + (copy_ms >= 0 ? num(copy_ms, "%.3f") : std::string("null")) +
+                ",\"copy_gbps\":" + (copy_ms > 0 ? num(v.m.copy_bytes/1e9/(copy_ms/1000.0), "%.2f") : std::string("null")) +
+                ",\"copy_bytes\":" + std::to_string(v.m.copy_bytes) +
+                ",\"busy_ms\":" + (v.m.busy.empty() ? std::string("null") : num(busy_ms, "%.3f")) +
+                ",\"span_ms\":" + num(sf_median(v.m.span_ms), "%.3f") +
+                ",\"compute_slowdown\":" + (base_ms > 0 ? num(busy_ms/base_ms, "%.3f") : std::string("null")) +
+                ",\"q_experts\":" + std::to_string(v.m.q_experts) + ",\"groups\":" + std::to_string(v.m.groups) +
+                ",\"z_ahead\":" + std::to_string(sf_o.z_ahead);
+        }
+        if (v.u_group > 0) {
+            // probe U: the group size, the median against V of the same process and, for UP, the median of each phase (the
+            // time since the previous stamp, so the launch gaps of a phase are in it); route, plan (host sync, upload),
+            // items, prologue, gemm, glu, scatter are the phases, total is first to last stamp
+            double v_med = -1.0;
+            for (const sf_variant & b : variants) {
+                if (b.name == "V") {
+                    v_med = sf_median(b.ms);
+                }
+            }
+            tail += ",\"u_group\":" + std::to_string(v.u_group) + ",\"u_minus_v_ms\":" + num(sf_median(v.ms) - v_med, "%.3f");
+            if (v.u_phase && !v.ph.empty()) {
+                static const char * names[12] = { "route", "plan", "items", "prologue", "gemm", "glu", "scatter", "total", "groups",
+                    "launches", "experts", "rows" };
+                const size_t nrep = v.ph.size()/12;
+                for (int i = 0; i < 12; ++i) {
+                    std::vector<double> col(nrep);
+                    for (size_t r = 0; r < nrep; ++r) {
+                        col[r] = v.ph[r*12 + i];
+                    }
+                    tail += std::string(",\"ph_") + names[i] + (i < 8 ? "_ms\":" : "\":") + num(sf_median(col), i < 8 ? "%.3f" : "%.0f");
+                }
+            }
+        }
+        printf("{\"type\":\"result\",\"shape\":\"%s\",\"W\":%" PRId64 ",\"route\":\"%s\",\"variant\":\"%s\",\"median_ms\":%.3f,"
+            "\"min_ms\":%.3f,\"max_ms\":%.3f,\"n\":%d,\"link_bytes\":%" PRId64 ",\"copy_cmds\":%d,\"check\":\"%s\"%s}\n",
+            ws.name.c_str(), W, route.c_str(), v.name.c_str(), sf_median(v.ms), *std::min_element(v.ms.begin(), v.ms.end()),
+            *std::max_element(v.ms.begin(), v.ms.end()), (int) v.ms.size(), v.link_bytes, v.n_cmds, v.check.c_str(), tail.c_str());
+    }
+    fflush(stdout);
+    return true;
+}
+
+static int sf_main(const char * backend_filter) {
+    ggml_backend_dev_t dev = nullptr;
+    for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+        ggml_backend_dev_t c = ggml_backend_dev_get(i);
+        if (backend_filter != nullptr ? strcmp(backend_filter, ggml_backend_dev_name(c)) == 0 :
+                ggml_backend_dev_type(c) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+            dev = c;
+            break;
+        }
+    }
+    if (dev == nullptr) {
+        fprintf(stderr, "stage-falsify: no backend (use -b <name>)\n");
+        return 1;
+    }
+    if (getenv("GGML_CUDA_HOST_DIRECT") == nullptr) {
+        fprintf(stderr, "stage-falsify: GGML_CUDA_HOST_DIRECT=1 is required for the host-direct variants\n");
+        return 1;
+    }
+    ggml_backend_ptr backend(ggml_backend_dev_init(dev, NULL));
+    GGML_ASSERT(backend != NULL);
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    sf_api api;
+    api.copy = (decltype(api.copy)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_stage_bench_copy");
+    api.wait = (decltype(api.wait)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_stage_bench_wait");
+    api.sync = (decltype(api.sync)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_stage_bench_sync");
+    api.ev   = (decltype(api.ev))   ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_stage_bench_ev");
+    api.diag = (decltype(api.diag)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_moe_group_diag");
+    if (!api.copy || !api.wait || !api.sync || !api.ev) {
+        fprintf(stderr, "stage-falsify: the backend has no stage bench entry points\n");
+        return 1;
+    }
+    {
+        size_t fr = 0, tot = 0;
+        ggml_backend_dev_memory(dev, &fr, &tot);
+        fprintf(stderr, "stage-falsify: %s, device free %.2f of %.2f GiB; reps %d warm %d l1 %.2f layout %s%s seed %" PRIu64 "\n",
+            ggml_backend_dev_description(dev), fr/1073741824.0, tot/1073741824.0, sf_o.reps, sf_o.warm, sf_o.l1,
+            sf_o.contig ? "contig" : "scatter", sf_o.split_cmds ? " split-cmds" : "", sf_o.seed);
+    }
+    std::unique_ptr<sf_wset> ws;
+    bool ok = true;
+    for (const std::string & spec : sf_o.shapes) {
+        const size_t colon = spec.find(':');
+        const std::string name = spec.substr(0, colon);
+        const int64_t W = colon == std::string::npos ? 8192 : atoll(spec.c_str() + colon + 1);
+        const sf_shape * sh = nullptr;
+        for (const sf_shape & s : sf_shapes) {
+            if (name == s.name) {
+                sh = &s;
+            }
+        }
+        if (sh == nullptr || W <= 0) {
+            fprintf(stderr, "stage-falsify: bad shape '%s' (glm, ds4f, ds41, tiny)\n", spec.c_str());
+            return 1;
+        }
+        if (!ws || ws->name != name) {
+            ws.reset();
+            ws.reset(new sf_wset());
+            if (!sf_make_wset(*ws, *sh, backend.get())) {
+                return 1;
+            }
+        }
+        for (const std::string & route : sf_o.routes) {
+            ok = sf_run_case(backend.get(), api, *ws, route, W) && ok;
+        }
+    }
+    return ok ? 0 : 1;
+}
+
 static void usage(char ** argv) {
     printf("Usage: %s [mode] [options]\n\n", argv[0]);
     printf("Valid modes:\n");
@@ -15557,6 +16638,15 @@ static void usage(char ** argv) {
     printf("  --list-ops                  list all available GGML operations\n");
     printf("  --show-coverage             show test coverage\n");
     printf("  --test-file <path>          read test operators from a test file generated by test-export-graph-ops\n");
+    printf("  --sf-shapes <a:W,..>        stage-falsify cases: glm, ds4f, ds41, tiny with the tokens W (default glm:8192,ds4f:8192,ds41:12288,ds41:2048)\n");
+    printf("  --sf-routes <uniform,u2>    routing (default both); --sf-variants V,A,B,C,D,X,R,Y,Z (Y adds YP,YC, Z adds ZP); --sf-reps N; --sf-warm N; --sf-seed N\n");
+    printf("  --sf-l1 <frac>              share of the experts resident in L1 (default 0); --sf-l1-hot picks the busiest\n");
+    printf("  --sf-contig                 number the re-read experts first (one copy run); --sf-split-cmds: one command per expert\n");
+    printf("  --sf-reread-min <rows>      rows over which an expert is re-read (default: the host tile); --sf-chunk-rows <n>\n");
+    printf("  --sf-kind <default|h2d|d2d> copy kind; --sf-no-check skips the poison/compare pass\n");
+    printf("  --sf-z-group <n>            probe Z: experts per copy group (default 8); --sf-z-ahead <n>: groups copied ahead (default 2, 0 = all first)\n");
+    printf("  --sf-u-group <n>            probe U (variants U, UP; needs a backend with the group diagnostic): used experts per group (default 16), one route, exact grids, one scatter; UP adds phase stamps\n");
+    printf("  --sf-y-split <half|alt>     probe Y: the copied set Q is the upper half of the used ids (default) or every second used expert\n");
     printf("  --host-weights              allocates quantized weight tensors from the backend device's host buffer type\n");
     printf("  -j <n>                      run tests using <n> parallel worker threads (default: 1, test mode only)\n\n");
     printf("Examples:\n");
@@ -15576,12 +16666,33 @@ int main(int argc, char ** argv) {
     const char * params_filter = nullptr;
     const char * test_file_path = nullptr;
     int parallel_workers = 1;
+    bool sf_mode = false;
+    auto sf_list = [](const char * v) {
+        std::vector<std::string> out;
+        std::string cur;
+        for (const char * c = v; ; ++c) {
+            if (*c == ',' || *c == 0) {
+                if (!cur.empty()) {
+                    out.push_back(cur);
+                }
+                cur.clear();
+                if (*c == 0) {
+                    break;
+                }
+            } else {
+                cur += *c;
+            }
+        }
+        return out;
+    };
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "test") == 0) {
             mode = MODE_TEST;
         } else if (strcmp(argv[i], "perf") == 0) {
             mode = MODE_PERF;
+        } else if (strcmp(argv[i], "stage-falsify") == 0) {
+            sf_mode = true;
         } else if (strcmp(argv[i], "grad") == 0) {
             mode = MODE_GRAD;
         } else if (strcmp(argv[i], "support") == 0) {
@@ -15623,6 +16734,37 @@ int main(int argc, char ** argv) {
                 fprintf(stderr, "warning: --host-weights without GGML_CUDA_HOST_DIRECT=1 leaves the weights in a "
                         "buffer that the backend did not map for kernel access\n");
             }
+        } else if (strncmp(argv[i], "--sf-", 5) == 0) {
+            const char * o = argv[i];
+            const bool flag = strcmp(o, "--sf-l1-hot") == 0 || strcmp(o, "--sf-contig") == 0 || strcmp(o, "--sf-split-cmds") == 0 ||
+                strcmp(o, "--sf-no-check") == 0;
+            if (!flag && i + 1 >= argc) {
+                usage(argv);
+                return 1;
+            }
+            const char * v = flag ? "" : argv[++i];
+            if      (strcmp(o, "--sf-shapes") == 0)     { sf_o.shapes = sf_list(v); }
+            else if (strcmp(o, "--sf-routes") == 0)     { sf_o.routes = sf_list(v); }
+            else if (strcmp(o, "--sf-variants") == 0)   { sf_o.variants = sf_list(v); }
+            else if (strcmp(o, "--sf-reps") == 0)       { sf_o.reps = std::max(1, atoi(v)); }
+            else if (strcmp(o, "--sf-warm") == 0)       { sf_o.warm = std::max(0, atoi(v)); }
+            else if (strcmp(o, "--sf-l1") == 0)         { sf_o.l1 = std::min(1.0, std::max(0.0, atof(v))); }
+            else if (strcmp(o, "--sf-l1-hot") == 0)     { sf_o.l1_hot = true; }
+            else if (strcmp(o, "--sf-contig") == 0)     { sf_o.contig = true; }
+            else if (strcmp(o, "--sf-split-cmds") == 0) { sf_o.split_cmds = true; }
+            else if (strcmp(o, "--sf-seed") == 0)       { sf_o.seed = strtoull(v, nullptr, 10); }
+            else if (strcmp(o, "--sf-reread-min") == 0) { sf_o.reread_min = atoi(v); }
+            else if (strcmp(o, "--sf-chunk-rows") == 0) { sf_o.chunk_rows = atoll(v); }
+            else if (strcmp(o, "--sf-kind") == 0)       { sf_o.copy_kind = strcmp(v, "h2d") == 0 ? 1 : strcmp(v, "d2d") == 0 ? 2 : 0; }
+            else if (strcmp(o, "--sf-no-check") == 0)   { sf_o.check = false; }
+            else if (strcmp(o, "--sf-z-group") == 0)    { sf_o.z_group = std::max(1, atoi(v)); }
+            else if (strcmp(o, "--sf-u-group") == 0)    { sf_o.u_group = std::max(1, atoi(v)); }
+            else if (strcmp(o, "--sf-z-ahead") == 0)    { sf_o.z_ahead = std::max(0, atoi(v)); }
+            else if (strcmp(o, "--sf-y-split") == 0)    { sf_o.y_alt = strcmp(v, "alt") == 0; }
+            else {
+                usage(argv);
+                return 1;
+            }
         } else if (strcmp(argv[i], "--list-ops") == 0) {
             list_all_ops();
             return 0;
@@ -15655,6 +16797,10 @@ int main(int argc, char ** argv) {
 
     // load and enumerate backends
     ggml_backend_load_all();
+
+    if (sf_mode) {
+        return sf_main(backend_filter);
+    }
 
     // Create printer for output format
     std::unique_ptr<printer> output_printer = create_printer(output_format);
