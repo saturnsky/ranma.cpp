@@ -1438,6 +1438,22 @@ struct llama_model_deepseek4 : public llama_model_base {
         // creates both when the ubatch qualifies (one stream, one sequence, see llm_graph_chunk_mask_usable)
         void build_inp_dsv4_chunk(llm_graph_input_dsv4 * inp_dsv4);
 
+        // ranma: for the attention of a chunked graph outside this file (deepseek41): the device-side prefix mask
+        // [n_kv, n] of the compressed plan of inp_comp (the csa, hca or lid input of inp_dsv4) for the token rows
+        // [i0, i0 + n), and the token key of those rows it is made from, F32 [1, n] -(n_visible - 0.5)
+        ggml_tensor * build_comp_chunk_mask(
+                llm_graph_input_dsv4 * inp_dsv4,
+                const llm_graph_input_dsv4::comp_input & inp_comp,
+                int64_t i0,
+                int64_t n,
+                ggml_type type) const;
+
+        ggml_tensor * build_comp_chunk_key(
+                llm_graph_input_dsv4 * inp_dsv4,
+                const llm_graph_input_dsv4::comp_input & inp_comp,
+                int64_t i0,
+                int64_t n) const;
+
         // ranma: the attention of a chunked graph: raw K written and the compressed K joined for the whole ubatch, then
         // per chunk of query rows the query (build_q of the qr rows), masks, LID selection, attention and the output
         // projection (build_tail); returns the joined [n_embd, n_tokens]
@@ -1556,7 +1572,9 @@ struct llama_model_deepseek41 : public llama_model_deepseek4 {
                 int64_t nt,
                 int il) const;
 
-        // which compressed positions this layer's queries attend to
+        // which compressed positions this layer's queries attend to. n < 0: the whole ubatch; otherwise
+        // the rows [i0, i0 + n) with comp_mask, the compressed causal mask of those rows, and a candidate
+        // keep made here goes to *cand_keep_out rather than into the carry
         ggml_tensor * build_indexer_top_k(
                 const llama_model & model,
                 llm_graph_input_dsv4 * inp_dsv4,
@@ -1565,6 +1583,19 @@ struct llama_model_deepseek41 : public llama_model_deepseek4 {
                 ggml_tensor * cur,
                 ggml_tensor * inp_pos,
                 dsv41_top_k_carry & top_k_carry,
+                int il,
+                int64_t i0 = 0,
+                int64_t n = -1,
+                ggml_tensor * comp_mask = nullptr,
+                ggml_tensor ** cand_keep_out = nullptr) const;
+
+        // the compressor of a KV source layer over the whole ubatch: cache writes and state carry
+        void build_kv_source(
+                const llama_model & model,
+                llm_graph_input_dsv4 * inp_dsv4,
+                const llm_graph_input_dsv4::comp_input & inp_comp,
+                const llama_dsv4_comp_state * comp_state,
+                ggml_tensor * cur,
                 int il) const;
 
         // level one of the two level top-k: the blocks of positions worth ranking
@@ -1579,6 +1610,25 @@ struct llama_model_deepseek41 : public llama_model_deepseek4 {
                 ggml_tensor * cur,
                 ggml_tensor * inp_pos,
                 dsv41_top_k_carry & top_k_carry,
+                int il) const;
+
+        // ranma: build_attention_v41 of a chunked graph with device-side masks (inp_cm, the attention chunk)
+        ggml_tensor * build_attention_v41_chunked(
+                const llama_model & model,
+                llm_graph_input_dsv4 * inp_dsv4,
+                ggml_tensor * cur,
+                ggml_tensor * inp_pos,
+                dsv41_top_k_carry & top_k_carry,
+                int il) const;
+
+        // ranma: the [n_raw + n_comp, n] attention mask of a chunk from its raw window mask and its top-k
+        ggml_tensor * build_chunk_kq_mask(
+                ggml_tensor * raw,
+                ggml_tensor * top_k,
+                ggml_tensor * key,
+                ggml_tensor * raw_idx,
+                ggml_tensor * ninf,
+                int64_t n_comp,
                 int il) const;
     };
 
