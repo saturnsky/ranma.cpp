@@ -26,6 +26,8 @@
 #include <cfloat>
 #include <map>
 #include <mutex>
+#include <set>
+#include <string>
 
 #define MMH_NG          128 // output columns per block, one H128 output block
 #define MMH_GEMV_TOKENS   8 // GEMV without a routing pass up to this many tokens
@@ -1912,6 +1914,11 @@ void ggml_cuda_mul_mat_had(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 // a wait over MMH_MOE_STAGE_TIMEOUT (or a staged source that is not 16-byte aligned) records an error in mapped host
 // memory and stops the copier and the waits; a host function after the op reports it and aborts. The legitimate waits are
 // bounded by one chunk of compute and one chunk of copies, far below the limit.
+//
+// LoRA (ggml_moe_ffn_lora deltas on the src[5] of a weight's node): after the GEMMs of a kind, before the GLU (up,
+// gate) or the scatter (down), each delta in chain order adds scale * B_e^T (A_e^T v) to the local rows of the chunk:
+// v is the F32 input of the weight (the token's row of x, or the GLU output for down; not the rotated fp16 prologue),
+// e the routed expert of the row (the op's expert ids, never a cache slot). A and B are read from VRAM.
 
 #define MMH_MOE_ROWS 4096 // default rows per chunk
 #define MMH_MOE_MAX_USED 64 // most experts per token
@@ -2300,6 +2307,145 @@ static __global__ void __launch_bounds__(256) mmh_moe_scatter(const mmh_moe_rout
     }
 }
 
+// one LoRA delta of a kind (ggml_moe_ffn_lora): A [k, rank, E], B [rank, n, E], F32 or F16
+struct mmh_moe_lora {
+    const char * a;
+    const char * b;
+    int64_t      a_nb1;
+    int64_t      a_nb2;
+    int64_t      b_nb1;
+    int64_t      b_nb2;
+    int          k;
+    int          n;
+    int          rank;
+    bool         a_f16;
+    bool         b_f16;
+    float        scale;
+};
+
+static __device__ __forceinline__ float mmh_moe_lora_load(const char * p, const bool f16, const int64_t i) {
+    return f16 ? __half2float(((const half *) p)[i]) : ((const float *) p)[i];
+}
+
+#define MMH_MOE_LORA_RB 8 // ranks per pass of the A kernel
+
+// z[r, :] = A_e^T v for the local rows r of chunk c (v: the row of the token in `in`, or local row r with `local`)
+static __global__ void __launch_bounds__(256) mmh_moe_lora_a(const mmh_moe_route rt, const int c, const int n_used,
+        const mmh_moe_lora l, const float * __restrict__ in, const int64_t in_nb1, const bool local, float * __restrict__ z) {
+    __shared__ float s_red[MMH_MOE_LORA_RB][8];
+
+    const int r = blockIdx.x;
+    if (c >= *rt.n_chunks || r >= rt.chunks[2*c + 1]) {
+        return;
+    }
+    const int g = rt.rows_sorted[rt.chunks[2*c + 0] + r];
+    const int e = rt.eid[g];
+    const float * v  = (const float *) ((const char *) in + (int64_t) (local ? r : g / n_used)*in_nb1);
+    const char  * ae = l.a + (int64_t) e*l.a_nb2;
+    const int lane = threadIdx.x % WARP_SIZE;
+    const int wave = threadIdx.x / WARP_SIZE;
+    const int n_wave = blockDim.x / WARP_SIZE;
+
+    for (int k0 = 0; k0 < l.rank; k0 += MMH_MOE_LORA_RB) {
+        float acc[MMH_MOE_LORA_RB];
+#pragma unroll
+        for (int j = 0; j < MMH_MOE_LORA_RB; ++j) {
+            acc[j] = 0.0f;
+        }
+        for (int i = threadIdx.x; i < l.k; i += blockDim.x) {
+            const float vi = v[i];
+#pragma unroll
+            for (int j = 0; j < MMH_MOE_LORA_RB; ++j) {
+                if (k0 + j < l.rank) {
+                    acc[j] += mmh_moe_lora_load(ae + (int64_t) (k0 + j)*l.a_nb1, l.a_f16, i)*vi;
+                }
+            }
+        }
+#pragma unroll
+        for (int j = 0; j < MMH_MOE_LORA_RB; ++j) {
+            acc[j] = warp_reduce_sum<WARP_SIZE>(acc[j]);
+        }
+        __syncthreads();
+        if (lane == 0) {
+#pragma unroll
+            for (int j = 0; j < MMH_MOE_LORA_RB; ++j) {
+                s_red[j][wave] = acc[j];
+            }
+        }
+        __syncthreads();
+        if (threadIdx.x < MMH_MOE_LORA_RB && k0 + (int) threadIdx.x < l.rank) {
+            float sum = 0.0f;
+            for (int w = 0; w < n_wave; ++w) {
+                sum += s_red[threadIdx.x][w];
+            }
+            z[(int64_t) r*l.rank + k0 + threadIdx.x] = sum;
+        }
+    }
+}
+
+// y[r, :] += scale * B_e^T z[r, :] for the local rows r of chunk c (grid: rows x ceil(n/256))
+static __global__ void __launch_bounds__(256) mmh_moe_lora_b(const mmh_moe_route rt, const int c, const mmh_moe_lora l,
+        const float * __restrict__ z, float * __restrict__ y) {
+    const int r = blockIdx.x;
+    const int n = blockIdx.y*blockDim.x + threadIdx.x;
+    if (c >= *rt.n_chunks || r >= rt.chunks[2*c + 1] || n >= l.n) {
+        return;
+    }
+    const int e = rt.eid[rt.rows_sorted[rt.chunks[2*c + 0] + r]];
+    const char  * be = l.b + (int64_t) e*l.b_nb2 + (int64_t) n*l.b_nb1;
+    const float * zr = z + (int64_t) r*l.rank;
+    float sum = 0.0f;
+    for (int k = 0; k < l.rank; ++k) {
+        sum += mmh_moe_lora_load(be, l.b_f16, k)*zr[k];
+    }
+    // as SCALE then ADD of the graph: the scaled delta is rounded before the add
+    float & o = y[(int64_t) r*l.n + n];
+    o = o + (l.scale == 1.0f ? sum : __fmul_rn(sum, l.scale));
+}
+
+// the LoRA deltas of a MOE_FFN_HAD weight node (its src[5] chain), in order; false if one cannot be read here
+static bool mmh_moe_lora_list(const ggml_tensor * d, std::vector<mmh_moe_lora> * out) {
+    for (const ggml_tensor * t = d->src[5]; t != nullptr; t = t->src[2]) {
+        const ggml_tensor * a = t->src[0];
+        const ggml_tensor * b = t->src[1];
+        if (t->op != GGML_OP_MOE_FFN_LORA) {
+            return false;
+        }
+        for (const ggml_tensor * ab : { a, b }) {
+            if ((ab->type != GGML_TYPE_F32 && ab->type != GGML_TYPE_F16) || ab->nb[0] != ggml_type_size(ab->type)) {
+                return false;
+            }
+            // read in place by the kernels: device memory only (not a host buffer, not the exclusive expert buffer)
+            const ggml_backend_buffer_t buf = ab->view_src ? ab->view_src->buffer : ab->buffer;
+            if (buf != nullptr && (ggml_backend_buffer_is_host(buf) ||
+                    ggml_cuda_expert_is_exclusive_buffer_type(ggml_backend_buffer_get_type(buf)))) {
+                return false;
+            }
+        }
+        if (a->ne[1] < 1 || a->ne[1] > 4096 || a->ne[0] >= INT_MAX || b->ne[1] >= INT_MAX) {
+            return false;
+        }
+        const float scale = ggml_get_op_params_f32(t, 0);
+        if (out != nullptr && scale != 0.0f) {
+            mmh_moe_lora l;
+            l.a     = (const char *) a->data;
+            l.b     = (const char *) b->data;
+            l.a_nb1 = a->nb[1];
+            l.a_nb2 = a->nb[2];
+            l.b_nb1 = b->nb[1];
+            l.b_nb2 = b->nb[2];
+            l.k     = (int) a->ne[0];
+            l.n     = (int) b->ne[1];
+            l.rank  = (int) a->ne[1];
+            l.a_f16 = a->type == GGML_TYPE_F16;
+            l.b_f16 = b->type == GGML_TYPE_F16;
+            l.scale = scale;
+            out->push_back(l);
+        }
+    }
+    return true;
+}
+
 static __global__ void mmh_moe_table_init(uint64_t * __restrict__ tab, const uint64_t * __restrict__ src, const int n) {
     const int i = blockIdx.x*blockDim.x + threadIdx.x;
     if (i < n) {
@@ -2593,6 +2739,9 @@ bool ggml_cuda_moe_ffn_had_supported(const int device, const ggml_tensor * op) {
                 !mmh_input_f16(d) || w->view_src != nullptr) {
             return false;
         }
+        if (!mmh_moe_lora_list(d, nullptr)) {
+            return false;
+        }
     }
     const int64_t n_exp = op->src[3]->src[0]->ne[2];
     const int64_t R     = std::min<int64_t>(mmh_moe_chunk_rows(op), n_rows);
@@ -2680,6 +2829,25 @@ void ggml_cuda_moe_ffn_had(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     }
     const bool all_local = !remote;
 
+    // LoRA deltas of each kind, and the rank values of a chunk's rows (the largest rank)
+    std::vector<mmh_moe_lora> lora[3];
+    int max_rank = 0;
+    for (int i = 0; i < 3; ++i) {
+        GGML_ASSERT(mmh_moe_lora_list(desc[i], &lora[i]));
+        for (const mmh_moe_lora & l : lora[i]) {
+            max_rank = std::max(max_rank, l.rank);
+        }
+    }
+    if (max_rank > 0) {
+        static std::mutex mutex;
+        static std::set<std::string> logged;
+        std::lock_guard<std::mutex> lock(mutex);
+        if (logged.insert(desc[0]->src[0]->name).second) {
+            GGML_LOG_INFO("%s: %s: LoRA deltas up %d, gate %d, down %d (largest rank %d)\n", __func__, desc[0]->src[0]->name,
+                (int) lora[0].size(), (int) lora[1].size(), (int) lora[2].size(), max_rank);
+        }
+    }
+
     const int64_t R     = std::min<int64_t>(mmh_moe_chunk_rows(dst), n_rows);
     const int     mt_v  = mmh_moe_mt(n_rows, n_exp, false);
     const int     mt_r  = mmh_moe_mt(n_rows, n_exp, true);
@@ -2731,6 +2899,7 @@ void ggml_cuda_moe_ffn_had(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_pool_alloc<float> vu(ctx.pool(), R*n_ff);
     ggml_cuda_pool_alloc<float> vg(ctx.pool(), R*n_ff);
     ggml_cuda_pool_alloc<float> vy(ctx.pool(), R*n_embd);
+    ggml_cuda_pool_alloc<float> lz(ctx.pool(), max_rank > 0 ? R*max_rank : 1);
 
     mmh_moe_route rt;
     rt.rows_sorted = route.get();
@@ -2882,6 +3051,16 @@ void ggml_cuda_moe_ffn_had(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
             if (!all_local) {
                 mmh_moe_gemm(desc[i]->src[0]->type, mt_r, dim3(groups, (unsigned) max_items_r, 1), stream, q, wd[i], xh.get(),
                     rscale.get(), items_r, n_items_r, iota.get());
+                CUDA_CHECK(cudaGetLastError());
+            }
+            // LoRA: the F32 input of the weight (x, or the GLU output in vu for down)
+            for (const mmh_moe_lora & l : lora[i]) {
+                mmh_moe_lora_a<<<(unsigned) R, 256, 0, stream>>>(rt, c, n_used, l,
+                    local ? vu.get() : (const float *) x->data, local ? n_ff*(int64_t) sizeof(float) : (int64_t) x->nb[1],
+                    local, lz.get());
+                CUDA_CHECK(cudaGetLastError());
+                mmh_moe_lora_b<<<dim3((unsigned) R, (unsigned) ((l.n + 255)/256), 1), 256, 0, stream>>>(rt, c, l, lz.get(),
+                    outs[i]);
                 CUDA_CHECK(cudaGetLastError());
             }
             if (i == 1) {

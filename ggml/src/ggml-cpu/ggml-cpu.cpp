@@ -442,7 +442,18 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
                     (w->buffer != nullptr && ggml_backend_cpu_is_extra_buffer_type(w->buffer->buft))) {
                 return false;
             }
+            for (const ggml_tensor * l = op->src[i]->src[5]; l != nullptr; l = l->src[2]) {
+                for (int j = 0; j < 2; j++) {
+                    const ggml_tensor * t = l->src[j];
+                    if (t->buffer != nullptr && ggml_backend_cpu_is_extra_buffer_type(t->buffer->buft)) {
+                        return false;
+                    }
+                }
+            }
         }
+        return true;
+    }
+    if (op->op == GGML_OP_MOE_FFN_LORA) {
         return true;
     }
     if (ggml_is_exl3(op->type) || ggml_is_row_gather_only(op->type)) {

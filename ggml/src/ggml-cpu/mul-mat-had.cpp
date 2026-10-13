@@ -189,7 +189,7 @@ void ggml_compute_forward_mul_mat_had(const ggml_compute_params * params, ggml_t
     }
 }
 
-// GGML_OP_MOE_FFN_HAD: reference implementation, one token at a time (see ggml_moe_ffn_had())
+// GGML_OP_MOE_FFN_HAD: reference implementation, one token at a time (see ggml_moe_ffn_had() and ggml_moe_ffn_lora())
 
 // y = rot_out * H(W_e^T H(rot_in * x)) for one row, with the weight and rotations of the MUL_MAT_HAD node d
 static void mmh_moe_row(const ggml_tensor * d, int64_t e, const float * x, float * y, float * xh, float * wblk,
@@ -234,7 +234,49 @@ static void mmh_moe_row(const ggml_tensor * d, int64_t e, const float * x, float
     }
 }
 
-// per thread: xh, the decoded weight block (F32 and raw F16), acc, up, gate, down output
+// y += scale * B_e^T (A_e^T v) for each LoRA delta of the MUL_MAT_HAD node d (its src[5] chain), in chain order;
+// z holds the largest rank
+static void mmh_moe_lora(const ggml_tensor * d, int64_t e, const float * v, float * y, float * z) {
+    for (const ggml_tensor * l = d->src[5]; l != nullptr; l = l->src[2]) {
+        const float scale = ggml_get_op_params_f32(l, 0);
+        if (scale == 0.0f) {
+            continue;
+        }
+        const ggml_tensor * a = l->src[0];
+        const ggml_tensor * b = l->src[1];
+        const int64_t k = a->ne[0];
+        const int64_t r = a->ne[1];
+        const int64_t n = b->ne[1];
+        for (int64_t j = 0; j < r; ++j) {
+            const char * col = (const char *) a->data + j*a->nb[1] + e*a->nb[2];
+            float sum = 0.0f;
+            for (int64_t i = 0; i < k; ++i) {
+                sum += mmh_load(a, col + i*a->nb[0]) * v[i];
+            }
+            z[j] = sum;
+        }
+        for (int64_t i = 0; i < n; ++i) {
+            const char * row = (const char *) b->data + i*b->nb[1] + e*b->nb[2];
+            float sum = 0.0f;
+            for (int64_t j = 0; j < r; ++j) {
+                sum += mmh_load(b, row + j*b->nb[0]) * z[j];
+            }
+            y[i] += scale*sum;
+        }
+    }
+}
+
+static int64_t mmh_moe_lora_max_rank(const ggml_tensor * node) {
+    int64_t r = 1;
+    for (int i = 3; i <= 5; ++i) {
+        for (const ggml_tensor * l = node->src[i]->src[5]; l != nullptr; l = l->src[2]) {
+            r = std::max(r, l->src[0]->ne[1]);
+        }
+    }
+    return r;
+}
+
+// per thread: xh, the decoded weight block (F32 and raw F16), acc, up, gate, down output, the LoRA rank values
 static size_t mmh_moe_thread_size(const ggml_tensor * node) {
     const int64_t n_embd = node->ne[0];
     const int64_t n_ff   = node->src[3]->src[0]->ne[1];
@@ -243,7 +285,8 @@ static size_t mmh_moe_thread_size(const ggml_tensor * node) {
     for (int i = 3; i <= 5; ++i) {
         had = std::max<int64_t>(had, ggml_get_op_params_i32(node->src[i], 0));
     }
-    return GGML_PAD((kmax + had*kmax + had + 2*n_ff + n_embd)*sizeof(float) + had*kmax*sizeof(ggml_fp16_t), CACHE_LINE_SIZE);
+    return GGML_PAD((kmax + had*kmax + had + 2*n_ff + n_embd + mmh_moe_lora_max_rank(node))*sizeof(float) +
+        had*kmax*sizeof(ggml_fp16_t), CACHE_LINE_SIZE);
 }
 
 size_t ggml_cpu_moe_ffn_had_wsize(const struct ggml_tensor * node, int n_tasks) {
@@ -280,7 +323,8 @@ void ggml_compute_forward_moe_ffn_had(const ggml_compute_params * params, ggml_t
     float * vu   = acc + had;
     float * vg   = vu + n_ff;
     float * vy   = vg + n_ff;
-    ggml_fp16_t * wraw = (ggml_fp16_t *) (vy + n_embd);
+    float * lz   = vy + n_embd;
+    ggml_fp16_t * wraw = (ggml_fp16_t *) (lz + mmh_moe_lora_max_rank(dst));
 
     for (int64_t t = params->ith; t < n_tokens; t += params->nth) {
         const float * xt  = (const float *) ((const char *) x->data + t*x->nb[1]);
@@ -293,7 +337,9 @@ void ggml_compute_forward_moe_ffn_had(const ggml_compute_params * params, ggml_t
             GGML_ASSERT(e >= 0 && e < n_exp);
             const float w = *(const float *) ((const char *) weights->data + k*weights->nb[1] + t*weights->nb[2]);
             mmh_moe_row(up,   e, xt, vu, xh, wblk, wraw, acc);
+            mmh_moe_lora(up,  e, xt, vu, lz);
             mmh_moe_row(gate, e, xt, vg, xh, wblk, wraw, acc);
+            mmh_moe_lora(gate, e, xt, vg, lz);
             for (int64_t i = 0; i < n_ff; ++i) {
                 float g = vg[i];
                 float u = vu[i];
@@ -304,6 +350,7 @@ void ggml_compute_forward_moe_ffn_had(const ggml_compute_params * params, ggml_t
                 vu[i] = g/(1.0f + expf(-g)) * u;
             }
             mmh_moe_row(down, e, vu, vy, xh, wblk, wraw, acc);
+            mmh_moe_lora(down, e, vu, vy, lz);
             for (int64_t i = 0; i < n_embd; ++i) {
                 out[i] += w*vy[i];
             }

@@ -7166,7 +7166,10 @@ struct test_mul_mat_had : public test_case {
 };
 
 // GGML_OP_MOE_FFN_HAD: the fused op of a layer of routed EXL3 experts against the MUL_MAT_HAD ops it replaces
-// (variant 0, both in one graph as test_mul_mat_had does; 1 = the fused op only, 2 = the MUL_MAT_HAD ops only, for perf)
+// (variant 0, both in one graph as test_mul_mat_had does; 1 = the fused op only, 2 = the MUL_MAT_HAD ops only, for perf;
+// 3 = the fused op with LoRA deltas of scale 0 against the fused op without them, which must be equal).
+// LoRA (lora_mask: bit 0 up, 1 gate, 2 down): n_lora adapters of rank lora_rank on those weights, the fused op with
+// ggml_moe_ffn_lora deltas against the MUL_MAT_ID A -> B -> scale -> ADD chain of build_lora_mm_id
 struct test_moe_ffn_had : public test_case {
     const ggml_type type;
     const int64_t n_embd;
@@ -7177,9 +7180,22 @@ struct test_moe_ffn_had : public test_case {
     const bool clamp;
     const int n_rows;   // rows per chunk of the backend, 0 = its default
     const int variant;
+    const int lora_mask;
+    const int n_lora;
+    const int lora_rank;
+    const ggml_type lora_type;
+    const float lora_scale; // of the first adapter; the second takes -0.75 times it
 
     std::string vars() override {
-        return VARS_TO_STR9(type, n_embd, n_ff, n_exp, n_used, n_tokens, clamp, n_rows, variant);
+        if (lora_mask == 0) {
+            return VARS_TO_STR9(type, n_embd, n_ff, n_exp, n_used, n_tokens, clamp, n_rows, variant);
+        }
+        return VARS_TO_STR14(type, n_embd, n_ff, n_exp, n_used, n_tokens, clamp, n_rows, variant, lora_mask, n_lora,
+            lora_rank, lora_type, lora_scale);
+    }
+
+    float adapter_scale(int j) const {
+        return j == 0 ? lora_scale : -0.75f*lora_scale;
     }
 
     std::string op_desc(ggml_tensor * t) override {
@@ -7194,6 +7210,14 @@ struct test_moe_ffn_had : public test_case {
     }
 
     double err(const float * a, const float * b, size_t n_all) override {
+        if (variant == 3) {
+            const size_t half = n_all/2;
+            size_t diff = 0;
+            for (size_t i = 0; i < half; ++i) {
+                diff += a[i] != a[half + i] || b[i] != b[half + i];
+            }
+            return (double) diff;
+        }
         if (variant != 0) {
             return nmse(a, b, n_all);
         }
@@ -7210,9 +7234,12 @@ struct test_moe_ffn_had : public test_case {
     bool use_weight_context()     override { return use_host_weight_buffer(); }
 
     test_moe_ffn_had(ggml_type type = GGML_TYPE_EXL3_M3, int64_t n_embd = 256, int64_t n_ff = 256, int n_exp = 8,
-            int n_used = 4, int64_t n_tokens = 64, bool clamp = true, int n_rows = 0, int variant = 0)
+            int n_used = 4, int64_t n_tokens = 64, bool clamp = true, int n_rows = 0, int variant = 0, int lora_mask = 0,
+            int n_lora = 1, int lora_rank = 2, ggml_type lora_type = GGML_TYPE_F32, float lora_scale = 1.0f)
         : type(type), n_embd(n_embd), n_ff(n_ff), n_exp(n_exp), n_used(n_used), n_tokens(n_tokens), clamp(clamp),
-            n_rows(n_rows), variant(variant) {
+            n_rows(n_rows), variant(variant), lora_mask(lora_mask), n_lora(n_lora), lora_rank(lora_rank),
+            lora_type(lora_type), lora_scale(lora_scale) {
+            GGML_ASSERT(n_lora >= 1 && n_lora <= 2);
             GGML_ASSERT(n_used <= n_exp);
         }
 
@@ -7248,28 +7275,65 @@ struct test_moe_ffn_had : public test_case {
             rin[i]  = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, k[i], n_exp);
             rout[i] = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, n[i], n_exp);
         }
+        // the LoRA A [K, r, E] and B [r, N, E] of adapter j on weight i (device tensors, as llama keeps them)
+        ggml_tensor * la[3][2] = {};
+        ggml_tensor * lb[3][2] = {};
+        for (int i = 0; i < 3; ++i) {
+            for (int j = 0; j < n_lora && ((lora_mask >> i) & 1); ++j) {
+                la[i][j] = ggml_new_tensor_3d(ctx, lora_type, k[i], lora_rank, n_exp);
+                lb[i][j] = ggml_new_tensor_3d(ctx, lora_type, lora_rank, n[i], n_exp);
+            }
+        }
 
         ggml_tensor * fused = nullptr;
         if (variant != 2) {
-            ggml_tensor * desc[3];
-            ggml_tensor * ids0 = ggml_view_2d(ctx, ids, n_used, 0, ids->nb[1], 0);
-            for (int i = 0; i < 3; ++i) {
-                ggml_tensor * b = ggml_view_3d(ctx, x, k[i], 1, 0, x->nb[1], x->nb[1], 0);
-                desc[i] = ggml_mul_mat_had(ctx, w[i], b, rin[i], rout[i], ids0, 128);
-            }
-            fused = ggml_moe_ffn_had(ctx, x, ids, wts, desc[0], desc[1], desc[2],
-                clamp ? GGML_GLU_OP_SWIGLU_CLAMP : GGML_GLU_OP_SWIGLU, clamp ? limit : 0.0f, n_rows);
+            auto build_fused = [&](bool lora) {
+                ggml_tensor * desc[3];
+                ggml_tensor * ids0 = ggml_view_2d(ctx, ids, n_used, 0, ids->nb[1], 0);
+                for (int i = 0; i < 3; ++i) {
+                    ggml_tensor * b = ggml_view_3d(ctx, x, k[i], 1, 0, x->nb[1], x->nb[1], 0);
+                    desc[i] = ggml_mul_mat_had(ctx, w[i], b, rin[i], rout[i], ids0, 128);
+                    ggml_tensor * chain = nullptr;
+                    for (int j = n_lora - 1; j >= 0 && lora && la[i][0]; --j) {
+                        chain = ggml_moe_ffn_lora(ctx, la[i][j], lb[i][j], chain, variant == 3 ? 0.0f : adapter_scale(j));
+                    }
+                    if (chain) {
+                        ggml_moe_ffn_had_set_lora(desc[i], chain);
+                    }
+                }
+                return ggml_moe_ffn_had(ctx, x, ids, wts, desc[0], desc[1], desc[2],
+                    clamp ? GGML_GLU_OP_SWIGLU_CLAMP : GGML_GLU_OP_SWIGLU, clamp ? limit : 0.0f, n_rows);
+            };
+            fused = build_fused(true);
             ggml_set_name(fused, "out_fused");
             if (variant == 1) {
                 return fused;
             }
+            if (variant == 3) {
+                ggml_tensor * plain = build_fused(false);
+                ggml_set_name(plain, "out_plain");
+                ggml_tensor * out = ggml_concat(ctx, fused, plain, 3);
+                ggml_set_name(out, "out");
+                return out;
+            }
         }
 
+        // build_lora_mm_id: res + scale * B(A(v)) for each adapter in order
+        auto add_lora = [&](int i, ggml_tensor * res, ggml_tensor * v) {
+            for (int j = 0; j < n_lora && la[i][0]; ++j) {
+                ggml_tensor * ab = ggml_mul_mat_id(ctx, lb[i][j], ggml_mul_mat_id(ctx, la[i][j], v, ids), ids);
+                if (adapter_scale(j) != 1.0f) {
+                    ab = ggml_scale(ctx, ab, adapter_scale(j));
+                }
+                res = ggml_add(ctx, res, ab);
+            }
+            return res;
+        };
         ggml_tensor * x3   = ggml_reshape_3d(ctx, x, n_embd, 1, n_tokens);
-        ggml_tensor * up   = ggml_mul_mat_had(ctx, w[0], x3, rin[0], rout[0], ids, 128);
-        ggml_tensor * gate = ggml_mul_mat_had(ctx, w[1], x3, rin[1], rout[1], ids, 128);
+        ggml_tensor * up   = add_lora(0, ggml_mul_mat_had(ctx, w[0], x3, rin[0], rout[0], ids, 128), x3);
+        ggml_tensor * gate = add_lora(1, ggml_mul_mat_had(ctx, w[1], x3, rin[1], rout[1], ids, 128), x3);
         ggml_tensor * act  = clamp ? ggml_swiglu_clamp(ctx, gate, up, limit) : ggml_swiglu_split(ctx, gate, up);
-        ggml_tensor * down = ggml_mul_mat_had(ctx, w[2], act, rin[2], rout[2], ids, 128);
+        ggml_tensor * down = add_lora(2, ggml_mul_mat_had(ctx, w[2], act, rin[2], rout[2], ids, 128), act);
         down = ggml_mul(ctx, down, wts);
         ggml_tensor * ref = ggml_view_2d(ctx, down, n_embd, n_tokens, down->nb[2], 0);
         for (int i = 1; i < n_used; ++i) {
@@ -12581,6 +12645,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_moe_ffn_had(GGML_TYPE_EXL3_T3, 256, 256, 32, 8, 200, true,  100));
     test_cases.emplace_back(new test_moe_ffn_had(GGML_TYPE_EXL3_M2, 512, 256, 64, 6, 128, true,  512));
     test_cases.emplace_back(new test_moe_ffn_had(GGML_TYPE_EXL3_M4, 256, 512, 64, 6, 128, true,  256));
+    // MOE_FFN_HAD with LoRA deltas (mask: 1 up, 2 gate, 4 down): down only (heretic: rank 2 F32), all, scale != 1,
+    // two adapters, F16 rank 8 over split experts; scale 0 equals no LoRA (variant 3)
+    test_cases.emplace_back(new test_moe_ffn_had(GGML_TYPE_EXL3_M3, 256, 256,  8, 4,  64, true,    0, 0, 4, 1, 2, GGML_TYPE_F32,  1.0f));
+    test_cases.emplace_back(new test_moe_ffn_had(GGML_TYPE_EXL3_M3, 256, 384, 16, 8, 200, true,   48, 0, 7, 1, 2, GGML_TYPE_F32,  1.0f));
+    test_cases.emplace_back(new test_moe_ffn_had(GGML_TYPE_EXL3_M3, 384, 256, 16, 8, 256, false,   0, 0, 7, 1, 2, GGML_TYPE_F32, -1.5f));
+    test_cases.emplace_back(new test_moe_ffn_had(GGML_TYPE_EXL3_M3, 256, 256, 32, 8, 200, true,  100, 0, 5, 2, 2, GGML_TYPE_F32,  0.5f));
+    test_cases.emplace_back(new test_moe_ffn_had(GGML_TYPE_EXL3_M3, 256, 256, 32, 8, 200, true,  300, 0, 7, 2, 8, GGML_TYPE_F16,  0.5f));
+    test_cases.emplace_back(new test_moe_ffn_had(GGML_TYPE_EXL3_M3, 256, 256,  8, 4,  64, true,   16, 3, 7, 2, 2, GGML_TYPE_F32,  1.0f));
 
     // backend default precision (not set; F16 on HIP)
     test_cases.emplace_back(new test_mul_mat_had(GGML_TYPE_EXL3_M3, GGML_TYPE_F16, 1024, 256, 1, 1, 0, false, 128, 0, 0, GGML_PREC_UNDEFINED));

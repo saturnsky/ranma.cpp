@@ -2662,9 +2662,11 @@ ggml_tensor * llm_graph_context::build_moe_ffn_expert_major(
         limit = hparams.swiglu_clamp_exp[il];
     }
 
-    // each weight: EXL3 with its rotations, unpadded, no LoRA; named by an empty MUL_MAT_HAD (no tokens)
+    // each weight: EXL3 with its rotations, unpadded; named by an empty MUL_MAT_HAD (no tokens), which carries the
+    // LoRA deltas of the weight (ggml_moe_ffn_lora, in the adapter order and with the scale of build_lora_mm_id)
     ggml_tensor * desc[3];
     ggml_tensor * ws[3] = { up_exps, gate_exps, down_exps };
+    std::vector<ggml_tensor *> lora_nodes;
     for (int i = 0; i < 3; ++i) {
         ggml_tensor * w = ws[i];
         const auto it = waux->find(w);
@@ -2672,16 +2674,44 @@ ggml_tensor * llm_graph_context::build_moe_ffn_expert_major(
                 it->second.n != w->ne[1] || (hdmd && hdmd->rot.count(w) > 0)) {
             return nullptr;
         }
+        std::vector<std::pair<llama_adapter_lora_weight *, float>> lws;
         for (const auto & lora : *loras) {
-            if (lora.first->get_weight(w) != nullptr) {
+            llama_adapter_lora_weight * lw = lora.first->get_weight(w);
+            if (lw == nullptr) {
+                continue;
+            }
+            const ggml_tensor * a = lw->a;
+            const ggml_tensor * b = lw->b;
+            const bool ok = (a->type == GGML_TYPE_F32 || a->type == GGML_TYPE_F16) &&
+                (b->type == GGML_TYPE_F32 || b->type == GGML_TYPE_F16) && a->nb[0] == ggml_type_size(a->type) &&
+                b->nb[0] == ggml_type_size(b->type) && a->ne[0] == w->ne[0] && a->ne[2] == w->ne[2] && a->ne[3] == 1 &&
+                b->ne[0] == a->ne[1] && b->ne[1] == w->ne[1] && b->ne[2] == w->ne[2] && b->ne[3] == 1;
+            if (!ok) {
+                static bool warned = false;
+                if (!warned) {
+                    warned = true;
+                    LLAMA_LOG_WARN("%s: LoRA of %s (%s [%lld, %lld, %lld]) is not supported by the expert-major op, the layer keeps the old path\n",
+                        __func__, w->name, ggml_type_name(a->type), (long long) a->ne[0], (long long) a->ne[1], (long long) a->ne[2]);
+                }
                 return nullptr;
             }
+            const float alpha = lora.first->alpha;
+            const float rank  = (float) b->ne[0];
+            lws.emplace_back(lw, alpha ? lora.second * alpha / rank : lora.second);
         }
         ggml_tensor * b    = ggml_view_3d(ctx0, cur, w->ne[0], 1, 0, cur->nb[1], cur->nb[1], 0);
         ggml_tensor * ids0 = ggml_view_2d(ctx0, selected_experts, selected_experts->ne[0], 0, selected_experts->nb[1], 0);
         desc[i] = ggml_mul_mat_had(ctx0, w, b, it->second.rot_in, it->second.rot_out, ids0, 128);
         if (prec_policy) {
             prec_policy->apply(desc[i]);
+        }
+        ggml_tensor * chain = nullptr;
+        for (auto l = lws.rbegin(); l != lws.rend(); ++l) {
+            chain = ggml_moe_ffn_lora(ctx0, l->first->a, l->first->b, chain, l->second);
+            lora_nodes.push_back(chain);
+        }
+        if (chain) {
+            ggml_moe_ffn_had_set_lora(desc[i], chain);
         }
     }
 
@@ -2698,8 +2728,20 @@ ggml_tensor * llm_graph_context::build_moe_ffn_expert_major(
         for (ggml_tensor * d : desc) {
             ggml_backend_sched_set_tensor_backend(sched, d, backend);
         }
+        for (ggml_tensor * l : lora_nodes) {
+            ggml_backend_sched_set_tensor_backend(sched, l, backend);
+        }
         ggml_backend_sched_set_tensor_backend(sched, res, backend);
         return res;
+    }
+    if (!lora_nodes.empty()) {
+        // e.g. LoRA tensors in host memory: the GPU op reads them in place from VRAM only
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            LLAMA_LOG_WARN("%s: the expert-major op cannot read the LoRA of layer %d here, layers with routed LoRA keep the old path\n",
+                __func__, il);
+        }
     }
     return nullptr;
 }
