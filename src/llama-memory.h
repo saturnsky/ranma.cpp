@@ -117,6 +117,10 @@ struct llama_memory_i {
     virtual llama_pos seq_pos_min(llama_seq_id seq_id) const = 0;
     virtual llama_pos seq_pos_max(llama_seq_id seq_id) const = 0;
 
+    // ranma: decoding can continue at pos (at most seq_pos_max + 1) once seq_rm(seq_id, pos, -1) removed the positions
+    // from pos on, with the memory as it is. A memory that cannot tell answers false, and the caller keeps its own rules.
+    virtual bool seq_can_resume(llama_seq_id /*seq_id*/, llama_pos /*pos*/) const { return false; }
+
     virtual std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const = 0;
 
     //

@@ -5046,6 +5046,14 @@ bool llama_memory_can_shift(llama_memory_t mem) {
     return mem->get_can_shift();
 }
 
+bool llama_memory_seq_can_resume(llama_memory_t mem, llama_seq_id seq_id, llama_pos pos) {
+    if (!mem) {
+        return false;
+    }
+
+    return mem->seq_can_resume(seq_id, pos);
+}
+
 // llama state API
 
 // deprecated

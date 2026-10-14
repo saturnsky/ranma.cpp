@@ -136,6 +136,10 @@ public:
     llama_pos seq_pos_min(llama_seq_id seq_id) const override;
     llama_pos seq_pos_max(llama_seq_id seq_id) const override;
 
+    // ranma: with the tail prefill (DeepSeek-V4.1), true when the raw cells the next position reads are written and the
+    // compressed state can be rolled back to pos (no rollback at seq_pos_max + 1)
+    bool seq_can_resume(llama_seq_id seq_id, llama_pos pos) const override;
+
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const override;
 
     void state_write(llama_io_write_i & io, llama_seq_id seq_id = -1, llama_state_seq_flags flags = 0) const override;
@@ -167,6 +171,10 @@ public:
     // unwritten cell is refused, and a refused removal marks the sequence broken until it is cleared or restored.
     void tail_set_written(llama_seq_id seq_id, int32_t il, llama_pos p0);
     bool tail_can_continue(llama_seq_id seq_id, llama_pos p_end) const;
+
+    // the compressed state of the sequence can go back to p0 > 0: nothing to undo past its end, else a rollback of at
+    // most n_rs_seq positions while none is pending. Independent of the raw cells (tail_can_continue).
+    bool comp_can_rollback(llama_seq_id seq_id, llama_pos p0) const;
 
     // ranma: the calls of the sequences of a batch begin with the first ubatch applied and end once the last one
     // computed; a call that never ends (an aborted or failed ubatch) leaves its sequences pending

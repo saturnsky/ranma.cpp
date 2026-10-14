@@ -843,6 +843,12 @@ extern "C" {
     // Check if the memory supports shifting
     LLAMA_API bool llama_memory_can_shift(llama_memory_t mem);
 
+    // ranma: decoding of the sequence can continue at pos (at most llama_memory_seq_pos_max + 1) once
+    // llama_memory_seq_rm(mem, seq_id, pos, -1) removed the positions from pos on, without the generic
+    // rules for SWA or recurrent memory. False when the memory cannot tell (every memory but the DeepSeek-V4
+    // cache of a V4.1 model).
+    LLAMA_API bool llama_memory_seq_can_resume(llama_memory_t mem, llama_seq_id seq_id, llama_pos pos);
+
     //
     // State / sessions
     //
