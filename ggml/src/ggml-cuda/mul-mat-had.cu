@@ -28,6 +28,7 @@
 #include "prefill-stamp.cuh"
 
 #include <algorithm>
+#include <atomic>
 #include <cfloat>
 #include <map>
 #include <mutex>
@@ -1964,6 +1965,7 @@ struct mmh_moe_stage_error {
 struct mmh_moe_stage_plan {
     int      n_chunks;
     int      stage_n[MMH_MOE_STAGE_MAX_CHUNKS];
+    int      chunk_b[MMH_MOE_STAGE_MAX_CHUNKS]; // first sorted row of each chunk (the PCIe-once op stores T there)
     uint64_t src[MMH_MOE_STAGE_MAX_CHUNKS*MMH_MOE_STAGE_MAX_SLOTS*3];
 };
 
@@ -2576,6 +2578,7 @@ static __global__ void mmh_moe_stage_plan_kernel(const mmh_moe_route rt, const i
         const int ns = rt.stage_n[c];
         if (threadIdx.x == 0) {
             plan->stage_n[c] = ns;
+            plan->chunk_b[c] = rt.chunks[2*c + 0];
         }
         for (int i = threadIdx.x; i < 3*ns; i += blockDim.x) {
             plan->src[3*(c*stage_cap) + i] = mmh_moe_src_address(s, i % 3, rt.stage_list[c*stage_cap + i/3]);
@@ -2601,6 +2604,55 @@ static __global__ void mmh_moe_stage_release(const mmh_moe_route rt, const int c
     if (threadIdx.x == 0) {
         __hip_atomic_store(&f->done, c + 1, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_AGENT);
     }
+}
+
+// ranma: link bytes of an op (counted when the PCIe-once op runs, or with RANMA_EXPERT_LINK_COUNT=1 / the bench switch):
+// cnt[0] the experts the staging copies (all three kinds, once per chunk that stages them), cnt[1] the in-place reads of the
+// other host experts, one weight read per GEMM item of mt_r rows. Logical bytes: the GPU caches may serve some of the
+// in-place reads. One block after the routing pass.
+static __global__ void __launch_bounds__(256) mmh_moe_link_count(const mmh_moe_route rt, const int n_exp,
+        const int32_t * __restrict__ slots, const bool all_local, const int stage_cap, const int mt_r, const uint64_t eb,
+        unsigned long long * __restrict__ cnt) {
+    __shared__ unsigned char s_staged[MMH_MAX_EXPERTS];
+    __shared__ unsigned long long s_sum[2];
+    if (threadIdx.x < 2) {
+        s_sum[threadIdx.x] = 0;
+    }
+    for (int e = threadIdx.x; e < n_exp; e += blockDim.x) {
+        s_staged[e] = 0;
+    }
+    __syncthreads();
+    const int nc = *rt.n_chunks;
+    unsigned long long staged = 0;
+    for (int c = 0; c < nc && stage_cap > 0; ++c) {
+        const int ns = rt.stage_n[c];
+        for (int j = threadIdx.x; j < ns; j += blockDim.x) {
+            s_staged[rt.stage_list[c*stage_cap + j]] = 1;
+            staged += eb;
+        }
+    }
+    __syncthreads();
+    unsigned long long inplace = 0;
+    for (int e = threadIdx.x; e < n_exp; e += blockDim.x) {
+        const int r = rt.cnt[e];
+        if (r > 0 && !all_local && (slots == nullptr || slots[e] < 0) && !s_staged[e]) {
+            inplace += (unsigned long long) ((r + mt_r - 1)/mt_r)*eb;
+        }
+    }
+    atomicAdd(&s_sum[0], staged);
+    atomicAdd(&s_sum[1], inplace);
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        atomicAdd(&cnt[0], s_sum[0]);
+        atomicAdd(&cnt[1], s_sum[1]);
+    }
+}
+
+// the chunk table of the final scatter of the PCIe-once op: one chunk of every row
+static __global__ void mmh_moe_all_rows(int * __restrict__ v, const int n_rows) {
+    v[0] = 0;
+    v[1] = n_rows;
+    v[2] = 1;
 }
 
 template <ggml_type type>
@@ -2744,6 +2796,62 @@ static int mmh_moe_group_diag_group() {
 // op 0: set the group size a (0 = off), op 1: stamps on (a != 0) or off, op 2: copy the phase ms of the last stamped op to out
 // (MMH_MOE_DIAG_N values), op 3: the streamed op's group (a > 0), off (0) or the environment (-1), op 4: its ring slots
 // (a > 0), or the environment (0), op 5: the bench check fills the ring of the next streamed op with 0x55 (a != 0)
+// ranma: the link counters of the expert-major op (mmh_moe_link_count): a device array per device, the host counts beside.
+// Counting runs for every PCIe-once op, and for the other ops with host experts when RANMA_EXPERT_LINK_COUNT=1 or the bench
+// turns it on (ggml_cuda_moe_link_stats); otherwise no kernel is added.
+struct mmh_moe_link_dev {
+    unsigned long long * cnt = nullptr; // [0] staged, [1] in place
+};
+static std::atomic<int>     g_mmh_moe_link_on{-1}; // -1: the environment
+static std::atomic<int64_t> g_mmh_moe_link_ops{0};
+static std::atomic<int64_t> g_mmh_moe_once_ops{0};
+static std::atomic<int64_t> g_mmh_moe_once_chunks{0};
+static std::atomic<int64_t> g_mmh_moe_once_fallback{0};
+static std::atomic<int>     g_mmh_moe_once_poison{0}; // the bench check: fill the two buffers of the next PCIe-once op with 0x55
+
+static bool mmh_moe_link_on() {
+    int v = g_mmh_moe_link_on.load(std::memory_order_relaxed);
+    if (v < 0) {
+        v = mmh_moe_env_int("RANMA_EXPERT_LINK_COUNT", 0) != 0 ? 1 : 0;
+        g_mmh_moe_link_on.store(v, std::memory_order_relaxed);
+    }
+    return v != 0;
+}
+
+static unsigned long long * mmh_moe_link_get(const int device) {
+    static std::mutex mutex;
+    static std::map<int, mmh_moe_link_dev> devs;
+    std::lock_guard<std::mutex> lock(mutex);
+    mmh_moe_link_dev & d = devs[device];
+    if (d.cnt == nullptr) {
+        CUDA_CHECK(cudaMalloc((void **) &d.cnt, 2*sizeof(unsigned long long)));
+        CUDA_CHECK(cudaMemset(d.cnt, 0, 2*sizeof(unsigned long long)));
+        CUDA_CHECK(cudaDeviceSynchronize());
+    }
+    return d.cnt;
+}
+
+bool ggml_cuda_moe_link_stats(const int device, const int enable, uint64_t * out) {
+    if (enable != 0) {
+        g_mmh_moe_link_on.store(enable > 0 ? 1 : 0, std::memory_order_relaxed);
+    }
+    if (out == nullptr) {
+        return true;
+    }
+    unsigned long long h[2] = { 0, 0 };
+    ggml_cuda_set_device(device);
+    unsigned long long * d = mmh_moe_link_get(device);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    CUDA_CHECK(cudaMemcpy(h, d, sizeof(h), cudaMemcpyDeviceToHost));
+    out[0] = h[0];
+    out[1] = h[1];
+    out[2] = (uint64_t) g_mmh_moe_link_ops.load();
+    out[3] = (uint64_t) g_mmh_moe_once_ops.load();
+    out[4] = (uint64_t) g_mmh_moe_once_chunks.load();
+    out[5] = (uint64_t) g_mmh_moe_once_fallback.load();
+    return true;
+}
+
 bool ggml_cuda_moe_group_diag(const int op, const int a, double * out) {
     if (op == 3) {
         g_mmh_moe_stream_group = std::max(-1, a);
@@ -2755,6 +2863,10 @@ bool ggml_cuda_moe_group_diag(const int op, const int a, double * out) {
     }
     if (op == 5) {
         g_mmh_moe_stream_poison = a != 0;
+        return true;
+    }
+    if (op == 6) {
+        g_mmh_moe_once_poison = a != 0;
         return true;
     }
     if (op == 0) {
@@ -2772,8 +2884,10 @@ bool ggml_cuda_moe_group_diag(const int op, const int a, double * out) {
     return false;
 }
 
-bool ggml_cuda_moe_ffn_had_graph_ok(void) {
-    return mmh_moe_stage_bytes() == 0 && mmh_moe_group_diag_group() == 0 && mmh_moe_stream_group() == 0;
+bool ggml_cuda_moe_ffn_had_graph_ok(const ggml_tensor * op) {
+    // the PCIe-once op (op_params[3], the layer-major prefill) stages on a side stream and reads its plan back
+    return mmh_moe_stage_bytes() == 0 && mmh_moe_group_diag_group() == 0 && mmh_moe_stream_group() == 0 &&
+        (op == nullptr || ggml_get_op_params_i32(op, 3) == 0) && !mmh_moe_link_on();
 }
 
 #if defined(GGML_USE_HIP) && !defined(cudaEventElapsedTime)
@@ -2838,9 +2952,12 @@ static mmh_moe_stage_dev * mmh_moe_stage_get(const int device) {
     static std::map<int, mmh_moe_stage_dev> devs;
     std::lock_guard<std::mutex> lock(mutex);
     mmh_moe_stage_dev & d = devs[device];
-    if (d.buf == nullptr) {
+    if (d.flags == nullptr) {
+        // the PCIe-once op takes its two buffers from the pool: without RANMA_EXPERT_MAJOR_STAGE_MIB there is none here
         d.bytes = mmh_moe_stage_bytes();
-        CUDA_CHECK(cudaMalloc((void **) &d.buf, d.bytes));
+        if (d.bytes > 0) {
+            CUDA_CHECK(cudaMalloc((void **) &d.buf, d.bytes));
+        }
         CUDA_CHECK(cudaMalloc((void **) &d.flags, sizeof(mmh_moe_stage_flags)));
         CUDA_CHECK(cudaMalloc((void **) &d.tabs, 3*MMH_MAX_EXPERTS*sizeof(uint64_t)));
         CUDA_CHECK(cudaMalloc((void **) &d.no_slots, MMH_MAX_EXPERTS*sizeof(int32_t)));
@@ -3163,11 +3280,11 @@ void ggml_cuda_moe_ffn_had(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         }
     }
 
-    const int64_t R     = std::min<int64_t>(mmh_moe_chunk_rows(dst), n_rows);
+    int64_t       R     = std::min<int64_t>(mmh_moe_chunk_rows(dst), n_rows); // the PCIe-once op may lower it, below
     const int     mt_v  = mmh_moe_mt(n_rows, n_exp, false);
     const int     mt_r  = mmh_moe_mt(n_rows, n_exp, true);
-    const int64_t max_items_v = mmh_moe_max_items(R, n_exp, mt_v);
-    const int64_t max_items_r = mmh_moe_max_items(R, n_exp, mt_r);
+    int64_t max_items_v = mmh_moe_max_items(R, n_exp, mt_v);
+    int64_t max_items_r = mmh_moe_max_items(R, n_exp, mt_r);
     GGML_ASSERT(max_items_v <= GGML_MOE_FFN_HAD_MAX_ITEMS && max_items_r <= GGML_MOE_FFN_HAD_MAX_ITEMS);
 
     // probe U (diagnostic): groups of experts of a one-chunk op; not with LoRA, not with several chunks
@@ -3239,35 +3356,88 @@ void ggml_cuda_moe_ffn_had(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     }
     ss.koff[3] = koff;
     const int stage_min = stage_min_env > 0 ? stage_min_env : mt_r + 1;
-    int stage_cap = 0;
-    int64_t c_max = 3*((n_rows + R - 1)/R) + 1;
-    if (u_group == 0 && !streamed && remote && mmh_moe_stage_bytes() > 0) {
-        stage_cap = (int) std::min<int64_t>(MMH_MOE_STAGE_MAX_SLOTS, (int64_t) (mmh_moe_stage_bytes()/2)/ss.koff[3]);
-        if (stage_cap > 0) {
-            c_max += n_rows/((int64_t) stage_cap*std::max(1, stage_min)) + 1;
-        }
-        if (c_max > MMH_MOE_STAGE_MAX_CHUNKS) {
-            stage_cap = 0;
-        }
-    }
-    if (stage_cap == 0) {
-        c_max = 3*((n_rows + R - 1)/R) + 1;
-    }
-    if (u_group > 0 || streamed) {
-        c_max = std::max<int64_t>(c_max, n_exp + 1); // one chunk-table entry per group, one more for the scatter
-    }
 
+    // ranma: PCIe once (op_params[3]: 1 exact, 2 partial sums; op_params[4]: staged experts per buffer), set by the layer-major
+    // prefill on the op of a group of ubatches. The host experts of the op with more rows than a host tile are copied once
+    // into VRAM (the staging below with the copy engine: two buffers, the experts of chunk c in buffer c % 2, chunks cut at
+    // op_params[4] staged experts), so each one crosses the link once per op instead of once per tile of mt_r rows; the
+    // others are read in place, which is one read. L1 experts are read in VRAM as before; a layer the SSD tier stages keeps
+    // its one file read (the plan reads its addresses after the tier's waits, as the staging always did).
+    // exact: the down rows of every chunk stay in T (n_rows rows, original sorted positions) and one scatter over all rows
+    // adds them per token in slot order, which is the sum of the one-chunk op of a ubatch (R >= ubatch rows): the result
+    // equals the ubatch-major op. partial: each chunk adds its rows as the multi-chunk op always did (no T; the sum of a
+    // token is split at chunk boundaries, a rounding difference to the ubatch-major op).
+    const int once_req   = ggml_get_op_params_i32(dst, 3);
+    const int once_slots = std::min(MMH_MOE_STAGE_MAX_SLOTS, ggml_get_op_params_i32(dst, 4));
+    bool once = once_req != 0 && once_slots > 0 && remote && !streamed && u_group == 0 && max_rank == 0 && n_rows > R;
+
+    int stage_cap = 0;
+    int64_t c_max = 0;
+    const int64_t R0 = R;
+    auto plan_chunks = [&]() {
+        stage_cap = 0;
+        c_max = 3*((n_rows + R - 1)/R) + 1;
+        if (u_group == 0 && !streamed && remote && (once || mmh_moe_stage_bytes() > 0)) {
+            stage_cap = once ? once_slots :
+                (int) std::min<int64_t>(MMH_MOE_STAGE_MAX_SLOTS, (int64_t) (mmh_moe_stage_bytes()/2)/ss.koff[3]);
+            if (stage_cap > 0) {
+                c_max += n_rows/((int64_t) stage_cap*std::max(1, stage_min)) + 1;
+            }
+            if (c_max > MMH_MOE_STAGE_MAX_CHUNKS) {
+                stage_cap = 0;
+            }
+        }
+        if (stage_cap == 0) {
+            c_max = 3*((n_rows + R - 1)/R) + 1;
+        }
+        if (u_group > 0 || streamed) {
+            c_max = std::max<int64_t>(c_max, n_exp + 1); // one chunk-table entry per group, one more for the scatter
+        }
+        max_items_v = mmh_moe_max_items(R, n_exp, mt_v);
+        max_items_r = mmh_moe_max_items(R, n_exp, mt_r);
+    };
+    plan_chunks();
+    if (once && stage_cap == 0) {
+        once = false; // too many chunks for the staging tables: the in-place path
+        g_mmh_moe_once_fallback++;
+    }
     // every device buffer of the launch in one block (moe-ffn-had-layout.h, shared with the layer mode's sizing); the
     // streamed op keeps the copied experts of each group in the staging lists (stage_cap = its group) and its ring last
-    const ggml_moe_ffn_had_layout lay = ggml_moe_ffn_had_layout_of(n_rows, R, n_exp, n_embd, n_ff, max_items_v, max_items_r,
-        c_max, streamed ? s_group : stage_cap, max_rank, streamed ? s_ring*(s_stride[0] + s_stride[1] + s_stride[2]) : 0);
+    auto layout = [&]() {
+        return ggml_moe_ffn_had_layout_of(n_rows, R, n_exp, n_embd, n_ff, max_items_v, max_items_r, c_max,
+            streamed ? s_group : stage_cap, max_rank, streamed ? s_ring*(s_stride[0] + s_stride[1] + s_stride[2]) : 0);
+    };
+    ggml_moe_ffn_had_layout lay = layout();
     // the expert cache's scratch block when there is one (lent to the decode pool between prompt graphs), else the pool
     ggml_cuda_pool_alloc<char> block(ctx.pool());
 #if defined(GGML_USE_HIP)
     char * blk = (char *) ggml_cuda_expert_op_scratch(ctx, lay.bytes);
+    // the PCIe-once op: the staging lists grow the route area, so fewer rows per chunk keep it in the block (its chunks
+    // only bound the work at a time: the experts are still copied once, and the exact sum does not depend on them)
+    while (blk == nullptr && once && R > std::max<int64_t>(1, R0/4)) {
+        R = std::max<int64_t>(std::max<int64_t>(1, R0/4), R - std::max<int64_t>(1, R0/16));
+        plan_chunks();
+        if (stage_cap == 0) {
+            break;
+        }
+        lay = layout();
+        blk = (char *) ggml_cuda_expert_op_scratch(ctx, lay.bytes);
+    }
+    if (blk == nullptr && R != R0) {
+        R = R0; // no block (or none that fits): the pool at the rows of the op
+        plan_chunks();
+        lay = layout();
+    }
+    if (once && stage_cap == 0) {
+        once = false;
+        g_mmh_moe_once_fallback++;
+    }
 #else
     char * blk = nullptr;
 #endif // defined(GGML_USE_HIP)
+    GGML_ASSERT(max_items_v <= GGML_MOE_FFN_HAD_MAX_ITEMS && max_items_r <= GGML_MOE_FFN_HAD_MAX_ITEMS);
+    const bool once_exact = once && once_req == 1;
+    const bool sdma       = once || stage_sdma; // the PCIe-once op copies with the copy engine
     if (blk == nullptr) {
         blk = block.alloc(lay.bytes);
     }
@@ -3280,6 +3450,17 @@ void ggml_cuda_moe_ffn_had(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     float * vg     = (float *) (blk + lay.vg);
     float * vy     = (float *) (blk + lay.vy);
     float * lz     = (float *) (blk + lay.lz);
+    // the PCIe-once op: its two staging buffers and (exact) T from the pool, returned at the end of the op (the compute
+    // stream waits for the copies there, so a later user of the pool memory comes after them)
+    ggml_cuda_pool_alloc<char>  once_buf(ctx.pool());
+    ggml_cuda_pool_alloc<float> once_t(ctx.pool());
+    if (once) {
+        once_buf.alloc((size_t) 2*stage_cap*ss.koff[3]);
+        if (once_exact) {
+            once_t.alloc((size_t) (n_rows*n_embd));
+        }
+        g_mmh_moe_once_ops++;
+    }
 
     mmh_moe_route rt;
     rt.rows_sorted = route;
@@ -3341,7 +3522,7 @@ void ggml_cuda_moe_ffn_had(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
             CUDA_CHECK(cudaGetLastError());
             // the GEMMs take the op's table where the tier's would be; without the cache a table of no VRAM slots
             if (p[i].w_cache == nullptr || p[i].w_slots == nullptr) {
-                p[i].w_cache = sd->buf;
+                p[i].w_cache = once ? once_buf.ptr : sd->buf;
                 p[i].w_slots = sd->no_slots;
             }
             p[i].w_host_addresses = tab[i];
@@ -3357,12 +3538,25 @@ void ggml_cuda_moe_ffn_had(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     mmh_moe_iota<<<(unsigned) ((R + 255)/256), 256, 0, stream>>>(iota, (int) R);
     CUDA_CHECK(cudaGetLastError());
     stamps.at(stream, mmh_moe_diag_stamps::PHASE_ROUTE);
+    if (once || (remote && mmh_moe_link_on())) {
+        // ranma: the link bytes of the op (logical, see mmh_moe_link_count)
+        mmh_moe_link_count<<<1, 256, 0, stream>>>(rt, (int) n_exp, slots, all_local, stage_cap, mt_r,
+            (uint64_t) (p[0].nb02 + p[1].nb02 + p[2].nb02), mmh_moe_link_get(ctx.device));
+        CUDA_CHECK(cudaGetLastError());
+        g_mmh_moe_link_ops++;
+    }
     // ranma: RANMA_PREFILL_GPU_STAMP records the rows and, from the device, the chunk count of the routing pass
     ggml_cuda_pstamp_moe(stream, rt.n_chunks, n_tokens, n_used, n_rows, R, mt_v, mt_r, streamed ? 2 : sd != nullptr ? 1 : 0,
         remote);
 
-    char * buf0 = sd ? sd->buf : nullptr;
-    char * buf1 = sd ? sd->buf + (sd->bytes/2)/256*256 : nullptr;
+    char * buf0 = once ? once_buf.ptr : sd ? sd->buf : nullptr;
+    char * buf1 = once ? once_buf.ptr + (size_t) stage_cap*ss.koff[3] : sd ? sd->buf + (sd->bytes/2)/256*256 : nullptr;
+    if (once && g_mmh_moe_once_poison.exchange(0) != 0) {
+        CUDA_CHECK(cudaMemsetAsync(once_buf.ptr, 0x55, (size_t) 2*stage_cap*ss.koff[3], stream));
+        if (once_exact) {
+            CUDA_CHECK(cudaMemsetAsync(once_t.ptr, 0x55, (size_t) (n_rows*n_embd)*sizeof(float), stream));
+        }
+    }
     int n_loop = (int) c_max;
     auto flush_side = [&]() {
 #if defined(GGML_USE_HIP)
@@ -3389,7 +3583,7 @@ void ggml_cuda_moe_ffn_had(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         CUDA_CHECK(cudaEventRecord(sd->ev_ready[c], sd->side));
         flush_side();
     };
-    if (sd && stage_sdma) {
+    if (sd && sdma) {
         CUDA_CHECK(cudaEventRecord(sd->ev_plan, stream));
         CUDA_CHECK(cudaStreamWaitEvent(sd->side, sd->ev_plan, 0));
         mmh_moe_stage_plan_kernel<<<1, 256, 0, stream>>>(rt, stage_cap, ss, sd->plan_dev);
@@ -3397,6 +3591,9 @@ void ggml_cuda_moe_ffn_had(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         const int64_t t_sync = ggml_account_enabled() ? ggml_time_us() : 0;
         CUDA_CHECK(cudaStreamSynchronize(stream));
         n_loop = sd->plan_host->n_chunks;
+        if (once) {
+            g_mmh_moe_once_chunks += n_loop;
+        }
         if (t_sync != 0) {
             // the plan holds the staged experts per chunk; the sync is the existing one
             int64_t n_staged = 0;
@@ -3779,11 +3976,11 @@ void ggml_cuda_moe_ffn_had(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
             items_v, n_items_v, items_r, n_items_r);
         CUDA_CHECK(cudaGetLastError());
         if (sd) {
-            if (stage_sdma) {
+            if (sdma) {
                 CUDA_CHECK(cudaStreamWaitEvent(stream, sd->ev_ready[c], 0));
             }
             mmh_moe_stage_wait<<<1, 64, 0, stream>>>(rt, c, stage_cap, ss, buf0, buf1, tab[0], tab[1], tab[2], sd->flags,
-                sd->err_dev, layer, !stage_sdma);
+                sd->err_dev, layer, !sdma);
             CUDA_CHECK(cudaGetLastError());
         }
         for (int i = 0; i < 3; ++i) {
@@ -3793,7 +3990,8 @@ void ggml_cuda_moe_ffn_had(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
                 xh, rscale);
             CUDA_CHECK(cudaGetLastError());
             mmh_params q = p[i];
-            q.dst = outs[i];
+            // exact PCIe-once op: the down rows of the chunk go to T at their sorted positions
+            q.dst = once_exact && i == 2 ? once_t.ptr + (int64_t) sd->plan_host->chunk_b[c]*n_embd : outs[i];
             const unsigned groups = (unsigned) (desc[i]->src[0]->ne[1]/MMH_NG);
             enqueue_kind_wait(i); // first chunk only; later chunks run after it in stream order
             mmh_moe_gemm(desc[i]->src[0]->type, mt_v, dim3(groups, (unsigned) max_items_v, 1), stream, q, wd[i], xh,
@@ -3823,12 +4021,25 @@ void ggml_cuda_moe_ffn_had(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         if (sd) {
             mmh_moe_stage_release<<<1, 64, 0, stream>>>(rt, c, stage_cap, ss, tab[0], tab[1], tab[2], sd->flags);
             CUDA_CHECK(cudaGetLastError());
-            if (stage_sdma) {
+            if (sdma) {
                 CUDA_CHECK(cudaEventRecord(sd->ev_cdone[c], stream));
                 enqueue_copies(c + 2);
             }
         }
-        mmh_moe_scatter<<<grid_scatter, 256, 0, stream>>>(rt, c, vy, (const float *) weights->data, weights->nb[1],
+        if (!once_exact) {
+            mmh_moe_scatter<<<grid_scatter, 256, 0, stream>>>(rt, c, vy, (const float *) weights->data, weights->nb[1],
+                weights->nb[2], n_used, (float *) dst->data, dst->nb[1], (int) n_embd);
+            CUDA_CHECK(cudaGetLastError());
+        }
+    }
+    if (once_exact) {
+        // one scatter over all rows of T: the slot order of a token is the one of the one-chunk op
+        mmh_moe_route rt_all = rt;
+        rt_all.chunks   = (int *) lz; // the LoRA rank area (no LoRA here): one chunk {0, n_rows}, its count
+        rt_all.n_chunks = (int *) lz + 2;
+        mmh_moe_all_rows<<<1, 1, 0, stream>>>((int *) lz, (int) n_rows);
+        CUDA_CHECK(cudaGetLastError());
+        mmh_moe_scatter<<<grid_scatter, 256, 0, stream>>>(rt_all, 0, once_t.ptr, (const float *) weights->data, weights->nb[1],
             weights->nb[2], n_used, (float *) dst->data, dst->nb[1], (int) n_embd);
         CUDA_CHECK(cudaGetLastError());
     }
@@ -3868,7 +4079,7 @@ void ggml_cuda_moe_ffn_had(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
                 }
             }
             GGML_LOG_INFO("%s: %s: %d chunks, %d experts staged, abort %d (cap %d, min %d, %s); link %.1f MiB staged + %.1f MiB read in place\n",
-                __func__, desc[0]->src[0]->name, n_chunks, f.staged, f.abort, stage_cap, stage_min, stage_sdma ? "sdma" : "kernel",
+                __func__, desc[0]->src[0]->name, n_chunks, f.staged, f.abort, stage_cap, stage_min, sdma ? "sdma" : "kernel",
                 n_staged*eb/1048576.0, reads*eb/1048576.0);
         }
     }

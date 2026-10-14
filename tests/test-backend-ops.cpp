@@ -17994,6 +17994,267 @@ static int sf_main(const char * backend_filter) {
     return ok ? 0 : 1;
 }
 
+// pcie-once (bench only, not for release): the PCIe-once expert-major op (MOE_FFN_HAD op_params[3], set by the layer-major
+// prefill) against the ubatch-major ops it replaces, on random EXL3 weights in a host buffer (GGML_CUDA_HOST_DIRECT=1).
+// A case is N tokens in ubatches of C: REF runs one op per ubatch (rows of a pass = C*k, one chunk each, the ubatch-major
+// prefill), OLD one op over the N tokens in passes of C*k with the host experts read in place (the layer-major op before),
+// EXACT the same op with op_params[3] = 1 (the host experts copied once, T and one scatter), PARTIAL op_params[3] = 2 (no T).
+// EXACT must equal REF byte for byte; OLD and PARTIAL differ by the sums split at chunk boundaries (reported, not judged).
+// The staging buffers (and T) of the next PCIe-once op are filled with 0x55 before the checked run, so a missing copy or
+// a missing row shows. Link bytes come from the backend counters (logical: one weight read per GEMM item of host rows).
+// The expert cache (L1 slots, SSD tier) is not part of this test: every expert is in the host buffer.
+
+struct po_opts {
+    std::vector<std::string> shapes = { "tiny:4096:1024", "ds41:13312:6656", "ds4f:12288:4096" };
+    int slots = 16;
+};
+static po_opts po_o;
+
+static bool po_run_case(ggml_backend_t backend, sf_wset & ws, const std::string & route, int64_t N, int64_t C,
+        bool (*link)(ggml_backend_t, int, uint64_t *), bool (*diag)(ggml_backend_t, int, int, double *)) {
+    const int E = ws.e, K = ws.k;
+    const int64_t d = ws.d;
+    const std::vector<int32_t> ids = sf_make_ids(route, E, K, N, sf_o.seed*1000003ull + (uint64_t) N*131 + E);
+
+    ggml_init_params ip = {
+        /* .mem_size = */ ggml_tensor_overhead()*1024 + 8*ggml_graph_overhead_custom(256, false),
+        /* .mem_base = */ NULL,
+        /* .no_alloc = */ true,
+    };
+    ggml_context_ptr ctx_p(ggml_init(ip));
+    ggml_context * ctx = ctx_p.get();
+    ggml_tensor * x_t   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d, N);
+    ggml_tensor * ids_t = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, K, N);
+    ggml_tensor * wts_t = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, 1, K, N);
+    const int64_t kdim[3] = { ws.d, ws.d, ws.f };
+
+    // one op over the tokens [t0, t0 + w): views of the inputs, descriptors of the host weights
+    auto make_op = [&](int64_t t0, int64_t w, int rows, int mode, int slots) {
+        ggml_tensor * x   = ggml_view_2d(ctx, x_t, d, w, x_t->nb[1], (size_t) t0*x_t->nb[1]);
+        ggml_tensor * id  = ggml_view_2d(ctx, ids_t, K, w, ids_t->nb[1], (size_t) t0*ids_t->nb[1]);
+        ggml_tensor * wt  = ggml_view_3d(ctx, wts_t, 1, K, w, wts_t->nb[1], wts_t->nb[2], (size_t) t0*wts_t->nb[2]);
+        ggml_tensor * id0 = ggml_view_2d(ctx, ids_t, K, 0, ids_t->nb[1], 0);
+        ggml_tensor * desc[3];
+        for (int i = 0; i < 3; ++i) {
+            ggml_tensor * b = ggml_view_3d(ctx, x_t, kdim[i], 1, 0, x_t->nb[1], x_t->nb[1], 0);
+            desc[i] = ggml_mul_mat_had(ctx, ws.wh[i], b, ws.rin[i], ws.rout[i], id0, 128);
+        }
+        ggml_tensor * op = ggml_moe_ffn_had(ctx, x, id, wt, desc[0], desc[1], desc[2], GGML_GLU_OP_SWIGLU_CLAMP, 1.0f, rows);
+        ((int32_t *) op->op_params)[3] = mode; // PCIe once (mul-mat-had.cu)
+        ((int32_t *) op->op_params)[4] = slots;
+        return op;
+    };
+    struct po_var {
+        std::string name;
+        ggml_cgraph * g = nullptr;
+        std::vector<ggml_tensor *> outs; // in token order
+        std::vector<double> ms;
+        uint64_t link[6] = {};
+        std::string check = "n/a";
+    };
+    std::vector<po_var> vars(4);
+    const int rows = (int) (C*K);
+    vars[0].name = "REF";
+    vars[0].g = ggml_new_graph_custom(ctx, 256, false);
+    for (int64_t t0 = 0; t0 < N; t0 += C) {
+        ggml_tensor * op = make_op(t0, std::min(C, N - t0), rows, 0, 0);
+        vars[0].outs.push_back(op);
+        ggml_build_forward_expand(vars[0].g, op);
+    }
+    const char * names[3] = { "OLD", "EXACT", "PARTIAL" };
+    for (int v = 1; v < 4; ++v) {
+        vars[v].name = names[v - 1];
+        vars[v].g = ggml_new_graph_custom(ctx, 256, false);
+        ggml_tensor * op = make_op(0, N, rows, v - 1, po_o.slots);
+        vars[v].outs.push_back(op);
+        ggml_build_forward_expand(vars[v].g, op);
+    }
+
+    ggml_backend_buffer_ptr buf(ggml_backend_alloc_ctx_tensors(ctx, backend));
+    if (!buf) {
+        fprintf(stderr, "pcie-once: cannot allocate the tensors of the case\n");
+        return false;
+    }
+    for (const po_var & v : vars) {
+        if (!test_host_weights_admitted(v.g, ws.buf_h.get(), backend)) {
+            fprintf(stderr, "pcie-once: host-direct weights not admitted for %s\n", v.name.c_str());
+            return false;
+        }
+    }
+    init_tensor_uniform(x_t);
+    init_tensor_uniform(wts_t, 0.0f, 1.0f);
+    ggml_backend_tensor_set(ids_t, ids.data(), 0, ids.size()*sizeof(int32_t));
+
+    const size_t n_out = (size_t) (d*N);
+    auto read_out = [&](const po_var & v, std::vector<float> & out) {
+        out.resize(n_out);
+        size_t at = 0;
+        for (ggml_tensor * t : v.outs) {
+            ggml_backend_tensor_get(t, out.data() + at, 0, ggml_nbytes(t));
+            at += (size_t) ggml_nelements(t);
+        }
+        GGML_ASSERT(at == n_out);
+    };
+    auto run = [&](po_var & v, bool count) {
+        uint64_t a[6] = {}, b[6] = {};
+        if (count) {
+            link(backend, 1, a);
+        }
+        GGML_ASSERT(ggml_backend_graph_compute(backend, v.g) == GGML_STATUS_SUCCESS);
+        ggml_backend_synchronize(backend);
+        if (count) {
+            link(backend, 0, b);
+            for (int i = 0; i < 6; ++i) {
+                v.link[i] = b[i] - a[i];
+            }
+        }
+    };
+
+    // check: REF, then each variant with its staging buffers (and T) poisoned first
+    std::vector<float> ref, cur;
+    run(vars[0], true);
+    read_out(vars[0], ref);
+    bool ok = true;
+    bool ref_finite = true;
+    for (float f : ref) {
+        ref_finite = ref_finite && std::isfinite(f);
+    }
+    vars[0].check = ref_finite ? "reference" : "FAIL non-finite reference";
+    ok = ok && ref_finite;
+    for (int v = 1; v < 4; ++v) {
+        if (v >= 2) {
+            GGML_ASSERT(diag(backend, 6, 1, nullptr));
+        }
+        run(vars[v], true);
+        read_out(vars[v], cur);
+        bool finite = true;
+        double max_abs = 0.0;
+        for (size_t i = 0; i < n_out; ++i) {
+            finite = finite && std::isfinite(cur[i]);
+            max_abs = std::max(max_abs, (double) fabsf(cur[i] - ref[i]));
+        }
+        const bool same = memcmp(cur.data(), ref.data(), n_out*sizeof(float)) == 0;
+        const double e = nmse(ref.data(), cur.data(), n_out);
+        char s[160];
+        if (vars[v].name == "EXACT") {
+            snprintf(s, sizeof(s), "%s max_abs=%.3g nmse=%.3g", same ? "bitequal" : "FAIL not bit-equal", max_abs, e);
+            ok = ok && same && vars[v].link[3] == 1 && vars[v].link[5] == 0;
+            if (vars[v].link[3] != 1 || vars[v].link[5] != 0) {
+                strncat(s, " FAIL not a PCIe-once op", sizeof(s) - strlen(s) - 1);
+            }
+        } else {
+            const bool good = finite && e <= 2e-5;
+            snprintf(s, sizeof(s), "%s%s max_abs=%.3g nmse=%.3g", good ? "ok" : "FAIL", same ? " bitequal" : "", max_abs, e);
+            ok = ok && good;
+        }
+        vars[v].check = s;
+    }
+
+    // time: interleaved, the start rotated every repetition; no counting (its kernel and graph rule stay out)
+    link(backend, -1, nullptr);
+    const int nv = (int) vars.size();
+    for (int r = -sf_o.warm; r < sf_o.reps; ++r) {
+        for (int j = 0; j < nv; ++j) {
+            po_var & v = vars[(j + std::max(r, 0)) % nv];
+            const int64_t t0 = ggml_time_us();
+            run(v, false);
+            if (r >= 0) {
+                v.ms.push_back((ggml_time_us() - t0)/1000.0);
+            }
+        }
+    }
+    // the EXACT result after the timed runs (same bytes again: no state carried between ops)
+    read_out(vars[2], cur);
+    const bool again = memcmp(cur.data(), ref.data(), n_out*sizeof(float)) == 0;
+    ok = ok && again;
+
+    const int64_t b_exp = ws.nb02[0] + ws.nb02[1] + ws.nb02[2];
+    printf("{\"type\":\"po_case\",\"shape\":\"%s\",\"N\":%" PRId64 ",\"C\":%" PRId64 ",\"route\":\"%s\",\"E\":%d,\"k\":%d,"
+        "\"expert_bytes\":%" PRId64 ",\"slots\":%d,\"exact_again\":%s}\n", ws.name.c_str(), N, C, route.c_str(), E, K, b_exp,
+        po_o.slots, again ? "true" : "false");
+    const double ref_ms = sf_median(vars[0].ms);
+    for (const po_var & v : vars) {
+        const double ms = sf_median(v.ms);
+        printf("{\"type\":\"po_variant\",\"shape\":\"%s\",\"N\":%" PRId64 ",\"route\":\"%s\",\"name\":\"%s\",\"check\":\"%s\","
+            "\"ms_median\":%.3f,\"ms_min\":%.3f,\"vs_ref\":%.4f,\"link_staged_mib\":%.1f,\"link_inplace_mib\":%.1f,"
+            "\"link_total_mib\":%.1f,\"ops\":%" PRIu64 ",\"once_ops\":%" PRIu64 ",\"once_chunks\":%" PRIu64 ",\"fallback\":%" PRIu64 "}\n",
+            ws.name.c_str(), N, route.c_str(), v.name.c_str(), v.check.c_str(), ms,
+            v.ms.empty() ? 0.0 : *std::min_element(v.ms.begin(), v.ms.end()), ref_ms > 0 ? ms/ref_ms : 0.0,
+            v.link[0]/1048576.0, v.link[1]/1048576.0, (v.link[0] + v.link[1])/1048576.0, v.link[2], v.link[3], v.link[4], v.link[5]);
+    }
+    fflush(stdout);
+    fprintf(stderr, "pcie-once: %s N%" PRId64 " C%" PRId64 " %s: %s\n", ws.name.c_str(), N, C, route.c_str(), ok ? "PASS" : "FAIL");
+    return ok;
+}
+
+static int po_main(const char * backend_filter) {
+    ggml_backend_dev_t dev = nullptr;
+    for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+        ggml_backend_dev_t c = ggml_backend_dev_get(i);
+        if (backend_filter != nullptr ? strcmp(backend_filter, ggml_backend_dev_name(c)) == 0 :
+                ggml_backend_dev_type(c) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+            dev = c;
+            break;
+        }
+    }
+    if (dev == nullptr) {
+        fprintf(stderr, "pcie-once: no backend (use -b <name>)\n");
+        return 1;
+    }
+    if (getenv("GGML_CUDA_HOST_DIRECT") == nullptr) {
+        fprintf(stderr, "pcie-once: GGML_CUDA_HOST_DIRECT=1 is required (host weights)\n");
+        return 1;
+    }
+    ggml_backend_ptr backend(ggml_backend_dev_init(dev, NULL));
+    GGML_ASSERT(backend != NULL);
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+    auto link = (bool (*)(ggml_backend_t, int, uint64_t *)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_moe_link_stats");
+    auto diag = (bool (*)(ggml_backend_t, int, int, double *)) ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_moe_group_diag");
+    if (link == nullptr || diag == nullptr) {
+        fprintf(stderr, "pcie-once: the backend has no link counters or diagnostic entry\n");
+        return 1;
+    }
+    diag(backend.get(), 3, 0, nullptr); // not the streamed op
+    {
+        size_t fr = 0, tot = 0;
+        ggml_backend_dev_memory(dev, &fr, &tot);
+        fprintf(stderr, "pcie-once: %s, device free %.2f of %.2f GiB; reps %d warm %d slots %d seed %" PRIu64 "\n",
+            ggml_backend_dev_description(dev), fr/1073741824.0, tot/1073741824.0, sf_o.reps, sf_o.warm, po_o.slots, sf_o.seed);
+    }
+    std::unique_ptr<sf_wset> ws;
+    bool ok = true;
+    for (const std::string & spec : po_o.shapes) {
+        // name:N:C
+        const size_t c1 = spec.find(':');
+        const size_t c2 = c1 == std::string::npos ? std::string::npos : spec.find(':', c1 + 1);
+        const std::string name = spec.substr(0, c1);
+        const int64_t N = c1 == std::string::npos ? 0 : atoll(spec.c_str() + c1 + 1);
+        const int64_t C = c2 == std::string::npos ? 0 : atoll(spec.c_str() + c2 + 1);
+        const sf_shape * sh = nullptr;
+        for (const sf_shape & s : sf_shapes) {
+            if (name == s.name) {
+                sh = &s;
+            }
+        }
+        if (sh == nullptr || N <= 0 || C <= 0 || C >= N) {
+            fprintf(stderr, "pcie-once: bad shape '%s' (name:N:C with C < N; glm, ds4f, ds41, tiny)\n", spec.c_str());
+            return 1;
+        }
+        if (!ws || ws->name != name) {
+            ws.reset();
+            ws.reset(new sf_wset());
+            if (!sf_make_wset(*ws, *sh, backend.get())) {
+                return 1;
+            }
+        }
+        for (const std::string & route : sf_o.routes) {
+            ok = po_run_case(backend.get(), *ws, route, N, C, link, diag) && ok;
+        }
+    }
+    fprintf(stderr, "pcie-once: %s\n", ok ? "ALL PASS" : "SOME FAILED");
+    return ok ? 0 : 1;
+}
+
 static void usage(char ** argv) {
     printf("Usage: %s [mode] [options]\n\n", argv[0]);
     printf("Valid modes:\n");
@@ -18010,6 +18271,7 @@ static void usage(char ** argv) {
     printf("  --list-ops                  list all available GGML operations\n");
     printf("  --show-coverage             show test coverage\n");
     printf("  --test-file <path>          read test operators from a test file generated by test-export-graph-ops\n");
+    printf("  --po-shapes <a:N:C,..>      pcie-once (bench): N tokens in ubatches of C (default tiny:4096:1024,ds41:13312:6656,ds4f:12288:4096); --po-slots <n> staged experts per buffer (16); --sf-routes/--sf-reps/--sf-warm/--sf-seed apply\n");
     printf("  --sf-shapes <a:W,..>        stage-falsify cases: glm, ds4f, ds41, tiny with the tokens W (default glm:8192,ds4f:8192,ds41:12288,ds41:2048)\n");
     printf("  --sf-routes <uniform,u2>    routing (default both); --sf-variants V,A,B,C,D,X,R,Y,Z (Y adds YP,YC, Z adds ZP); --sf-reps N; --sf-warm N; --sf-seed N\n");
     printf("  --sf-l1 <frac>              share of the experts resident in L1 (default 0); --sf-l1-hot picks the busiest\n");
@@ -18039,6 +18301,7 @@ int main(int argc, char ** argv) {
     const char * test_file_path = nullptr;
     int parallel_workers = 1;
     bool sf_mode = false;
+    bool po_mode = false;
     auto sf_list = [](const char * v) {
         std::vector<std::string> out;
         std::string cur;
@@ -18065,6 +18328,12 @@ int main(int argc, char ** argv) {
             mode = MODE_PERF;
         } else if (strcmp(argv[i], "stage-falsify") == 0) {
             sf_mode = true;
+        } else if (strcmp(argv[i], "pcie-once") == 0) {
+            po_mode = true;
+        } else if (strcmp(argv[i], "--po-shapes") == 0 && i + 1 < argc) {
+            po_o.shapes = sf_list(argv[++i]);
+        } else if (strcmp(argv[i], "--po-slots") == 0 && i + 1 < argc) {
+            po_o.slots = std::max(1, atoi(argv[++i]));
         } else if (strcmp(argv[i], "grad") == 0) {
             mode = MODE_GRAD;
         } else if (strcmp(argv[i], "support") == 0) {
@@ -18174,6 +18443,9 @@ int main(int argc, char ** argv) {
 
     if (sf_mode) {
         return sf_main(backend_filter);
+    }
+    if (po_mode) {
+        return po_main(backend_filter);
     }
 
     // Create printer for output format

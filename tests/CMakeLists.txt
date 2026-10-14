@@ -386,6 +386,7 @@ target_include_directories(test-expert-profile-store PRIVATE ${PROJECT_SOURCE_DI
 # ranma: expert cache policy tests (no GPU)
 llama_build_and_test(test-expert-geometry.cpp)
 target_include_directories(test-expert-geometry PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src/ggml-cuda)
+llama_build_and_test(test-moe-once-schedule.cpp) # the PCIe-once expert-major op against a simulated device
 llama_build_and_test(test-expert-plan.cpp)
 target_include_directories(test-expert-plan PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src/ggml-cuda)
 llama_build_and_test(test-expert-exclusive.cpp)
