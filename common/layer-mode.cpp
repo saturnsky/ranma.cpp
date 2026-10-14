@@ -555,6 +555,14 @@ void common_layer_mode_apply(common_params & params) {
 
     // ---- apply -------------------------------------------------------------------------------------------------------
     set_width(ub);
+    // the logical batch: the context (the context clamps it), so that a prompt is one call of several ubatches and a
+    // model that computes only what the output of a call needs (the exact tail of DeepSeek-V4.1) does that once, at the
+    // end of the prompt. The measurement above ran with -b = -ub: n_batch sizes no buffer of these contexts (KV cache
+    // and graphs follow n_ubatch, the outputs n_outputs_max), only the per-token target features a drafter reads, and a
+    // drafter turns the layer mode off (above)
+    if (!params.n_batch_explicit) {
+        params.n_batch = (int32_t) std::max<int64_t>(ub, n_ctx);
+    }
     lm_cfg.attn_chunk        = c >= ub ? 0 : c;
     lm_cfg.expert_major_rows = rows_of(ub);
     llama_layer_mode_set_config(lm_cfg);
