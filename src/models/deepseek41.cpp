@@ -775,7 +775,8 @@ void llm_graph_input_engram::set_input(const llama_ubatch * ubatch) {
     const auto & hp = pmodel.hparams;
 
     const bool account = ggml_account_enabled();
-    const int64_t t_start = account ? ggml_time_us() : 0;
+    const bool timing  = llama_prefetch_timing_enabled();
+    const int64_t t_start = account || timing ? ggml_time_us() : 0;
 
     const int64_t n_tokens = ubatch->n_tokens;
     const int64_t n_gram   = hp.engram_max_ngram_size;
@@ -833,9 +834,10 @@ void llm_graph_input_engram::set_input(const llama_ubatch * ubatch) {
         }
     }
 
-    const int64_t t_hashed = account ? ggml_time_us() : 0;
+    const int64_t t_hashed = account || timing ? ggml_time_us() : 0;
+    llama_prefetch_stats stats;   // LLAMA_PREFETCH_TIMING
     if (pmodel.can_prefetch.count(table->parts[0])) {
-        llama_prefetch_table_pieces_rows(table->parts, table->part_rows, idx, prefetch);
+        llama_prefetch_table_pieces_rows(table->parts, table->part_rows, idx, prefetch, timing ? &stats : nullptr);
     }
     if (account) {
         // logical rows: one per index, whatever the number of pieces
@@ -844,6 +846,7 @@ void llm_graph_input_engram::set_input(const llama_ubatch * ubatch) {
         ggml_account_add(GGML_ACCOUNT_ENGRAM_LOGICAL_BYTES,
                 (double) idx.size() * (double) ggml_row_size(table->parts[0]->type, table->parts[0]->ne[0]));
     }
+    const int64_t t_input = timing ? ggml_time_us() : 0;
 
     // global row numbers -> per piece local row numbers and the mask that keeps the piece which holds the row
     std::vector<int32_t> piece_idx;
@@ -853,6 +856,12 @@ void llm_graph_input_engram::set_input(const llama_ubatch * ubatch) {
     ggml_backend_tensor_set(rows, piece_idx.data(), 0, piece_idx.size()*ggml_element_size(rows));
     if (mask) {
         ggml_backend_tensor_set(mask, piece_mask.data(), 0, piece_mask.size()*ggml_element_size(mask));
+    }
+
+    if (timing) {
+        stats.t_hash_us  = t_hashed - t_start;
+        stats.t_input_us = ggml_time_us() - t_input;
+        llama_prefetch_stats_log("engram", (int) pmodel.hparams.engram_layer_ids[eg], n_tokens, stats);
     }
 }
 
