@@ -696,6 +696,19 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
         }
     }
 
+#ifdef GGML_USE_HIP
+    // The 16-row bound is a conservative policy choice, not a kernel requirement: 2..15 rows were not measured.
+    // A multiple of 8 runs as groups of 8 Q heads (ncols2 = 8). The MMA kernel has no gather on HIP, so above 8 a shape
+    // that the tile kernel would gather keeps the tile kernel, but only from twice the tile kernel's own bound (the bound
+    // of 8 query rows instead of 4 at ncols2 = 8): that bound weighs the gather against the dense tile kernel, and the
+    // WMMA kernel scans a dense K about twice as fast. For 64 heads of 512 and lists of 640 cells the gather and the
+    // dense WMMA kernel break even at about 10K (lists shared by neighbouring rows) to 20K cells (independent lists).
+    if (GGML_CUDA_CC_IS_RDNA4(cc) && amd_wmma_available(cc) &&
+        Q->ne[0] == 512 && V->ne[0] == 512 && Q->ne[1] >= 16 &&
+        gqa_ratio == 8 && gqa_opt_applies && K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16) {
+        return BEST_FATTN_KERNEL_MMA_F16;
+    }
+#endif
     // AMD WMMA is faster than the tile kernel if the wide tiles with high arithmetic intensity can be utilized.
     if ((amd_wmma_available(cc) && gqa_opt_applies && Q->ne[0] <= 256) && Q->ne[0] != 40 && Q->ne[0] != 72 &&
             Q->ne[1] * gqa_ratio_eff > (Q->ne[0] <= 128 ? 8 : 16)) {
