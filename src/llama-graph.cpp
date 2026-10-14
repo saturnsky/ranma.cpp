@@ -17,15 +17,20 @@
 #include "llama-memory-hybrid.h"
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-recurrent.h"
+#include "llama-prefetch.h"
+
+#include "ggml-account.h"
 
 #include <algorithm>
 #include <cassert>
+#include <cctype>
 #include <cstdlib>
 #include <cmath>
 #include <cstring>
 #include <numeric>
 #include <sstream>
 #include <string>
+#include <typeinfo>
 #include <unordered_set>
 
 // dedup helpers
@@ -1081,11 +1086,40 @@ void llm_graph_input_dsv4::set_input(const llama_ubatch * ubatch) {
     const int64_t n_stream = plan_csa.n_stream;
 
     inp_raw->mctx = mctx->get_raw();
-    inp_raw->set_input(ubatch);
+
+    // RANMA_PREFILL_ACCOUNT / LLAMA_PREFETCH_TIMING: the parts of this input, as notes input_dsv4_<part>_us of the account
+    // record and one "set_inputs_dsv4 {json}" log line (the whole is input_dsv4_us of llm_graph_result::set_inputs)
+    const bool account = ggml_account_current() != 0;
+    const bool timing  = account || llama_prefetch_timing_enabled();
+    int64_t t = timing ? ggml_time_us() : 0;
+    int64_t us[6] = {};
+    auto lap = [&](int part) {
+        if (timing) {
+            const int64_t now = ggml_time_us();
+            us[part] += now - t;
+            t = now;
+        }
+    };
+
+    if (inp_raw->self_k_idxs && inp_raw->self_k_idxs->buffer) {
+        inp_raw->mctx->set_input_k_idxs(inp_raw->self_k_idxs);
+    }
+    lap(0);
+    if (inp_raw->self_kq_mask && inp_raw->self_kq_mask->buffer) {
+        inp_raw->mctx->set_input_kq_mask(inp_raw->self_kq_mask, ubatch, inp_raw->cparams.causal_attn);
+    }
+    lap(1);
+    if (inp_raw->self_k_rot) {
+        inp_raw->mctx->set_input_k_rot(inp_raw->self_k_rot);
+    }
+    lap(5);
 
     dsv4_set_comp_inputs(inp_csa, plan_csa, "csa", debug > 0, ubatch->n_tokens, n_stream);
+    lap(2);
     dsv4_set_comp_inputs(inp_hca, plan_hca, "hca", debug > 0, ubatch->n_tokens, n_stream);
+    lap(3);
     dsv4_set_comp_inputs(inp_lid, plan_lid, "lid", debug > 0, ubatch->n_tokens, n_stream);
+    lap(4);
 
     if (inp_csa.k_rot && inp_csa.k_rot->buffer) {
         mctx->get_csa()->set_input_k_rot(inp_csa.k_rot);
@@ -1097,6 +1131,23 @@ void llm_graph_input_dsv4::set_input(const llama_ubatch * ubatch) {
 
     if (inp_lid.k_rot && inp_lid.k_rot->buffer) {
         mctx->get_lid()->set_input_k_rot(inp_lid.k_rot);
+    }
+    lap(5);
+
+    if (timing) {
+        static const char * names[6] = { "raw_k_idxs", "raw_kq_mask", "csa", "hca", "lid", "k_rot" };
+        std::string line = "{\"kind\":\"set_inputs_dsv4\",\"ub\":" + std::to_string(ggml_account_current()) +
+            ",\"tokens\":" + std::to_string(ubatch->n_tokens) + ",\"us\":{";
+        for (int i = 0; i < 6; ++i) {
+            if (account) {
+                ggml_account_note((std::string("input_dsv4_") + names[i] + "_us").c_str(), std::to_string(us[i]).c_str());
+            }
+            line += std::string(i ? ",\"" : "\"") + names[i] + "\":" + std::to_string(us[i]);
+        }
+        line += "}}";
+        if (llama_prefetch_timing_enabled()) {
+            LLAMA_LOG_INFO("set_inputs_dsv4 %s\n", line.c_str());
+        }
     }
 }
 
@@ -1444,9 +1495,61 @@ void llm_graph_result::reset() {
     gf = ggml_new_graph_custom(ctx_compute.get(), max_nodes, false);
 }
 
+// The input class of a graph input, from its type (llm_graph_input_attn_kv -> attn_kv), for the input timing below.
+static std::string llm_graph_input_class(const llm_graph_input_i & input) {
+    std::string name = typeid(input).name();
+    for (const char * prefix : { "class ", "struct " }) {
+        if (name.rfind(prefix, 0) == 0) {
+            name.erase(0, strlen(prefix));
+        }
+    }
+    const size_t at = name.find("llm_graph_input_");
+    if (at != std::string::npos) {
+        name.erase(0, at + strlen("llm_graph_input_"));
+    }
+    std::string out;
+    for (char c : name) {
+        out += (isalnum((unsigned char) c) || c == '_') ? c : '_';
+    }
+    return out;
+}
+
 void llm_graph_result::set_inputs(const llama_ubatch * ubatch) {
+    // RANMA_PREFILL_ACCOUNT / LLAMA_PREFETCH_TIMING (diagnostics): the time of each input class, summed per class, as
+    // notes "input_<class>_us" of the ubatch's account record and one "set_inputs {json}" log line. The uploads of these
+    // inputs to a device happen later, in the scheduler's input copies (host_submit_ms).
+    const bool account = ggml_account_current() != 0;
+    const bool timing  = llama_prefetch_timing_enabled();
+    if (!account && !timing) {
+        for (auto & input : inputs) {
+            input->set_input(ubatch);
+        }
+        return;
+    }
+    std::vector<std::pair<std::string, int64_t>> per_class;
     for (auto & input : inputs) {
+        const int64_t t0 = ggml_time_us();
         input->set_input(ubatch);
+        const int64_t us = ggml_time_us() - t0;
+        const std::string cls = llm_graph_input_class(*input);
+        auto it = std::find_if(per_class.begin(), per_class.end(), [&](const auto & e) { return e.first == cls; });
+        if (it == per_class.end()) {
+            per_class.emplace_back(cls, us);
+        } else {
+            it->second += us;
+        }
+    }
+    std::string line = "{\"kind\":\"set_inputs\",\"ub\":" + std::to_string(ggml_account_current()) +
+        ",\"tokens\":" + std::to_string(ubatch->n_tokens) + ",\"us\":{";
+    for (size_t i = 0; i < per_class.size(); ++i) {
+        if (account) {
+            ggml_account_note(("input_" + per_class[i].first + "_us").c_str(), std::to_string(per_class[i].second).c_str());
+        }
+        line += (i ? ",\"" : "\"") + per_class[i].first + "\":" + std::to_string(per_class[i].second);
+    }
+    line += "}}";
+    if (timing) {
+        LLAMA_LOG_INFO("set_inputs %s\n", line.c_str());
     }
 }
 
