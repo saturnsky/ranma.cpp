@@ -12,6 +12,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
+#include <future>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -741,7 +742,11 @@ public:
                            int eg,
                            const llama_table_pieces * table,
                            enum llama_ple_prefetch prefetch) : pmodel(pmodel), mctx(mctx), eg(eg), table(table), prefetch(prefetch) {}
-    virtual ~llm_graph_input_engram() = default;
+    virtual ~llm_graph_input_engram() {
+        if (prefetch_job.valid()) {
+            prefetch_job.wait();
+        }
+    }
 
     void set_input(const llama_ubatch * ubatch) override;
 
@@ -769,9 +774,20 @@ public:
 
     // scratch, reused across set_input() calls
     std::vector<llama_token> prev;
+
+    // LLAMA_ENGRAM_PREFETCH_ASYNC: the prefetch of a later engram layer, still running on a worker thread
+    std::future<void> prefetch_job;
 };
 
 void llm_graph_input_engram::set_input(const llama_ubatch * ubatch) {
+    // collect the previous ubatch's prefetch before its input is reused
+    if (prefetch_job.valid()) {
+        prefetch_job.wait();
+    }
+    static const bool async_late = [] {
+        const char * env = getenv("LLAMA_ENGRAM_PREFETCH_ASYNC");
+        return env == nullptr || atoi(env) != 0;
+    }();
     const auto & hp = pmodel.hparams;
 
     const bool account = ggml_account_enabled();
@@ -837,7 +853,35 @@ void llm_graph_input_engram::set_input(const llama_ubatch * ubatch) {
     const int64_t t_hashed = account || timing ? ggml_time_us() : 0;
     llama_prefetch_stats stats;   // LLAMA_PREFETCH_TIMING
     if (pmodel.can_prefetch.count(table->parts[0])) {
-        llama_prefetch_table_pieces_rows(table->parts, table->part_rows, idx, prefetch, timing ? &stats : nullptr);
+        // LLAMA_ENGRAM_PREFETCH_ASYNC (default on, 0 turns it off): the prefill hint of every engram layer but the first
+        // runs on a worker thread, so that it overlaps the GPU work of the layers before it instead of delaying the graph.
+        // The first engram layer keeps the synchronous hint, its gather follows too soon. The hint never changes what the
+        // gather reads, so a hint that is late or fails only costs page faults. The worker owns copies of everything it
+        // reads; the job is collected by the next set_input() and by the destructor (the model outlives the inputs).
+        if (async_late && eg > 0 && n_tokens > 1 && prefetch != LLAMA_PLE_PREFETCH_OFF) {
+            const auto parts = table->parts;
+            const auto part_rows = table->part_rows;
+            const auto mode = prefetch;
+            const int layer = (int) hp.engram_layer_ids[eg];
+            auto work = [parts, part_rows, idx, mode, timing, layer, n_tokens] {
+                try {
+                    llama_prefetch_stats st;
+                    llama_prefetch_table_pieces_rows(parts, part_rows, idx, mode, timing ? &st : nullptr);
+                    if (timing) {
+                        llama_prefetch_stats_log("engram_async", layer, n_tokens, st);
+                    }
+                } catch (const std::exception & e) {
+                    LLAMA_LOG_WARN("engram prefetch: %s\n", e.what());
+                }
+            };
+            try {
+                prefetch_job = std::async(std::launch::async, work);
+            } catch (const std::exception &) {
+                work();
+            }
+        } else {
+            llama_prefetch_table_pieces_rows(table->parts, table->part_rows, idx, prefetch, timing ? &stats : nullptr);
+        }
     }
     if (account) {
         // logical rows: one per index, whatever the number of pieces

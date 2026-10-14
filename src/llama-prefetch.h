@@ -56,6 +56,7 @@ struct llama_prefetch_stats {
     int64_t t_pages_us   = 0;   // this diagnostic's page arithmetic (not part of the prefetch)
     int64_t t_input_us   = -1;  // caller: per-piece row numbers and mask, and their copy into the input tensors
     int64_t faults_before = -1, faults_after = -1;   // process page faults right before and after the prefetch
+    int64_t t_begin_us = -1, t_end_us = -1;          // ggml_time_us() at the start and the end of the prefetch
     int64_t page_size    = 0;
     bool    skipped      = true; // nothing was handed to the OS (mode off, too few rows, table not in host memory)
     std::vector<llama_prefetch_piece_stats> pieces;

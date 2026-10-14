@@ -48,6 +48,13 @@ the per-layer embedding prefetch, `ple-prefetch.md`). It follows `--ple-prefetch
 (256 rows for `prefill`, 16 for `always`; a decode token gathers 24 rows per engram layer). A CPU `GET_ROWS` of
 an engram table with 256 rows or more also runs on the threadpool.
 
+In a prompt ubatch (more than one token) the hint of every engram layer but the first runs on a worker thread, so
+that it overlaps the GPU work of the layers before it instead of delaying the graph (`LLAMA_ENGRAM_PREFETCH_ASYNC=0`
+keeps all hints synchronous). The first engram layer's gather follows too soon for that and keeps the synchronous
+hint. The hint never changes what the gather reads; the job is collected by the next `set_input()` and when the
+input is destroyed. A 7309-token DS4.1F prompt (ds41-serial-probe, 2026-10-14): 12.79 s -> 11.91 s, the same
+content and top-10 hashes with `GGML_CUDA_TOP_K_STABLE_TIES=1`.
+
 ## Tests
 
 `test-backend-ops -o GET_ROWS` has `test_get_rows_mxfp8` cases. The numpy dequantization is in
