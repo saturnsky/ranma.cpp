@@ -10,9 +10,11 @@
 #include <algorithm>
 #include <cinttypes>
 #include <cmath>
+#include <cstdlib>
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 // DeepSeek-V4.1.
@@ -39,6 +41,306 @@
 // inside those blocks. Until the compressed length passes candidate_topk_blocks *
 // candidate_block_size (16384 tokens on the ratio 1 stream) every block is kept, so nothing is
 // built there. The carry holds one entry per block, not per position. See build_candidate_keep().
+
+// ranma: the tail prefill (RANMA_DSV41_EXACT_TAIL, RANMA_DSV41_TAIL_DIAG). When a ubatch of one sequence asks for the logits of its last row
+// alone, the layers from il_first on compute only the rows that row still depends on through the sliding window. With
+// a window of W rows and the last layer L, the query rows of layer l are O_L = 1 and O_l = K_(l+1), and its input and
+// raw KV rows are K_l = O_l + W - 1 = W + (L - l)(W - 1). Rows are tails of the ubatch, counted from its end. il_first
+// is the last layer that has to see every row (the last KV source, whose compressor projects every row, or the last
+// engram layer); it reads all rows for that and computes the tail like the layers after it. The layers before it run
+// over the whole ubatch, so that nothing a later ubatch or a later layer reads is missing, except the raw KV of the
+// tail layers outside their K rows (see dsv41_tail_plan_make for the risk this carries).
+//
+// mode EXACT: a tail layer makes and writes the raw KV of its K rows; the query, the indexer, the attention, the
+// hyper-connections and the FFN run over its O rows. The math is that of the whole graph for the output row and the raw
+// KV of the last W rows of every layer, but the matrix products see other row counts, so the result is not bit exact.
+//
+// mode DIAG, the falsifier of the design: the attention of a tail layer runs over its K rows and only the hyper-
+// connection post mix and the FFN are narrowed to the O rows. The queries of the first W - 1 of the K rows read raw
+// cells this ubatch did not write at this layer; those rows are dropped before the FFN, so the O rows do not see them.
+struct dsv41_tail_rows {
+    int64_t n_k = 0; // input and raw KV rows
+    int64_t n_o = 0; // rows handed to the next layer
+};
+
+// ranma: how the graph chunks its attention (the attention chunk, the raw chunk): the chunk size of its device-side
+// masks, 0 for an unchunked graph, and the ops of the raw cache that give the raw window of a chunk of query rows
+struct dsv41_tail_chunking {
+    int64_t c = 0;
+    llm_graph_chunk_kv_ops ops = {};
+};
+
+struct dsv41_tail_plan {
+    enum mode_t : int32_t { OFF = 0, DIAG = 1, EXACT = 2 };
+
+    int32_t mode      = OFF;
+    bool    requested = false;   // the env asked for a tail mode
+    int32_t il_first  = -1;
+    int64_t n_tokens  = 0;
+    int64_t c         = 0;       // the query chunk size of a chunked graph, 0 unchunked
+    std::vector<dsv41_tail_rows> rows; // [n_layer], 0 before il_first
+    // chunked graph: per layer from il_first, the chunks of its query rows in ubatch rows [i0, i0 + n) with the raw
+    // columns [j0, j0 + nj) they read (all raw cells without the raw chunk); baked into the graph's views
+    std::vector<std::vector<llm_graph_chunk_window>> q_chunks;
+    const char * reason = nullptr;     // why the plan is off
+
+    bool active() const { return mode != OFF; }
+
+    // the query rows of layer il: the attention of DIAG runs over all its input rows
+    int64_t n_q(int il) const { return mode == EXACT ? rows[il].n_o : rows[il].n_k; }
+
+    bool same_graph(const dsv41_tail_plan & o) const {
+        if (!active() || !o.active()) {
+            return active() == o.active();
+        }
+        if (mode != o.mode || il_first != o.il_first || n_tokens != o.n_tokens || c != o.c || rows.size() != o.rows.size()) {
+            return false;
+        }
+        for (size_t il = 0; il < rows.size(); ++il) {
+            if (rows[il].n_k != o.rows[il].n_k || rows[il].n_o != o.rows[il].n_o) {
+                return false;
+            }
+        }
+        return q_chunks == o.q_chunks;
+    }
+};
+
+// env: RANMA_DSV41_EXACT_TAIL (default 0), RANMA_DSV41_TAIL_DIAG (default 0; EXACT_TAIL wins), read at each graph build
+static int32_t dsv41_tail_mode_env() {
+    const char * exact = getenv("RANMA_DSV41_EXACT_TAIL");
+    if (exact != nullptr && atoi(exact) != 0) {
+        return dsv41_tail_plan::EXACT;
+    }
+    const char * diag = getenv("RANMA_DSV41_TAIL_DIAG");
+    if (diag != nullptr && atoi(diag) != 0) {
+        return dsv41_tail_plan::DIAG;
+    }
+    return dsv41_tail_plan::OFF;
+}
+
+// The plan of one ubatch. Anything outside what the tail covers runs the whole graph:
+//   - one sequence of token rows at consecutive positions, with one position per row;
+//   - one output, the last row, and no embeddings or layer inputs extracted;
+//   - a standard sliding window on every tail layer, and a ubatch longer than K_(il_first).
+// A chunked graph (ch.c > 0) chunks the query rows of every tail layer by the same size, the first chunk at the first
+// query row; each chunk keeps its rows of the ubatch, so the masks, positions, compressed keys and raw windows are those
+// of the same rows in the whole graph. mctx gives the raw windows and the cell count.
+// The earlier ubatches of a prompt run in full, so a tail ubatch only has to rebuild what it computes itself.
+//
+// Risk: the raw KV of a tail layer is written for its K rows only. Every layer writes at least its last W rows, so
+// decoding on from the end of the ubatch reads written cells, but a cache that is later cut back to a position inside
+// this ubatch (prompt cache reuse, a context checkpoint taken inside it) would read stale cells. Nothing records that
+// yet; see the design notes before turning this on for a server.
+static dsv41_tail_plan dsv41_tail_plan_make(
+        const llama_model_deepseek41 & pmodel,
+        const llama_cparams & cparams,
+        const llama_ubatch & ubatch,
+        int64_t n_outputs,
+        const llama_memory_context_i * mctx,
+        const dsv41_tail_chunking & ch) {
+    const auto & hparams = pmodel.hparams;
+
+    dsv41_tail_plan plan;
+    plan.n_tokens = ubatch.n_tokens;
+
+    const int32_t mode = dsv41_tail_mode_env();
+    plan.requested = mode != dsv41_tail_plan::OFF;
+
+    auto off = [&](const char * reason) {
+        plan.mode     = dsv41_tail_plan::OFF;
+        plan.il_first = -1;
+        plan.c        = 0;
+        plan.reason   = reason;
+        plan.rows.clear();
+        plan.q_chunks.clear();
+        return plan;
+    };
+
+    if (mode == dsv41_tail_plan::OFF) {
+        return off("not requested");
+    }
+    if (cparams.embeddings) {
+        return off("embeddings");
+    }
+    for (bool b : cparams.embeddings_layer_inp) {
+        if (b) {
+            return off("layer inputs extracted");
+        }
+    }
+
+    const int64_t n = ubatch.n_tokens;
+
+    if (ubatch.token == nullptr || ubatch.embd != nullptr || ubatch.embd_state != nullptr || ubatch.is_mixed()) {
+        return off("not a token batch");
+    }
+    if (ubatch.n_pos != 1 || ubatch.pos == nullptr) {
+        return off("not one position per row");
+    }
+    if (ubatch.n_seqs_unq != 1 || ubatch.n_seq_id == nullptr || ubatch.seq_id == nullptr) {
+        return off("not one sequence");
+    }
+    for (int64_t i = 0; i < n; ++i) {
+        if (ubatch.n_seq_id[i] != 1 || ubatch.seq_id[i][0] != ubatch.seq_id_unq[0]) {
+            return off("not one sequence");
+        }
+        if (ubatch.pos[i] != ubatch.pos[0] + (llama_pos) i) {
+            return off("positions not consecutive");
+        }
+    }
+    if (n_outputs != 1 || ubatch.output == nullptr || !ubatch.output[n - 1]) {
+        return off("output not the last row alone");
+    }
+
+    const int32_t n_layer = (int32_t) hparams.n_layer();
+    const int64_t n_swa   = hparams.n_swa;
+
+    if (hparams.swa_type != LLAMA_SWA_TYPE_STANDARD || n_swa <= 0) {
+        return off("no standard sliding window");
+    }
+
+    // the last layer that reads every row
+    int32_t il_first = 0;
+    for (int32_t il = 0; il < n_layer; ++il) {
+        if (hparams.dsv41_is_kv_source(il) || pmodel.engram_index(il) >= 0) {
+            il_first = il;
+        }
+    }
+    for (int32_t il = il_first; il < n_layer; ++il) {
+        if (!hparams.is_swa(il)) {
+            return off("a tail layer has no sliding window");
+        }
+    }
+
+    plan.rows.assign(n_layer, dsv41_tail_rows{});
+    for (int32_t il = n_layer - 1; il >= il_first; --il) {
+        auto & r = plan.rows[il];
+        r.n_o = il == n_layer - 1 ? 1 : plan.rows[il + 1].n_k;
+        r.n_k = r.n_o + n_swa - 1;
+    }
+
+    // a ubatch no longer than the tail gains nothing at its first layer; it runs in full, explicitly
+    if (n <= plan.rows[il_first].n_k) {
+        return off("ubatch not longer than the tail");
+    }
+
+    plan.mode     = mode;
+    plan.il_first = il_first;
+    plan.reason   = nullptr;
+
+    if (ch.c > 0) {
+        GGML_ASSERT(mctx != nullptr);
+
+        const int64_t n_kv = ch.ops.n_kv(mctx);
+
+        plan.c = ch.c;
+        plan.q_chunks.assign(n_layer, {});
+        for (int32_t il = il_first; il < n_layer; ++il) {
+            const int64_t n_q = plan.n_q(il);
+            const int64_t q0  = n - n_q;
+
+            // one chunk where the query rows fit in one (always on the last layer)
+            const llm_graph_chunks chunks(n_q, ch.c);
+            for (int k = 0; k < chunks.n; ++k) {
+                llm_graph_chunk_window w = { q0 + chunks.i0(k), chunks.nk(k), 0, n_kv };
+                if (ch.ops.window != nullptr) {
+                    ch.ops.window(mctx, w.i0, w.n, w.j0, w.nj);
+                    // as llm_graph_input_chunk_mask::make_windows
+                    if (w.j0 < 0 || w.nj <= 0 || w.j0 + w.nj > n_kv) {
+                        w.j0 = 0;
+                        w.nj = n_kv;
+                    }
+                }
+                plan.q_chunks[il].push_back(w);
+            }
+        }
+    }
+
+    return plan;
+}
+
+static void dsv41_tail_log(const dsv41_tail_plan & plan) {
+    if (!plan.requested) {
+        return;
+    }
+
+    std::string msg;
+    if (plan.active()) {
+        int64_t sum_k = 0;
+        int64_t sum_o = 0;
+        for (const auto & r : plan.rows) {
+            sum_k += r.n_k;
+            sum_o += r.n_o;
+        }
+        msg = format("%s: %" PRId64 " rows, tail from layer %d (K %" PRId64 ", O %" PRId64 "), sum K %" PRId64 ", sum O %" PRId64,
+                plan.mode == dsv41_tail_plan::DIAG ? "diag" : "exact", plan.n_tokens, plan.il_first,
+                plan.rows[plan.il_first].n_k, plan.rows[plan.il_first].n_o, sum_k, sum_o);
+        if (plan.c > 0) {
+            size_t n_chunks = 0;
+            for (const auto & qc : plan.q_chunks) {
+                n_chunks += qc.size();
+            }
+            msg += format(", query chunks of %" PRId64 " (%zu in all)", plan.c, n_chunks);
+        }
+    } else {
+        msg = format("off for %" PRId64 " rows: %s", plan.n_tokens, plan.reason);
+    }
+
+    // once per change, a graph is rebuilt for every ubatch that cannot reuse the last one
+    static std::string last;
+    if (msg != last) {
+        LLAMA_LOG_INFO("%s: %s\n", __func__, msg.c_str());
+        last = msg;
+    }
+}
+
+// ranma: keeps a graph of one tail plan from being reused for a ubatch that plans differently (another output row,
+// another length class, other query chunks or raw windows); every tensor the plan narrows is a view of an input that
+// set_input refreshes
+class llm_graph_input_dsv41_tail : public llm_graph_input_i {
+public:
+    llm_graph_input_dsv41_tail(const llama_model_deepseek41 & pmodel, dsv41_tail_plan plan,
+                               const llama_memory_context_i * mctx, dsv41_tail_chunking chunking) :
+        pmodel(pmodel), plan(std::move(plan)), mctx(mctx), chunking(chunking) {}
+    virtual ~llm_graph_input_dsv41_tail() = default;
+
+    // RANMA_DSV4_RAW_NKV_CHECK: the raw windows of the query chunks against the host mask, as the chunk mask input
+    // checks those of the ubatch chunks
+    void set_input(const llama_ubatch * ubatch) override {
+        if (!plan.active() || chunking.ops.window == nullptr || chunking.ops.check == nullptr) {
+            return;
+        }
+        std::vector<llm_graph_chunk_window> windows;
+        for (const auto & qc : plan.q_chunks) {
+            windows.insert(windows.end(), qc.begin(), qc.end());
+        }
+        chunking.ops.check(mctx, ubatch, windows);
+    }
+
+    bool can_reuse(const llm_graph_params & params) override {
+        mctx = params.mctx;
+        return dsv41_tail_plan_make(pmodel, params.cparams, params.ubatch, params.n_outputs, mctx, chunking).same_graph(plan);
+    }
+
+    const llama_model_deepseek41 & pmodel;
+    const dsv41_tail_plan plan;
+    const llama_memory_context_i * mctx;
+    const dsv41_tail_chunking chunking;
+};
+
+// ranma: the carried top-k (and candidate keep) narrowed to the last n of the query rows it holds; the query rows of a
+// tail layer are a tail of those of every layer before it
+static dsv41_top_k_carry dsv41_carry_tail(ggml_context * ctx, const dsv41_top_k_carry & c, int64_t n) {
+    dsv41_top_k_carry res = c;
+    if (res.top_k != nullptr) {
+        GGML_ASSERT(res.top_k->ne[3] == 1 && n <= res.top_k->ne[1]);
+        res.top_k = llm_graph_rows(ctx, res.top_k, 1, res.top_k->ne[1] - n, n);
+    }
+    if (res.cand_keep != nullptr) {
+        GGML_ASSERT(res.cand_keep->ne[3] == 1 && n <= res.cand_keep->ne[2]);
+        res.cand_keep = llm_graph_rows(ctx, res.cand_keep, 2, res.cand_keep->ne[2] - n, n);
+    }
+    return res;
+}
 
 // mean over the hyper-connection copies; deepseek4.cpp keeps its own copy of this
 static ggml_tensor * dsv41_hc_mean(ggml_context * ctx, ggml_tensor * x) {
@@ -1115,6 +1417,11 @@ static ggml_tensor * dsv41_join_rows(ggml_context * ctx, const std::vector<ggml_
                                      const llm_graph_chunks & chunks) {
     GGML_ASSERT((int) parts.size() == chunks.n);
 
+    // one chunk holds every row
+    if (chunks.n == 1) {
+        return parts[0];
+    }
+
     ggml_tensor * res = ggml_pad(ctx, parts[0], 0, (int) (chunks.n_tokens - chunks.nk(0)), 0, 0);
     for (int ic = 1; ic < chunks.n; ++ic) {
         const int64_t i0 = chunks.i0(ic);
@@ -1200,9 +1507,10 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention_v41_chunked(
     const bool index_source = inp_comp != nullptr && hparams.dsv41_is_index_source(il);
     const bool cand_source  = index_source && il == hparams.candidate_source_layer;
 
+    // the carried top-k holds the last of the ubatch rows (all of them, or the query rows of a tail layer)
     if (inp_comp != nullptr && !index_source) {
         GGML_ASSERT(top_k_carry.top_k != nullptr && top_k_carry.il == hparams.dsv41_topk_source[il] &&
-                top_k_carry.top_k->ne[1] == nt && "a compressed layer needs the top-k of its index source");
+                top_k_carry.top_k->ne[1] >= nt && "a compressed layer needs the top-k of its index source");
     }
 
     ggml_tensor * k_rot = inp_attn->self_k_rot;
@@ -1310,7 +1618,7 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention_v41_chunked(
                     keeps.push_back(keep);
                 }
             } else {
-                top_k = llm_graph_rows(ctx0, top_k_carry.top_k, 1, i0, n);
+                top_k = llm_graph_rows(ctx0, top_k_carry.top_k, 1, top_k_carry.top_k->ne[1] - nt + i0, n);
             }
 
             mask = build_chunk_kq_mask(inp_cm->mask(ctx0, i0, n, GGML_TYPE_F32), top_k,
@@ -1351,6 +1659,387 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention_v41_chunked(
     return build_attention_tail(model, out, inp_pos, nt, il);
 }
 
+// ranma: the attention of a tail layer (see dsv41_tail_plan) over the input cur of n_in rows, the last n_in of the
+// ubatch: the whole ubatch on il_first, whose KV source compresses every row, and K rows after it. The raw KV is made
+// and written for the last K rows, through the write indices of the same tokens; the query, the indexer, the masks and
+// the output for the last n_q. Positions stay those of the ubatch rows. Returns [n_embd, n_q].
+struct dsv41_tail_builder {
+    const llama_model_deepseek41::graph & g;
+    const dsv41_tail_plan & plan;
+
+    // the host masks narrowed once to the widest query rows of the tail, as one copy that every layer views: a view of a
+    // host input per layer would be a device copy of its own for the whole graph (see llm_graph_rows_cache)
+    std::vector<std::pair<const ggml_tensor *, ggml_tensor *>> masks;
+
+    ggml_tensor * mask(ggml_tensor * m, int64_t n) {
+        GGML_ASSERT(m->ne[1] == g.n_tokens && m->ne[2] == 1 && m->ne[3] == 1);
+
+        ggml_tensor * t = nullptr;
+        for (const auto & e : masks) {
+            if (e.first == m) {
+                t = e.second;
+            }
+        }
+        if (t == nullptr) {
+            const int64_t n_max = plan.n_q(plan.il_first);
+            t = ggml_cont(g.ctx0, llm_graph_rows(g.ctx0, m, 1, g.n_tokens - n_max, n_max));
+            masks.emplace_back(m, t);
+        }
+
+        GGML_ASSERT(n <= t->ne[1]);
+        return llm_graph_rows(g.ctx0, t, 1, t->ne[1] - n, n);
+    }
+
+    // a chunked graph: the device-side raw mask [nj, n] of the ubatch rows [i0, i0 + n) over the raw columns [j0, j0 + nj)
+    // of w, made as llm_graph_input_chunk_mask::mask makes it for a chunk of the ubatch (which looks its window up by i0
+    // among the ubatch chunks, where a query chunk need not be)
+    ggml_tensor * raw_chunk_mask(const llm_graph_chunk_window & w, ggml_type type) const {
+        llm_graph_input_chunk_mask * cm = g.inp_cm;
+
+        ggml_tensor * tab = cm->rows.get(g.ctx0, cm->kv_pos, 0, w.j0, w.nj, false);
+        return llm_graph_chunk_mask(g.ctx0, cm->rows, tab, cm->pos.tok_pos, cm->pos.tok_seq, w.i0, w.n, type, cm->n_swa);
+    }
+
+    // a chunked graph: the attention of the n_q query rows of a tail layer, after its raw KV is written, as
+    // build_attention_v41_chunked computes it for the whole ubatch. Every chunk of plan.q_chunks[il] reads the device
+    // masks, the compressed token keys and its raw window by its ubatch rows, and q, qr, cur_q, pos_q and the selection
+    // by its rows among the query rows. The compressed width stays that of the ubatch. An index source carries the top-k
+    // (and the candidate keep) of the query rows. Returns the joined [n_embd_head*n_head, n_q], before k_rot is undone.
+    ggml_tensor * attention_chunked(
+            const llama_model & model,
+            llm_graph_input_dsv4 * inp_dsv4,
+            const llm_graph_input_dsv4::comp_input * inp_comp,
+            ggml_tensor * qr,
+            ggml_tensor * cur_q,
+            ggml_tensor * pos_q,
+            ggml_tensor * q,
+            ggml_tensor * raw_k,
+            dsv41_top_k_carry & top_k_carry,
+            float kq_scale,
+            int il) {
+        ggml_context * ctx0 = g.ctx0;
+        const auto & hparams = g.hparams;
+
+        const auto & layer = model.layers[il];
+        llm_graph_input_dsv4_raw * inp_attn = inp_dsv4->get_raw();
+        llm_graph_input_chunk_mask * cm = g.inp_cm;
+
+        const int64_t n_q = plan.n_q(il);
+        const int64_t q0  = g.n_tokens - n_q;
+
+        const std::vector<llm_graph_chunk_window> & qc = plan.q_chunks[il];
+
+        GGML_ASSERT(cm != nullptr && g.inp_dch != nullptr && !qc.empty());
+        GGML_ASSERT(q->ne[2] == n_q && cur_q->ne[1] == n_q && pos_q->ne[0] == n_q);
+
+        // the host masks stay out of a chunked graph; only their shapes and types are read
+        const int64_t   n_raw     = inp_attn->self_kq_mask->ne[0];
+        const ggml_type type_mask = inp_attn->self_kq_mask->type;
+
+        // raw chunk: every chunk reads only its raw window
+        const bool win = cm->ops.window != nullptr;
+
+        const bool index_source = inp_comp != nullptr && hparams.dsv41_is_index_source(il);
+        const bool cand_source  = index_source && il == hparams.candidate_source_layer;
+
+        // the selection of the query rows: the carry holds the last rows of the ubatch, at least the query rows
+        dsv41_top_k_carry carry_q;
+        if (inp_comp != nullptr) {
+            if (!index_source) {
+                GGML_ASSERT(top_k_carry.top_k != nullptr && top_k_carry.il == hparams.dsv41_topk_source[il] &&
+                        "a compressed layer needs the top-k of its index source");
+            }
+            carry_q = dsv41_carry_tail(ctx0, top_k_carry, n_q);
+        }
+
+        ggml_tensor * k_all   = raw_k;
+        ggml_tensor * comp_k  = nullptr;
+        ggml_tensor * raw_idx = nullptr;
+        ggml_tensor * ninf    = nullptr;
+        int64_t       n_comp  = 0;
+
+        if (inp_comp != nullptr) {
+            comp_k = inp_dsv4->mctx->get_csa()->get_k(ctx0, il);
+
+            n_comp = inp_comp->kq_mask->ne[0];
+            GGML_ASSERT(n_comp > 0);
+            GGML_ASSERT(n_comp <= comp_k->ne[2]);
+
+            comp_k = ggml_view_4d(ctx0, comp_k,
+                    comp_k->ne[0], comp_k->ne[1], n_comp, comp_k->ne[3],
+                    comp_k->nb[1], comp_k->nb[2], comp_k->nb[3], 0);
+            g.cb(comp_k, "comp_k", il);
+
+            // once for the layer
+            if (!win) {
+                k_all = ggml_concat(ctx0, raw_k, comp_k, 2);
+                g.cb(k_all, "k_all", il);
+                ggml_build_forward_expand(g.gf, k_all);
+            }
+
+            raw_idx = ggml_cast(ctx0, ggml_arange(ctx0, 0.0f, (float) n_raw, 1.0f), GGML_TYPE_I32);
+            ninf    = ggml_fill(ctx0, ggml_new_tensor_4d(ctx0, type_mask, 1, 1, 1, 1), -INFINITY);
+        }
+
+        // the causal mask the indexer of a chunk reads, as in build_attention_v41_chunked
+        const ggml_type type_idx = g.cparams.fused_lid && !cand_source ? GGML_TYPE_F16 : GGML_TYPE_F32;
+
+        std::vector<ggml_tensor *> outs;
+        std::vector<ggml_tensor *> top_ks;
+        std::vector<ggml_tensor *> keeps;
+
+        int64_t i_next = q0;
+        for (const llm_graph_chunk_window & w : qc) {
+            GGML_ASSERT(w.i0 == i_next && w.n > 0);
+            i_next += w.n;
+
+            // the rows of the chunk among the query rows
+            const int64_t i0 = w.i0 - q0;
+
+            ggml_tensor * k_cur = k_all;
+            if (win) {
+                k_cur = llm_graph_rows(ctx0, raw_k, 2, w.j0, w.nj);
+                if (inp_comp != nullptr) {
+                    k_cur = ggml_concat(ctx0, k_cur, comp_k, 2);
+                    g.cb(k_cur, "k_all", il);
+                }
+            }
+
+            ggml_tensor * mask     = nullptr;
+            int64_t       n_kv_max = 0;
+
+            if (inp_comp == nullptr) {
+                // no compressed stream, so this layer sees only its own window
+                mask = raw_chunk_mask(w, type_mask);
+            } else {
+                ggml_tensor * top_k = nullptr;
+                if (index_source) {
+                    ggml_tensor * comp_mask = g.build_comp_chunk_mask(inp_dsv4, *inp_comp, w.i0, w.n, type_idx);
+                    ggml_tensor * keep      = nullptr;
+
+                    top_k = g.build_indexer_top_k(model, inp_dsv4, *inp_comp, qr, cur_q, pos_q, carry_q, il,
+                            i0, w.n, comp_mask, &keep);
+
+                    top_ks.push_back(top_k);
+                    if (keep != nullptr) {
+                        keeps.push_back(keep);
+                    }
+                } else {
+                    top_k = llm_graph_rows(ctx0, carry_q.top_k, 1, i0, w.n);
+                }
+
+                mask = g.build_chunk_kq_mask(raw_chunk_mask(w, GGML_TYPE_F32), top_k,
+                        g.build_comp_chunk_key(inp_dsv4, *inp_comp, w.i0, w.n), llm_graph_rows(ctx0, raw_idx, 0, 0, w.nj),
+                        ninf, n_comp, il);
+
+                n_kv_max = std::min<int64_t>(w.nj, hparams.n_swa) + top_k->ne[0];
+            }
+
+            ggml_tensor * out = g.build_attn_mha(llm_graph_rows(ctx0, q, 2, i0, w.n), k_cur, k_cur, nullptr, mask,
+                    layer.attn_sinks, nullptr, n_kv_max, kq_scale, il);
+
+            // finish this chunk before the next one starts, so the allocator reuses its intermediates
+            ggml_build_forward_expand(g.gf, out);
+            outs.push_back(out);
+        }
+        GGML_ASSERT(i_next == g.n_tokens);
+
+        if (index_source) {
+            carry_q.top_k = llm_graph_join(ctx0, top_ks, 1);
+            carry_q.il    = (int32_t) il;
+            ggml_build_forward_expand(g.gf, carry_q.top_k);
+
+            if (cand_source) {
+                // build_candidate_keep gives every chunk a keep or none at all, by the compressed length only
+                GGML_ASSERT(keeps.empty() || keeps.size() == outs.size());
+                carry_q.cand_keep = keeps.empty() ? nullptr : llm_graph_join(ctx0, keeps, 2);
+                if (carry_q.cand_keep != nullptr) {
+                    ggml_build_forward_expand(g.gf, carry_q.cand_keep);
+                }
+            }
+
+            top_k_carry = carry_q;
+        }
+
+        // joined over the query rows, with the chunks the plan made
+        return dsv41_join_rows(ctx0, outs, llm_graph_chunks(n_q, plan.c));
+    }
+
+    ggml_tensor * attention(
+            const llama_model & model,
+            llm_graph_input_dsv4 * inp_dsv4,
+            ggml_tensor * cur,
+            ggml_tensor * inp_pos,
+            dsv41_top_k_carry & top_k_carry,
+            int il) {
+        ggml_context * ctx0 = g.ctx0;
+        const auto & hparams = g.hparams;
+
+        const auto & layer = model.layers[il];
+        llm_graph_input_dsv4_raw * inp_attn = inp_dsv4->get_raw();
+
+        const int64_t n_embd_head      = hparams.n_embd_head_k();
+        const int64_t n_embd_head_rope = hparams.n_rot();
+        const int64_t ratio            = hparams.dsv4_compress_ratios[il];
+
+        const int64_t n_tokens = g.n_tokens;
+        const int64_t n_in     = cur->ne[1];
+        const int64_t n_k      = plan.rows[il].n_k;
+        const int64_t n_q      = plan.n_q(il);
+
+        GGML_ASSERT(n_embd_head == g.n_embd_head_v);
+        GGML_ASSERT(g.n_head % hparams.dsv4_o_group_count == 0);
+        GGML_ASSERT(hparams.is_swa(il));
+        GGML_ASSERT(0 < n_q && n_q <= n_k && n_k <= n_in && n_in <= n_tokens);
+        GGML_ASSERT(il == plan.il_first ? n_in == n_tokens : n_in == n_k);
+
+        const dsv41_rope_cfg rc = g.rope_cfg(il);
+
+        ggml_tensor * cur_k = llm_graph_rows(ctx0, cur,     1, n_in - n_k,     n_k);
+        ggml_tensor * cur_q = llm_graph_rows(ctx0, cur,     1, n_in - n_q,     n_q);
+        ggml_tensor * pos_k = llm_graph_rows(ctx0, inp_pos, 0, n_tokens - n_k, n_k);
+        ggml_tensor * pos_q = llm_graph_rows(ctx0, inp_pos, 0, n_tokens - n_q, n_q);
+
+        ggml_tensor * qr = g.build_lora_mm(layer.wq_a, cur_q);
+        qr = g.build_norm(qr, layer.attn_q_a_norm, nullptr, LLM_NORM_RMS, il);
+        g.cb(qr, "qr", il);
+
+        ggml_tensor * q = g.build_lora_mm(layer.wq_b, qr);
+        q = ggml_reshape_3d(ctx0, q, n_embd_head, g.n_head, n_q);
+        q = ggml_rope_ext(ctx0, q, pos_q, nullptr, n_embd_head_rope, g.rope_type, rc.n_ctx_orig,
+                rc.base, rc.scale, rc.ext_factor, rc.attn_factor, rc.beta_fast, rc.beta_slow);
+        q = ggml_rope_set_offset(q, n_embd_head - n_embd_head_rope);
+        g.cb(q, "q", il);
+
+        ggml_tensor * kv = g.build_lora_mm(layer.wkv, cur_k);
+        kv = g.build_norm(kv, layer.attn_kv_norm, nullptr, LLM_NORM_RMS, il);
+        kv = ggml_reshape_3d(ctx0, kv, n_embd_head, 1, n_k);
+        kv = ggml_rope_ext(ctx0, kv, pos_k, nullptr, n_embd_head_rope, g.rope_type, rc.n_ctx_orig,
+                rc.base, rc.scale, rc.ext_factor, rc.attn_factor, rc.beta_fast, rc.beta_slow);
+        kv = ggml_rope_set_offset(kv, n_embd_head - n_embd_head_rope);
+        g.cb(kv, "kv", il);
+
+        const float kq_scale = 1.0f/sqrtf(float(n_embd_head));
+
+        // the compressed stream: the compressor of a source over every row, the selection for the query rows
+        const llm_graph_input_dsv4::comp_input * inp_comp = nullptr;
+        llm_graph_input_dsv4::comp_input comp_q;
+        ggml_tensor * top_k = nullptr;
+
+        // a chunked graph has no host masks; the source and the raw KV are the same, the rest is per query chunk
+        const bool chunked = plan.c > 0;
+        GGML_ASSERT(chunked == (g.inp_cm != nullptr));
+
+        if (ratio != 0) {
+            const bool use_csa = (uint32_t) ratio == inp_dsv4->mctx->get_csa_state()->get_ratio();
+
+            inp_comp = use_csa ? &inp_dsv4->get_csa() : &inp_dsv4->get_hca();
+
+            const llama_dsv4_comp_state * comp_state = use_csa
+                ? inp_dsv4->mctx->get_csa_state()
+                : inp_dsv4->mctx->get_hca_state();
+
+            GGML_ASSERT(inp_comp->kq_mask && "a compressed layer needs a plan for its ratio");
+
+            if (hparams.dsv41_is_kv_source(il) && inp_comp->state_pos) {
+                GGML_ASSERT(n_in == n_tokens && "a KV source of the tail compresses every row");
+                g.build_kv_source(model, inp_dsv4, *inp_comp, comp_state, cur, il);
+            }
+        }
+
+        if (inp_comp != nullptr && !chunked) {
+            // the plan of the query rows: the causal mask narrowed to them, everything else as is
+            comp_q = *inp_comp;
+            comp_q.kq_mask = mask(inp_comp->kq_mask, n_q);
+
+            if (hparams.dsv41_is_index_source(il)) {
+                // the candidate keep of an earlier source is narrowed with the queries; a new one has their rows
+                dsv41_top_k_carry carry_q = dsv41_carry_tail(ctx0, top_k_carry, n_q);
+                carry_q.top_k = g.build_indexer_top_k(model, inp_dsv4, comp_q, qr, cur_q, pos_q, carry_q, il);
+                carry_q.il    = (int32_t) il;
+                top_k_carry   = carry_q;
+                top_k = top_k_carry.top_k;
+            } else {
+                GGML_ASSERT(top_k_carry.top_k != nullptr && top_k_carry.il == hparams.dsv41_topk_source[il] &&
+                        "a compressed layer needs the top-k of its index source");
+                top_k = dsv41_carry_tail(ctx0, top_k_carry, n_q).top_k;
+            }
+            GGML_ASSERT(top_k->ne[1] == n_q);
+        }
+
+        ggml_tensor * k_rot = inp_attn->self_k_rot;
+        if (k_rot) {
+            q  = llama_mul_mat_hadamard(ctx0, q, k_rot);
+            kv = llama_mul_mat_hadamard(ctx0, kv, k_rot);
+        }
+
+        ggml_build_forward_expand(g.gf, q);
+        ggml_build_forward_expand(g.gf, kv);
+
+        const llama_kv_cache_dsv4_raw_context * mctx_raw = inp_attn->mctx;
+
+        // the write indices of the K rows: one stream, and the write ubatch is the ubatch itself (one sequence, no
+        // shared tokens), so row i of the indices is token i
+        ggml_tensor * k_idxs = inp_attn->get_k_idxs();
+        GGML_ASSERT(k_idxs->ne[0] == n_tokens && (int64_t) mctx_raw->get_n_write() == n_tokens);
+        k_idxs = llm_graph_rows(ctx0, k_idxs, 0, n_tokens - n_k, n_k);
+
+        ggml_build_forward_expand(g.gf, mctx_raw->cpy_k(ctx0, kv, k_idxs, il));
+
+        ggml_tensor * raw_k = mctx_raw->get_k(ctx0, il);
+        g.cb(raw_k, "raw_k", il);
+
+        if (chunked) {
+            ggml_tensor * out = attention_chunked(model, inp_dsv4, inp_comp, qr, cur_q, pos_q, q, raw_k,
+                    top_k_carry, kq_scale, il);
+            if (k_rot) {
+                out = llama_mul_mat_hadamard(ctx0, out, k_rot);
+            }
+            g.cb(out, "attn_out_raw", il);
+
+            return g.build_attention_tail(model, out, pos_q, n_q, il);
+        }
+
+        ggml_tensor * raw_mask = mask(inp_attn->get_kq_mask(), n_q);
+
+        ggml_tensor * out = nullptr;
+
+        if (inp_comp == nullptr) {
+            out = g.build_attn_mha(q, raw_k, raw_k, nullptr, raw_mask, layer.attn_sinks, nullptr, 0, kq_scale, il);
+        } else {
+            ggml_tensor * comp_k = inp_dsv4->mctx->get_csa()->get_k(ctx0, il);
+
+            const int64_t n_comp = inp_comp->kq_mask->ne[0];
+            GGML_ASSERT(n_comp > 0);
+            GGML_ASSERT(n_comp <= comp_k->ne[2]);
+
+            comp_k = ggml_view_4d(ctx0, comp_k,
+                    comp_k->ne[0], comp_k->ne[1], n_comp, comp_k->ne[3],
+                    comp_k->nb[1], comp_k->nb[2], comp_k->nb[3], 0);
+            g.cb(comp_k, "comp_k", il);
+
+            ggml_tensor * k_all = ggml_concat(ctx0, raw_k, comp_k, 2);
+            g.cb(k_all, "k_all", il);
+
+            ggml_tensor * comp_mask = g.build_top_k_mask(comp_q.kq_mask, top_k, "comp_top_k_mask", il);
+
+            ggml_tensor * kq_mask = ggml_concat(ctx0, raw_mask, comp_mask, 0);
+            g.cb(kq_mask, "kq_mask", il);
+
+            const int64_t n_kv_max = std::min<int64_t>(raw_mask->ne[0], hparams.n_swa) + top_k->ne[0];
+
+            out = g.build_attn_mha(q, k_all, k_all, nullptr, kq_mask, layer.attn_sinks,
+                    nullptr, n_kv_max, kq_scale, il);
+        }
+        if (k_rot) {
+            out = llama_mul_mat_hadamard(ctx0, out, k_rot);
+        }
+        g.cb(out, "attn_out_raw", il);
+
+        return g.build_attention_tail(model, out, pos_q, n_q, il);
+    }
+};
+
 llama_model_deepseek41::graph::graph(const llama_model & model, const llm_graph_params & params) :
     llama_model_deepseek4::graph(params) {
     const auto & pmodel = static_cast<const llama_model_deepseek41 &>(model);
@@ -1359,7 +2048,6 @@ llama_model_deepseek41::graph::graph(const llama_model & model, const llm_graph_
 
     ggml_tensor * inp = build_inp_embd(model.tok_embd);
     ggml_tensor * inp_pos = build_inp_pos();
-    ggml_tensor * inp_out_ids = build_inp_out_ids();
     llm_graph_input_dsv4 * inp_dsv4 = build_inp_dsv4();
     llm_graph_input_dsv4_raw * inp_attn = inp_dsv4->get_raw();
 
@@ -1368,6 +2056,24 @@ llama_model_deepseek41::graph::graph(const llama_model & model, const llm_graph_
     if (inp_cm == nullptr) {
         ggml_build_forward_expand(gf, inp_attn->self_kq_mask);
     }
+
+    // ranma: the tail prefill (RANMA_DSV41_EXACT_TAIL, RANMA_DSV41_TAIL_DIAG). Its last layer computes the output row alone, so there is
+    // nothing to gather and no output ids. A chunked graph chunks the query rows of its tail layers by its chunk size.
+    dsv41_tail_chunking tail_chunking;
+    if (inp_cm != nullptr) {
+        tail_chunking.c   = inp_cm->c_req;
+        tail_chunking.ops = inp_cm->ops;
+        // a graph of one chunk (llm_graph_chunk_mask_one) reads every raw cell, like build_attention_v41_chunked; so do its tail layers
+        if (inp_cm->windows.empty()) { tail_chunking.ops.window = nullptr; }
+    }
+    const dsv41_tail_plan tail = dsv41_tail_plan_make(pmodel, cparams, ubatch, n_outputs, mctx, tail_chunking);
+    dsv41_tail_log(tail);
+    if (tail.requested) {
+        res->add_input(std::make_unique<llm_graph_input_dsv41_tail>(pmodel, tail, mctx, tail_chunking));
+    }
+    dsv41_tail_builder tail_attn { *this, tail, {} };
+
+    ggml_tensor * inp_out_ids = tail.active() ? nullptr : build_inp_out_ids();
 
     const int64_t hc = hparams.dsv4_hc_mult;
     ggml_tensor * inpL = ggml_reshape_3d(ctx0, inp, n_embd, 1, n_tokens);
@@ -1397,13 +2103,23 @@ llama_model_deepseek41::graph::graph(const llama_model & model, const llm_graph_
             cb(inpL, "engram_out", il);
         }
 
-        ggml_tensor * residual = inpL;
+        // ranma: a tail layer reads n_in rows (every row on the first one) and carries on with the rows of its
+        // attention output (O for EXACT, K for DIAG); the hyper-connections are per row, so they follow the rows: the
+        // incoming mix collapses the n_in rows for the attention, the attention mixes are made for its output rows
+        const bool in_tail = tail.active() && il >= tail.il_first;
+        GGML_ASSERT(!in_tail || il == tail.il_first || pmodel.engram_index(il) < 0);
+
+        const int64_t n_in  = inpL->ne[2];
+        const int64_t n_att = in_tail ? tail.n_q(il) : n_in;
+
+        ggml_tensor * inp_att  = llm_graph_rows(ctx0, inpL, 2, n_in - n_att, n_att);
+        ggml_tensor * residual = inp_att;
         ggml_tensor * attn_pre = nullptr;
         ggml_tensor * post     = nullptr;
         ggml_tensor * comb     = nullptr;
 
         // this sublayer's mixes are for the next one, so the collapse uses the incoming mix
-        build_hc_mixes(inpL,
+        build_hc_mixes(inp_att,
                 model.layers[il].hc_attn_fn,
                 model.layers[il].hc_attn_scale,
                 model.layers[il].hc_attn_base,
@@ -1415,10 +2131,19 @@ llama_model_deepseek41::graph::graph(const llama_model & model, const llm_graph_
         cur = build_norm(cur, model.layers[il].attn_norm, nullptr, LLM_NORM_RMS, il);
         cb(cur, "attn_norm", il);
 
-        cur = build_attention_v41(model, inp_dsv4, cur, inp_pos, top_k_carry, il);
+        cur = in_tail
+            ? tail_attn.attention(model, inp_dsv4, cur, inp_pos, top_k_carry, il)
+            : build_attention_v41(model, inp_dsv4, cur, inp_pos, top_k_carry, il);
 
         inpL = build_hc_post(cur, residual, post, comb, il);
         cb(inpL, "hc_attn_post", il);
+
+        if (in_tail && tail.rows[il].n_o < n_att) {
+            // DIAG: the attention ran over every input row, the FFN takes the rows the next layer reads
+            const int64_t n_o = tail.rows[il].n_o;
+            inpL     = llm_graph_rows(ctx0, inpL,     2, n_att - n_o, n_o);
+            attn_pre = llm_graph_rows(ctx0, attn_pre, 1, n_att - n_o, n_o);
+        }
 
         residual = inpL;
 
@@ -1481,7 +2206,10 @@ llama_model_deepseek41::graph::graph(const llama_model & model, const llm_graph_
         ggml_build_forward_expand(gf, res->t_layer_inp[n_layer]);
     }
 
-    if (inp_out_ids) {
+    if (tail.active()) {
+        // the last tail layer computed the output row and nothing else
+        GGML_ASSERT(n_outputs == 1 && inpL->ne[2] == 1 && pre_mix->ne[1] == 1);
+    } else if (inp_out_ids) {
         ggml_tensor * flat = ggml_reshape_2d(ctx0, inpL, n_embd*hc, n_tokens);
         inpL = ggml_reshape_3d(ctx0, ggml_get_rows(ctx0, flat, inp_out_ids), n_embd, hc, n_outputs);
         pre_mix = ggml_get_rows(ctx0, pre_mix, inp_out_ids);
