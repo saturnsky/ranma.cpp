@@ -3,6 +3,7 @@
 
 #include "llama-kv-cache-dsv4.h"
 #include "llama-graph-chunk.h"
+#include "llama-layer-exec.h"
 #include "llama-prefetch.h"
 
 #include "ggml-account.h"
@@ -478,6 +479,24 @@ int llama_model_deepseek41::engram_index(int il) const {
         }
     }
     return -1;
+}
+
+// ranma: the layer-major prefill (llama-layer-exec.h) runs the layers before the first tail layer layer by layer: the
+// tail prefill never narrows their rows, whatever ubatch of the batch the output lies in
+int llama_dsv41_layer_exec_layers(const llama_model & model) {
+    const auto & pmodel = static_cast<const llama_model_deepseek41 &>(model);
+    const int32_t n_layer = (int32_t) pmodel.hparams.n_layer();
+    if (dsv41_tail_mode_env() == dsv41_tail_plan::OFF) {
+        return n_layer;
+    }
+    // as dsv41_tail_plan_make: the last layer that reads every row
+    int32_t il_first = 0;
+    for (int32_t il = 0; il < n_layer; ++il) {
+        if (pmodel.hparams.dsv41_is_kv_source(il) || pmodel.engram_index(il) >= 0) {
+            il_first = il;
+        }
+    }
+    return il_first;
 }
 
 void llama_model_deepseek41::load_arch_hparams(llama_model_loader & ml) {
