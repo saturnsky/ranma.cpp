@@ -1538,32 +1538,6 @@ ggml_tensor * llama_model_deepseek41::graph::build_chunk_kq_mask(
     return mask;
 }
 
-// ranma: the chunk outputs [ne0, n] joined into [ne0, n_tokens]: the first chunk padded to the whole ubatch, then
-// every other chunk written over its rows. Each row is copied once, where the concat tree of llm_graph_join copies
-// it once per level, and the attention output is 128 KiB per token here.
-static ggml_tensor * dsv41_join_rows(ggml_context * ctx, const std::vector<ggml_tensor *> & parts,
-                                     const llm_graph_chunks & chunks) {
-    GGML_ASSERT((int) parts.size() == chunks.n);
-
-    // one chunk holds every row
-    if (chunks.n == 1) {
-        return parts[0];
-    }
-
-    ggml_tensor * res = ggml_pad(ctx, parts[0], 0, (int) (chunks.n_tokens - chunks.nk(0)), 0, 0);
-    for (int ic = 1; ic < chunks.n; ++ic) {
-        const int64_t i0 = chunks.i0(ic);
-        const int64_t n  = chunks.nk(ic);
-
-        GGML_ASSERT(parts[ic]->ne[0] == res->ne[0] && parts[ic]->ne[1] == n);
-
-        ggml_tensor * idx = ggml_cast(ctx, ggml_arange(ctx, (float) i0, (float) (i0 + n), 1.0f), GGML_TYPE_I32);
-        res = ggml_set_rows(ctx, res, parts[ic], idx);
-    }
-
-    return res;
-}
-
 // ranma: build_attention_v41 of a chunked graph (the attention chunk; one stream, one sequence, device-side masks,
 // see build_inp_dsv4_chunk). The whole ubatch computes the query and the raw KV, runs the compressor of a source
 // layer and writes the raw window, as the unchunked graph does. Then every chunk of query rows makes its raw window
@@ -1703,9 +1677,9 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention_v41_chunked(
     const llm_graph_chunks chunks = inp_cm->chunks(nt);
     GGML_ASSERT(chunks.n > 1 || (inp_cm->one && inp_cm->windows.empty()));
 
-    std::vector<ggml_tensor *> outs;
-    std::vector<ggml_tensor *> top_ks;
-    std::vector<ggml_tensor *> keeps;
+    llm_graph_join_acc outs(ctx0, gf, 1, nt);
+    llm_graph_join_acc top_ks(ctx0, gf, 1, nt);
+    llm_graph_join_acc keeps(ctx0, gf, 2, nt);
 
     for (int ic = 0; ic < chunks.n; ++ic) {
         const int64_t i0 = chunks.i0(ic);
@@ -1741,9 +1715,9 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention_v41_chunked(
                 top_k = build_indexer_top_k(model, inp_dsv4, *inp_comp, qr, cur, inp_pos, top_k_carry, il,
                         i0, n, comp_mask, &keep);
 
-                top_ks.push_back(top_k);
+                top_ks.add(top_k, i0);
                 if (keep != nullptr) {
-                    keeps.push_back(keep);
+                    keeps.add(keep, i0);
                 }
             } else {
                 top_k = llm_graph_rows(ctx0, top_k_carry.top_k, 1, top_k_carry.top_k->ne[1] - nt + i0, n);
@@ -1760,25 +1734,24 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention_v41_chunked(
 
         // finish this chunk before the next one starts, so the allocator reuses its intermediates
         ggml_build_forward_expand(gf, out);
-        outs.push_back(out);
+        outs.add(out, i0);
     }
 
     if (index_source) {
-        top_k_carry.top_k = llm_graph_join(ctx0, top_ks, 1);
+        top_k_carry.top_k = top_ks.get();
         top_k_carry.il    = (int32_t) il;
         ggml_build_forward_expand(gf, top_k_carry.top_k);
 
         if (cand_source) {
             // build_candidate_keep gives every chunk a keep or none at all, by the compressed length only
-            GGML_ASSERT(keeps.empty() || keeps.size() == outs.size());
-            top_k_carry.cand_keep = keeps.empty() ? nullptr : llm_graph_join(ctx0, keeps, 2);
+            top_k_carry.cand_keep = keeps.empty() ? nullptr : keeps.get();
             if (top_k_carry.cand_keep != nullptr) {
                 ggml_build_forward_expand(gf, top_k_carry.cand_keep);
             }
         }
     }
 
-    ggml_tensor * out = dsv41_join_rows(ctx0, outs, chunks);
+    ggml_tensor * out = outs.get();
     if (k_rot) {
         out = llama_mul_mat_hadamard(ctx0, out, k_rot);
     }
@@ -1912,9 +1885,9 @@ struct dsv41_tail_builder {
         // the causal mask the indexer of a chunk reads, as in build_attention_v41_chunked
         const ggml_type type_idx = g.cparams.fused_lid && !cand_source ? GGML_TYPE_F16 : GGML_TYPE_F32;
 
-        std::vector<ggml_tensor *> outs;
-        std::vector<ggml_tensor *> top_ks;
-        std::vector<ggml_tensor *> keeps;
+        llm_graph_join_acc outs(ctx0, g.gf, 1, n_q);
+        llm_graph_join_acc top_ks(ctx0, g.gf, 1, n_q);
+        llm_graph_join_acc keeps(ctx0, g.gf, 2, n_q);
 
         int64_t i_next = q0;
         for (const llm_graph_chunk_window & w : qc) {
@@ -1948,9 +1921,9 @@ struct dsv41_tail_builder {
                     top_k = g.build_indexer_top_k(model, inp_dsv4, *inp_comp, qr, cur_q, pos_q, carry_q, il,
                             i0, w.n, comp_mask, &keep);
 
-                    top_ks.push_back(top_k);
+                    top_ks.add(top_k, i0);
                     if (keep != nullptr) {
-                        keeps.push_back(keep);
+                        keeps.add(keep, i0);
                     }
                 } else {
                     top_k = llm_graph_rows(ctx0, carry_q.top_k, 1, i0, w.n);
@@ -1968,19 +1941,18 @@ struct dsv41_tail_builder {
 
             // finish this chunk before the next one starts, so the allocator reuses its intermediates
             ggml_build_forward_expand(g.gf, out);
-            outs.push_back(out);
+            outs.add(out, i0);
         }
         GGML_ASSERT(i_next == g.n_tokens);
 
         if (index_source) {
-            carry_q.top_k = llm_graph_join(ctx0, top_ks, 1);
+            carry_q.top_k = top_ks.get();
             carry_q.il    = (int32_t) il;
             ggml_build_forward_expand(g.gf, carry_q.top_k);
 
             if (cand_source) {
                 // build_candidate_keep gives every chunk a keep or none at all, by the compressed length only
-                GGML_ASSERT(keeps.empty() || keeps.size() == outs.size());
-                carry_q.cand_keep = keeps.empty() ? nullptr : llm_graph_join(ctx0, keeps, 2);
+                carry_q.cand_keep = keeps.empty() ? nullptr : keeps.get();
                 if (carry_q.cand_keep != nullptr) {
                     ggml_build_forward_expand(g.gf, carry_q.cand_keep);
                 }
@@ -1989,8 +1961,8 @@ struct dsv41_tail_builder {
             top_k_carry = carry_q;
         }
 
-        // joined over the query rows, with the chunks the plan made
-        return dsv41_join_rows(ctx0, outs, llm_graph_chunks(n_q, plan.c));
+        // joined over the query rows
+        return outs.get();
     }
 
     // RANMA_DSV41_TAIL_POISON: the raw cells of the ubatch rows before the K rows of layer il, which the plan leaves

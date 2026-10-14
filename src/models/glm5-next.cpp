@@ -1285,8 +1285,8 @@ ggml_tensor * llama_model_glm5_next::graph::build_dsa_layer(
     ggml_build_forward_expand(gf, kv_cmpr);
     ggml_build_forward_expand(gf, mctx_mla->cpy_k(ctx0, kv_cmpr, inp_attn->get_k_idxs(), il));
 
-    std::vector<ggml_tensor *> outs;
-    std::vector<ggml_tensor *> sels;
+    llm_graph_join_acc outs(ctx0, gf, 1, n_tokens);
+    llm_graph_join_acc sels(ctx0, gf, 1, n_tokens);
     for (int ic = 0; ic < chunks.n; ++ic) {
         const int64_t i0 = chunks.i0(ic);
         const int64_t n  = chunks.nk(ic);
@@ -1294,7 +1294,7 @@ ggml_tensor * llama_model_glm5_next::graph::build_dsa_layer(
         ggml_tensor * sel_idx = full ? build_kpool_top(cur, qr, pooled, layer, inp_kpool, i0, n, il)
                                      : llm_graph_rows(ctx0, *prev_sel, 1, i0, n);
         if (full) {
-            sels.push_back(sel_idx);
+            sels.add(sel_idx, i0);
         }
 
         ggml_tensor * mask = build_kpool_mask(sel_idx, kq_mask, mctx_hyb, inp_kpool, i0, n, il);
@@ -1309,12 +1309,12 @@ ggml_tensor * llama_model_glm5_next::graph::build_dsa_layer(
 
         // finish this chunk before the next one starts, so the allocator reuses its intermediates
         ggml_build_forward_expand(gf, out);
-        outs.push_back(out);
+        outs.add(out, i0);
     }
 
     if (full) {
-        *prev_sel = llm_graph_join(ctx0, sels, 1);
+        *prev_sel = sels.get();
     }
 
-    return llm_graph_join(ctx0, outs, 1);
+    return outs.get();
 }

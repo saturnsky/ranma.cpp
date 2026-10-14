@@ -1282,7 +1282,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_chunked(
     const llm_graph_chunks chunks(n_tokens);
     GGML_ASSERT(chunks.n > 1);
 
-    std::vector<ggml_tensor *> outs;
+    llm_graph_join_acc outs(ctx0, gf, 1, n_tokens);
     for (int ic = 0; ic < chunks.n; ++ic) {
         const int64_t i0 = chunks.i0(ic);
         const int64_t n  = chunks.nk(ic);
@@ -1302,10 +1302,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_attn_chunked(
 
         // finish this chunk before the next one starts, so the allocator reuses its intermediates
         ggml_build_forward_expand(gf, out);
-        outs.push_back(out);
+        outs.add(out, i0);
     }
 
-    return llm_graph_join(ctx0, outs, 1);
+    return outs.get();
 }
 
 ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn_linear(

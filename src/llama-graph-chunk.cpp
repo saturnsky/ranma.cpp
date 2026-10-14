@@ -81,18 +81,78 @@ ggml_tensor * llm_graph_rows_cache::get(ggml_context * ctx, ggml_tensor * t, int
     return v;
 }
 
-static ggml_tensor * llm_graph_join_range(ggml_context * ctx, const std::vector<ggml_tensor *> & parts, int dim,
-                                          size_t b, size_t e) {
-    if (e - b == 1) {
-        return parts[b];
-    }
-    const size_t m = b + (e - b)/2;
-    return ggml_concat(ctx, llm_graph_join_range(ctx, parts, dim, b, m), llm_graph_join_range(ctx, parts, dim, m, e), dim);
+llm_graph_join_acc::llm_graph_join_acc(ggml_context * ctx, ggml_cgraph * gf, int dim, int64_t n_total) :
+        ctx(ctx), gf(gf), dim(dim), n_total(n_total) {
+    GGML_ASSERT(dim >= 0 && dim < GGML_MAX_DIMS && n_total > 0);
 }
 
-ggml_tensor * llm_graph_join(ggml_context * ctx, const std::vector<ggml_tensor *> & parts, int dim) {
-    GGML_ASSERT(!parts.empty());
-    return llm_graph_join_range(ctx, parts, dim, 0, parts.size());
+void llm_graph_join_acc::add(ggml_tensor * part, int64_t i0) {
+    const int64_t n = part->ne[dim];
+    GGML_ASSERT(i0 == n_added && n > 0 && i0 + n <= n_total && "chunks are joined in row order");
+    for (int d = dim + 1; d < GGML_MAX_DIMS; ++d) {
+        GGML_ASSERT(part->ne[d] == 1);
+    }
+    n_added += n;
+
+    if (acc == nullptr) {
+        for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+            ne[d] = part->ne[d];
+        }
+        ne[dim] = n_total;
+    } else {
+        for (int d = 0; d < dim; ++d) {
+            GGML_ASSERT(part->ne[d] == ne[d]);
+        }
+    }
+
+    // one chunk holds every row
+    if (n == n_total) {
+        acc = part;
+        return;
+    }
+
+    if (!ggml_is_contiguous(part)) {
+        part = ggml_cont(ctx, part);
+    }
+
+    if (part->type == GGML_TYPE_F32 || part->type == GGML_TYPE_F16) {
+        const int64_t row = ggml_nelements(part)/n;
+        ggml_tensor * rows = ggml_reshape_2d(ctx, part, row, n);
+        if (acc == nullptr && part->type == GGML_TYPE_F32) {
+            // the first chunk padded to every row; the padding is written over by the later chunks
+            acc = ggml_pad(ctx, rows, 0, (int) (n_total - n), 0, 0);
+        } else {
+            if (acc == nullptr) {
+                // a tensor of every row whose values the chunks write over
+                acc = ggml_reshape_2d(ctx, ggml_cast(ctx, ggml_arange(ctx, 0.0f, (float) (row*n_total), 1.0f), part->type),
+                        row, n_total);
+            }
+            ggml_tensor * idx = ggml_cast(ctx, ggml_arange(ctx, (float) i0, (float) (i0 + n), 1.0f), GGML_TYPE_I32);
+            acc = ggml_set_rows(ctx, acc, rows, idx);
+        }
+    } else {
+        GGML_ASSERT(part->type == GGML_TYPE_I32);
+        if (acc == nullptr) {
+            // a tensor of the whole shape whose values the chunks write over
+            ggml_tensor * blank = ggml_cast(ctx, ggml_arange(ctx, 0.0f, (float) (ggml_nelements(part)/n*n_total), 1.0f),
+                    GGML_TYPE_I32);
+            acc = ggml_reshape_4d(ctx, blank, ne[0], ne[1], ne[2], ne[3]);
+        }
+        const size_t offs = (size_t) i0*acc->nb[dim];
+        GGML_ASSERT(offs <= (size_t) INT32_MAX && "ggml_set takes a 32-bit offset");
+        acc = ggml_set_inplace(ctx, acc, part, acc->nb[1], acc->nb[2], acc->nb[3], offs);
+    }
+
+    // the copy right after the chunk, so its result is free before the next chunk
+    ggml_build_forward_expand(gf, acc);
+}
+
+ggml_tensor * llm_graph_join_acc::get() const {
+    GGML_ASSERT(acc != nullptr && n_added == n_total && "every row joined");
+    if (acc->ne[0] == ne[0] && acc->ne[1] == ne[1] && acc->ne[2] == ne[2] && acc->ne[3] == ne[3]) {
+        return acc;
+    }
+    return ggml_reshape_4d(ctx, acc, ne[0], ne[1], ne[2], ne[3]);
 }
 
 bool llm_graph_chunk_mask_enabled() {
