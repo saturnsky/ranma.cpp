@@ -10536,12 +10536,10 @@ struct test_dsv4_raw_attn : public test_case {
     const bool    chunk_comp;
     // S2 probe (TBO_S2_PROBE=1), timing only: part repeats one group of the chain (0 all, 1 FA, 2 masks, 3 K concat,
     // 4 output join; the whole chain still runs once per graph, see make_test_cases_perf); comp_first puts the
-    // compressed rows before the raw window; gqa_kv > 1 hands FA a K view of gqa_kv heads with stride 0 (GQA 64/gqa_kv);
-    // tile sets GGML_HIP_FATTN_TILE512 for this case ("" = default dispatch)
+    // compressed rows before the raw window; gqa_kv > 1 hands FA a K view of gqa_kv heads with stride 0 (GQA 64/gqa_kv)
     int         part       = 0;
     bool        comp_first = false;
     int64_t     gqa_kv     = 1;
-    std::string tile;
     std::string diag; // GGML_CUDA_FA_DIAG for this case ("" = unset), see ggml-cuda/fattn-common.cuh
 
     std::vector<ggml_tensor *> chain;
@@ -10568,8 +10566,8 @@ struct test_dsv4_raw_attn : public test_case {
         if (is_chunked()) {
             ss << ",chunk=" << chunk << ",chunk_comp=" << chunk_comp;
         }
-        if (part != 0 || comp_first || gqa_kv != 1 || !tile.empty()) {
-            ss << ",part=" << part << ",comp_first=" << comp_first << ",gqa_kv=" << gqa_kv << ",tile=" << (tile.empty() ? "def" : tile);
+        if (part != 0 || comp_first || gqa_kv != 1) {
+            ss << ",part=" << part << ",comp_first=" << comp_first << ",gqa_kv=" << gqa_kv;
         }
         if (!diag.empty()) {
             ss << ",diag=" << diag;
@@ -10687,8 +10685,10 @@ struct test_dsv4_raw_attn : public test_case {
         return k_lo + n_raw == n_raw_cache;
     }
 
+    int64_t ratio_ov = 0; // TBO_SEG_C: the compress ratio of another model (0: 4 / 128)
+
     int64_t ratio() const {
-        return csa ? 4 : 128;
+        return ratio_ov > 0 ? ratio_ov : csa ? 4 : 128;
     }
 
     // the raw K of [lo, lo + n) followed by the first nc compressed K rows, as get_k_joint / ggml_concat in deepseek4.cpp
@@ -10781,10 +10781,8 @@ struct test_dsv4_raw_attn : public test_case {
         kcat_nodes.clear();
         join_nodes.clear();
 #ifdef _WIN32
-        _putenv_s("GGML_HIP_FATTN_TILE512", tile.c_str());
         _putenv_s("GGML_CUDA_FA_DIAG", diag.c_str());
 #else
-        setenv("GGML_HIP_FATTN_TILE512", tile.c_str(), 1);
         setenv("GGML_CUDA_FA_DIAG", diag.c_str(), 1);
 #endif
 
@@ -10961,11 +10959,6 @@ struct test_dsv4_win_fa : public test_case {
         : hs(hs), nh(nh), n_tokens(n_tokens), blk(blk), n_swa(n_swa), ratio(ratio), gqa_kv(gqa_kv) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
-#ifdef _WIN32
-        _putenv_s("GGML_HIP_FATTN_TILE512", "");
-#else
-        setenv("GGML_HIP_FATTN_TILE512", "", 1);
-#endif
         const int64_t w = width();
         ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hs, blk, nh, n_blk());
         ggml_set_name(q, "q");
@@ -15432,8 +15425,148 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 #endif
 
 // Test cases for performance evaluation: should be representative of real-world use cases
+// ranma TBO_SEG_C=1 (diagnostic, timing only): the dense products of a layer segment at a ubatch of m tokens: one
+// MUL_MAT_HAD of an EXL3 weight (k -> n, n_b batches for the grouped output projection) or one F32 MUL_MAT, without the
+// composite of test_mul_mat_had
+struct test_seg_mm : public test_case {
+    const std::string name;
+    const ggml_type type_a;
+    const int64_t k, n, m, n_b;
+    std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "SEG_MM"; }
+    std::string vars() override {
+        std::ostringstream ss;
+        ss << "w=" << name << ",type=" << ggml_type_name(type_a) << ",k=" << k << ",n=" << n << ",m=" << m << ",nb=" << n_b;
+        return ss.str();
+    }
+    uint64_t op_flops(ggml_tensor * t) override { GGML_UNUSED(t); return 2ull*k*n*m*n_b; }
+    test_seg_mm(std::string name, ggml_type type_a, int64_t k, int64_t n, int64_t m, int64_t n_b = 1)
+        : name(std::move(name)), type_a(type_a), k(k), n(n), m(m), n_b(n_b) {}
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * a = ggml_new_tensor_3d(ctx, type_a, k, n, n_b);
+        ggml_set_name(a, "a");
+        ggml_tensor * b = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, k, m, n_b);
+        ggml_set_name(b, "b");
+        ggml_tensor * out;
+        if (ggml_is_exl3(type_a)) {
+            ggml_tensor * rot_in  = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, k, n_b);
+            ggml_tensor * rot_out = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, n, n_b);
+            out = ggml_mul_mat_had(ctx, a, b, rot_in, rot_out, nullptr, 128);
+        } else {
+            out = ggml_mul_mat(ctx, a, b);
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+    void initialize_tensors(ggml_context * ctx) override {
+        std::default_random_engine rng(1234);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->op != GGML_OP_NONE) {
+                continue;
+            }
+            if (ggml_is_exl3(t->type)) {
+                std::vector<uint8_t> bytes(ggml_nbytes(t));
+                for (auto & v : bytes) { v = (uint8_t) rng(); }
+                ggml_backend_tensor_set(t, bytes.data(), 0, bytes.size());
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+    // TBO_SEG_C=1: the segment ops of a layer-major prefill (everything of a layer but the routed MoE) at graph widths
+    // (ubatches) C of TBO_SEG_C_LIST (default 1024,2048,4096,8192,16384) over a prompt of TBO_SEG_C_N tokens (default
+    // 65536) at ctx 65536 (the visible raw windows), DeepSeek V4 Flash (TBO_SEG_C_MODEL 4f) and V4.1 Flash
+    // (41), C innermost so the widths alternate in one process, the list twice. Position-dependent ops (attention chain,
+    // indexer) at one chunk per stratum centred on N*(2i+1)/8 (p0 = centre - C/2): the mean of the four is the per-token
+    // mean over the prompt for costs linear in the position. Dense products at m = C. TBO_SEG_C_PARTS: d dense, a
+    // attention chains, p indexer (default "dap").
+    if (getenv("TBO_SEG_C") != nullptr && atoi(getenv("TBO_SEG_C")) != 0) {
+        std::vector<int64_t> cs = { 1024, 2048, 4096, 8192, 16384 };
+        if (const char * v = getenv("TBO_SEG_C_LIST")) {
+            cs.clear();
+            for (const char * q = v; *q; ) {
+                cs.push_back(atoll(q));
+                while (*q && *q != ',') { ++q; }
+                if (*q == ',') { ++q; }
+            }
+        }
+        const int64_t N   = getenv("TBO_SEG_C_N") ? atoll(getenv("TBO_SEG_C_N")) : 65536;
+        const int64_t ctx = 65536;
+        const std::string models = getenv("TBO_SEG_C_MODEL") ? getenv("TBO_SEG_C_MODEL") : "4f,41";
+        const std::string parts  = getenv("TBO_SEG_C_PARTS") ? getenv("TBO_SEG_C_PARTS") : "dap";
+        auto pad = [](int64_t x) { return (x + 255)/256*256; };
+        struct mm { const char * name; ggml_type t; int64_t k, n, nb; };
+        const ggml_type M5 = GGML_TYPE_EXL3_M5;
+        // a compressed layer of each model: the dense weights of the layer, the hc and router F32 products
+        const std::vector<mm> mm4f = {
+            { "q_a", M5, 4096, 1024, 1 }, { "q_b", M5, 1024, 32768, 1 }, { "kv", M5, 4096, 512, 1 },
+            { "out_a", M5, 4096, 1024, 8 }, { "out_b", M5, 8192, 4096, 1 },
+            { "sh_gate", M5, 4096, 2048, 1 }, { "sh_up", M5, 4096, 2048, 1 }, { "sh_down", M5, 2048, 4096, 1 },
+            { "cmp_gate", M5, 4096, 1024, 1 }, { "cmp_kv", M5, 4096, 1024, 1 },
+            { "icmp_gate", M5, 4096, 256, 1 }, { "icmp_kv", M5, 4096, 256, 1 }, { "idx_q_b", M5, 1024, 8192, 1 },
+            { "idx_proj", GGML_TYPE_F32, 4096, 64, 1 }, { "gate_inp", GGML_TYPE_F32, 4096, 256, 1 },
+            { "hc_attn", GGML_TYPE_F32, 16384, 24, 1 }, { "hc_ffn", GGML_TYPE_F32, 16384, 24, 1 },
+        };
+        const std::vector<mm> mm41 = {
+            { "q_a", M5, 5120, 1280, 1 }, { "q_b", M5, 1280, 32768, 1 }, { "kv", M5, 5120, 512, 1 },
+            { "out_a", M5, 4096, 1024, 8 }, { "out_b", M5, 8192, 5120, 1 },
+            { "sh_gate", M5, 5120, 2304, 1 }, { "sh_up", M5, 5120, 2304, 1 }, { "sh_down", M5, 2304, 5120, 1 },
+            { "cmp_gate", M5, 5120, 512, 1 }, { "cmp_kv", M5, 5120, 512, 1 }, { "idx_q_b", M5, 1280, 4096, 1 },
+            { "idx_proj", GGML_TYPE_F32, 5120, 32, 1 }, { "gate_inp", GGML_TYPE_F32, 5120, 384, 1 },
+            { "hc_attn", GGML_TYPE_F32, 20480, 24, 1 }, { "hc_ffn", GGML_TYPE_F32, 20480, 24, 1 },
+        };
+        for (int pass = 0; pass < 2; ++pass) {
+            for (const char * mdl : { "4f", "41" }) {
+                if (models.find(mdl) == std::string::npos) {
+                    continue;
+                }
+                const bool v41 = strcmp(mdl, "41") == 0;
+                if (parts.find('d') != std::string::npos) {
+                    for (const mm & w : v41 ? mm41 : mm4f) {
+                        for (int64_t c : cs) {
+                            test_cases.emplace_back(new test_seg_mm(std::string(mdl) + ":" + w.name, w.t, w.k, w.n, c, w.nb));
+                        }
+                    }
+                }
+                for (int i = 0; i < 4; ++i) {
+                    const int64_t centre = N*(2*i + 1)/8;
+                    // attention chains: (csa, ratio) per compressed layer kind of the model
+                    std::vector<std::pair<bool, int64_t>> kinds;
+                    if (v41) {
+                        kinds = { { true, 2 }, { true, 1 } };
+                    } else {
+                        kinds = { { true, 4 }, { false, 128 } };
+                    }
+                    if (parts.find('a') != std::string::npos) {
+                        for (const auto & kd : kinds) {
+                            for (int64_t c : cs) {
+                                const int64_t p0 = std::max<int64_t>(0, centre - c/2);
+                                const int64_t lo = std::max<int64_t>(0, (p0 - 128 + 1)/256*256);
+                                const int64_t hi = std::min<int64_t>(ctx, pad(p0 + c));
+                                const int64_t nc = std::max<int64_t>(kd.first ? 512 : 256, pad((p0 + c)/kd.second));
+                                auto * t = new test_dsv4_raw_attn(kd.first, c, p0, ctx, lo, hi - lo, nc, false);
+                                t->ratio_ov = kd.second;
+                                test_cases.emplace_back(t);
+                            }
+                        }
+                    }
+                    if (parts.find('p') != std::string::npos) {
+                        // the lightning indexer of a compressed layer (64 heads ratio 4 / 32 heads ratio 2)
+                        for (int64_t c : cs) {
+                            const int64_t p0 = std::max<int64_t>(0, centre - c/2);
+                            const int64_t r  = v41 ? 2 : 4;
+                            test_cases.emplace_back(new test_lightning_indexer(128, v41 ? 32 : 64, std::max<int64_t>(256, pad((p0 + c)/r)), c,
+                                1, 1, GGML_TYPE_F16, r, p0));
+                        }
+                    }
+                }
+            }
+        }
+        return test_cases;
+    }
     // TBO_HC_PRENORM=1: the HC pre-norm chain at D 7168, T 2048 and its HC_PRE-only upper bound, the list twice
     if (getenv("TBO_HC_PRENORM") != nullptr && atoi(getenv("TBO_HC_PRENORM")) != 0) {
         for (int pass = 0; pass < 2; ++pass) {
@@ -15552,31 +15685,31 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     //       whole chain, so group = (9*t_part - t_all)/8
     //   (2) CSA and HCA: the chain with the compressed rows first (FA can then stop at the last visible raw tile); HCA: the
     //       FA over only the visible cells of each block of blk queries (DSV4_WIN_FA, upper bound)
-    //   (3) FA only with other tiles: K as gqa_kv heads of stride 0 (GQA 8 -> RDNA4 WMMA prefill), dense tile shapes
-    //       <ncols2>x<cols per block> forced by GGML_HIP_FATTN_TILE512; then the whole chain at chunk 512/1024/2048
+    //   (3) FA only with K as gqa_kv heads of stride 0 (GQA 8 -> RDNA4 WMMA prefill); then the whole chain at chunk 512/1024/2048
     //       (CSA with the whole compressed width: top-k 512 needs it below chunk 2048)
     // TBO_S2_PROBE_SET selects the groups (default "123").
     if (getenv("TBO_S2_PROBE") != nullptr && atoi(getenv("TBO_S2_PROBE")) != 0) {
         const char * sel_env = getenv("TBO_S2_PROBE_SET");
         const std::string sel = sel_env ? sel_env : "123";
-        auto raw = [](bool csa, int64_t chunk, bool chunk_comp, int part, bool comp_first, int64_t gqa_kv, const char * tile) {
+        auto raw = [](bool csa, int64_t chunk, bool chunk_comp, int part, bool comp_first, int64_t gqa_kv) {
             auto * t = new test_dsv4_raw_attn(csa, 7305, 0, 16384, 0, 7424, csa ? 2048 : 256, false, 512, 64, 128, 512, chunk, chunk_comp);
             t->part = part;
             t->comp_first = comp_first;
             t->gqa_kv = gqa_kv;
-            t->tile = tile;
             return t;
         };
         for (int pass = 0; pass < 2; ++pass) {
             for (bool csa : { true, false }) {
                 if (sel.find('1') != std::string::npos) {
                     for (int part : { 0, 1, 2, 3, 4 }) {
-                        test_cases.emplace_back(raw(csa, 2048, true, part, false, 1, ""));
+                        test_cases.emplace_back(raw(csa, 2048, true, part, false, 1));
                     }
                 }
                 if (sel.find('2') != std::string::npos) {
-                    test_cases.emplace_back(raw(csa, 2048, true, 0, true, 1, ""));
-                    test_cases.emplace_back(raw(csa, 2048, true, 1, true, 1, ""));
+                    test_cases.emplace_back(raw(csa, 2048, true, 0, true, 1));
+                    test_cases.emplace_back(raw(csa, 2048, true, 1, true, 1));
+                    test_cases.emplace_back(raw(csa, 2048, true, 0, true, 8));
+                    test_cases.emplace_back(raw(csa, 2048, true, 1, true, 8));
                 }
                 if (sel.find('2') != std::string::npos && !csa) {
                     for (int64_t blk : { 32, 64, 128, 256 }) {
@@ -15585,12 +15718,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
                     test_cases.emplace_back(new test_dsv4_win_fa(7305, 128, 8));
                 }
                 if (sel.find('3') != std::string::npos) {
-                    test_cases.emplace_back(raw(csa, 2048, true, 1, false, 8, ""));
-                    for (const char * tile : { "8x8", "8x16", "8x32", "16x16", "16x32", "32x32" }) {
-                        test_cases.emplace_back(raw(csa, 2048, true, 1, false, 1, tile));
-                    }
+                    test_cases.emplace_back(raw(csa, 2048, true, 1, false, 8));
                     for (int64_t chunk : { 512, 1024, 2048 }) {
-                        test_cases.emplace_back(raw(csa, chunk, !csa, 0, false, 1, ""));
+                        test_cases.emplace_back(raw(csa, chunk, !csa, 0, false, 1));
+                        test_cases.emplace_back(raw(csa, chunk, !csa, 0, false, 8));
                     }
                 }
             }

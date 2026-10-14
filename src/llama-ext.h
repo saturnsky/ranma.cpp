@@ -48,6 +48,8 @@ struct llama_layer_mode_config {
     int64_t expert_major_rows       = 0;
     int64_t expert_major_min_tokens = 64;
     bool    layer_exec              = false;
+    int64_t layer_exec_group_tokens = 0;
+    int64_t layer_exec_moe_tokens   = 0;
 };
 
 LLAMA_API llama_layer_mode_config llama_layer_mode_get_config();

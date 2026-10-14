@@ -18,28 +18,44 @@
 #include "ggml.h"
 
 #include <cstdint>
+#include <set>
 #include <string>
 #include <vector>
 
 struct ggml_cgraph;
 struct ggml_tensor;
+struct llama_model;
 
 bool llama_layer_exec_enabled();
 
 // RANMA_LAYER_EXEC_LOG=1: the plan and the time of every phase
 int llama_layer_exec_log();
 
+// DeepSeek-V4.1: the layers the layer-major prefill runs layer by layer, those before the first layer of the tail prefill
+// (deepseek41.cpp), whose rows it never narrows; all of them when the tail is off. The layers from there on run in
+// the last segment of every ubatch, ubatch by ubatch, as in the ubatch loop (deepseek41.cpp).
+int llama_dsv41_layer_exec_layers(const llama_model & model);
+
 // the names the graph callback gives the router input and the MoE output of layer il ("<name>-<il>")
 struct llama_lx_names {
     const char * moe_in  = nullptr;
     const char * moe_out = nullptr;
+    // states that a later segment may read after the segment that writes them: caches that never give a cell of a live
+    // sequence to another position (DeepSeek-V4.1's compressed and index key caches, which the layers after a source read).
+    // A later ubatch only adds cells for its own positions, which the masks of the earlier ubatches hide.
+    const std::set<const ggml_tensor *> * appendable = nullptr;
 };
 
-// a tensor of segment s that segment s+1 (or the MoE of layer s) reads
+// a tensor of segment s that a later segment (or the MoE of layer s) reads
 struct llama_lx_edge {
     int           node = -1;  // index in the graph
     ggml_tensor * t    = nullptr;
     size_t        pt   = 0;   // bytes per token row
+    int           s    = -1;  // the segment that writes it
+    int           t_last = -1; // the last segment that reads it
+    // the result of an in-place op (e.g. the last ggml_set of a chunk join) is a view of the node it writes into: that node
+    // is placed in the buffer, and the writes into it fill it
+    ggml_tensor * place_as = nullptr;
 };
 
 // the cut of a chunk graph
@@ -54,6 +70,9 @@ struct llama_lx_plan {
     std::vector<std::vector<int>> nodes;
     // per segment: the tensors it stores for the next one, in graph order; the router input x[s] is one of them
     std::vector<std::vector<llama_lx_edge>> out;
+    // the tensors read two or more segments after the one that writes them (e.g. the top-k an index source carries to
+    // the layers after it), in graph order: each keeps its own buffer from its segment to the last one that reads it
+    std::vector<llama_lx_edge> carry;
     // per segment: the index in out[s - 1] of each tensor it reads from the previous segment (by graph node)
     // true when every read of a segment's inputs precedes the writes of its outputs, so one buffer set serves all layers
     bool one_set = true;
