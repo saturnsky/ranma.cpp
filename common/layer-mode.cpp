@@ -231,8 +231,28 @@ static bool lm_lora_rank(const std::string & path, int64_t & rank, int & n_other
     return true;
 }
 
+// DeepSeek-V4.1 with the layer mode off: its prompt processing is slow, and a small n_batch cuts the exact tail prefill short
+static void lm_warn_off(const common_params & params) {
+    if (params.model.path.empty()) {
+        return;
+    }
+    gguf_init_params gp = { /*.no_alloc =*/ true, /*.ctx =*/ nullptr };
+    gguf_context_ptr g(gguf_init_from_file(params.model.path.c_str(), gp));
+    if (!g) {
+        return;
+    }
+    const int64_t id = gguf_find_key(g.get(), "general.architecture");
+    if (id < 0 || gguf_get_kv_type(g.get(), id) != GGUF_TYPE_STRING || strcmp(gguf_get_val_str(g.get(), id), "deepseek41") != 0) {
+        return;
+    }
+    LOG_WRN("layer mode is off: DeepSeek-V4.1 prompt processing is slow without it; --layer-mode on is recommended. "
+            "The exact tail prefill applies only in part when n_batch (%d) is smaller than the tail "
+            "it needs\n", (int) params.n_batch);
+}
+
 void common_layer_mode_apply(common_params & params) {
     if (params.layer_mode == 0) {
+        lm_warn_off(params);
         return;
     }
     auto off = [&](const std::string & why) {
