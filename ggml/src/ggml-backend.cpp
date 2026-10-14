@@ -21,6 +21,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <map>
 #include <string>
@@ -1018,6 +1019,15 @@ struct ggml_backend_sched {
     bool op_offload;
 
     int debug;
+
+    // host time split of the scheduler (RANMA_PREFILL_ACCOUNT, LLAMA_PREFETCH_TIMING), us of the current split:
+    // the waits for a backend and the synchronous copies
+    bool    tm_on;
+    int64_t tm_wait, tm_copy;
+    // account records submitted by this scheduler whose wall time ends at the next synchronization (the struct is
+    // calloc'ed: plain members only)
+    uint64_t tm_pending[8];
+    int      n_tm_pending;
 
     // asynchronous graph-input uploads
     // the inputs of a split are copied into a pinned staging ring and uploaded on the stream of the
@@ -2266,6 +2276,31 @@ static bool ggml_backend_sched_is_host_weight(const struct ggml_tensor * t) {
         ggml_backend_buffer_is_host(t->buffer);
 }
 
+// the waits and synchronous copies of the scheduler, timed when sched->tm_on (see ggml_backend_sched::tm_on)
+static void ggml_backend_sched_tm_event_synchronize(ggml_backend_sched_t sched, ggml_backend_event_t event) {
+    const int64_t t0 = sched->tm_on ? ggml_time_us() : 0;
+    ggml_backend_event_synchronize(event);
+    if (sched->tm_on) {
+        sched->tm_wait += ggml_time_us() - t0;
+    }
+}
+
+static void ggml_backend_sched_tm_synchronize(ggml_backend_sched_t sched, ggml_backend_t backend) {
+    const int64_t t0 = sched->tm_on ? ggml_time_us() : 0;
+    ggml_backend_synchronize(backend);
+    if (sched->tm_on) {
+        sched->tm_wait += ggml_time_us() - t0;
+    }
+}
+
+static void ggml_backend_sched_tm_tensor_copy(ggml_backend_sched_t sched, struct ggml_tensor * src, struct ggml_tensor * dst) {
+    const int64_t t0 = sched->tm_on ? ggml_time_us() : 0;
+    ggml_backend_tensor_copy(src, dst);
+    if (sched->tm_on) {
+        sched->tm_copy += ggml_time_us() - t0;
+    }
+}
+
 static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggml_backend_sched_split * split, struct ggml_tensor * input) {
     const int split_backend_id = split->backend_id;
     ggml_backend_t split_backend = sched->backends[split_backend_id];
@@ -2279,11 +2314,11 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
             return;
         }
         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
-            ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
+            ggml_backend_sched_tm_event_synchronize(sched, sched->events[split_backend_id][sched->cur_copy]);
         } else {
-            ggml_backend_synchronize(split_backend);
+            ggml_backend_sched_tm_synchronize(sched, split_backend);
         }
-        ggml_backend_tensor_copy(input, input_cpy);
+        ggml_backend_sched_tm_tensor_copy(sched, input, input_cpy);
         return;
     }
 
@@ -2300,7 +2335,7 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
     if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
         ggml_backend_event_wait(split_backend, sched->events[split_backend_id][sched->cur_copy]);
     } else {
-        ggml_backend_synchronize(split_backend);
+        ggml_backend_sched_tm_synchronize(sched, split_backend);
     }
 
     if (sched->callback_copy != NULL && ggml_backend_sched_is_host_weight(input) &&
@@ -2311,13 +2346,13 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
     // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
     // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
     if (!split_backend->iface.cpy_tensor_async || !split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {
-        ggml_backend_synchronize(input_backend);
+        ggml_backend_sched_tm_synchronize(sched, input_backend);
         if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
-            ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
+            ggml_backend_sched_tm_event_synchronize(sched, sched->events[split_backend_id][sched->cur_copy]);
         } else {
-            ggml_backend_synchronize(split_backend);
+            ggml_backend_sched_tm_synchronize(sched, split_backend);
         }
-        ggml_backend_tensor_copy(input, input_cpy);
+        ggml_backend_sched_tm_tensor_copy(sched, input, input_cpy);
     }
 }
 
@@ -2356,18 +2391,28 @@ static int64_t ggml_backend_sched_page_faults(void) {
 #endif
 }
 
+// account internals (defined with the account records below)
+enum ggml_account_submit_part { ACCOUNT_SUBMIT_ISSUE, ACCOUNT_SUBMIT_WAIT, ACCOUNT_SUBMIT_COPY, ACCOUNT_SUBMIT_CPU,
+                                ACCOUNT_SUBMIT_ALLOC, ACCOUNT_SUBMIT_PARTS };
+static void ggml_account_submit_parts(uint64_t key, const int64_t * us, int n_parts);
+static void ggml_account_cpu_split(uint64_t key, int split, const char * first, int64_t wait_us, int64_t compute_us);
+static bool ggml_account_submitted(uint64_t key);
+static void ggml_account_synced(uint64_t key, int64_t t_us, int64_t wait_us);
+
 static void ggml_backend_sched_split_timing_log(ggml_backend_sched_t sched, int split_id, const struct ggml_backend_sched_split * split,
-        int64_t t0, int64_t t1, int64_t t2, int64_t f1, int64_t f2) {
+        int64_t t0, int64_t t1, int64_t t2, int64_t f1, int64_t f2, int64_t switch_us, int64_t wait_us, int64_t copy_us) {
     ggml_backend_t backend = sched->backends[split->backend_id];
     const bool cpu = ggml_backend_dev_type(ggml_backend_get_device(backend)) == GGML_BACKEND_DEVICE_TYPE_CPU;
     const int n = split->graph.n_nodes;
     // the fault counter is 32 bits on Windows: the difference is taken modulo 2^32
     const long long faults = cpu && f1 >= 0 && f2 >= 0 ? (long long) (uint32_t) (f2 - f1) : -1;
     GGML_LOG_INFO("sched_split {\"kind\":\"sched_split\",\"ub\":%llu,\"split\":%d,\"backend\":\"%s\",\"inputs\":%d,"
-        "\"nodes\":%d,\"first\":\"%s\",\"last\":\"%s\",\"t_us\":%lld,\"inputs_us\":%lld,\"compute_us\":%lld,\"faults\":%lld}\n",
+        "\"nodes\":%d,\"first\":\"%s\",\"last\":\"%s\",\"t_us\":%lld,\"inputs_us\":%lld,\"compute_us\":%lld,\"faults\":%lld,"
+        "\"switch_wait_us\":%lld,\"input_wait_us\":%lld,\"input_sync_copy_us\":%lld}\n",
         (unsigned long long) ggml_account_current(), split_id, ggml_backend_name(backend), split->n_inputs, n,
         n > 0 ? split->graph.nodes[0]->name : "", n > 0 ? split->graph.nodes[n - 1]->name : "",
-        (long long) t0, (long long) (t1 - t0), (long long) (t2 - t1), faults);
+        (long long) t0, (long long) (t1 - t0), (long long) (t2 - t1), faults,
+        (long long) switch_us, (long long) wait_us, (long long) copy_us);
 }
 
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
@@ -2378,22 +2423,28 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
     int prev_backend_id = -1;
     const bool timing = ggml_backend_sched_split_timing();
+    // the host time split of the submit goes to the account record of the ubatch being submitted
+    const uint64_t acct_key = ggml_account_current();
+    sched->tm_on = timing || acct_key != 0;
+    int64_t parts[ACCOUNT_SUBMIT_PARTS] = {};
 
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
-        const int64_t t_split = timing ? ggml_time_us() : 0;
+        const int64_t t_split = sched->tm_on ? ggml_time_us() : 0;
+        sched->tm_wait = sched->tm_copy = 0;
 
         // ensure the previous split's async work has completed before we start
         // this split, the allocator may have reused buffer regions across splits
         if (split->n_inputs == 0 && prev_backend_id >= 0 && prev_backend_id != split_backend_id) {
             if (sched->events[prev_backend_id][sched->cur_copy] != NULL) {
-                ggml_backend_event_synchronize(sched->events[prev_backend_id][sched->cur_copy]);
+                ggml_backend_sched_tm_event_synchronize(sched, sched->events[prev_backend_id][sched->cur_copy]);
             } else {
-                ggml_backend_synchronize(sched->backends[prev_backend_id]);
+                ggml_backend_sched_tm_synchronize(sched, sched->backends[prev_backend_id]);
             }
         }
+        const int64_t switch_wait = sched->tm_wait;
 
         // copy the input tensors to the split backend
         // the weights in host memory are copied last, so that the copy callback can read the other inputs of the split
@@ -2411,8 +2462,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         // record how far the staged input uploads of this split have progressed on the backend stream
         ggml_backend_sched_staging_end_split(sched, split_backend_id);
 
-        const int64_t t_compute = timing ? ggml_time_us() : 0;
+        const int64_t t_compute = sched->tm_on ? ggml_time_us() : 0;
         const int64_t f_compute = timing ? ggml_backend_sched_page_faults() : -1;
+        const int64_t wait_inputs = sched->tm_wait - switch_wait, copy_inputs = sched->tm_copy;
 
         if (!sched->callback_eval) {
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
@@ -2453,10 +2505,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
+        const int64_t t_done = sched->tm_on ? ggml_time_us() : 0;
         if (timing) {
-            const int64_t t_done = ggml_time_us();
             ggml_backend_sched_split_timing_log(sched, split_id, split, t_split, t_compute, t_done, f_compute,
-                ggml_backend_sched_page_faults());
+                ggml_backend_sched_page_faults(), switch_wait, wait_inputs, copy_inputs);
         }
 
         // record the event of this split
@@ -2464,7 +2516,35 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             ggml_backend_event_record(sched->events[split_backend_id][sched->cur_copy], split_backend);
         }
 
+        if (sched->tm_on) {
+            // waits and synchronous copies as timed, the CPU backend computes synchronously, a device backend only queues;
+            // everything else of the split (input copies that queue, staging, the event record) is issue time
+            const bool cpu = ggml_backend_dev_type(ggml_backend_get_device(split_backend)) == GGML_BACKEND_DEVICE_TYPE_CPU;
+            const int64_t compute = t_done - t_compute;
+            const int64_t total   = ggml_time_us() - t_split;
+            parts[ACCOUNT_SUBMIT_WAIT] += switch_wait + wait_inputs;
+            parts[ACCOUNT_SUBMIT_COPY] += copy_inputs;
+            parts[cpu ? ACCOUNT_SUBMIT_CPU : ACCOUNT_SUBMIT_ISSUE] += compute;
+            parts[ACCOUNT_SUBMIT_ISSUE] += total - compute - switch_wait - wait_inputs - copy_inputs;
+            if (cpu) {
+                ggml_account_cpu_split(acct_key, split_id, split->graph.n_nodes > 0 ? split->graph.nodes[0]->name : "",
+                    switch_wait + wait_inputs, compute);
+            }
+        }
+
         prev_backend_id = split_backend_id;
+    }
+
+    if (acct_key != 0) {
+        ggml_account_submit_parts(acct_key, parts, ACCOUNT_SUBMIT_PARTS);
+        bool known = false;
+        for (int i = 0; i < sched->n_tm_pending; ++i) {
+            known = known || sched->tm_pending[i] == acct_key;
+        }
+        // its wall time ends at the next ggml_backend_sched_synchronize (more than 8 unsynchronized records: no wall time)
+        if (!known && sched->n_tm_pending < 8 && ggml_account_submitted(acct_key)) {
+            sched->tm_pending[sched->n_tm_pending++] = acct_key;
+        }
     }
 
     return GGML_STATUS_SUCCESS;
@@ -3050,8 +3130,15 @@ enum ggml_status ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sch
     }
 
     if (!sched->is_alloc) {
+        const uint64_t acct_key = ggml_account_current();
+        const int64_t t0 = acct_key != 0 ? ggml_time_us() : 0;
         if (!ggml_backend_sched_alloc_graph(sched, graph)) {
             return GGML_STATUS_ALLOC_FAILED;
+        }
+        if (acct_key != 0) {
+            int64_t parts[ACCOUNT_SUBMIT_PARTS] = {};
+            parts[ACCOUNT_SUBMIT_ALLOC] = ggml_time_us() - t0;
+            ggml_account_submit_parts(acct_key, parts, ACCOUNT_SUBMIT_PARTS);
         }
     }
 
@@ -3060,8 +3147,17 @@ enum ggml_status ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sch
 
 void ggml_backend_sched_synchronize(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
+    const int64_t t0 = sched->n_tm_pending == 0 ? 0 : ggml_time_us();
     for (int i = 0; i < sched->n_backends; i++) {
         ggml_backend_synchronize(sched->backends[i]);
+    }
+    if (sched->n_tm_pending > 0) {
+        // the submitted ubatches are complete on every backend now: their wall time ends here
+        const int64_t t1 = ggml_time_us();
+        for (int i = 0; i < sched->n_tm_pending; ++i) {
+            ggml_account_synced(sched->tm_pending[i], t1, t1 - t0);
+        }
+        sched->n_tm_pending = 0;
     }
     if (!sched->is_alloc) {
         // if the graph is not already allocated, always use copy 0 after a synchronization
@@ -3715,6 +3811,13 @@ struct account_rec {
     bool     set[GGML_ACCOUNT_FIELDS] = {};
     std::map<const void *, std::pair<int64_t, int64_t>> spans;
     std::vector<std::pair<std::string, std::string>> notes;
+    // host time split of the submit (ggml_account_submit_part, us), the CPU splits (split, first node, wait, compute us)
+    int64_t  submit[ACCOUNT_SUBMIT_PARTS] = {};
+    bool     submit_set = false;
+    std::vector<std::pair<std::string, std::array<int64_t, 3>>> cpu_splits;
+    // wall time: from the record's opening to the return of the first scheduler synchronization after its submit
+    bool     wall_pending = false;
+    int64_t  t_sync_us = 0, sync_wait_us = 0;
     int      outstanding = 0;
     bool     ended = false;
     bool     ok = false;
@@ -3779,15 +3882,22 @@ void account_print_locked(account_state & st, std::map<uint64_t, account_rec>::i
     const account_rec & r = it->second;
     std::string out;
     char buf[192];
-    snprintf(buf, sizeof(buf), "{\"kind\":\"prefill_account\",\"v\":1,\"ctx\":%llu,\"ub\":%llu,\"tokens\":%d",
+    snprintf(buf, sizeof(buf), "{\"kind\":\"prefill_account\",\"v\":2,\"ctx\":%llu,\"ub\":%llu,\"tokens\":%d",
         (unsigned long long) r.ctx, (unsigned long long) r.ub, (int) r.tokens);
     out += buf;
     for (const auto & n : r.notes) {
         const bool digits = !n.second.empty() && n.second.find_first_not_of("0123456789") == std::string::npos;
         out += ",\"" + n.first + "\":" + (digits ? n.second : "\"" + n.second + "\"");
     }
-    snprintf(buf, sizeof(buf), ",\"complete\":%s,\"ssd_complete\":%s,\"wall_ms\":null,\"host_total_ms\":%.3f",
-        r.ok ? "true" : "false", r.outstanding <= 0 ? "true" : "false", (r.t_end_us - r.t_open_us)/1000.0);
+    snprintf(buf, sizeof(buf), ",\"complete\":%s,\"ssd_complete\":%s", r.ok ? "true" : "false", r.outstanding <= 0 ? "true" : "false");
+    out += buf;
+    if (r.t_sync_us > 0) {
+        snprintf(buf, sizeof(buf), ",\"wall_ms\":%.3f", (r.t_sync_us - r.t_open_us)/1000.0);
+    } else {
+        snprintf(buf, sizeof(buf), ",\"wall_ms\":null");
+    }
+    out += buf;
+    snprintf(buf, sizeof(buf), ",\"host_total_ms\":%.3f", (r.t_end_us - r.t_open_us)/1000.0);
     out += buf;
     account_field(out, "begin_ms",           r, GGML_ACCOUNT_BEGIN_MS,           ms_fmt);
     account_field(out, "host_submit_ms",     r, GGML_ACCOUNT_SUBMIT_MS,          ms_fmt);
@@ -3833,8 +3943,45 @@ void account_print_locked(account_state & st, std::map<uint64_t, account_rec>::i
     out += ",\"l2_vram_bytes\":null,\"l2_vram_wait_ms\":null";
     account_field(out, "op_stage_bytes",  r, GGML_ACCOUNT_OP_STAGE_BYTES,  bytes_fmt);
     account_field(out, "ctrl_stage_bytes", r, GGML_ACCOUNT_CTRL_STAGE_BYTES, bytes_fmt);
-    account_field(out, "host_sync_ms",    r, GGML_ACCOUNT_HOST_SYNC_MS,    ms_fmt);
-    out += ",\"checkpoint_ms\":null,\"residual_ms\":null";
+    // host_sync_ms: every host wait of the submit, the scheduler's (split switches, input copies) and the expert-major op
+    // staging plan's (GGML_ACCOUNT_HOST_SYNC_MS, inside a device backend's compute call), printed apart as op_stage_sync_ms
+    const double op_sync = r.set[GGML_ACCOUNT_HOST_SYNC_MS] ? r.v[GGML_ACCOUNT_HOST_SYNC_MS] : 0.0;
+    if (r.submit_set) {
+        snprintf(buf, sizeof(buf), ",\"host_sync_ms\":%.3f", r.submit[ACCOUNT_SUBMIT_WAIT]/1000.0 + op_sync);
+        out += buf;
+    } else {
+        account_field(out, "host_sync_ms", r, GGML_ACCOUNT_HOST_SYNC_MS, ms_fmt);
+    }
+    account_field(out, "op_stage_sync_ms", r, GGML_ACCOUNT_HOST_SYNC_MS, ms_fmt);
+    if (r.submit_set) {
+        // host_submit_ms = issue + wait + copy + cpu + alloc + other; issue excludes the op staging sync, wait includes it
+        const double submit = r.set[GGML_ACCOUNT_SUBMIT_MS] ? r.v[GGML_ACCOUNT_SUBMIT_MS] : 0.0;
+        const double issue  = r.submit[ACCOUNT_SUBMIT_ISSUE]/1000.0 - op_sync;
+        const double wait   = r.submit[ACCOUNT_SUBMIT_WAIT]/1000.0 + op_sync;
+        const double copy   = r.submit[ACCOUNT_SUBMIT_COPY]/1000.0;
+        const double cpu    = r.submit[ACCOUNT_SUBMIT_CPU]/1000.0;
+        const double alloc  = r.submit[ACCOUNT_SUBMIT_ALLOC]/1000.0;
+        snprintf(buf, sizeof(buf), ",\"submit\":{\"issue_ms\":%.3f,\"wait_ms\":%.3f,\"sync_copy_ms\":%.3f,\"cpu_ms\":%.3f,"
+            "\"alloc_ms\":%.3f,\"other_ms\":%.3f,\"cpu_splits\":[", issue, wait, copy, cpu, alloc,
+            submit - issue - wait - copy - cpu - alloc);
+        out += buf;
+        for (size_t i = 0; i < r.cpu_splits.size(); ++i) {
+            snprintf(buf, sizeof(buf), "%s{\"split\":%lld,\"first\":\"%.60s\",\"wait_ms\":%.3f,\"compute_ms\":%.3f}", i ? "," : "",
+                (long long) r.cpu_splits[i].second[0], r.cpu_splits[i].first.c_str(),
+                r.cpu_splits[i].second[1]/1000.0, r.cpu_splits[i].second[2]/1000.0);
+            out += buf;
+        }
+        out += "]}";
+    }
+    out += ",\"checkpoint_ms\":null";
+    if (r.t_sync_us > 0) {
+        // wall time the host spent neither in this record's host phases nor waiting in that synchronization
+        snprintf(buf, sizeof(buf), ",\"sync_wait_ms\":%.3f,\"residual_ms\":%.3f", r.sync_wait_us/1000.0,
+            (r.t_sync_us - r.t_open_us - (r.t_end_us - r.t_open_us) - r.sync_wait_us)/1000.0);
+        out += buf;
+    } else {
+        out += ",\"residual_ms\":null";
+    }
     out += r.set[GGML_ACCOUNT_GPU_STREAM_MS] ? ",\"timing\":\"gpu_stamp\"}\n" : ",\"timing\":\"cpu_only\"}\n";
     fputs(out.c_str(), stderr);
     fflush(stderr);
@@ -3976,7 +4123,7 @@ void ggml_account_settle(uint64_t key, int n) {
         return;
     }
     it->second.outstanding = std::max(0, it->second.outstanding - n);
-    if (it->second.ended && it->second.outstanding == 0) {
+    if (it->second.ended && it->second.outstanding == 0 && !it->second.wall_pending) {
         account_print_locked(st, it);
     }
 }
@@ -3996,7 +4143,68 @@ void ggml_account_end(uint64_t key, bool ok) {
     it->second.ended = true;
     it->second.ok = ok;
     it->second.t_end_us = ggml_time_us();
-    if (it->second.outstanding == 0) {
+    if (it->second.outstanding == 0 && !it->second.wall_pending) {
+        account_print_locked(st, it);
+    }
+}
+
+static void ggml_account_submit_parts(uint64_t key, const int64_t * us, int n_parts) {
+    if (key == 0 || !ggml_account_enabled()) {
+        return;
+    }
+    account_state & st = account_get();
+    std::lock_guard<std::mutex> lock(st.mutex);
+    auto it = st.recs.find(key);
+    if (it == st.recs.end()) {
+        return;
+    }
+    for (int i = 0; i < n_parts && i < ACCOUNT_SUBMIT_PARTS; ++i) {
+        it->second.submit[i] += us[i];
+    }
+    it->second.submit_set = true;
+}
+
+static void ggml_account_cpu_split(uint64_t key, int split, const char * first, int64_t wait_us, int64_t compute_us) {
+    if (key == 0 || !ggml_account_enabled()) {
+        return;
+    }
+    account_state & st = account_get();
+    std::lock_guard<std::mutex> lock(st.mutex);
+    auto it = st.recs.find(key);
+    if (it != st.recs.end() && it->second.cpu_splits.size() < 64) {
+        it->second.cpu_splits.push_back({ std::string(first ? first : ""), { (int64_t) split, wait_us, compute_us } });
+    }
+}
+
+// the record's wall time waits for the next scheduler synchronization; false when the record is gone
+static bool ggml_account_submitted(uint64_t key) {
+    if (key == 0 || !ggml_account_enabled()) {
+        return false;
+    }
+    account_state & st = account_get();
+    std::lock_guard<std::mutex> lock(st.mutex);
+    auto it = st.recs.find(key);
+    if (it == st.recs.end()) {
+        return false;
+    }
+    it->second.wall_pending = true;
+    return true;
+}
+
+static void ggml_account_synced(uint64_t key, int64_t t_us, int64_t wait_us) {
+    if (key == 0 || !ggml_account_enabled()) {
+        return;
+    }
+    account_state & st = account_get();
+    std::lock_guard<std::mutex> lock(st.mutex);
+    auto it = st.recs.find(key);
+    if (it == st.recs.end() || !it->second.wall_pending) {
+        return;
+    }
+    it->second.wall_pending = false;
+    it->second.t_sync_us    = t_us;
+    it->second.sync_wait_us = wait_us;
+    if (it->second.ended && it->second.outstanding == 0) {
         account_print_locked(st, it);
     }
 }
