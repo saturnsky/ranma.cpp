@@ -1573,8 +1573,12 @@ void llama_model_deepseek4::graph::build_inp_dsv4_chunk(llm_graph_input_dsv4 * i
         return;
     }
 
+    // one chunk (llm_graph_chunk_mask_one): the chunked attention of one chunk is the unchunked one with device masks. This
+    // holds for V4.1 as well: its tail layers read every raw cell too when the graph has one chunk (see deepseek41.cpp), so
+    // the K layout of the tail layers and of the rest is the unchunked one
+    const bool one = llm_graph_chunk_mask_one();
     inp_cm = llm_graph_build_inp_chunk_mask(res, ctx0, gf, cparams, hparams, ubatch, mctx,
-            dsv4_chunk_kv_ops(hparams), hparams.n_swa, dsv4_chunk_tokens(hparams));
+            dsv4_chunk_kv_ops(hparams), hparams.n_swa, dsv4_chunk_tokens(hparams), one);
     if (inp_cm == nullptr) {
         return;
     }
@@ -1723,8 +1727,9 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention_chunked(
 
     const ggml_type type_raw = inp_attn->self_kq_mask->type;
 
+    // one chunk with llm_graph_chunk_mask_one (no window: every key, the unchunked K and mask layout)
     const llm_graph_chunks chunks = inp_cm->chunks(n_tokens);
-    GGML_ASSERT(chunks.n > 1);
+    GGML_ASSERT(chunks.n > 1 || (inp_cm->one && !win));
 
     llm_graph_join_acc outs(ctx0, gf, 1, n_tokens);
     for (int ic = 0; ic < chunks.n; ++ic) {

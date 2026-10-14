@@ -177,6 +177,7 @@ set(LLAMA_CONTEXT_TEST_SRC
     llama-context/test-util.cpp
 )
 llama_build(${LLAMA_CONTEXT_TEST_SRC})
+llama_build(test-layer-exec-dsv4.cpp) # ranma: layer-major prefill against the ubatch loop on a tiny random DeepSeek-V4 model (CPU)
 llama_build(test-dsv41-ckpt-split.cpp) # ranma: DS4.1 call split and partial checkpoint restore on a tiny random model (CPU)
 
 if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)

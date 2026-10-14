@@ -14,17 +14,6 @@
 #include <cstdio>
 #include <cstdlib>
 
-// the layer mode's decisions for the graphs of the process (llama-ext.h)
-static llama_layer_mode_config g_layer_mode_config;
-
-llama_layer_mode_config llama_layer_mode_get_config() {
-    return g_layer_mode_config;
-}
-
-void llama_layer_mode_set_config(const llama_layer_mode_config & cfg) {
-    g_layer_mode_config = cfg;
-}
-
 // read at every graph build: the layer mode (common/layer-mode.cpp) sets it between the no_alloc measurements of its
 // candidate chunks, before the model it serves loads; it does not change afterwards
 int64_t llm_graph_chunk_tokens() {
@@ -155,21 +144,27 @@ ggml_tensor * llm_graph_join_acc::get() const {
     return ggml_reshape_4d(ctx, acc, ne[0], ne[1], ne[2], ne[3]);
 }
 
-bool llm_graph_chunk_mask_enabled() {
-    static const bool on = [] {
-        const char * env = getenv("RANMA_CHUNK_MASK");
-        return env == nullptr || atoi(env) != 0;
-    }();
-    return on;
+static thread_local int llm_graph_chunk_mask_one_depth = 0;
+
+llm_graph_chunk_mask_one_scope::llm_graph_chunk_mask_one_scope() {
+    llm_graph_chunk_mask_one_depth++;
+}
+
+llm_graph_chunk_mask_one_scope::~llm_graph_chunk_mask_one_scope() {
+    llm_graph_chunk_mask_one_depth--;
+}
+
+bool llm_graph_chunk_mask_one() {
+    return llm_graph_chunk_mask_one_depth > 0;
 }
 
 bool llm_graph_chunk_mask_usable(const llama_cparams & cparams, const llama_hparams & hparams, const llama_ubatch & ubatch,
-                                 bool swa_ok, int64_t c_req) {
+                                 bool swa_ok, int64_t c_req, bool one) {
     const bool swa = hparams.swa_type == LLAMA_SWA_TYPE_NONE || (swa_ok && hparams.swa_type == LLAMA_SWA_TYPE_STANDARD);
     if (c_req < 0) {
         c_req = llm_graph_chunk_tokens();
     }
-    return llm_graph_chunk_mask_enabled() && llm_graph_chunks(ubatch.n_tokens, c_req).n > 1 &&
+    return (one || llm_graph_chunks(ubatch.n_tokens, c_req).n > 1) &&
         cparams.causal_attn && !hparams.use_alibi && swa &&
         (!ubatch.is_pos_2d() || ubatch.embd == nullptr) && (cparams.kv_unified || ubatch.n_seqs_unq == 1);
 }
@@ -333,7 +328,9 @@ void llm_graph_input_chunk_mask::set_input(const llama_ubatch * ubatch) {
 bool llm_graph_input_chunk_mask::can_reuse(const llm_graph_params & params) {
     mctx = params.mctx;
 
-    bool res = llm_graph_chunk_mask_usable(params.cparams, params.hparams, params.ubatch, n_swa > 0, c_req);
+    // a graph built with one chunk allowed is reused only where one chunk is still allowed
+    bool res = llm_graph_chunk_mask_usable(params.cparams, params.hparams, params.ubatch, n_swa > 0, c_req, one) &&
+        (!one || llm_graph_chunk_mask_one());
 
     res &= kv_pos->ne[0] == ops.n_kv(mctx);
     res &= kv_pos->ne[1] == params.ubatch.n_seqs_unq;
@@ -349,21 +346,24 @@ bool llm_graph_input_chunk_mask::can_reuse(const llm_graph_params & params) {
 
 llm_graph_input_chunk_mask * llm_graph_build_inp_chunk_mask(llm_graph_result * res, ggml_context * ctx, ggml_cgraph * gf,
         const llama_cparams & cparams, const llama_hparams & hparams, const llama_ubatch & ubatch,
-        const llama_memory_context_i * mctx, llm_graph_chunk_kv_ops ops, uint32_t n_swa, int64_t c_req) {
+        const llama_memory_context_i * mctx, llm_graph_chunk_kv_ops ops, uint32_t n_swa, int64_t c_req, bool one) {
     if (c_req < 0) {
         c_req = llm_graph_chunk_tokens();
     }
-    if (!llm_graph_chunk_mask_usable(cparams, hparams, ubatch, n_swa > 0, c_req)) {
+    if (!llm_graph_chunk_mask_usable(cparams, hparams, ubatch, n_swa > 0, c_req, one)) {
         return nullptr;
     }
 
-    auto inp = std::make_unique<llm_graph_input_chunk_mask>(mctx, ops, n_swa, c_req);
+    auto inp = std::make_unique<llm_graph_input_chunk_mask>(mctx, ops, n_swa, c_req, one);
 
     inp->kv_pos = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ops.n_kv(mctx), ubatch.n_seqs_unq);
     ggml_set_input(inp->kv_pos);
     ggml_set_name(inp->kv_pos, "chunk_kv_pos");
     inp->pos.build(ctx, ubatch.n_tokens);
-    inp->windows = inp->make_windows(ubatch.n_tokens);
+    // one chunk reads every key, like the unchunked graph
+    if (inp->chunks(ubatch.n_tokens).n > 1) {
+        inp->windows = inp->make_windows(ubatch.n_tokens);
+    }
 
     // set_input fills them, so they stay allocated in every graph
     ggml_build_forward_expand(gf, inp->kv_pos);

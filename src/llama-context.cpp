@@ -2298,6 +2298,19 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     int64_t n_tokens_prev  = 0;
 
     do {
+        // ranma: layer-major prefill: every ubatch of the batch at once, layer by layer
+        if (n_tokens_prev == 0) {
+            const int ret = layer_exec_decode(mctx.get(), n_tokens_all, n_outputs_all);
+            if (ret < 0) {
+                return ret;
+            }
+            if (ret == 0) {
+                n_outputs_prev = n_outputs_all;
+                n_tokens_prev  = n_tokens_all;
+                break;
+            }
+        }
+
         const auto & ubatch = mctx->get_ubatch();
 
         // count the outputs in this ubatch
