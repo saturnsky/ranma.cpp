@@ -200,6 +200,67 @@ static __global__ void dsv4_hc_coef_f32(
     dsv4_hc_coef_token(mixes + it*sm1, scale, base, dst + it*sd1, sm0, ss0, sb0, sd0, eps, n_iter);
 }
 
+
+#if defined(GGML_USE_HIP)
+// HC_PRE -> RMS_NORM -> gamma MUL in one block per token, in the operation order of the separate kernels.
+template<int block_size>
+static __global__ void hc_pre_norm_mul_f32(
+        const float * x, const float * w, const float * gamma, float * dst,
+        int n, int hc, int64_t sx1, int64_t sx2, int64_t sw0, int64_t sw1,
+        float pre_scale, float eps) {
+    extern __shared__ float scratch[];
+    float * pre = scratch;
+    float * red = scratch + n;
+    const int tid = threadIdx.x;
+    const int it = blockIdx.x;
+    ggml_cuda_pdl_lc();
+    ggml_cuda_pdl_sync();
+    for (int col = tid; col < n; col += block_size) {
+        float sum = 0.0f;
+        for (int ih = 0; ih < hc; ++ih) {
+            sum += x[it*sx2 + ih*sx1 + col] * w[it*sw1 + ih*sw0];
+        }
+        pre[col] = pre_scale * sum;
+    }
+    __syncthreads();
+    float sq = 0.0f;
+    for (int col = tid; col < n; col += block_size) {
+        const float v = pre[col];
+        sq += v * v;
+    }
+    sq = block_reduce<block_reduce_method::SUM, block_size>(sq, red);
+    const float scale = rsqrtf(sq / n + eps);
+    for (int col = tid; col < n; col += block_size) {
+        dst[int64_t(it)*n + col] = (scale * pre[col]) * gamma[col];
+    }
+}
+
+void ggml_cuda_op_hc_pre_norm_mul(ggml_backend_cuda_context & ctx,
+        const ggml_tensor * pre, const ggml_tensor * norm, ggml_tensor * mul) {
+    const ggml_tensor * x = pre->src[0];
+    const ggml_tensor * w = pre->src[1];
+    const int n = (int) pre->ne[0];
+    const int bs = n < 1024 ? 256 : 1024;
+    const dim3 grid((unsigned) pre->ne[1], 1, 1);
+    const dim3 block(bs, 1, 1);
+    const ggml_cuda_kernel_launch_params lp = {grid, block, (n + 32)*sizeof(float), ctx.stream()};
+    const float * gamma = (const float *) mul->src[1]->data;
+    const float sc = ggml_get_op_params_f32(pre, 0);
+    const float eps = ggml_get_op_params_f32(norm, 0);
+    if (bs == 256) {
+        ggml_cuda_kernel_launch(hc_pre_norm_mul_f32<256>, lp,
+            (const float *) x->data, (const float *) w->data, gamma, (float *) mul->data,
+            n, (int) x->ne[1], x->nb[1]/sizeof(float), x->nb[2]/sizeof(float),
+            w->nb[0]/sizeof(float), w->nb[1]/sizeof(float), sc, eps);
+    } else {
+        ggml_cuda_kernel_launch(hc_pre_norm_mul_f32<1024>, lp,
+            (const float *) x->data, (const float *) w->data, gamma, (float *) mul->data,
+            n, (int) x->ne[1], x->nb[1]/sizeof(float), x->nb[2]/sizeof(float),
+            w->nb[0]/sizeof(float), w->nb[1]/sizeof(float), sc, eps);
+    }
+}
+#endif
+
 template <bool gated>
 static __global__ void dsv4_hc_pre_f32(
         const float * x,

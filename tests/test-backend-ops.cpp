@@ -4811,6 +4811,103 @@ struct test_dsv4_hc_mixes : public test_dsv4_hc {
     int perf_max_reps() override { return 8; }
 };
 
+// ranma HC pre-norm probe (TBO_HC_PRENORM=1): HC_PRE -> RMS_NORM -> gamma MUL as in a DeepSeek V4 layer (pre_only: the
+// HC_PRE alone, the upper bound of a one-launch fusion). Deterministic inputs, so the printed output hash compares
+// builds; nmse against an FP64 reference.
+struct test_hc_prenorm : public test_case {
+    const int64_t n_embd, n_tokens;
+    const float   amp;
+    const bool    pre_only;
+    const bool    w_view;  // weights as a strided view of a [24, n_tokens] coefficient tensor, as in the model
+    const int64_t hc = 4;
+    int64_t ws = 4, woff = 0;
+    const float   eps = 1e-6f;
+    std::vector<float> x_h, w_h, g_h;
+    std::vector<ggml_tensor *> rep; // the whole chain repeats in perf mode
+
+    std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "HC_PRENORM"; }
+    std::vector<ggml_tensor *> perf_nodes(ggml_tensor * out) override { GGML_UNUSED(out); return rep; }
+    std::string vars() override { return VARS_TO_STR5(n_embd, n_tokens, amp, pre_only, w_view); }
+    bool run_whole_graph() override { return true; }
+    double max_nmse_err() override { return 1e-6; }
+
+    test_hc_prenorm(int64_t n_embd, int64_t n_tokens, float amp, bool pre_only, bool w_view = false)
+        : n_embd(n_embd), n_tokens(n_tokens), amp(amp), pre_only(pre_only), w_view(w_view) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, n_tokens);
+        ggml_set_name(x, "x");
+        ggml_tensor * w;
+        if (w_view) {
+            ws = 24; woff = 8;
+            ggml_tensor * wb = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ws, n_tokens);
+            ggml_set_name(wb, "w");
+            w = ggml_view_2d(ctx, wb, hc, n_tokens, wb->nb[1], woff*sizeof(float));
+        } else {
+            w = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc, n_tokens);
+            ggml_set_name(w, "w");
+        }
+        ggml_tensor * g = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_embd);
+        ggml_set_name(g, "g");
+        ggml_tensor * out = ggml_dsv4_hc_pre(ctx, x, w);
+        rep = { out };
+        if (!pre_only) {
+            ggml_tensor * norm = ggml_rms_norm(ctx, out, eps);
+            out = ggml_mul(ctx, norm, g);
+            rep.push_back(norm);
+            rep.push_back(out);
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 rng(1234);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            const std::string name = ggml_get_name(t);
+            std::vector<float> * h = name == "x" ? &x_h : name == "w" ? &w_h : name == "g" ? &g_h : nullptr;
+            if (h == nullptr) {
+                continue;
+            }
+            std::uniform_real_distribution<float> d(name == "x" ? -amp : name == "w" ? 0.0f : 0.5f, name == "x" ? amp : name == "w" ? 1.0f : 1.5f);
+            h->resize(ggml_nelements(t));
+            for (float & v : *h) { v = d(rng); }
+            ggml_backend_tensor_set(t, h->data(), 0, h->size()*sizeof(float));
+        }
+    }
+
+    double err(const float * a, const float * b, size_t n) override {
+        if ((int64_t) n != n_embd*n_tokens) {
+            return 0.0;
+        }
+        double sr = 0.0, ea = 0.0, eb = 0.0, maxd = 0.0, maxab = 0.0;
+        size_t ndiff = 0, nfin = 0;
+        uint64_t hx = 1469598103934665603ull;
+        std::vector<double> pre(n_embd);
+        for (int64_t t = 0; t < n_tokens; ++t) {
+            double ss = 0.0;
+            for (int64_t i = 0; i < n_embd; ++i) {
+                double s = 0.0;
+                for (int64_t h = 0; h < hc; ++h) { s += (double) x_h[(t*hc + h)*n_embd + i] * w_h[t*ws + woff + h]; }
+                pre[i] = s; ss += s*s;
+            }
+            const double sc = pre_only ? 1.0 : 1.0/sqrt(ss/n_embd + eps);
+            for (int64_t i = 0; i < n_embd; ++i) {
+                const double r = pre[i]*sc*(pre_only ? 1.0 : g_h[i]);
+                const size_t k = t*n_embd + i;
+                sr += r*r; ea += (a[k] - r)*(a[k] - r); eb += (b[k] - r)*(b[k] - r);
+                maxd = std::max(maxd, fabs(a[k] - r)); maxab = std::max(maxab, (double) fabsf(a[k] - b[k]));
+                ndiff += a[k] != b[k]; nfin += std::isfinite(a[k]);
+                uint32_t u; memcpy(&u, a + k, sizeof(u)); hx = (hx ^ u)*1099511628211ull;
+            }
+        }
+        printf("HCPRENORM n_embd=%lld n_tokens=%lld amp=%g pre_only=%d w_view=%d: nmse %.3e max_abs %.3e | cpu nmse %.3e diff_vs_cpu %zu max %.3e | finite %zu/%zu | out %016llx\n",
+            (long long) n_embd, (long long) n_tokens, (double) amp, (int) pre_only, (int) w_view, ea/sr, maxd, eb/sr, ndiff, maxab, nfin, n,
+            (unsigned long long) hx);
+        return ea/sr;
+    }
+};
+
 struct test_dsv4_hc_pre : public test_dsv4_hc {
     const int64_t n_embd;
     const int64_t n_hc;
@@ -12585,6 +12682,18 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_dsv4_compress( 37,   4,   3, true,  true));
     test_cases.emplace_back(new test_dsv4_compress( 37, 128,   2, false, false));
 
+    if (getenv("TBO_HC_PRENORM") != nullptr && atoi(getenv("TBO_HC_PRENORM")) != 0) {
+        for (int64_t n_embd : { 512, 7168 }) {
+            for (int64_t n_tokens : { 17, 2048 }) {
+                for (float amp : { 1.0f, 64.0f }) {
+                    test_cases.emplace_back(new test_hc_prenorm(n_embd, n_tokens, amp, false));
+                }
+            }
+        }
+        test_cases.emplace_back(new test_hc_prenorm(7168, 2048, 1.0f, true));
+        test_cases.emplace_back(new test_hc_prenorm(7168, 2048, 1.0f, false, true));
+        test_cases.emplace_back(new test_hc_prenorm(512, 17, 64.0f, false, true));
+    }
     test_cases.emplace_back(new test_dsv4_hc_pre(1, 4, 1));
     test_cases.emplace_back(new test_dsv4_hc_pre(31, 4, 17));
     test_cases.emplace_back(new test_dsv4_hc_pre(128, 4, 257));
@@ -15325,6 +15434,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+    // TBO_HC_PRENORM=1: the HC pre-norm chain at D 7168, T 2048 and its HC_PRE-only upper bound, the list twice
+    if (getenv("TBO_HC_PRENORM") != nullptr && atoi(getenv("TBO_HC_PRENORM")) != 0) {
+        for (int pass = 0; pass < 2; ++pass) {
+            test_cases.emplace_back(new test_hc_prenorm(7168, 2048, 1.0f, false));
+            test_cases.emplace_back(new test_hc_prenorm(7168, 2048, 1.0f, true));
+        }
+        return test_cases;
+    }
     // hyper-connection mixes of one decode token (GLM 3.05, DeepSeek V4); 64 sites keep the weights out of the caches
     test_cases.emplace_back(new test_dsv4_hc_mixes(16384, 1, true, 1e-6f, 64));
     test_cases.emplace_back(new test_dsv4_hc_mixes(16384, 1, false, 1e-6f, 64));
