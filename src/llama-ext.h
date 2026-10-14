@@ -37,6 +37,11 @@ struct llama_graph_counts {
 
 LLAMA_API bool llama_get_graph_counts(const struct llama_context * ctx, struct llama_graph_counts * out);
 
+// ranma: the prompt buffers of the layer-major prefill for one pass of n_tokens tokens: out[0] the VRAM
+// it borrows from L1 (the prefill lend), out[1] its host inputs (a host buffer of the context, not lent); l1_bytes sizes
+// the staging as the lend would. It builds graphs and computes nothing, so a context of a no_alloc model works. false
+// when the layer-major prefill would not run.
+LLAMA_API bool llama_layer_exec_lend_bytes(struct llama_context * ctx, int64_t n_tokens, size_t l1_bytes, uint64_t out[2]);
 // ranma: what the layer mode (common/layer-mode.cpp) decides for the graphs of the process: the chunk of query rows of
 // the attention (0 = one chunk), the expert-major MoE op of a prompt batch (its pass rows, 0 = the backend's default,
 // and the smallest batch that takes it) and the layer-major prefill with the widths of its passes and MoE bundles (0 =

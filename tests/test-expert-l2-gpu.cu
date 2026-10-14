@@ -63,7 +63,7 @@ static int bitmap_test() {
             }
         }
         CUDA_CHECK(hipMemcpy(ids, input.data(), input.size()*sizeof(int32_t), hipMemcpyHostToDevice));
-        l2_publish_kernel<<<1, 128, words*sizeof(uint32_t)>>>(device, device_bits, device_serve, ids, rows, used, stride, experts, nullptr, nullptr, 0, nullptr);
+        l2_publish_kernel<<<1, 128, words*sizeof(uint32_t)>>>(device, device_bits, device_serve, ids, rows, used, stride, experts, nullptr, nullptr, nullptr, 0, nullptr);
         CUDA_CHECK(hipDeviceSynchronize());
         CHECK(host->published == uint32_t(pattern + 1));
         CHECK(bool(host->invalid) == (pattern == 3));
@@ -94,18 +94,18 @@ static int serve_test() {
     const int routed = input[0], absent = experts - 1;   // rows*used = 32 < absent
     CUDA_CHECK(hipMemcpy(ids, input.data(), input.size()*sizeof(int32_t), hipMemcpyHostToDevice));
 
-    l2_publish_kernel<<<1, 128, words*sizeof(uint32_t)>>>(device, device_bits, device_serve, ids, rows, used, stride, experts, nullptr, nullptr, 0, nullptr);
+    l2_publish_kernel<<<1, 128, words*sizeof(uint32_t)>>>(device, device_bits, device_serve, ids, rows, used, stride, experts, nullptr, nullptr, nullptr, 0, nullptr);
     CUDA_CHECK(hipDeviceSynchronize());
     CHECK(host->published == 1 && host->need == 0 && host->ready == host->generation);
 
     serve[routed/32] |= 1u << (routed%32);
-    l2_publish_kernel<<<1, 128, words*sizeof(uint32_t)>>>(device, device_bits, device_serve, ids, rows, used, stride, experts, nullptr, nullptr, 0, nullptr);
+    l2_publish_kernel<<<1, 128, words*sizeof(uint32_t)>>>(device, device_bits, device_serve, ids, rows, used, stride, experts, nullptr, nullptr, nullptr, 0, nullptr);
     CUDA_CHECK(hipDeviceSynchronize());
     CHECK(host->published == 2 && host->need == 1 && host->ready == 0);
 
     serve[routed/32] &= ~(1u << (routed%32));
     serve[absent/32] |= 1u << (absent%32);
-    l2_publish_kernel<<<1, 128, words*sizeof(uint32_t)>>>(device, device_bits, device_serve, ids, rows, used, stride, experts, nullptr, nullptr, 0, nullptr);
+    l2_publish_kernel<<<1, 128, words*sizeof(uint32_t)>>>(device, device_bits, device_serve, ids, rows, used, stride, experts, nullptr, nullptr, nullptr, 0, nullptr);
     CUDA_CHECK(hipDeviceSynchronize());
     CHECK(host->published == 3 && host->need == 0 && host->ready == host->generation);
 
@@ -116,23 +116,40 @@ static int serve_test() {
     serve[absent/32] &= ~(1u << (absent%32));
     serve[routed/32] |= 1u << (routed%32);
     pooled[routed/32] |= 1u << (routed%32);
-    l2_publish_kernel<<<1, 128, words*sizeof(uint32_t)>>>(device, device_bits, device_serve, ids, rows, used, stride, experts, device_pooled, nullptr, 0, nullptr);
+    l2_publish_kernel<<<1, 128, words*sizeof(uint32_t)>>>(device, device_bits, device_serve, ids, rows, used, stride, experts, device_pooled, nullptr, nullptr, 0, nullptr);
     CUDA_CHECK(hipDeviceSynchronize());
     CHECK(host->published == 4 && host->need == 0 && host->ready == host->generation);
     CHECK((bits[routed/32] & (1u << (routed%32))) == 0);
     CHECK((bits[input[1]/32] & (1u << (input[1]%32))) != 0);
     pooled[routed/32] = 0;
-    l2_publish_kernel<<<1, 128, words*sizeof(uint32_t)>>>(device, device_bits, device_serve, ids, rows, used, stride, experts, device_pooled, nullptr, 0, nullptr);
+    l2_publish_kernel<<<1, 128, words*sizeof(uint32_t)>>>(device, device_bits, device_serve, ids, rows, used, stride, experts, device_pooled, nullptr, nullptr, 0, nullptr);
     CUDA_CHECK(hipDeviceSynchronize());
     CHECK(host->published == 5 && host->need == 1 && host->ready == 0);
     CHECK((bits[routed/32] & (1u << (routed%32))) != 0);
     CUDA_CHECK(hipHostFree(pooled));
 
+    // the prefill lend's restore: a served expert restored into its VRAM slot is read there, the same as a pooled one
+    uint32_t * restored = nullptr, * device_restored = nullptr;
+    CHECK(coherent_alloc((void **) &restored, (void **) &device_restored, words*sizeof(uint32_t)));
+    memset(restored, 0, words*sizeof(uint32_t));
+    restored[routed/32] |= 1u << (routed%32);
+    l2_publish_kernel<<<1, 128, words*sizeof(uint32_t)>>>(device, device_bits, device_serve, ids, rows, used, stride, experts, nullptr, device_restored, nullptr, 0, nullptr);
+    CUDA_CHECK(hipDeviceSynchronize());
+    CHECK(host->published == 6 && host->need == 0 && host->ready == host->generation);
+    CHECK((bits[routed/32] & (1u << (routed%32))) == 0);
+    CHECK((bits[input[1]/32] & (1u << (input[1]%32))) != 0);
+    restored[routed/32] = 0;
+    l2_publish_kernel<<<1, 128, words*sizeof(uint32_t)>>>(device, device_bits, device_serve, ids, rows, used, stride, experts, nullptr, device_restored, nullptr, 0, nullptr);
+    CUDA_CHECK(hipDeviceSynchronize());
+    CHECK(host->published == 7 && host->need == 1 && host->ready == 0);
+    CHECK((bits[routed/32] & (1u << (routed%32))) != 0);
+    CUDA_CHECK(hipHostFree(restored));
+
     CUDA_CHECK(hipFree(ids));
     CUDA_CHECK(hipHostFree(serve));
     CUDA_CHECK(hipHostFree(bits));
     CUDA_CHECK(hipHostFree(host));
-    printf("PASS: a resident plan answers its own wait; one served expert still calls the worker; a pooled one does not\n");
+    printf("PASS: a resident plan answers its own wait; one served expert still calls the worker; a pooled or restored one does not\n");
     return 0;
 }
 

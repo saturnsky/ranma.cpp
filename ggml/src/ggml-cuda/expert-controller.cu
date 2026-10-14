@@ -7,6 +7,7 @@
 #include "expert-hash-stage.cuh"
 #include "expert-host.cuh"
 #include "expert-l2.cuh"
+#include "expert-lend.h"
 #include "expert-os.h"
 #include "expert-plan.h"
 #include "expert-profiler.cuh"
@@ -38,6 +39,9 @@
 #include <thread>
 #include <string>
 #include <vector>
+
+// a device buffer over memory the cache owns (ggml-cuda.cu)
+ggml_backend_buffer_t ggml_backend_cuda_buffer_wrap(int device, void * ptr, size_t size);
 
 namespace ggml_cuda_expert {
 
@@ -136,6 +140,106 @@ struct plan_state {
     // prompt processing), so the plan leaves its VRAM slices as they are when it is installed
     std::vector<uint8_t> keep;
 };
+
+// ---- the prefill lend's restore kernel (expert-lend.h) -------------------------------------------------------------
+
+// Per routed layer, on the device: where a restored expert comes from and goes to.
+struct lend_restore_desc {
+    int32_t        * slots        = nullptr;   // the layer's VRAM slot table
+    int32_t        * restore      = nullptr;   // [expert] lent slot to restore into, -1
+    uint32_t       * bits         = nullptr;   // [words] restored experts (the SSD tier's publish skips them), or null
+    char           * dst[3]       = {};        // arena base per kind
+    const char     * src[3]       = {};        // host arena base (exclusive) or the mapped tensor (inclusive)
+    const int32_t  * host_slots   = nullptr;   // exclusive: host slot of an expert, null otherwise
+    const uint64_t * addresses[3] = {};        // the address table the kernels take first (the lookup's host_addresses), or null
+    uint64_t         bytes[3]     = {};        // slot stride and copy size per kind
+    int32_t          enabled      = 0;
+};
+
+struct lend_live {
+    unsigned long long restores, bytes;
+};
+
+static constexpr int lend_restore_max    = 64;
+static constexpr int lend_restore_blocks = 64;
+
+// One decode launch of a layer: every block decides the same list (lend_restore_list), copies its share of the bytes
+// and the last block publishes the slots. Nothing reads the tables a block decides from until the last block, so all
+// blocks see the same list. The layer's matmuls run after this kernel on the same stream.
+static __global__ void lend_restore_kernel(const lend_restore_desc * descs, int layer, const int32_t * ids, int rows,
+        int used, int stride, int n_experts, unsigned int * tickets, lend_live * live) {
+    const lend_restore_desc & d = descs[layer];
+    __shared__ int32_t list[lend_restore_max];
+    __shared__ int n;
+    __shared__ int last;
+    if (threadIdx.x == 0) {
+        n = d.enabled ? lend_restore_list(ids, rows, used, stride, n_experts, d.restore, d.slots, list, lend_restore_max) : 0;
+        // an expert without a readable source (no address and no host slot) stays where it is
+        int m = 0;
+        for (int i = 0; i < n; ++i) {
+            const int e = list[i];
+            bool ok = true;
+            for (int k = 0; k < 3; ++k) {
+                const uint64_t a = d.addresses[k] != nullptr ? d.addresses[k][e] : 0;
+                if (a == 0 && d.host_slots != nullptr && d.host_slots[e] < 0) { ok = false; }
+            }
+            if (ok) { list[m++] = e; }
+        }
+        n = m;
+    }
+    __syncthreads();
+    if (n == 0) {
+        return;
+    }
+    const size_t tid = (size_t) blockIdx.x*blockDim.x + threadIdx.x;
+    const size_t nth = (size_t) gridDim.x*blockDim.x;
+    for (int i = 0; i < n; ++i) {
+        const int e    = list[i];
+        const int slot = d.restore[e];
+        for (int k = 0; k < 3; ++k) {
+            const size_t b = (size_t) d.bytes[k];
+            if (b == 0) {
+                continue;
+            }
+            const uint64_t a = d.addresses[k] != nullptr ? d.addresses[k][e] : 0;
+            const char * src = a != 0 ? (const char *) (uintptr_t) a :
+                d.host_slots != nullptr ? d.src[k] + (size_t) d.host_slots[e]*b : d.src[k] + (size_t) e*b;
+            char * dst = d.dst[k] + (size_t) slot*b;
+            const size_t n16 = (((uintptr_t) src | (uintptr_t) dst) & 15) == 0 ? b/16 : 0;
+            for (size_t u = tid; u < n16; u += nth) {
+                ((int4 *) dst)[u] = ((const int4 *) src)[u];
+            }
+            for (size_t u = n16*16 + tid; u < b; u += nth) {
+                dst[u] = src[u];
+            }
+        }
+    }
+    __threadfence();
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        last = atomicAdd(tickets + layer, 1u) == gridDim.x - 1;
+    }
+    __syncthreads();
+    if (!last || threadIdx.x != 0) {
+        return;
+    }
+    unsigned long long bytes = 0;
+    for (int i = 0; i < n; ++i) {
+        const int e = list[i];
+        d.slots[e]   = d.restore[e];
+        d.restore[e] = -1;
+        if (d.bits != nullptr) {
+            atomicOr(d.bits + e/32, 1u << (e%32));
+        }
+        bytes += d.bytes[0] + d.bytes[1] + d.bytes[2];
+    }
+    tickets[layer] = 0;
+    if (live != nullptr) {
+        live->restores += (unsigned long long) n;
+        live->bytes    += bytes;
+    }
+    __threadfence_system();
+}
 
 // Defined below the controller: the exclusive buffer type needs the controller instance.
 static ggml_backend_buffer_t exclusive_buffer_create(ggml_context * ctx, ggml_backend_buffer_type_t buft);
@@ -596,8 +700,8 @@ public:
                 report_tier_plan_locked("at model load");
             }
             log_members_locked("at model load");
-            allocate_op_scratch_locked();
             allocate_ub_pool_locked();
+            lend_setup_locked();
             return true;
         }
 
@@ -612,6 +716,7 @@ public:
         // The bank that seeds the load-time plan. Its stored profile decides the frozen capacities.
         std::vector<uint64_t> scores;
         const uint64_t * counts = seed_counts_locked(scores);
+        lend_scores_ = counts != nullptr ? scores : std::vector<uint64_t>();
 
         placement_inputs in;
         in.geo          = &geo_;
@@ -666,8 +771,8 @@ public:
             (table_bytes + (profiler_ ? profiler_->device_bytes() : 0))/1024, models_text_locked().c_str());
         log_aux_locked("at model load");
         log_members_locked("at model load");
-        allocate_op_scratch_locked();
         allocate_ub_pool_locked();
+        lend_setup_locked();
         return true;
     }
 
@@ -701,8 +806,8 @@ public:
         installed_plan_ = GGML_EXPERT_PLAN_NONE;
         banks_.clear();
         n_banks_.store(0, std::memory_order_release);
+        lend_free_locked();
         free_ub_pool_locked();
-        free_op_scratch_locked();
         // the worker must stop before the arenas it reads into go away
         tier_.reset();
         free_stage_locked();
@@ -837,7 +942,7 @@ public:
         plan.selected = std::move(next.selected);
         plan.stats    = next.stats;
         plan.keep     = std::move(keep);
-        if (tier_ && b.total_selections() != 0) {
+        if ((tier_ || cfg_.lend) && b.total_selections() != 0) {
             plan.scores = scores;
         }
         const ggml_expert_plan_id id = next_plan_id_++;
@@ -894,6 +999,10 @@ public:
             }
         }
         const plan_state & plan = kept ? patched : stored;
+        // a prefill lease: the plan goes into the kept slots, the rest of it into the restore space
+        if (lend_on_.load(std::memory_order_acquire) && lend_.state != lend_state::none) {
+            return lend_install_locked(id, plan);
+        }
         // Installing what is already in the arena costs nothing: no drain, no copies, one line. The unified
         // host policy also skips it unless the rings are reseeded from the plan's profile at every install.
         const bool tier_static = !tier_ || (tier_->unified() && tier_->unified_reseed() == 0);
@@ -918,10 +1027,37 @@ public:
     }
 
     bool install_once_locked(ggml_expert_plan_id id, const plan_state & plan) {
-        if (tier_) {
-            return install_tier_locked(id, plan, /*seed =*/ false);
+        const bool ok = tier_ ? install_tier_locked(id, plan, /*seed =*/ false) : install_plain_locked(id, plan);
+        if (ok && id != GGML_EXPERT_PLAN_NONE) {
+            lend_scores_ = plan.scores;
+            lend_set_want_locked(plan);
         }
-        return install_plain_locked(id, plan);
+        return ok;
+    }
+
+    // The experts a restore space takes back: those the installed plan keeps in L1, when it is a decode plan with a
+    // profile; none for a prompt plan or a cold one.
+    void lend_set_want_locked(const plan_state & plan) {
+        const bool decode = plan.bank >= banks_.size() || !banks_[plan.bank].prompt;
+        lend_set_want_locked(decode && !plan.scores.empty() ? &plan.selected : nullptr);
+    }
+
+    void lend_set_want_locked(const expert_slot_table * selected) {
+        lend_want_.clear();
+        if (selected == nullptr) {
+            return;
+        }
+        const size_t E = (size_t) geo_.n_experts;
+        lend_want_.assign((size_t) geo_.n_layers*E, 0);
+        for (size_t l = 0; l < selected->size() && l < (size_t) geo_.n_layers; ++l) {
+            for (int32_t e : (*selected)[l]) {
+                if (e >= 0 && (size_t) e < E) { lend_want_[l*E + (size_t) e] = 1; }
+            }
+        }
+    }
+
+    const char * bank_label_locked(ggml_expert_bank_id bank) const {
+        return bank < banks_.size() ? banks_[bank].label.c_str() : "prefill lend";
     }
 
     // An install without the SSD tier.
@@ -1036,6 +1172,9 @@ public:
             }
             if (ub_ && ub_->lent() && ub_owner_ == key) {
                 ub_reclaim_sync_locked("context freed");
+            }
+            if (lend_.state == lend_state::held && lend_.owner == key) {
+                lend_end_locked("context freed");
             }
             if (ub_last_cctx_ == key) {
                 ub_last_cctx_   = nullptr;
@@ -1205,6 +1344,15 @@ public:
         // The SSD tier needs the same ids: this is the one site that sees both the fused and the
         // unfused router, and it is ordered before the layer's MUL_MAT_ID on the same stream.
         tier_route(ctx, (int) joint, ids);
+        // The prefill lend: a decode launch copies the evicted experts it selects back into their lent slots, after the
+        // tier made their file bytes readable and before the layer's matmuls. It runs whether or not a restore is due
+        // (an empty list returns at once), so a captured graph stays valid either way.
+        if (lend_on_.load(std::memory_order_acquire) && member == 0 && ids->ne[1] <= (int64_t) lend_rows_) {
+            const ggml_cuda_kernel_launch_params lp(dim3(lend_restore_blocks), dim3(256), 0, ctx.stream());
+            ggml_cuda_kernel_launch(lend_restore_kernel, lp, (const lend_restore_desc *) lend_desc_dev_, (int) joint,
+                (const int32_t *) ids->data, (int) ids->ne[1], (int) ids->ne[0], (int) (ids->nb[1]/sizeof(int32_t)),
+                geo_.n_experts, lend_tickets_dev_, lend_live_dev_);
+        }
     }
 
     // ---- the decode pool (expert-ub-pool.cuh) ----------------------------------------------------
@@ -1214,6 +1362,15 @@ public:
     // batch, e.g. a K-shift). Lends the part above the decode graphs, and takes it back before a
     // graph that reaches into it.
     bool compute_spare(ggml_backend_t backend, void * base, size_t size, size_t extent, int32_t n_tokens) {
+        if (lend_on_.load(std::memory_order_acquire) && backend != nullptr && ggml_backend_is_cuda(backend) &&
+                n_tokens >= 1 && n_tokens <= lend_rows_) {
+            // a decode graph: the prompt's implicit lend (graph_begin) ends here, without a refill
+            ggml_backend_cuda_context * lctx = (ggml_backend_cuda_context *) backend->context;
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (lctx->device == device_ && state_ == state_t::installed && lend_.state == lend_state::held && !lend_.explicit_) {
+                lend_end_locked("a decode graph");
+            }
+        }
         if (!ub_on_.load(std::memory_order_acquire) || backend == nullptr || !ggml_backend_is_cuda(backend)) {
             return false;
         }
@@ -1286,19 +1443,9 @@ public:
             return true;
         }
         if (begin >= size || size - begin < ub_cfg_.min_bytes) {
-            begin = size;   // no part of the compute buffer; the op's scratch block may still be lent
-        }
-        // the expert-major op's scratch block: only between graphs that do not run the op (graph_begin takes it back)
-        void * const s_base  = op_scratch_;
-        const size_t s_bytes = op_scratch_ != nullptr ? op_scratch_bytes_ : 0;
-        if (begin >= size && s_bytes == 0) {
             return true;
         }
-        if (s_bytes > 0 && op_scratch_stream_ != nullptr && op_scratch_stream_ != stream) {
-            CUDA_CHECK(cudaStreamSynchronize(op_scratch_stream_));   // the last op that used the block ran elsewhere
-        }
-        const int r = ub_->lend(begin < size ? (char *) base + begin : nullptr, size - begin, stream,
-            s_bytes > 0 ? s_base : nullptr, s_bytes);
+        const int r = ub_->lend((char *) base + begin, size - begin, stream);
         if (r > 0) {
             xp_resume_locked();
             ub_owner_     = cctx;
@@ -1306,115 +1453,818 @@ public:
             ub_begin_     = begin;
             ub_lent_base_ = base;
             ++ub_lends_;
-            if (ub_->r2() > 0) {
-                ub_scratch_lent_.store(true, std::memory_order_release);
-                ++op_scratch_lends_;
-            }
-            if (ub_cfg_.log || ub_lends_ == 1 || (ub_->r2() > 0 && op_scratch_lends_ == 1)) {
+            if (ub_cfg_.log || ub_lends_ == 1) {
                 GGML_LOG_INFO("expert cache: decode pool lent %.1f MiB above %.1f MiB of a %.1f MiB compute buffer (decode "
-                              "graphs reach %.1f MiB) and %.1f MiB of the expert-major op's scratch: %d positions per layer "
-                              "(%d in the scratch), %d layers (lend %llu)\n",
-                    (size - begin)/1048576.0, begin/1048576.0, size/1048576.0, ub_hwm_/1048576.0,
-                    ub_->r2() > 0 ? s_bytes/1048576.0 : 0.0, r, ub_->r2(), ub_n_layers_, (unsigned long long) ub_lends_);
+                              "graphs reach %.1f MiB): %d positions per layer, %d layers (lend %llu)\n",
+                    (size - begin)/1048576.0, begin/1048576.0, size/1048576.0, ub_hwm_/1048576.0, r, ub_n_layers_,
+                    (unsigned long long) ub_lends_);
             }
         }
         return true;
     }
 
-    // ---- the expert-major op's scratch block (ggml_expert_config::op_scratch_bytes) ----------------------------------
+    // ---- the prefill lend (expert-lend.h, ggml_expert_config::lend) -------------------------------------------------
     //
-    // One fixed VRAM block that MOE_FFN_HAD takes its device buffers from (moe-ffn-had-layout.h). The layer mode's
-    // sizing carves it out of the L1 budget. While the graphs do not run the op (decode), compute_spare lends it to the
-    // decode pool together with the spare part of the compute buffer: its positions hold copies of host experts only,
-    // never an L1 resident, so taking it back loses only recently missed experts and copies nothing (each pooled
-    // expert's table entries return to its home). A graph with the op takes it back in graph_begin, before the graph
-    // is launched or captured:
-    //   - stream order: the decode graphs that read the pooled positions, and the step/copy kernels that fill them, run
-    //     on the lending context's stream; the reclaim kernel is queued on the stream of the graph with the op. Same
-    //     context: the reclaim and then the op's writes come after every earlier decode kernel of that stream. Another
-    //     context: its stream is synchronized first (as compute_spare does for the compute buffer).
-    //   - the inplace prefetch copies into positions on its own stream: xp_pause_locked makes the compute stream wait
-    //     for them, and the reclaim empties pending positions.
-    //   - a plan install (the prefill/decode profile swap, LLM_EXPERT_PREFILL_SWAP) reclaims the pool synchronously
-    //     while nothing computes (ub_reclaim_sync_locked) and touches neither the block nor the op.
-    //   - only a graph that contains the op takes the block back: a prompt too short for the op (RANMA_EXPERT_MAJOR_
-    //     MIN_TOKENS) keeps the decode pool's positions in it. With -np 2, every graph that runs a wide prompt batch of
-    //     one slot takes it back and the next decode-only graph lends it again, empty (the same cycle as the compute
-    //     buffer's part of the pool).
-    // The op uses the block only on the stream that last took it (else it falls back to the pool).
-    void allocate_op_scratch_locked() {
-        if (op_scratch_ != nullptr || cfg_.op_scratch_bytes == 0) {
+    // A prompt borrows its buffers from L1 (nothing from host memory). The lease (lend_book):
+    //   none/restore -> held (lend_take_locked): the lowest ranked L1 residents leave (an install that retires the top
+    //     slots of each class, after the kept residents above them moved down), and the pieces point into the retired
+    //     slots;
+    //   held -> restore (lend_end_locked): the explicit release, or the first decode graph after an implicit lend
+    //     (graph_begin). Every lent slot is given an evicted expert (highest rank first), and a decode launch that
+    //     reads such an expert copies it into its slot first (lend_restore_kernel);
+    //   restore -> held: the restored copies leave the tables (they return to the mirror); more residents leave only
+    //     when the pieces need more slots. A plan install under a lease installs the plan inside the kept slots, and
+    //     the rest of the plan becomes the restore set (lend_install_locked).
+
+    void lend_setup_locked() {
+        lend_on_.store(false, std::memory_order_release);
+        if (!cfg_.lend) {
+            return;
+        }
+        const char * why = nullptr;
+        if (joint_ || members_.size() > 1) {
+            why = "a joint cache";
+        } else if (!l1_ || !l1_->allocated()) {
+            why = "no L1 arena";
+        } else if (l1_->owns_host_storage() && !tier_ && (!host_ || !host_->chunked())) {
+            why = "the exclusive host arena is not chunked";
+        }
+        if (why != nullptr) {
+            GGML_LOG_WARN("expert cache: prefill lend off: %s; the prompt buffers use the pool\n", why);
             return;
         }
         ggml_cuda_set_device(device_);
-        if (cudaMalloc(&op_scratch_, cfg_.op_scratch_bytes) != cudaSuccess) {
-            (void) cudaGetLastError();
-            op_scratch_ = nullptr;
-            GGML_LOG_WARN("expert cache: the expert-major op's scratch block (%.1f MiB) was not allocated; the op uses the "
-                          "pool\n", cfg_.op_scratch_bytes/1048576.0);
-            return;
+        const size_t L = (size_t) geo_.n_layers, E = (size_t) geo_.n_experts, W = (E + 31)/32;
+        CUDA_CHECK(cudaMalloc((void **) &lend_restore_dev_, L*E*sizeof(int32_t)));
+        CUDA_CHECK(cudaMemset(lend_restore_dev_, 0xff, L*E*sizeof(int32_t)));
+        CUDA_CHECK(cudaMalloc((void **) &lend_bits_dev_, L*W*sizeof(uint32_t)));
+        CUDA_CHECK(cudaMemset(lend_bits_dev_, 0, L*W*sizeof(uint32_t)));
+        CUDA_CHECK(cudaMalloc((void **) &lend_desc_dev_, L*sizeof(lend_restore_desc)));
+        CUDA_CHECK(cudaMemset(lend_desc_dev_, 0, L*sizeof(lend_restore_desc)));
+        CUDA_CHECK(cudaMalloc((void **) &lend_tickets_dev_, L*sizeof(unsigned int)));
+        CUDA_CHECK(cudaMemset(lend_tickets_dev_, 0, L*sizeof(unsigned int)));
+        CUDA_CHECK(cudaHostAlloc((void **) &lend_live_host_, sizeof(lend_live), cudaHostAllocMapped));
+        memset(lend_live_host_, 0, sizeof(lend_live));
+        CUDA_CHECK(cudaHostGetDevicePointer((void **) &lend_live_dev_, lend_live_host_, 0));
+        CUDA_CHECK(cudaStreamCreateWithFlags(&lend_stream_, cudaStreamNonBlocking));
+        CUDA_CHECK(cudaDeviceSynchronize());
+        if (tier_) {
+            tier_->set_restored_bits(lend_bits_dev_);
         }
-        op_scratch_bytes_ = cfg_.op_scratch_bytes;
-        GGML_LOG_INFO("expert cache: expert-major op scratch block %.1f MiB, lent to the decode pool between prompt "
-                      "graphs\n", op_scratch_bytes_/1048576.0);
+        lend_rows_ = (int) std::max<uint64_t>(1, cfg_.l2_decode_rows);
+        lend_ = lend_book();
+        lend_.slots = l1_->slot_counts();
+        lend_.limit = lend_.slots;
+        lend_guard_.assign(geo_.class_bytes.size()*geometry::n_kinds, 0);
+        for (size_t c = 0; c < geo_.class_bytes.size(); ++c) {
+            for (int k = 0; k < geometry::n_kinds; ++k) {
+                lend_guard_[c*geometry::n_kinds + (size_t) k] = GGML_PAD(arena_tail_bytes(geo_, (int) c, k), 256);
+            }
+        }
+        lend_upload_descs_locked();
+        GGML_LOG_INFO("expert cache: prefill lend on: prompt buffers from the lowest ranked L1 experts (%s slots per class), "
+                      "none from host memory; the decode copies an evicted expert back when it reads it (launches of up to %d "
+                      "rows)\n", split_text(lend_.slots).c_str(), lend_rows_);
+        lend_on_.store(true, std::memory_order_release);
     }
 
-    void free_op_scratch_locked() {
-        if (op_scratch_ != nullptr) {
-            ggml_cuda_set_device(device_ >= 0 ? device_ : 0);
+    void lend_free_locked() {
+        lend_on_.store(false, std::memory_order_release);
+        if (device_ >= 0) {
+            ggml_cuda_set_device(device_);
             CUDA_CHECK(cudaDeviceSynchronize());
-            (void) cudaFree(op_scratch_);
         }
-        op_scratch_ = nullptr;
-        op_scratch_bytes_ = 0;
-        op_scratch_stream_ = nullptr;
-        ub_scratch_lent_.store(false, std::memory_order_release);
+        for (lend_held_piece & pc : lend_pieces_) {
+            if (pc.buf != nullptr) {
+                ggml_backend_buffer_free(pc.buf);
+            }
+        }
+        lend_pieces_.clear();
+        if (lend_restore_dev_)  { (void) cudaFree(lend_restore_dev_); }
+        if (lend_bits_dev_)     { (void) cudaFree(lend_bits_dev_); }
+        if (lend_desc_dev_)     { (void) cudaFree(lend_desc_dev_); }
+        if (lend_tickets_dev_)  { (void) cudaFree(lend_tickets_dev_); }
+        if (lend_live_host_)    { (void) cudaFreeHost(lend_live_host_); }
+        if (lend_stream_)       { (void) cudaStreamDestroy(lend_stream_); }
+        lend_restore_dev_ = nullptr;
+        lend_bits_dev_ = nullptr;
+        lend_desc_dev_ = nullptr;
+        lend_tickets_dev_ = nullptr;
+        lend_live_host_ = nullptr;
+        lend_live_dev_ = nullptr;
+        lend_stream_ = nullptr;
+        lend_holder_stream_ = nullptr;
+        lend_ = lend_book();
+        lend_scores_.clear();
+        lend_want_.clear();
+        lend_counts_ = {};
+        lend_live_mark_ = 0;
     }
 
-    // Before a graph on `cctx` that contains n_op MOE_FFN_HAD nodes (ggml-cuda.cu, before launch or capture).
-    void graph_begin(ggml_backend_cuda_context * cctx, int n_op) {
-        if (n_op == 0 || op_scratch_ == nullptr || cctx->device != device_) {
+    // The per-layer source and destination of the restore kernel (the tier's address tables exist once it started).
+    void lend_upload_descs_locked() {
+        std::vector<lend_restore_desc> d((size_t) geo_.n_layers);
+        const size_t W = ((size_t) geo_.n_experts + 31)/32;
+        const bool owned = l1_->owns_host_storage();
+        for (int l = 0; l < geo_.n_layers; ++l) {
+            const int c = geo_.layer_class[l];
+            if (c < 0) {
+                continue;
+            }
+            lend_restore_desc & x = d[(size_t) l];
+            for (int k = 0; k < geometry::n_kinds; ++k) {
+                const ggml_cuda_expert_lookup lk = l1_->lookup(l, k);
+                if (k == 0) {
+                    x.slots      = const_cast<int32_t *>(lk.slots);
+                    x.host_slots = lk.host_slots;
+                }
+                x.dst[k] = (char *) const_cast<void *>(lk.data);
+                // inclusive: the mapped tensor is the home; exclusive: the host arena, or only the address table
+                x.src[k] = lk.host_data != nullptr ? (const char *) lk.host_data :
+                    !owned && geo_.tensors[l][k] != nullptr ? (const char *) geo_.tensors[l][k]->data : nullptr;
+                x.addresses[k] = lk.host_addresses;
+                x.bytes[k] = geo_.class_bytes[(size_t) c][(size_t) k];
+            }
+            x.restore = lend_restore_dev_ + (size_t) l*(size_t) geo_.n_experts;
+            x.bits    = tier_ ? lend_bits_dev_ + (size_t) l*W : nullptr;
+            x.enabled = x.slots != nullptr && x.dst[0] != nullptr ? 1 : 0;
+        }
+        CUDA_CHECK(cudaMemcpyAsync(lend_desc_dev_, d.data(), d.size()*sizeof(lend_restore_desc), cudaMemcpyHostToDevice, lend_stream_));
+        CUDA_CHECK(cudaStreamSynchronize(lend_stream_));
+    }
+
+    // The restore table of lend_.restore and the restored bitmap of `kept` (experts already back at their slot).
+    void lend_upload_restore_locked(const std::vector<lend_restore> & kept) {
+        const size_t L = (size_t) geo_.n_layers, E = (size_t) geo_.n_experts, W = (E + 31)/32;
+        std::vector<int32_t> t(L*E, -1);
+        for (const lend_restore & r : lend_.restore) {
+            t[(size_t) r.layer*E + (size_t) r.expert] = r.slot;
+        }
+        std::vector<uint32_t> bits(L*W, 0);
+        for (const lend_restore & r : kept) {
+            bits[(size_t) r.layer*W + (size_t) r.expert/32] |= 1u << (r.expert%32);
+        }
+        CUDA_CHECK(cudaMemcpyAsync(lend_restore_dev_, t.data(), t.size()*sizeof(int32_t), cudaMemcpyHostToDevice, lend_stream_));
+        CUDA_CHECK(cudaMemcpyAsync(lend_bits_dev_, bits.data(), bits.size()*sizeof(uint32_t), cudaMemcpyHostToDevice, lend_stream_));
+        CUDA_CHECK(cudaStreamSynchronize(lend_stream_));
+        lend_upload_descs_locked();
+    }
+
+    std::vector<int> lend_held_locked() const {
+        std::vector<int> held(lend_.slots.size(), 0);
+        for (size_t c = 0; c < held.size(); ++c) {
+            held[c] = lend_.slots[c] - lend_.limit[c];
+        }
+        return held;
+    }
+
+    std::vector<lend_class> lend_classes_locked() const {
+        const size_t nc = geo_.class_bytes.size();
+        std::vector<lend_class> out(nc);
+        for (size_t c = 0; c < nc; ++c) {
+            for (int k = 0; k < geometry::n_kinds; ++k) {
+                out[c].kind_bytes.push_back(geo_.class_bytes[c][(size_t) k]);
+                out[c].guard.push_back(lend_guard_[c*geometry::n_kinds + (size_t) k]);
+            }
+            out[c].slots = lend_.slots[c];
+        }
+        const auto & gpu = l1_->host_slots();
+        const size_t E = (size_t) geo_.n_experts;
+        for (int l = 0; l < geo_.n_layers; ++l) {
+            const int c = geo_.layer_class[l];
+            if (c < 0) {
+                continue;
+            }
+            for (int e = 0; e < geo_.experts(l); ++e) {
+                const int32_t g = gpu[(size_t) l][(size_t) e];
+                if (g < 0) {
+                    continue;
+                }
+                lend_resident r;
+                r.layer  = l;
+                r.expert = e;
+                r.slot   = g;
+                r.score  = lend_scores_.empty() ? 0 : lend_scores_[(size_t) l*E + (size_t) e];
+                out[(size_t) c].residents.push_back(r);
+            }
+        }
+        return out;
+    }
+
+    bool lend_host_layout_locked() const {
+        return !tier_ || tier_->class_layout();
+    }
+
+    // The L1 plan of `req`: the fewest lowest ranked residents whose slots hold every piece, over the slots held already.
+    lend_l1_plan lend_plan_locked(const std::vector<ggml_expert_lend_piece> & req) {
+        std::vector<size_t> bytes;
+        for (const auto & pc : req) {
+            bytes.push_back(pc.bytes);
+        }
+        const std::vector<int> held = lend_held_locked();
+        return plan_l1_lend(lend_classes_locked(), bytes, 256, &held);
+    }
+
+    // Whether `req` could be lent now (nothing moves).
+    bool lend_fits_locked(const std::vector<ggml_expert_lend_piece> & req) {
+        return lend_plan_locked(req).ok;
+    }
+
+    // An install of the kept L1 residents with the top `plan.evict` slots of each class retired (a shrink install,
+    // expert-redraw.h's evacuation): the kept residents above the new slot counts move down first; the evicted
+    // experts go to their host home (exclusive without a finite tier: the host arena grows by them), the ring or the file.
+    bool lend_evict_locked(const lend_l1_plan & plan) {
+        const size_t nc = capacities_.size();
+        const std::vector<int> full = capacities_;
+        std::vector<int> caps(nc);
+        const std::vector<int> held = lend_held_locked();
+        for (size_t c = 0; c < nc; ++c) {
+            caps[c] = full[c] - plan.evict[c];
+            if (caps[c] < 0) {
+                return false;
+            }
+        }
+        const size_t L = (size_t) geo_.n_layers, E = (size_t) geo_.n_experts;
+        std::vector<std::vector<uint8_t>> gone(L, std::vector<uint8_t>(E, 0));
+        std::vector<int> per_class(nc, 0);
+        for (const lend_resident & v : plan.victims) {
+            gone[(size_t) v.layer][(size_t) v.expert] = 1;
+            per_class[(size_t) geo_.layer_class[(size_t) v.layer]]++;
+        }
+        const auto & gpu = l1_->host_slots();
+        expert_slot_table keep(L);
+        for (size_t l = 0; l < L; ++l) {
+            for (size_t e = 0; e < E; ++e) {
+                if (gpu[l][e] >= 0 && !gone[l][e]) {
+                    keep[l].push_back((int32_t) e);
+                }
+            }
+        }
+        const std::vector<int> slots_now = l1_->slot_counts();
+        std::vector<std::vector<uint8_t>> other(nc);
+        for (size_t c = 0; c < nc; ++c) {
+            other[c].assign((size_t) std::max(slots_now[c], 0), 0);
+        }
+        const auto & spares = l1_->gpu_spares();
+        for (size_t c = 0; c < spares.size() && c < nc; ++c) {
+            for (int sl : spares[c]) {
+                if (sl >= 0 && sl < slots_now[c]) { other[c][(size_t) sl] = 1; }
+            }
+        }
+        const evac_plan ev = plan_evacuation(geo_.layer_class, geo_.n_experts, gpu, keep, other, slots_now, plan.limit);
+        if (!ev.valid) {
+            GGML_LOG_WARN("expert cache: prefill lend: %s\n", ev.reason.c_str());
+            return false;
+        }
+        double evac_ms = 0.0;
+        if (!l1_->evacuate(ev.ops, evac_ms)) {
+            abort_locked("prefill lend: the evacuation copies failed");
+        }
+        if (l1_->owns_host_storage() && !tier_) {
+            std::vector<int> host_up = host_->capacities();
+            for (size_t c = 0; c < nc; ++c) {
+                host_up[c] += per_class[c];
+            }
+            l1_arena::host_resize_stats hs;
+            std::string why;
+            if (!l1_->resize_host(host_up, hs, why)) {
+                abort_locked(("prefill lend: host arena growth: " + why).c_str());
+            }
+        }
+        set_capacities_locked(caps);
+        l1_->set_retire(plan.limit);
+        unequal_ = cfg_.mode == GGML_EXPERT_MODE_EXCLUSIVE;
+        l1_->set_unequal(unequal_);
+        plan_state step;
+        step.selected = keep;
+        step.scores   = lend_scores_;
+        bool ok = false;
+        if (tier_) {
+            ok = install_tier_locked(GGML_EXPERT_PLAN_NONE, step, /*seed =*/ false);
+        } else {
+            l1_install_stats st;
+            ok = l1_->install(keep, /*retain =*/ true, st);
+            if (ok && l1_->owns_host_storage()) {
+                std::string reason;
+                if (!l1_->verify_current_assignment(reason)) {
+                    GGML_ABORT("expert cache: exclusive assignment is inconsistent after the prefill lend: %s", reason.c_str());
+                }
+            }
+            lend_last_d2h_ = st.d2h_bytes;
+        }
+        l1_->set_retire({});
+        unequal_ = false;
+        l1_->set_unequal(false);
+        set_capacities_locked(full);
+        if (!ok) {
+            disable_locked("prefill lend: the install that evicts the lowest ranked experts failed");
+            return false;
+        }
+        lend_last_moves_ = ev.ops.size();
+        lend_last_d2h_   = install_last_d2h_;
+        GGML_UNUSED(held);
+        return true;
+    }
+
+    // One line per lend after its summary: where each piece went (role, MiB, class.kind), what each lent region holds
+    // (used / capacity MiB past its zero guard of `g` bytes), and the residents it evicted per class (count, MiB). The
+    // difference of the evicted and the lent bytes is the capacity of the regions the pieces leave unused.
+    void lend_log_packing_locked(uint64_t n, const std::vector<ggml_expert_lend_piece> & req, const lend_l1_plan & plan,
+                                 const std::vector<lend_resident> & victims) const {
+        static const char * role_name[] = { "buf", "scratch0", "scratch1", "scratch2", "stage0", "T", "stage1" };
+        std::vector<size_t> bytes;
+        for (const auto & pc : req) { bytes.push_back(pc.bytes); }
+        std::string pieces;
+        for (size_t i = 0; i < req.size() && i < plan.fits.size(); ++i) {
+            if (req[i].bytes == 0) { continue; }
+            const int role = req[i].role;
+            const lend_region & r = plan.regions[(size_t) plan.fits[i].region];
+            char t[96];
+            snprintf(t, sizeof(t), "%s%s %.1f@%d.%d", pieces.empty() ? "" : ", ",
+                role >= 0 && role < (int) (sizeof(role_name)/sizeof(role_name[0])) ? role_name[role] : "?", req[i].bytes/1048576.0,
+                r.cls, r.kind);
+            pieces += t;
+        }
+        const std::vector<size_t> used = lend_region_used(plan.regions, plan.fits, bytes);
+        std::string regions;
+        for (size_t i = 0; i < plan.regions.size(); ++i) {
+            const lend_region & r = plan.regions[i];
+            char t[96];
+            snprintf(t, sizeof(t), "%s%d.%d %.1f/%.1f g%zu", regions.empty() ? "" : ", ", r.cls, r.kind, used[i]/1048576.0,
+                r.bytes/1048576.0, lend_guard_[(size_t) r.cls*3 + (size_t) r.kind]);
+            regions += t;
+        }
+        std::vector<size_t> n_cls(lend_.slots.size(), 0), b_cls(lend_.slots.size(), 0);
+        for (const lend_resident & v : victims) {
+            const int c = v.layer >= 0 && v.layer < geo_.n_layers ? geo_.layer_class[(size_t) v.layer] : -1;
+            if (c < 0 || (size_t) c >= n_cls.size()) { continue; }
+            n_cls[(size_t) c]++;
+            b_cls[(size_t) c] += geo_.class_total_bytes(c);
+        }
+        std::string ev;
+        for (size_t c = 0; c < n_cls.size(); ++c) {
+            if (n_cls[c] == 0) { continue; }
+            char t[64];
+            snprintf(t, sizeof(t), "%s%zu: %zu x %.1f", ev.empty() ? "" : ", ", c, n_cls[c], b_cls[c]/1048576.0);
+            ev += t;
+        }
+        GGML_LOG_INFO("expert cache: prefill lend %llu packing: pieces (role MiB@class.kind) %s; regions (class.kind used/capacity "
+                      "MiB, zero guard bytes) %s; evicted per class (n x MiB) %s, %d of the last tie given back (a class not "
+                      "needed)\n", (unsigned long long) n, pieces.c_str(), regions.c_str(), ev.empty() ? "none" : ev.c_str(),
+            plan.untied);
+    }
+
+    bool lend_take_locked(ggml_backend_cuda_context * cctx, const std::vector<ggml_expert_lend_piece> & req, bool expl,
+                          ggml_expert_lend_grant * out) {
+        if (!lend_on_.load(std::memory_order_acquire) || state_ != state_t::installed || req.empty() ||
+                req.size() > GGML_EXPERT_LEND_MAX_PIECES) {
+            return false;
+        }
+        if (lend_.state == lend_state::held) {
+            if (lend_.owner == cctx && lend_same_locked(req)) {
+                lend_.explicit_ = lend_.explicit_ || expl;
+                lend_grant_locked(out);
+                return true;
+            }
+            if (lend_.explicit_ && lend_.owner != cctx) {
+                return false;   // another context's prompt holds it
+            }
+            lend_end_locked("a new lend");
+        }
+        const auto t0 = std::chrono::steady_clock::now();
+        ggml_cuda_set_device(device_);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        ub_reclaim_sync_locked("prefill lend");
+        for (std::vector<int32_t> & owners : stage_owner_) { stage_forget(owners); }
+        const bool was_restore = lend_.state == lend_state::restore;
+        if (was_restore) {
+            lend_drop_restore_locked("a new lend");
+        }
+        const std::vector<int> held = lend_held_locked();
+        lend_l1_plan plan = lend_plan_locked(req);
+        if (!plan.ok) {
+            return false;
+        }
+        bool more = false;
+        for (size_t c = 0; c < held.size(); ++c) {
+            more = more || plan.evict[c] > held[c];
+        }
+        lend_last_d2h_ = 0;
+        lend_last_moves_ = 0;
+        if (more && !lend_evict_locked(plan)) {
+            return false;
+        }
+        // the pieces
+        lend_pieces_.clear();
+        size_t di = 0, dev_bytes = 0, n_dev = 0;
+        for (size_t i = 0; i < req.size(); ++i) {
+            const auto & pc = req[i];
+            lend_held_piece h;
+            h.req = pc;
+            if (pc.bytes == 0) {
+                lend_pieces_.push_back(h);
+                di++;
+                continue;
+            }
+            const lend_fit f = plan.fits[di++];
+            const lend_region & r = plan.regions[(size_t) f.region];
+            h.ptr = l1_->gpu_slice_address(r.cls, r.kind, 0) + r.begin + f.offset;
+            h.buf = ggml_backend_cuda_buffer_wrap(device_, h.ptr, pc.bytes);
+            dev_bytes += pc.bytes;
+            n_dev++;
+            if (h.buf == nullptr) {
+                lend_pieces_.push_back(h);
+                GGML_LOG_WARN("expert cache: prefill lend: a piece of %.1f MiB has no buffer\n", pc.bytes/1048576.0);
+                lend_.hold(plan.limit, plan.victims, cctx, expl);
+                lend_holder_stream_ = cctx->stream();
+                lend_end_locked("a piece failed");
+                return false;
+            }
+            lend_pieces_.push_back(h);
+        }
+        // the head of the first lent slot stays zero: MMQ reads past the last row of the slot below it
+        for (size_t c = 0; c < plan.limit.size(); ++c) {
+            if (plan.limit[c] < lend_.slots[c]) {
+                size_t g[3];
+                for (int k = 0; k < 3; ++k) { g[k] = lend_guard_[c*3 + (size_t) k]; }
+                l1_->zero_heads((int) c, plan.limit[c], 1, g);
+            }
+        }
+        const size_t new_victims = plan.victims.size();
+        uint64_t lo = 0, hi_score = 0;
+        if (new_victims > 0) {
+            lo = plan.victims.front().score;
+            hi_score = plan.victims.back().score;
+        }
+        lend_.hold(plan.limit, plan.victims, cctx, expl);
+        lend_holder_stream_ = cctx->stream();
+        lend_counts_.acquires += more ? 1 : 0;
+        lend_counts_.retakes  += more ? 0 : 1;
+        lend_counts_.evicted  += new_victims;
+        size_t ev_bytes = 0;
+        for (const lend_resident & v : plan.victims) {
+            ev_bytes += geo_.class_total_bytes(geo_.layer_class[(size_t) v.layer]);
+        }
+        lend_counts_.evicted_bytes += ev_bytes;
+        lend_grant_locked(out);
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        int held_slots = 0;
+        for (int h : lend_held_locked()) { held_slots += h; }
+        size_t residents = 0;
+        for (const auto & row : l1_->host_slots()) { for (int32_t g : row) { residents += g >= 0 ? 1 : 0; } }
+        // the bytes to host are the install's own copies out of VRAM (its d2h), the moves its relocations in VRAM
+        GGML_LOG_INFO("expert cache: prefill lend %llu (%s): %.1f MiB VRAM in %zu pieces from %d lent L1 slots (%s per class kept), "
+                      "%zu experts evicted now (%.1f MiB, the lowest ranked: scores %llu..%llu, %zu kept residents, %zu moved down, "
+                      "%.1f MiB copied to host), nothing from host memory in %.1f ms\n",
+            (unsigned long long) (lend_counts_.acquires + lend_counts_.retakes), expl ? "layer-major" : "ubatch op",
+            dev_bytes/1048576.0, n_dev, held_slots, split_text(plan.limit).c_str(), new_victims, ev_bytes/1048576.0,
+            (unsigned long long) lo, (unsigned long long) hi_score, residents, lend_last_moves_, lend_last_d2h_/1048576.0, ms);
+        lend_log_packing_locked(lend_counts_.acquires + lend_counts_.retakes, req, plan, plan.victims);
+        return true;
+    }
+
+    bool lend_same_locked(const std::vector<ggml_expert_lend_piece> & req) const {
+        if (req.size() != lend_pieces_.size()) {
+            return false;
+        }
+        for (size_t i = 0; i < req.size(); ++i) {
+            const auto & h = lend_pieces_[i].req;
+            if (h.role != req[i].role || h.bytes < req[i].bytes) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    void lend_grant_locked(ggml_expert_lend_grant * out) const {
+        if (out == nullptr) {
             return;
+        }
+        memset(out, 0, sizeof(*out));
+        for (size_t i = 0; i < lend_pieces_.size(); ++i) {
+            out->buffers[i] = lend_pieces_[i].buf;
+        }
+    }
+
+    // The holder's graphs that used the pieces are done: the lent L1 slots become the restore space of the evicted experts.
+    void lend_end_locked(const char * why) {
+        if (lend_.state != lend_state::held) {
+            return;
+        }
+        ggml_cuda_set_device(device_);
+        if (lend_holder_stream_ != nullptr) {
+            CUDA_CHECK(cudaStreamSynchronize(lend_holder_stream_));
+        }
+        for (lend_held_piece & pc : lend_pieces_) {
+            if (pc.buf != nullptr) {
+                ggml_backend_buffer_free(pc.buf);
+            }
+        }
+        lend_pieces_.clear();
+        lend_.open_restore(geo_.layer_class, &lend_want_, geo_.n_experts);
+        int held_slots = 0;
+        for (size_t c = 0; c < lend_.slots.size(); ++c) {
+            if (!lend_.lent((int) c)) {
+                continue;
+            }
+            size_t g[3];
+            for (int k = 0; k < 3; ++k) { g[k] = lend_guard_[c*3 + (size_t) k]; }
+            l1_->zero_heads((int) c, lend_.limit[c], lend_.slots[c] - lend_.limit[c], g);
+            held_slots += lend_.slots[c] - lend_.limit[c];
+        }
+        std::vector<l1_arena::slot_entry> ent;
+        for (const lend_restore & r : lend_.restore) {
+            ent.push_back({r.layer, r.expert, r.slot});
+        }
+        if (!l1_->stage_aux(ent)) {
+            abort_locked("prefill lend: the aux rows of the restore slots");
+        }
+        lend_upload_restore_locked({});
+        lend_holder_stream_ = nullptr;
+        lend_counts_.releases++;
+        size_t wanted = 0;
+        for (const lend_resident & v : lend_.victims) {
+            wanted += lend_wanted(lend_want_, geo_.n_experts, v.layer, v.expert) ? 1 : 0;
+        }
+        GGML_LOG_INFO("expert cache: prefill lend ends (%s): %zu evicted experts, %zu of them in the installed decode plan%s; "
+                      "%zu may come back into %d lent L1 slots as the decode reads them (no refill), the others are read "
+                      "where the L2 has them\n", why, lend_.victims.size(), wanted, lend_want_.empty() ? " (none: no decode plan)" : "",
+            lend_.restore.size(), held_slots);
+    }
+
+    // A restore space taken back (the device is idle): the restored copies leave the tables.
+    void lend_drop_restore_locked(const char * why) {
+        if (lend_.state != lend_state::restore) {
+            return;
+        }
+        if (!l1_->publish_overlay({})) {
+            abort_locked("prefill lend: the tables of the restore space");
+        }
+        lend_.restore.clear();
+        lend_upload_restore_locked({});
+        lend_log_restores_locked(why);
+    }
+
+    void lend_log_restores_locked(const char * why) {
+        if (lend_live_host_ == nullptr) {
+            return;
+        }
+        const volatile lend_live * live = lend_live_host_;
+        const unsigned long long n = live->restores, b = live->bytes;
+        lend_counts_.restores      = n;
+        lend_counts_.restore_bytes = b;
+        if (n != lend_live_mark_) {
+            GGML_LOG_INFO("expert cache: prefill lend: the decode restored %llu experts (%llu in all, %.1f MiB) before %s\n",
+                n - lend_live_mark_, n, b/1048576.0, why);
+        }
+        lend_live_mark_ = n;
+    }
+
+    // A plan install under a lease: the plan inside the kept slots; the rest of it is the restore set, and the experts the
+    // decode restored already stay where the plan still wants them.
+    bool lend_install_locked(ggml_expert_plan_id id, const plan_state & plan) {
+        if (lend_.state == lend_state::held) {
+            if (lend_.explicit_) {
+                GGML_LOG_WARN("expert cache: plan %u not installed: a prompt holds the prefill lend\n", id);
+                return false;
+            }
+            lend_end_locked("a plan install");
+        }
+        ggml_cuda_set_device(device_);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        ub_reclaim_sync_locked("install");
+        for (std::vector<int32_t> & owners : stage_owner_) { stage_forget(owners); }
+        lend_log_restores_locked("a plan install");
+        std::vector<std::vector<int32_t>> dev;
+        if (!l1_->read_device_tables(dev)) {
+            abort_locked("prefill lend: the device tables");
+        }
+        const auto mirror = l1_->host_slots();
+        std::vector<lend_restore> restored;
+        for (int l = 0; l < geo_.n_layers; ++l) {
+            const int c = geo_.layer_class[l];
+            if (c < 0) {
+                continue;
+            }
+            for (int e = 0; e < geo_.experts(l); ++e) {
+                const int32_t g = dev[(size_t) l][(size_t) e];
+                if (g >= lend_.limit[(size_t) c] && g < lend_.slots[(size_t) c] && mirror[(size_t) l][(size_t) e] < 0) {
+                    restored.push_back({l, e, c, g});
+                }
+            }
+        }
+        const size_t nc = capacities_.size();
+        const std::vector<int> full = capacities_;
+        std::vector<int> caps(nc);
+        for (size_t c = 0; c < nc; ++c) {
+            caps[c] = full[c] - (lend_.slots[c] - lend_.limit[c]);
+        }
+        placement_inputs in;
+        in.geo              = &geo_;
+        in.counts           = plan.scores.empty() ? nullptr : plan.scores.data();
+        in.budget_bytes     = SIZE_MAX;
+        in.exclusive        = l1_->owns_host_storage();
+        in.fixed_capacities = &caps;
+        plan_state step = plan;
+        step.selected = plan_placement(in).selected;
+        set_capacities_locked(caps);
+        l1_->set_retire(lend_.limit);
+        unequal_ = cfg_.mode == GGML_EXPERT_MODE_EXCLUSIVE;
+        l1_->set_unequal(unequal_);
+        const bool ok = install_once_locked(id, step);
+        l1_->set_retire({});
+        unequal_ = false;
+        l1_->set_unequal(false);
+        set_capacities_locked(full);
+        if (!ok) {
+            return false;
+        }
+        lend_scores_ = plan.scores;
+        lend_set_want_locked(plan);
+        // the restore set: what the plan holds beyond the kept slots
+        const size_t E = (size_t) geo_.n_experts;
+        std::vector<lend_resident> victims;
+        for (int l = 0; l < geo_.n_layers; ++l) {
+            const auto & want = plan.selected[(size_t) l];
+            const auto & got  = step.selected[(size_t) l];
+            for (int32_t e : want) {
+                if (std::find(got.begin(), got.end(), e) != got.end()) {
+                    continue;
+                }
+                lend_resident r;
+                r.layer  = l;
+                r.expert = e;
+                r.score  = lend_scores_.empty() ? 0 : lend_scores_[(size_t) l*E + (size_t) e];
+                victims.push_back(r);
+            }
+        }
+        lend_rank_order(victims);
+        std::vector<lend_restore> kept;
+        for (const lend_restore & r : restored) {
+            if (!lend_wanted(lend_want_, geo_.n_experts, r.layer, r.expert)) {
+                continue;
+            }
+            for (const lend_resident & v : victims) {
+                if (v.layer == r.layer && v.expert == r.expert) {
+                    kept.push_back(r);
+                    break;
+                }
+            }
+        }
+        lend_.victims = victims;
+        lend_.restore = plan_restore(victims, geo_.layer_class, lend_.limit, lend_.slots, &kept, &lend_want_, geo_.n_experts);
+        std::vector<l1_arena::slot_entry> ent, keep_ent;
+        for (const lend_restore & r : lend_.restore) {
+            ent.push_back({r.layer, r.expert, r.slot});
+        }
+        for (const lend_restore & r : kept) {
+            keep_ent.push_back({r.layer, r.expert, r.slot});
+        }
+        if (!l1_->stage_aux(ent) || !l1_->publish_overlay(keep_ent)) {
+            abort_locked("prefill lend: the restore space after an install");
+        }
+        lend_upload_restore_locked(kept);
+        GGML_LOG_INFO("expert cache: prefill lend: plan %u installed in the %s kept slots per class; %zu experts of it wait in the "
+                      "restore space (%zu restored copies kept)\n", id, split_text(lend_.limit).c_str(), lend_.restore.size(), kept.size());
+        return true;
+    }
+
+    // ---- the iface entries and the op's hooks ----
+
+    void graph_begin(ggml_backend_cuda_context * cctx, int n_op, int64_t n_tok) {
+        if (n_op == 0 || !lend_on_.load(std::memory_order_acquire) || cctx->device != device_ || n_tok <= lend_rows_) {
+            return;
+        }
+        if (cfg_.lend_scratch[0] + cfg_.lend_scratch[1] + cfg_.lend_scratch[2] == 0) {
+            return;
+        }
+        // the blocks of this call's width, not of the configured ubatch: a short prompt borrows (and evicts) only what its op
+        // reads. A held lend of this holder stays when its pieces cover the width, else it is taken again at the larger one.
+        size_t need[3] = { cfg_.lend_scratch[0], cfg_.lend_scratch[1], cfg_.lend_scratch[2] };
+        if (cfg_.lend_scratch_of != nullptr) {
+            size_t w[3] = { 0, 0, 0 };
+            cfg_.lend_scratch_of(cfg_.lend_scratch_user, n_tok, w);
+            for (int i = 0; i < 3; ++i) { need[i] = std::min(need[i], w[i]); }
         }
         std::lock_guard<std::mutex> lock(mutex_);
-        if (op_scratch_ == nullptr) {
+        if (lend_.state == lend_state::held && lend_.explicit_) {
             return;
         }
-        cudaStream_t stream = cctx->stream();
-        if (ub_ && ub_->lent() && ub_->r2() > 0) {
-            if ((const void *) cctx != ub_owner_) {
-                CUDA_CHECK(cudaStreamSynchronize(ub_stream_));
+        if (lend_.state == lend_state::held && lend_.owner == cctx) {
+            bool covered = lend_pieces_.size() == 3;
+            for (const lend_held_piece & pc : lend_pieces_) {
+                const int i = pc.req.role - GGML_EXPERT_LEND_SCRATCH0;
+                if (i < 0 || i >= 3) { covered = false; continue; }
+                covered = covered && pc.req.bytes >= need[i];
+                need[i] = std::max(need[i], pc.req.bytes);
             }
-            long invalidated = -1;
-            if (ub_cfg_.log) {
-                CUDA_CHECK(cudaStreamSynchronize(ub_stream_));
-                invalidated = ub_->owned_in_second();
-                op_scratch_invalidated_ += (uint64_t) std::max(0L, invalidated);
+            if (covered) {
+                return;
             }
-            xp_pause_locked(stream);
-            ub_reclaim_locked(stream, "the expert-major op takes its scratch");
-            ++op_scratch_reclaims_;
-            if (ub_cfg_.log) {
-                GGML_LOG_INFO("expert cache: expert-major op scratch taken back from the decode pool (%d op nodes): %ld pooled "
-                              "experts in it dropped; lends %llu, takebacks %llu, dropped %llu in all\n", n_op, invalidated,
-                    (unsigned long long) op_scratch_lends_, (unsigned long long) op_scratch_reclaims_,
-                    (unsigned long long) op_scratch_invalidated_);
-            }
+            // wider than the held pieces: the lend is taken again at the larger blocks (the held ones end first)
         }
-        if (op_scratch_stream_ != nullptr && op_scratch_stream_ != stream) {
-            CUDA_CHECK(cudaStreamSynchronize(op_scratch_stream_));   // the block's last user ran on another stream
+        std::vector<ggml_expert_lend_piece> req;
+        for (int i = 0; i < 3; ++i) {
+            ggml_expert_lend_piece pc = {};
+            pc.bytes = need[i];
+            pc.role  = GGML_EXPERT_LEND_SCRATCH0 + i;
+            req.push_back(pc);
         }
-        op_scratch_stream_ = stream;
+        if (!lend_take_locked(cctx, req, false, nullptr) && !lend_scratch_warned_) {
+            lend_scratch_warned_ = true;
+            GGML_LOG_WARN("expert cache: prefill lend: the expert-major op's scratch (%.1f MiB) does not fit in L1; the op uses "
+                          "the pool\n", (need[0] + need[1] + need[2])/1048576.0);
+        }
     }
 
-    // The block for an op of `bytes` on `cctx`, or null (then the op uses the pool).
-    void * op_scratch(ggml_backend_cuda_context * cctx, size_t bytes) {
-        if (op_scratch_ == nullptr || bytes > op_scratch_bytes_ || cctx->device != device_ ||
-                ub_scratch_lent_.load(std::memory_order_acquire)) {
+    bool lend_is_on() const {
+        return lend_on_.load(std::memory_order_acquire);
+    }
+
+    // The lent piece of `role` for an op on `cctx` that needs `bytes`, or null (the op then uses the pool).
+    void * lent(ggml_backend_cuda_context * cctx, int role, size_t bytes) {
+        if (!lend_on_.load(std::memory_order_acquire) || cctx->device != device_) {
             return nullptr;
         }
         std::lock_guard<std::mutex> lock(mutex_);
-        return op_scratch_stream_ == cctx->stream() ? op_scratch_ : nullptr;
+        if (lend_.state != lend_state::held || lend_.owner != (const void *) cctx) {
+            return nullptr;
+        }
+        for (const lend_held_piece & pc : lend_pieces_) {
+            if (pc.req.role == role && pc.req.bytes >= bytes && pc.ptr != nullptr) {
+                return pc.ptr;
+            }
+        }
+        return nullptr;
+    }
+
+    static bool lend_request_of(const ggml_expert_lend_request * r, std::vector<ggml_expert_lend_piece> & out) {
+        out.clear();
+        if (r == nullptr || r->n_pieces <= 0 || r->n_pieces > GGML_EXPERT_LEND_MAX_PIECES) {
+            return false;
+        }
+        out.assign(r->pieces, r->pieces + r->n_pieces);
+        return true;
+    }
+
+    bool iface_lend_fits(ggml_backend_t backend, const ggml_expert_lend_request * request) {
+        std::vector<ggml_expert_lend_piece> req;
+        if (!lend_on_.load(std::memory_order_acquire) || backend == nullptr || !ggml_backend_is_cuda(backend) ||
+                !lend_request_of(request, req)) {
+            return false;
+        }
+        std::lock_guard<std::mutex> lock(mutex_);
+        return state_ == state_t::installed && lend_fits_locked(req);
+    }
+
+    bool iface_lend_acquire(ggml_backend_t backend, const ggml_expert_lend_request * request, ggml_expert_lend_grant * out) {
+        std::vector<ggml_expert_lend_piece> req;
+        if (!lend_on_.load(std::memory_order_acquire) || backend == nullptr || !ggml_backend_is_cuda(backend) ||
+                !lend_request_of(request, req)) {
+            return false;
+        }
+        ggml_backend_cuda_context * cctx = (ggml_backend_cuda_context *) backend->context;
+        if (cctx->device != device_) {
+            return false;
+        }
+        std::lock_guard<std::mutex> lock(mutex_);
+        return lend_take_locked(cctx, req, true, out);
+    }
+
+    bool iface_lend_release(ggml_backend_t backend) {
+        if (!lend_on_.load(std::memory_order_acquire) || backend == nullptr || !ggml_backend_is_cuda(backend)) {
+            return false;
+        }
+        ggml_backend_cuda_context * cctx = (ggml_backend_cuda_context *) backend->context;
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (lend_.state != lend_state::held || lend_.owner != (const void *) cctx) {
+            return false;
+        }
+        lend_end_locked("released");
+        return true;
+    }
+
+    bool iface_lend_counts(ggml_expert_lend_counts * out) {
+        if (out == nullptr) {
+            return false;
+        }
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (lend_live_host_ != nullptr) {
+            const volatile lend_live * live = lend_live_host_;
+            lend_counts_.restores      = live->restores;
+            lend_counts_.restore_bytes = live->bytes;
+        }
+        lend_counts_.held_slots = 0;
+        for (int h : lend_held_locked()) { lend_counts_.held_slots += h; }
+        lend_counts_.state = (int32_t) lend_.state;
+        lend_counts_.lendable_bytes = 0;
+        if (lend_on_.load(std::memory_order_acquire) && state_ == state_t::installed) {
+            size_t total = 0, largest = 0;
+            lend_l1_capacity(lend_classes_locked(), lend_held_locked(), total, largest);
+            lend_counts_.lendable_bytes = total;
+        }
+        *out = lend_counts_;
+        return lend_on_.load(std::memory_order_acquire);
     }
 
     // Ring admission: a step copies from a ring slot that only the stream order protects
@@ -1484,7 +2334,6 @@ public:
 
     void ub_reclaim_locked(cudaStream_t stream, const char * why) {
         ub_->reclaim(stream);
-        ub_scratch_lent_.store(false, std::memory_order_release);
         ++ub_reclaims_;
         if (ub_cfg_.log) {
             CUDA_CHECK(cudaStreamSynchronize(stream));
@@ -1511,7 +2360,6 @@ public:
         }
         ub_->reclaim(ub_stream_);
         CUDA_CHECK(cudaStreamSynchronize(ub_stream_));
-        ub_scratch_lent_.store(false, std::memory_order_release);
         ++ub_reclaims_;
         if (ub_cfg_.log) {
             ub_log_counters_locked(why);
@@ -1528,11 +2376,10 @@ public:
         if (ub_->ring_enabled()) {
             snprintf(ring_text, sizeof(ring_text), " ring_fills=%llu", (unsigned long long) c[ub_pool_ring_fills]);
         }
-        GGML_LOG_INFO("expert cache: decode pool counters (%s): lends=%llu (scratch %llu, taken back by the op %llu) reclaims=%llu "
+        GGML_LOG_INFO("expert cache: decode pool counters (%s): lends=%llu reclaims=%llu "
                       "steps=%llu hits=%llu fills=%llu "
                       "(%.1f MiB) over=%llu evictions=%llu rejected=%llu prefetch_fills=%llu prefetch_arrived=%llu%s\n", why,
-            (unsigned long long) ub_lends_, (unsigned long long) op_scratch_lends_, (unsigned long long) op_scratch_reclaims_,
-            (unsigned long long) ub_reclaims_, (unsigned long long) c[ub_pool_steps], (unsigned long long) c[ub_pool_hits],
+            (unsigned long long) ub_lends_, (unsigned long long) ub_reclaims_, (unsigned long long) c[ub_pool_steps], (unsigned long long) c[ub_pool_hits],
             (unsigned long long) c[ub_pool_fills], c[ub_pool_fill_bytes]/1048576.0, (unsigned long long) c[ub_pool_over],
             (unsigned long long) c[ub_pool_evictions], (unsigned long long) c[ub_pool_rejected],
             (unsigned long long) c[ub_pool_pf_fills], (unsigned long long) c[ub_pool_pf_arrived], ring_text);
@@ -3321,7 +4168,8 @@ private:
         tier_->stop_worker();
         bool has_prefill = false;
         for (const bank_state & bank : banks_) { has_prefill |= bank.prompt && bank.latest_plan != GGML_EXPERT_PLAN_NONE; }
-        const bool prompt = plan_uses_prompt_ring(cfg_.l2_phase_rings, !banks_[plan.bank].prompt, has_prefill, seed);
+        const bool decode_bank = plan.bank < banks_.size() && !banks_[plan.bank].prompt;
+        const bool prompt = plan_uses_prompt_ring(cfg_.l2_phase_rings, decode_bank, has_prefill, seed);
         const int ring_before = tier_->ring_count();
         const auto layout = tier_layout_locked(prompt);
         auto cut = host_capacities_base_;
@@ -3365,6 +4213,7 @@ private:
             {cfg_.mode == GGML_EXPERT_MODE_INCLUSIVE, cfg_.spare_slots}, true, /*retain =*/ true,
             /*unequal =*/ unequal_ && cfg_.mode == GGML_EXPERT_MODE_EXCLUSIVE);
         if (!tx.valid) { abort_locked(("install transaction: " + tx.reason).c_str()); }
+        install_last_d2h_ = tx.d2h_bytes;
         std::string reason;
         // Class layout: the moves run as relabels of the storage slots (the rings keep their
         // contents); the separate ring of direct tier users goes through the mover.
@@ -3426,7 +4275,7 @@ private:
         }
         GGML_LOG_INFO("expert cache: installed plan %u of bank '%s': mode=%s-l2 ring=%s%s retained=%zu/%zu "
                       "h2d=%zu slices / %zu MiB d2h=%zu slices / %zu MiB ssd=%zu slices / %zu MiB%s in %.1f ms\n",
-            id, banks_[plan.bank].label.c_str(), cfg_.mode == GGML_EXPERT_MODE_INCLUSIVE ? "inclusive" : "exclusive",
+            id, bank_label_locked(plan.bank), cfg_.mode == GGML_EXPERT_MODE_INCLUSIVE ? "inclusive" : "exclusive",
             prompt ? "prompt" : "decode", repartition ? " (changed)" : "", tx.retained_gpu, tx.retained_host,
             tx.h2d_slices, tx.h2d_bytes/(1024*1024), tx.d2h_slices, tx.d2h_bytes/(1024*1024),
             tx.ssd_slices, tx.ssd_bytes/(1024*1024), relabel_text.c_str(), ms);
@@ -3438,12 +4287,15 @@ private:
                           "\"relabel\":%d,\"read_slices\":%zu,\"read_bytes\":%zu,\"relabel_slices\":%zu,\"relabel_bytes\":%zu,"
                           "\"ring_copy_slices\":%zu,\"ring_copy_bytes\":%zu,\"ring_occupants_before\":%zu,\"ring_kept\":%zu,"
                           "\"ring_occupants_after\":%zu,\"demoted_to_ring\":%zu,\"read_batches\":%d}\n",
-                banks_[plan.bank].label.c_str(), id, ms, tx.h2d_bytes, tx.d2h_bytes, tx.ssd_bytes, ring_before, tier_->ring_count(),
+                bank_label_locked(plan.bank), id, ms, tx.h2d_bytes, tx.d2h_bytes, tx.ssd_bytes, ring_before, tier_->ring_count(),
                 relabel ? 1 : 0, moved.read_slices, moved.read_bytes, moved.relabel_slices, moved.relabel_bytes,
                 moved.ring_copy_slices, moved.ring_copy_bytes, moved.ring_before, moved.ring_kept, moved.ring_after,
                 moved.demoted, moved.batches);
         }
-        finish_plan_locked(id); verify_all_locked();
+        if (id != GGML_EXPERT_PLAN_NONE) {
+            finish_plan_locked(id);
+        }
+        verify_all_locked();
         if (joint_) { log_members_locked("after install"); }
         return true;
     }
@@ -4097,6 +4949,8 @@ private:
 
         std::vector<uint64_t> scores;
         const uint64_t * counts = seed_counts_locked(scores);
+        lend_scores_ = counts != nullptr ? scores : std::vector<uint64_t>();
+        lend_want_.clear();
         if (counts != nullptr) {
             tier_scores_ = scores;
         }
@@ -4131,15 +4985,22 @@ private:
         if (cfg_.l2_bytes != 0 && !size_tier_locked(initial.selected, host_capacities)) {
             return false;
         }
+        // the seed plan is the installed plan until the first install (a cold cache has none)
+        lend_set_want_locked(counts != nullptr ? &initial.selected : nullptr);
 
         // Plan time, before the first expert byte is copied: a host requirement larger than the
         // installed memory can never be met, so it is a configuration error, not a slow run.
         size_t host_required = cfg_.l2_bytes;
+        // exclusive mode without a finite tier: the prefill lend grows the host arenas (expert-host-layout.h)
+        const bool host_chunks = !tier_ && cfg_.lend;
         if (host_required == 0) {
             for (size_t cls = 0; cls < host_capacities.size(); ++cls) {
                 for (int kind = 0; kind < geometry::n_kinds; ++kind) {
-                    host_required += size_t(host_capacities[cls] + cfg_.spare_slots)*geo_.class_bytes[cls][kind] +
-                        arena_tail_bytes(geo_, (int) cls, kind);
+                    const int slots = host_capacities[cls] + cfg_.spare_slots;
+                    host_required += host_chunks ?
+                        host_chunked_bytes(geo_.class_bytes[cls][kind], arena_tail_bytes(geo_, (int) cls, kind), slots,
+                            host_chunk_slots(geo_, (int) cls, host_chunk_mib << 20)) :
+                        size_t(slots)*geo_.class_bytes[cls][kind] + arena_tail_bytes(geo_, (int) cls, kind);
                 }
             }
         }
@@ -4159,6 +5020,11 @@ private:
         }
         allocate_stage_locked();
         host_.reset(new host_arena(geo_));
+        if (!tier_ && cfg_.lend) {
+            // the prefill lend grows the host capacity by the experts it evicts: an address table and chunked arenas
+            host_->enable_addresses();
+            host_->enable_chunks(host_chunk_mib << 20);
+        }
         if (!host_->allocate(host_capacities, cfg_.spare_slots, device_,
                 tier_ && tier_->class_layout() ? &tier_->storage() : nullptr)) {
             host_.reset();
@@ -4166,6 +5032,14 @@ private:
             profiler_.reset();
             disable_locked("host arena allocation failed");
             return false;
+        }
+        if (host_->addresses_enabled()) {
+            size_t table = size_t(geo_.n_routed_layers())*geometry::n_kinds*size_t(geo_.n_experts)*sizeof(uint64_t);
+            std::string per;
+            for (size_t c = 0; c < host_capacities.size(); ++c) { per += (c ? "," : "") + std::to_string(host_->chunk_slots((int) c)); }
+            GGML_LOG_INFO("expert cache: host address table on (%zu KiB of routed-layer entries); host arenas in %zu chunks "
+                          "of about %zu MiB (slots per chunk %s), %.1f MiB of chunk slack\n", table/1024, host_->chunk_count(),
+                host_chunk_mib, per.c_str(), double(host_->slack_bytes())/double(1 << 20));
         }
         l1_->attach_host(host_.get(), cfg_.spare_slots, cfg_.mode == GGML_EXPERT_MODE_INCLUSIVE);
         if (tier_) {
@@ -4674,12 +5548,32 @@ private:
     uint64_t ub_lends_ = 0, ub_reclaims_ = 0, ub_calls_ = 0;
     size_t   ub_max_size_ = 0;              // the largest compute buffer (view) seen
     std::map<const void *, size_t> ub_hwm_of_;   // decode high-water mark per compute buffer base
-    // the expert-major op's scratch block
-    void * op_scratch_ = nullptr;
-    size_t op_scratch_bytes_ = 0;
-    cudaStream_t op_scratch_stream_ = nullptr;     // the stream of the last graph that took it (under mutex_)
-    std::atomic<bool> ub_scratch_lent_{ false };   // the decode pool holds positions in it
-    uint64_t op_scratch_lends_ = 0, op_scratch_reclaims_ = 0, op_scratch_invalidated_ = 0;
+    // the prefill lend (expert-lend.h)
+    std::atomic<bool> lend_on_{ false };           // read by compute_spare, graph_begin and profile_ids without the mutex
+    int lend_rows_ = 1;                            // decode launches of at most this many rows end an implicit lend
+    lend_book lend_;
+    std::vector<uint64_t> lend_scores_;            // the installed plan's scores, empty = cold
+    std::vector<uint8_t>  lend_want_;              // [layer*experts + expert] the installed decode plan's L1 experts, empty = none
+    struct lend_held_piece {
+        ggml_expert_lend_piece req{};
+        void * ptr = nullptr;
+        ggml_backend_buffer_t buf = nullptr;
+    };
+    std::vector<lend_held_piece> lend_pieces_;
+    cudaStream_t lend_holder_stream_ = nullptr;
+    cudaStream_t lend_stream_ = nullptr;           // the lend's own copies (tables, heads)
+    std::vector<size_t> lend_guard_;               // [class*3 + kind] zero bytes at the start of a lent slot
+    size_t lend_last_d2h_ = 0, lend_last_moves_ = 0;   // the last eviction install's VRAM -> host bytes and its moves
+    size_t install_last_d2h_ = 0;                  // the VRAM -> host bytes of the last tier install (its d2h)
+    int32_t * lend_restore_dev_ = nullptr;         // [layer][expert]
+    uint32_t * lend_bits_dev_ = nullptr;           // [layer][words]
+    lend_restore_desc * lend_desc_dev_ = nullptr;  // [layer]
+    unsigned int * lend_tickets_dev_ = nullptr;    // [layer]
+    lend_live * lend_live_host_ = nullptr;         // mapped
+    lend_live * lend_live_dev_ = nullptr;
+    unsigned long long lend_live_mark_ = 0;        // restores at the last log line
+    ggml_expert_lend_counts lend_counts_{};
+    bool lend_scratch_warned_ = false;
     // the expert prefetch (RANMA_EXPERT_PREFETCH)
     xp_config xp_cfg_;
     std::atomic<bool> xp_on_{ false };      // read by xp_publish without the mutex
@@ -4910,12 +5804,16 @@ void ggml_cuda_expert_prefetch_publish(ggml_backend_cuda_context & ctx, const gg
     instance().xp_publish(ctx, order);
 }
 
-void ggml_cuda_expert_graph_begin(ggml_backend_cuda_context & ctx, int n_op) {
-    instance().graph_begin(&ctx, n_op);
+void ggml_cuda_expert_graph_begin(ggml_backend_cuda_context & ctx, int n_op, int64_t n_tok) {
+    instance().graph_begin(&ctx, n_op, n_tok);
 }
 
-void * ggml_cuda_expert_op_scratch(ggml_backend_cuda_context & ctx, size_t bytes) {
-    return instance().op_scratch(&ctx, bytes);
+void * ggml_cuda_expert_lent(ggml_backend_cuda_context & ctx, int role, size_t bytes) {
+    return instance().lent(&ctx, role, bytes);
+}
+
+bool ggml_cuda_expert_lend_on() {
+    return instance().lend_is_on();
 }
 
 void ggml_cuda_expert_layer_done(ggml_backend_cuda_context & ctx, const ggml_tensor * src0) {
@@ -4992,6 +5890,14 @@ static uint32_t iface_prefetch_layers(int32_t n_rows, uint64_t * mask, int32_t n
     return instance().prefetch_layers(n_rows, mask, n_words);
 }
 static bool iface_pool_counts(ggml_expert_pool_counts * out) { return instance().pool_counts(out); }
+static bool iface_lend_fits(ggml_backend_t backend, const ggml_expert_lend_request * request) {
+    return instance().iface_lend_fits(backend, request);
+}
+static bool iface_lend_acquire(ggml_backend_t backend, const ggml_expert_lend_request * request, ggml_expert_lend_grant * out) {
+    return instance().iface_lend_acquire(backend, request, out);
+}
+static bool iface_lend_release(ggml_backend_t backend) { return instance().iface_lend_release(backend); }
+static bool iface_lend_counts(ggml_expert_lend_counts * out) { return instance().iface_lend_counts(out); }
 
 static const ggml_expert_iface g_expert_iface = {
     /* .abi_version      = */ GGML_EXPERT_ABI_VERSION,
@@ -5016,6 +5922,10 @@ static const ggml_expert_iface g_expert_iface = {
     /* .compact_rows     = */ iface_compact_rows,
     /* .pool_counts      = */ iface_pool_counts,
     /* .prefetch_layers  = */ iface_prefetch_layers,
+    /* .lend_fits        = */ iface_lend_fits,
+    /* .lend_acquire     = */ iface_lend_acquire,
+    /* .lend_release     = */ iface_lend_release,
+    /* .lend_counts      = */ iface_lend_counts,
 };
 
 const ggml_expert_iface * ggml_backend_cuda_expert_iface(void) {

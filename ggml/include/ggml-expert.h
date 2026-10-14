@@ -23,7 +23,7 @@
 extern "C" {
 #endif
 
-#define GGML_EXPERT_ABI_VERSION      12
+#define GGML_EXPERT_ABI_VERSION      13
 #define GGML_EXPERT_IFACE_PROC_NAME  "ggml_backend_expert_iface"
 
 #define GGML_EXPERT_BANK_NONE        0xFFFFFFFFu
@@ -99,10 +99,72 @@ struct ggml_expert_config {
     const int32_t * early_route_layers; // [n_early_route_layers] the model's own layer indices
     uint32_t n_early_route_layers;
 
-    // Bytes of a fixed VRAM block the expert-major MoE op (MOE_FFN_HAD) takes its device buffers from instead of the
-    // pool; 0 = none. Between wide prompt graphs the decode pool (RANMA_EXPERT_UB_POOL) lends it as positions, and a
-    // graph with the op takes it back first (no copy: the pooled experts' entries return to their homes).
-    size_t   op_scratch_bytes;
+    // The prefill lend (ggml_expert_lend_*). `lend` turns it on: the prompt buffers come out of L1, and the
+    // decode restores the evicted experts as it reads them. lend_scratch: the three device blocks of the expert-major
+    // op (MOE_FFN_HAD) of one prompt ubatch (moe-ffn-had-layout.h), which a graph with the op borrows before it runs;
+    // 0 = the op of the ubatch-major prompt borrows nothing.
+    bool     lend;
+    size_t   lend_scratch[3];
+
+    // ABI 13: the three blocks of lend_scratch for a prompt call of n_tokens (called without a lock; never larger than
+    // lend_scratch is used). A graph borrows only these, not the blocks of the configured ubatch. NULL = lend_scratch always.
+    void   (*lend_scratch_of)(void * user, int64_t n_tokens, size_t out[3]);
+    void *   lend_scratch_user;
+};
+
+// ---- the prefill lend -------------------------------------------------------------------------------------------
+//
+// slots of a finite L2 (an unlimited L2 allocates host memory, which is its budget). A lend that does not fit is
+// refused; the caller then narrows its width. The release does not refill: a decode launch that reads an evicted
+// A prompt borrows its VRAM buffers from the L1 budget: the pieces evict the lowest ranked L1 experts (by the installed
+// plan's profile) and take the top slots of each size class. Nothing is lent from host memory: a lend that does not fit
+// L1 is refused and the caller narrows its width (more passes). The evicted experts go where an install sends them (the
+// L2, which holds only experts). The release does not refill: a decode launch that reads an evicted expert copies it
+// back into a lent slot first (lazy restore).
+
+#define GGML_EXPERT_LEND_MAX_PIECES 48
+
+// What a piece is for: a device piece of a role other than BUFFER is also handed to the expert-major op of the
+// holder's graphs (in place of its pool or block allocations).
+enum ggml_expert_lend_role {
+    GGML_EXPERT_LEND_BUFFER   = 0,
+    GGML_EXPERT_LEND_SCRATCH0 = 1, // the op's three scratch blocks (moe-ffn-had-layout.h)
+    GGML_EXPERT_LEND_SCRATCH1 = 2,
+    GGML_EXPERT_LEND_SCRATCH2 = 3,
+    GGML_EXPERT_LEND_STAGE    = 4, // the first of the two staging buffers of the PCIe-once op
+    GGML_EXPERT_LEND_T        = 5, // the down rows (T) of the exact PCIe-once op
+    GGML_EXPERT_LEND_STAGE1   = 6, // the second staging buffer (a piece of its own: two smaller pieces pack better)
+};
+
+struct ggml_expert_lend_piece {
+    size_t  bytes;
+    int32_t role;  // ggml_expert_lend_role
+};
+
+struct ggml_expert_lend_request {
+    int32_t n_pieces;
+    struct ggml_expert_lend_piece pieces[GGML_EXPERT_LEND_MAX_PIECES];
+};
+
+// buffers[i] wraps the VRAM of piece i (a device buffer of the backend); the lend owns them: they stay valid until
+// lend_release. Null for a piece of 0 bytes.
+struct ggml_expert_lend_grant {
+    ggml_backend_buffer_t buffers[GGML_EXPERT_LEND_MAX_PIECES];
+};
+
+// Cumulative since the cache was configured.
+struct ggml_expert_lend_counts {
+    uint64_t acquires;      // lends of new slots
+    uint64_t retakes;       // lends of a restore space that held enough slots (no eviction)
+    uint64_t releases;
+    uint64_t evicted;       // L1 experts the lends evicted
+    uint64_t evicted_bytes;
+    uint64_t l2_bytes;      // host bytes the lends gave (finite L2 slots or unlimited L2 memory)
+    uint64_t restores;      // experts the decode copied back into their lent slot
+    uint64_t restore_bytes;
+    int32_t  held_slots;    // L1 slots of the current lease or restore space
+    int32_t  state;         // 0 none, 1 held, 2 restore
+    uint64_t lendable_bytes; // VRAM the whole L1 could lend now (every resident evicted), in its contiguous ranges
 };
 
 // The experts one layer of the next graph will select, known before the graph is built. `ids`
@@ -211,6 +273,15 @@ struct ggml_expert_iface {
     // predict (bit l of mask[l/64]), for the first model of the cache. Returns a version that changes whenever a
     // mask changes (a graph built with another version must be rebuilt), 0 when nothing is predicted.
     uint32_t (*prefetch_layers)(int32_t n_rows, uint64_t * mask, int32_t n_words);
+
+    // The prefill lend (above). lend_fits: whether `request` could be lent now (pure: nothing moves). lend_acquire:
+    // with no compute in flight on `backend`; evicts what the pieces need and fills `out`. lend_release: the holder's
+    // graphs that used the pieces were synchronized; the slots become the restore space. All false when the lend is
+    // off. A lend taken here is ended only by lend_release (or the cache's release).
+    bool (*lend_fits)(ggml_backend_t backend, const struct ggml_expert_lend_request * request);
+    bool (*lend_acquire)(ggml_backend_t backend, const struct ggml_expert_lend_request * request, struct ggml_expert_lend_grant * out);
+    bool (*lend_release)(ggml_backend_t backend);
+    bool (*lend_counts)(struct ggml_expert_lend_counts * out);
 };
 
 typedef const struct ggml_expert_iface * (*ggml_backend_expert_iface_t)(void);

@@ -154,15 +154,20 @@ ggml_expert_config expert_config_from_params(const common_params & params) {
     cfg.abi_version = GGML_EXPERT_ABI_VERSION;
 
     cfg.l1_bytes = (size_t) params.expert_l1_mib * 1024 * 1024;
-    // the layer mode's staging and scratch buffers are part of the L1 budget (common/layer-mode.cpp)
-    if (params.layer_mode_l1_carve_mib > 0 && params.layer_mode_l1_carve_mib < params.expert_l1_mib) {
-        cfg.l1_bytes -= (size_t) params.layer_mode_l1_carve_mib * 1024 * 1024;
-        COM_INF("expert cache: %d MiB of the L1 budget go to the layer mode's buffers, %zu MiB to expert slices\n",
-            params.layer_mode_l1_carve_mib, cfg.l1_bytes/(1024*1024));
-    }
     cfg.mode     = params.expert_cache_mode == "exclusive" ? GGML_EXPERT_MODE_EXCLUSIVE : GGML_EXPERT_MODE_INCLUSIVE;
-    // the scratch block of the expert-major op, which the decode pool borrows between prompt graphs
-    cfg.op_scratch_bytes = (size_t) std::max(0, params.layer_mode_scratch_mib) * 1024 * 1024;
+    // the layer mode's prompt buffers are lent from L1 and L2 while a prompt runs (ggml_expert_lend_*)
+    cfg.lend = params.layer_mode_lend;
+    for (int i = 0; i < 3; ++i) {
+        cfg.lend_scratch[i] = params.layer_mode_lend_scratch[i];
+    }
+    if (params.layer_mode_lend_scratch_of) {
+        // lives as long as the process (the backend keeps the pointer)
+        auto * fn = new std::function<void(int64_t, size_t[3])>(params.layer_mode_lend_scratch_of);
+        cfg.lend_scratch_user = fn;
+        cfg.lend_scratch_of = [](void * user, int64_t n, size_t out[3]) {
+            (*static_cast<std::function<void(int64_t, size_t[3])> *>(user))(n, out);
+        };
+    }
 
     const size_t mib = 1024*1024;
     const int32_t prefill_mib = params.expert_l2_prefill_ring_mib >= 0 ?

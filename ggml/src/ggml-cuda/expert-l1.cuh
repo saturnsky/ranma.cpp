@@ -241,6 +241,15 @@ public:
     // tables can differ from the host mirror: the VRAM staging of early-route layers points at its own slots.
     bool read_device_tables(std::vector<std::vector<int32_t>> & out) const;
 
+    // The prefill lend (expert-lend.h), while nothing computes. publish_overlay: the device tables are the mirror plus
+    // `extra` (layer, expert, slot) entries the mirror does not hold (restored copies); the mirror stays. stage_aux: the
+    // aux rows of the (layer, expert, slot) entries arrive at their slots before any table names them. zero_heads: the
+    // first `bytes[kind]` bytes of slots [first, first + count) of a class are zeroed (MMQ reads past the slot below).
+    struct slot_entry { int layer, expert, slot; };
+    bool publish_overlay(const std::vector<slot_entry> & extra);
+    bool stage_aux(const std::vector<slot_entry> & entries);
+    bool zero_heads(int cls, int first, int count, const size_t bytes[3]);
+
 private:
     // Arena parts of a class: the weight kinds, then the aux rows (kind-major, rot_in then rot_out).
     static constexpr int n_parts = geometry::n_kinds*(1 + geometry::n_aux);

@@ -300,6 +300,7 @@ public:
     // ranma: the graph counts of llama_get_graph_counts (llama-ext.h)
     void graph_counts(struct llama_graph_counts & out) const;
 
+    bool layer_exec_lend_bytes(int64_t n_tokens, size_t l1_bytes, uint64_t out[2]);
 private:
     llm_graph_result * get_gf_res_prev();
 
@@ -502,6 +503,7 @@ private:
     // computed every ubatch of mctx and wrote their logits, 1 when it did not start (the ubatch loop runs), < 0 when it
     // failed after the memory changed (the batch is removed from the memory)
     int layer_exec_decode(llama_memory_context_i * mctx, uint32_t n_tokens_all, uint32_t n_outputs_all);
+        uint64_t bytes[2] = { 0, 0 }; // VRAM lent, host inputs (not lent)
 
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;
