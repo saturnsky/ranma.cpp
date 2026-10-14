@@ -620,12 +620,28 @@ llama_context::llama_context(
             sampling.token_ids_full_vocab[i] = i;
         }
     }
+
+    // ranma expert sidecar (RANMA_EXPERT_SIDECAR): nothing happens unless it is set
+    if (llama_sidecar_enabled()) {
+        bool gpu_compute = false;
+        for (auto & backend : backends) {
+            const auto type = ggml_backend_dev_type(ggml_backend_get_device(backend.get()));
+            gpu_compute |= type == GGML_BACKEND_DEVICE_TYPE_GPU || type == GGML_BACKEND_DEVICE_TYPE_IGPU;
+        }
+        sidecar = llama_sidecar_ctx_init(this, expert_backend, gpu_compute, &cparams.cb_eval, &cparams.cb_eval_user_data);
+        if (sidecar && sched && cparams.cb_eval) {
+            ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+        }
+    }
 }
 
 llama_context::~llama_context() {
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
     llama_prefetch_decode_wait();
+
+    // the sidecar reads its last calls through the backends, so before they go
+    sidecar.reset();
 
     if (account_ctx != 0) {
         ggml_account_flush(0);
@@ -1022,6 +1038,10 @@ void llama_context::synchronize() {
 
     n_queued_tokens = 0;
     t_compute_start_us = 0;
+
+    if (sidecar) {
+        llama_sidecar_collect(sidecar.get());
+    }
 }
 
 const llama_model & llama_context::get_model() const {
@@ -2234,6 +2254,9 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         LLAMA_LOG_ERROR("%s: n_tokens == 0\n", __func__);
         return -1;
     }
+
+    // ranma expert sidecar: one record per call, read after a later synchronization
+    llama_sidecar_scope sidecar_scope(sidecar.get(), batch_inp, sched.get());
 
     if (batch_inp.n_embd > 0 && batch_inp.n_embd != batch_inp.n_embd_inp) {
         LLAMA_LOG_ERROR("%s: embd row width %zu does not match the decoder input %zu\n",
