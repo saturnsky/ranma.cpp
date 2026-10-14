@@ -498,6 +498,11 @@ private:
     // drop every stored graph (they are rebuilt on their next use)
     void graph_reuse_invalidate();
 
+    // ranma: layer-major prefill of a batch of several ubatches (llama-layer-exec.cpp): 0 when it
+    // computed every ubatch of mctx and wrote their logits, 1 when it did not start (the ubatch loop runs), < 0 when it
+    // failed after the memory changed (the batch is removed from the memory)
+    int layer_exec_decode(llama_memory_context_i * mctx, uint32_t n_tokens_all, uint32_t n_outputs_all);
+
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;
 

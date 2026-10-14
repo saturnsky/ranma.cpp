@@ -38,14 +38,16 @@ struct llama_graph_counts {
 LLAMA_API bool llama_get_graph_counts(const struct llama_context * ctx, struct llama_graph_counts * out);
 
 // ranma: what the layer mode (common/layer-mode.cpp) decides for the graphs of the process: the chunk of query rows of
-// the attention (0 = one chunk) and the expert-major MoE op of a prompt batch (its pass rows, 0 = the backend's default,
-// and the smallest batch that takes it). Process-wide and read at every graph build, so a measurement context sees the
-// value set before it; the defaults are those of a process without the layer mode.
+// the attention (0 = one chunk), the expert-major MoE op of a prompt batch (its pass rows, 0 = the backend's default,
+// and the smallest batch that takes it) and the layer-major prefill with the widths of its passes and MoE bundles (0 =
+// automatic). Process-wide and read at every graph build or batch, so a measurement context sees the value set before
+// it; the defaults are those of a process without the layer mode.
 struct llama_layer_mode_config {
     int64_t attn_chunk              = 0;
     bool    expert_major            = false;
     int64_t expert_major_rows       = 0;
     int64_t expert_major_min_tokens = 64;
+    bool    layer_exec              = false;
 };
 
 LLAMA_API llama_layer_mode_config llama_layer_mode_get_config();

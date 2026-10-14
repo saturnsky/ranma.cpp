@@ -19,6 +19,7 @@ set(LLAMA_CORE_SOURCES
     llama-grammar.cpp
     llama-graph.cpp
     llama-graph-chunk.cpp
+    llama-layer-exec.cpp
     llama-hparams.cpp
     llama-impl.cpp
     llama-io.cpp

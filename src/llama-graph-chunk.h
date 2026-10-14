@@ -109,14 +109,31 @@ struct llama_ubatch;
 // The mask is causal over positions: key r is visible to token t when tab[r, seq(t)] is finite and pos(r) <= pos(t).
 // It covers what a single stream without SWA, ALiBi or 2D positions puts into the host mask (0 or -inf), bit for bit.
 // It is on whenever the graph is chunked.
+//
+// A graph of one chunk keeps the host masks, except where the caller allows one chunk (DeepSeek V4 and V4.1, see
+// llm_graph_chunk_mask_one): the layer-major prefill (llama-layer-exec) builds every ubatch graph in a
+// llm_graph_chunk_mask_one_scope, since it holds the inputs of all its ubatches at once and the compressed masks of a
+// ubatch at position p are p/4 keys wide (about N^2/2 bytes over a prefill of N tokens, whatever the ubatch size).
+// The one chunk then reads every key, like the unchunked graph. Read at every graph build.
+// True inside a llm_graph_chunk_mask_one_scope of this thread.
+bool llm_graph_chunk_mask_one();
+
+struct llm_graph_chunk_mask_one_scope {
+    llm_graph_chunk_mask_one_scope();
+    ~llm_graph_chunk_mask_one_scope();
+    llm_graph_chunk_mask_one_scope(const llm_graph_chunk_mask_one_scope &) = delete;
+    llm_graph_chunk_mask_one_scope & operator=(const llm_graph_chunk_mask_one_scope &) = delete;
+};
+
 struct llama_cparams;
 
 // enabled, the graph of this ubatch is chunked, and its causal mask is what llama_kv_cache::set_input_kq_pos covers
 // (causal, one stream, no SWA or ALiBi, 2D positions only for tokens); fixed per ubatch shape, so usable in can_reuse
 // swa_ok: the cache applies a standard sliding window, which the mask then takes as n_swa
 // c_req: the chunk size, < 0 for llm_graph_chunk_tokens()
+// one: a graph of one chunk qualifies as well (see llm_graph_chunk_mask_one)
 bool llm_graph_chunk_mask_usable(const llama_cparams & cparams, const llama_hparams & hparams, const llama_ubatch & ubatch,
-                                 bool swa_ok = false, int64_t c_req = -1);
+                                 bool swa_ok = false, int64_t c_req = -1, bool one = false);
 
 struct llm_graph_chunk_pos {
     ggml_tensor * tok_pos = nullptr; // F32 [1, n_tokens] -(pos + 0.5)
@@ -192,8 +209,9 @@ llm_graph_chunk_kv_ops llm_graph_chunk_kv_ops_of() {
 // graph then leaves out).
 class llm_graph_input_chunk_mask : public llm_graph_input_i {
 public:
-    llm_graph_input_chunk_mask(const llama_memory_context_i * mctx, llm_graph_chunk_kv_ops ops, uint32_t n_swa, int64_t c_req) :
-        mctx(mctx), ops(ops), n_swa(n_swa), c_req(c_req) {}
+    llm_graph_input_chunk_mask(const llama_memory_context_i * mctx, llm_graph_chunk_kv_ops ops, uint32_t n_swa, int64_t c_req,
+                               bool one = false) :
+        mctx(mctx), ops(ops), n_swa(n_swa), c_req(c_req), one(one) {}
     virtual ~llm_graph_input_chunk_mask() = default;
 
     void set_input(const llama_ubatch * ubatch) override;
@@ -221,8 +239,9 @@ public:
     const llm_graph_chunk_kv_ops ops;
     const uint32_t n_swa; // 0, or the standard window of an SWA cache
     const int64_t  c_req; // the chunk size (see llm_graph_chunks)
+    const bool     one;   // built with one chunk allowed (llm_graph_chunk_mask_one)
 
-    std::vector<llm_graph_chunk_window> windows; // per chunk, baked into the graph's views; empty: the whole n_kv
+    std::vector<llm_graph_chunk_window> windows; // per chunk, baked into the graph's views; empty: the whole n_kv (always for one chunk)
 
     ggml_tensor * kv_pos = nullptr; // F32 [n_kv, n_seqs_unq], see llama_kv_cache::set_input_kq_pos
     llm_graph_chunk_pos  pos;
@@ -231,6 +250,8 @@ public:
 
 // creates the input (when llm_graph_chunk_mask_usable) and adds it to the graph result; nullptr otherwise
 // c_req: the chunk size, < 0 for llm_graph_chunk_tokens()
+// one: allow a graph of one chunk (the caller's attention must take one chunk; see llm_graph_chunk_mask_one)
 llm_graph_input_chunk_mask * llm_graph_build_inp_chunk_mask(llm_graph_result * res, ggml_context * ctx, ggml_cgraph * gf,
         const llama_cparams & cparams, const llama_hparams & hparams, const llama_ubatch & ubatch,
-        const llama_memory_context_i * mctx, llm_graph_chunk_kv_ops ops, uint32_t n_swa = 0, int64_t c_req = -1);
+        const llama_memory_context_i * mctx, llm_graph_chunk_kv_ops ops, uint32_t n_swa = 0, int64_t c_req = -1,
+        bool one = false);
