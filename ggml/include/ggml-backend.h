@@ -399,6 +399,8 @@ extern "C" {
 
     // Set a callback to be called for each resulting node during graph compute
     GGML_API void                 ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backend_sched_eval_callback callback, void * user_data);
+    // Called after input copies and backend transition waits, before a CPU split computes. Does not split the graph.
+    GGML_API void                 ggml_backend_sched_set_cpu_ready_callback(ggml_backend_sched_t sched, void (*callback)(struct ggml_cgraph *, void *), void * user_data);
 
     // Set a callback to be called when the inputs weights of a split are being copied
     GGML_API void                 ggml_backend_sched_set_copy_callback(ggml_backend_sched_t sched, ggml_backend_sched_copy_callback callback, void * user_data);

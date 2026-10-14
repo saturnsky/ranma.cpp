@@ -2393,17 +2393,15 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
                 // FIXME: get_rows can use additional threads, but the cost of launching additional threads
                 // decreases performance with GPU offloading
                 //n_tasks = n_threads;
-                // One exception, gated by tensor name: the per-layer embedding table is multi-GiB and
-                // lazily mapped, so a big gather is page faults, not work. Extra threads make the
-                // faults concurrent. The rows are disjoint, so the output is the same.
-                // 256 rows is the measured threshold; see docs/ranma/ple-prefetch.md.
-                const int64_t n_rows_ple = ggml_nelements(node->src[1]);
-                // (DeepSeek V4.1 engram tables, blk.N.engram_embd.weight, are lazily mapped the same way)
-                // a table stored in pieces names them <table>.p<i>.weight
-                const char * name_src0 = ggml_get_name(node->src[0]);
-                const bool is_ple = strcmp(name_src0, "per_layer_token_embd.weight") == 0 || strncmp(name_src0, "per_layer_token_embd.p", 22) == 0 ||
-                    strstr(name_src0, ".engram_embd.") != NULL;
-                n_tasks = is_ple && n_rows_ple >= 256 ? (int) MIN((int64_t) n_threads, n_rows_ple) : 1;
+                // Lazy host tables benefit from concurrent faults; small gathers keep the single-thread path.
+                const int64_t n_rows = ggml_nelements(node->src[1]);
+                const struct ggml_tensor * weight = node->src[0];
+                while (weight->view_src) {
+                    weight = weight->view_src;
+                }
+                const bool lazy = node->op == GGML_OP_GET_ROWS && (weight->flags & GGML_TENSOR_FLAG_LAZY) &&
+                    weight->buffer && ggml_backend_buffer_is_host(weight->buffer);
+                n_tasks = lazy && n_rows >= 256 ? (int) MIN((int64_t) n_threads, n_rows) : 1;
             } break;
         case GGML_OP_SCALE:
         case GGML_OP_SET:

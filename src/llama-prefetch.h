@@ -5,6 +5,10 @@
 #include <cstddef>
 #include <cstdint>
 #include <vector>
+#include <functional>
+#include <memory>
+
+#include "ggml-backend.h"
 
 struct ggml_tensor;
 
@@ -78,3 +82,24 @@ void llama_prefetch_table_rows(const struct ggml_tensor * table, const std::vect
 void llama_prefetch_table_pieces_rows(const std::vector<struct ggml_tensor *> & parts, int64_t part_rows,
                                       const std::vector<int32_t> & rows, enum llama_ple_prefetch mode,
                                       llama_prefetch_stats * stats = nullptr);
+
+// One ubatch owns its hints until submission finishes, including abort and error returns.
+class llama_prefetch_batch {
+public:
+    explicit llama_prefetch_batch(ggml_backend_sched_t sched = nullptr);
+    ~llama_prefetch_batch();
+    llama_prefetch_batch(const llama_prefetch_batch &) = delete;
+    llama_prefetch_batch & operator=(const llama_prefetch_batch &) = delete;
+
+    void prepare(struct ggml_cgraph * graph, enum llama_ple_prefetch mode, int64_t n_tokens);
+    void add(const ggml_tensor * table, std::vector<int32_t> rows, enum llama_ple_prefetch mode, bool async);
+    void start(bool parallel, std::function<void()> before_hint = {});
+    void wait(const ggml_tensor * table);
+    void finish() noexcept;
+    int64_t wait_us() const;
+    size_t task_count() const;
+
+private:
+    struct impl;
+    std::unique_ptr<impl> state;
+};

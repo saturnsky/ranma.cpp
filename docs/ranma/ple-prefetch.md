@@ -14,12 +14,11 @@ about to read to the operating system before the gather runs.
 It is a common option, so `llama-server`, `llama-cli` and the other common tools take it;
 `llama-bench` parses the same three values and applies one value to the whole run.
 
-Independently of the option, a CPU `GET_ROWS` on a tensor named exactly
-`per_layer_token_embd.weight` runs on the threadpool when it gathers 256 rows or more. Every other
+Independently of the option, a CPU `GET_ROWS` on a host tensor marked `GGML_TENSOR_FLAG_LAZY`
+runs on the threadpool when it gathers 256 rows or more. Every other
 `GET_ROWS` keeps the single-thread path.
 
-The option does nothing for a model without a per-layer embedding table, and nothing when that table
-is not in host memory.
+The common prompt path applies to lazy host gather tables, including engram and PLE. It does nothing when a table is not in host memory or its IDs are computed during graph execution.
 
 ## Why it exists
 
@@ -52,14 +51,9 @@ dynamically so that the link line does not change and an older host simply gets 
 `madvise(MADV_WILLNEED)` on POSIX; nothing elsewhere. The call is best-effort: it cannot fail in a
 way the caller has to handle, and its result is ignored.
 
-The prefetch is issued by the graph input that builds the gather index list, before that list is
-uploaded, so the rows are already being read while the rest of the ubatch is set up. A table whose
-buffer is not host memory is skipped, because a device pointer is not page-faulted by the CPU.
+Prompt prefetch is issued after graph inputs are filled and before graph submission. A gather with preceding device computation can overlap its hint with that computation; the CPU split waits for its table hints before computing. A gather at the front of the graph stays synchronous. Decode input calls remain synchronous. See `engram-mxfp8.md` for readiness, lifetime, timing and environment switches. A table whose buffer is not host memory is skipped.
 
-The thread-count decision lives in the CPU backend's task-count function and is made by tensor name.
-A name is what that function has at hand; a tensor flag or an op parameter would keep the backend
-independent of model tensor names but would need a format or graph-builder change. The cost of the
-current choice is that the CPU backend knows one model tensor name.
+The thread-count decision lives in the CPU backend's task-count function and uses the loader's lazy tensor flag and host buffer property. It has no model tensor-name dependency and does not change the file format.
 
 ## Thresholds
 
@@ -93,8 +87,7 @@ lazy tensor and other tensors is still mapped whole.
 ## Limits
 
 - Measured on Windows only; the POSIX path is written but not measured.
-- The gather parallelization is gated on one tensor name, so a model without a per-layer embedding
-  table sees no change at all.
+- Gather parallelization requires a lazy host table and at least 256 rows.
 - A table that is not in host memory is skipped.
 - The shard-mapping change applies only when ordinary mmap loading is off, and only reduces the
   mapping count for a model whose lazy tensor does not share its shard with everything else.
