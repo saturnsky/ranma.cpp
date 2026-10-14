@@ -22,6 +22,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace ggml_cuda_expert {
@@ -380,6 +381,10 @@ private:
     void   acct_reads(int layer, const std::vector<l2_read> & reads);
     void   acct_deliver(int layer);
     bool   acct_collect(int layer, bool force);
+    // RANMA_EXPERT_L2_TIMELINE (diagnostic): the host side of a served prompt generation, its print with the GPU side
+    void   tl_begin(int layer, uint32_t seq, const std::vector<int> & ids);
+    void   tl_end(int layer, const std::vector<l2_read> & reads, size_t ring_slots, int ring_busy);
+    void   tl_flush(int layer);
     struct sample {
         uint32_t seq = 0, rows = 0;
         uint64_t ubatch = 0;
@@ -471,6 +476,24 @@ private:
     l2_acct * acct_host_ = nullptr, * acct_dev_ = nullptr;
     std::vector<acct_layer> acct_;
     int acct_open_ = 0;
+    // RANMA_EXPERT_L2_TIMELINE=1 (diagnostic, default off): one "expert_timeline {json}" log line per served prompt
+    // generation of a layer: the experts of the layer by place before the service, the reads, when the worker saw the
+    // route, started reading and released each kind (host steady clock), and the GPU side (wall_clock64 ticks): end of the
+    // publish kernel, entry and pass of each kind wait, mark_done. The GPU side is complete when the layer publishes again,
+    // so the line of a generation is printed then (or when the worker stops).
+    bool timeline_ = false;
+    void * stamp_host_ = nullptr, * stamp_device_ = nullptr;   // l2_stamp[n_layers][2], by generation parity
+    struct timeline_layer {
+        bool open = false;
+        uint32_t seq = 0;
+        int64_t t_seen = 0, t_read = -1, t_end = -1;
+        int64_t t_kind[3] = {-1, -1, -1};
+        std::vector<std::pair<size_t, int64_t>> progress;   // (completed reads, us), a few points per generation
+        size_t progress_step = 1, progress_next = 1;
+        std::string head;                                   // the fields known before the reads
+        std::string body;                                   // the fields known after them
+    };
+    std::vector<timeline_layer> tl_;
     std::vector<uint32_t> wait_seen_;
     std::vector<uint8_t>  staged_layer_;   // compute thread: the last route of the layer was staged
     std::vector<uint32_t> stage_seen_;     // worker: the stage wait ticks of each layer already counted

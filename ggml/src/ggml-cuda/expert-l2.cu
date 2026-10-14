@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <sstream>
@@ -30,6 +31,21 @@ struct alignas(64) l2_mailbox {
 };
 static_assert(sizeof(l2_mailbox) == 64, "the mailbox layout is part of the host budget");
 
+// RANMA_EXPERT_L2_TIMELINE: the GPU side of one generation of a layer, in wall_clock64 ticks (steady_khz). Two per layer,
+// by the parity of the generation, so that the next generation does not overwrite one the worker has yet to print.
+struct alignas(64) l2_stamp {
+    uint32_t seq, pad;
+    uint64_t publish;    // end of the publish kernel: the route of the generation is known
+    uint64_t enter[3];   // the wait kernel of each kind starts ...
+    uint64_t pass[3];    // ... and passes
+    uint64_t done;       // mark_done: the last kernel of the layer that reads its slices has run
+};
+
+// the device address of the two timeline stamps of a layer, null when the timeline is off
+static l2_stamp * stamp_at(void * device, int layer) {
+    return device != nullptr ? static_cast<l2_stamp *>(device) + 2*size_t(layer) : nullptr;
+}
+
 // `serve` marks the experts only the worker can place: file residents and ring occupants. It follows
 // a plan, not a generation. When no routed id needs the worker, this kernel answers its own wait, so
 // a fully resident layer never reaches the CPU.
@@ -37,7 +53,7 @@ static_assert(sizeof(l2_mailbox) == 64, "the mailbox layout is part of the host 
 // some hosts an atomicOr on the mapped mailbox is lost.
 static __global__ void l2_publish_kernel(l2_mailbox * m, uint32_t * demand, const uint32_t * serve,
         const int32_t * ids, int rows, int used, int stride, int experts, const uint32_t * pooled, l2_acct * acct,
-        uint64_t key) {
+        uint64_t key, l2_stamp * stamp) {
     extern __shared__ uint32_t demand_shared[];
     __shared__ uint32_t need, invalid;
     const int words = (experts + 31)/32;
@@ -71,6 +87,13 @@ static __global__ void l2_publish_kernel(l2_mailbox * m, uint32_t * demand, cons
             acct->key = key;
             acct->key_seq = seq;
         }
+        if (stamp != nullptr) {
+            l2_stamp & st = stamp[seq & 1];
+            st.seq = seq;
+            for (int k = 0; k < 3; ++k) { st.enter[k] = 0; st.pass[k] = 0; }
+            st.done = 0;
+            st.publish = wall_clock64();
+        }
         if (!need) {
             __hip_atomic_store(&m->ready, seq, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
         }
@@ -79,13 +102,17 @@ static __global__ void l2_publish_kernel(l2_mailbox * m, uint32_t * demand, cons
     }
 }
 
-static __global__ void l2_wait_kernel(l2_mailbox * m, l2_acct * acct) {
+static __global__ void l2_wait_kernel(l2_mailbox * m, l2_acct * acct, l2_stamp * stamp) {
     const uint64_t begin = clock64(), steady_begin = wall_clock64();
     while (__hip_atomic_load(&m->ready, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM) != m->generation) {
         __builtin_amdgcn_s_sleep(1);
     }
     m->wait_ticks = clock64() - begin;
     m->steady_ticks = wall_clock64() - steady_begin;
+    if (stamp != nullptr && stamp[m->generation & 1].seq == m->generation) {
+        stamp[m->generation & 1].enter[0] = steady_begin;
+        stamp[m->generation & 1].pass[0]  = steady_begin + m->steady_ticks;
+    }
     if (acct != nullptr) {
         acct->ticks[0] = m->steady_ticks;
     }
@@ -100,12 +127,16 @@ static __global__ void l2_wait_kernel(l2_mailbox * m, l2_acct * acct) {
 // generation the publish kernel answered itself passes at once. The first kind records the
 // per-generation sample exactly like l2_wait_kernel, the later kinds only add their wall time to
 // stage_ticks.
-static __global__ void l2_wait_kind_kernel(l2_mailbox * m, int kind, int record, l2_acct * acct) {
+static __global__ void l2_wait_kind_kernel(l2_mailbox * m, int kind, int record, l2_acct * acct, l2_stamp * stamp) {
     const uint64_t begin = clock64(), steady_begin = wall_clock64();
     const uint32_t seq = m->generation;
     while (__hip_atomic_load(&m->ready, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM) != seq &&
            __hip_atomic_load(&m->kind_ready[kind], __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM) != seq) {
         __builtin_amdgcn_s_sleep(1);
+    }
+    if (stamp != nullptr && stamp[seq & 1].seq == seq) {
+        stamp[seq & 1].enter[kind] = steady_begin;
+        stamp[seq & 1].pass[kind]  = wall_clock64();
     }
     if (record) {
         m->wait_ticks = clock64() - begin;
@@ -124,8 +155,12 @@ static __global__ void l2_wait_kind_kernel(l2_mailbox * m, int kind, int record,
     }
 }
 
-static __global__ void l2_done_kernel(l2_mailbox * m) {
+static __global__ void l2_done_kernel(l2_mailbox * m, l2_stamp * stamp) {
     if (threadIdx.x == 0) {
+        if (stamp != nullptr && stamp[m->generation & 1].seq == m->generation) {
+            stamp[m->generation & 1].done = wall_clock64();
+            __threadfence_system();
+        }
         __hip_atomic_store(&m->done, m->generation, __ATOMIC_RELEASE, __HIP_MEMORY_SCOPE_SYSTEM);
     }
 }
@@ -150,6 +185,8 @@ l2_tier::l2_tier(const geometry & geo, const l2_config & cfg) : geo_(geo), cfg_(
     size_ring();
     verify_ = cfg_.verify;
     account_ = ggml_account_enabled();
+    const char * timeline = getenv("RANMA_EXPERT_L2_TIMELINE");
+    timeline_ = timeline != nullptr && timeline[0] != '\0' && strcmp(timeline, "0") != 0;
 }
 
 l2_tier::~l2_tier() {
@@ -170,6 +207,7 @@ l2_tier::~l2_tier() {
     }
     if (mail_host_)   { (void) hipHostFree(mail_host_); }
     if (acct_host_)   { (void) hipHostFree(acct_host_); }
+    if (stamp_host_)  { (void) hipHostFree(stamp_host_); }
     if (maps_host_)   { (void) hipHostFree(maps_host_); }
     if (demand_host_) { (void) hipHostFree(demand_host_); }
     if (serve_host_)  { (void) hipHostFree(serve_host_); }
@@ -309,6 +347,15 @@ bool l2_tier::allocate(int device) {
         } else {
             GGML_LOG_WARN("expert cache: the accounting slots could not be allocated, per kind SSD accounting is off\n");
             account_ = false;
+        }
+    }
+    if (timeline_) {
+        if (coherent_alloc(&stamp_host_, &stamp_device_, (size_t) geo_.n_layers*2*sizeof(l2_stamp))) {
+            tl_.assign((size_t) geo_.n_layers, timeline_layer());
+            GGML_LOG_INFO("expert cache: RANMA_EXPERT_L2_TIMELINE: one expert_timeline line per served prompt generation\n");
+        } else {
+            GGML_LOG_WARN("expert cache: the timeline stamps could not be allocated, RANMA_EXPERT_L2_TIMELINE is off\n");
+            timeline_ = false;
         }
     }
     void * maps = nullptr, * maps_device = nullptr;
@@ -1111,6 +1158,8 @@ void l2_tier::service_layer(int layer, uint32_t seq, const std::vector<int> & id
     account_layer(layer, seq, ids);
     auto & item = pending_[layer];
     const auto before_bytes = counters_.ssd_bytes;
+    const bool tl = timeline_ && item.prompt;
+    if (tl) { tl_begin(layer, seq, ids); }
     for (int other = 0; other < geo_.n_layers; ++other) {
         const uint32_t done = expert_os::load_acquire(&static_cast<l2_mailbox *>(mail_host_)[other].done);
         if (class_layout()) { cledger_.set_done(other, done); } else { ledger_.set_done(other, done); }
@@ -1153,6 +1202,12 @@ void l2_tier::service_layer(int layer, uint32_t seq, const std::vector<int> & id
     std::string reason;
     const bool staged_service = staged() && item.rows >= uint64_t(cfg_.staged_min_rows);
     acct_reads(layer, service.reads);
+    if (tl) {
+        const int s = class_layout() ? cledger_.storage_of(layer) : -1;
+        tl_end(layer, service.reads, (size_t) ring_count(), s >= 0 ? cledger_.ring_busy(s) : -1);
+        tl_[(size_t) layer].t_read = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
     const auto t_read = account_ ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
     if (staged_service) {
         serve_staged(layer, seq, service.reads);
@@ -1164,6 +1219,10 @@ void l2_tier::service_layer(int layer, uint32_t seq, const std::vector<int> & id
         acct_[(size_t) layer].worker_ms[0] += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_read).count();
     }
     item.ssd_bytes = counters_.ssd_bytes - before_bytes;
+    if (tl) {
+        tl_[(size_t) layer].t_end = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+    }
     // The staged service published every kind before its readiness, so the GPU may already be past this layer;
     // with the decode pool's ring admission a later step of the layer may own an entry this repeat would overwrite.
     if (!(staged_service && pool_bits_host_ != nullptr)) {
@@ -1194,10 +1253,24 @@ void l2_tier::serve_staged(int layer, uint32_t seq, const std::vector<l2_read> &
     // accounting: the worker time up to the release of each kind, from the start of the reads
     const auto t_start = account_ ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point();
     double released_ms = 0.0;
+    timeline_layer * tl = timeline_ && tl_[(size_t) layer].open && tl_[(size_t) layer].seq == seq ? &tl_[(size_t) layer] : nullptr;
+    if (tl) {
+        tl->progress_step = std::max<size_t>(1, ordered.size()/32);
+        tl->progress_next = tl->progress_step;
+    }
     auto release = [&](size_t count) {
+        if (tl && count >= tl->progress_next) {
+            tl->progress.emplace_back(count, (int64_t) std::chrono::duration_cast<std::chrono::microseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count());
+            tl->progress_next = count + tl->progress_step;
+        }
         for (; released < geometry::n_kinds && end[released] <= count; ++released) {
             publish_layer_kind(layer, released);
             expert_os::store_release(&mail.kind_ready[released], seq);
+            if (tl) {
+                tl->t_kind[released] = std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count();
+            }
             if (account_ && acct_[(size_t) layer].open) {
                 const double now_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_start).count();
                 acct_[(size_t) layer].worker_ms[released] += now_ms - released_ms;
@@ -1309,6 +1382,7 @@ void l2_tier::verify_addresses(int demanded_layer, const std::vector<int> & ids)
 
 void l2_tier::handle_publish(int layer, uint32_t seq) {
     l2_mailbox * mail = static_cast<l2_mailbox *>(mail_host_);
+    if (timeline_) { tl_flush(layer); }   // the stream passed the previous generation of this layer
     collect_wait(layer);   // the previous sample, before this one overwrites it
     collect_stage(layer);
     acct_collect(layer, true);   // every wait kernel of the previous generation has run: the stream passed this publish
@@ -1409,6 +1483,9 @@ void l2_tier::stop_worker() {
     if (mail_host_) {
         std::lock_guard<std::mutex> lock(io_mutex_);
         for (int l = 0; l < geo_.n_layers; ++l) { collect_wait(l); collect_stage(l); acct_collect(l, true); }
+        if (timeline_) {
+            for (int l = 0; l < geo_.n_layers; ++l) { tl_flush(l); }
+        }
     }
 }
 
@@ -1586,17 +1663,19 @@ void l2_tier::publish_and_wait(int layer, const ggml_tensor * ids, cudaStream_t 
         demand_device_ + size_t(layer)*bitmap_words(), serve_device_ + size_t(layer)*bitmap_words(),
         (const int32_t *) ids->data, (int) ids->ne[1], (int) ids->ne[0],
         (int) (ids->nb[1]/sizeof(int32_t)), geo_.n_experts,
-        pool_bits_dev_ != nullptr ? pool_bits_dev_ + size_t(layer)*bitmap_words() : (const uint32_t *) nullptr, acct, acct_key);
+        pool_bits_dev_ != nullptr ? pool_bits_dev_ + size_t(layer)*bitmap_words() : (const uint32_t *) nullptr, acct, acct_key,
+        stamp_at(stamp_device_, layer));
     if (staged()) {
         // The worker decides from the same row count. A mismatch would still be safe: every kind
         // wait also passes on the whole generation, and the worker publishes that last either way.
         staged_layer_[(size_t) layer] = any_ssd_ && ids->ne[1] >= cfg_.staged_min_rows;
         if (staged_layer_[(size_t) layer]) {
-            ggml_cuda_kernel_launch(l2_wait_kind_kernel, launch, static_cast<l2_mailbox *>(mail_device_) + layer, 0, 1, acct);
+            ggml_cuda_kernel_launch(l2_wait_kind_kernel, launch, static_cast<l2_mailbox *>(mail_device_) + layer, 0, 1, acct,
+                stamp_at(stamp_device_, layer));
             return;
         }
     }
-    ggml_cuda_kernel_launch(l2_wait_kernel, launch, static_cast<l2_mailbox *>(mail_device_) + layer, acct);
+    ggml_cuda_kernel_launch(l2_wait_kernel, launch, static_cast<l2_mailbox *>(mail_device_) + layer, acct, stamp_at(stamp_device_, layer));
 }
 
 bool l2_tier::layer_staged(int layer) const {
@@ -1610,7 +1689,7 @@ void l2_tier::wait_kind(int layer, int kind, cudaStream_t stream) {
     }
     const ggml_cuda_kernel_launch_params launch(dim3(1), dim3(1), 0, stream);
     ggml_cuda_kernel_launch(l2_wait_kind_kernel, launch, static_cast<l2_mailbox *>(mail_device_) + layer, kind, 0,
-        account_ ? acct_dev_ + layer : nullptr);
+        account_ ? acct_dev_ + layer : nullptr, stamp_at(stamp_device_, layer));
 }
 
 void l2_tier::mark_done(int layer, cudaStream_t stream) {
@@ -1619,7 +1698,7 @@ void l2_tier::mark_done(int layer, cudaStream_t stream) {
         return;
     }
     const ggml_cuda_kernel_launch_params launch(dim3(1), dim3(1), 0, stream);
-    ggml_cuda_kernel_launch(l2_done_kernel, launch, static_cast<l2_mailbox *>(mail_device_) + layer);
+    ggml_cuda_kernel_launch(l2_done_kernel, launch, static_cast<l2_mailbox *>(mail_device_) + layer, stamp_at(stamp_device_, layer));
 }
 
 void l2_tier::collect_wait(int layer) {
@@ -1716,6 +1795,87 @@ bool l2_tier::acct_collect(int layer, bool force) {
     st.open = false;
     --acct_open_;
     return true;
+}
+
+// ---- timeline (RANMA_EXPERT_L2_TIMELINE) -----------------------------------------------------------------------------
+
+static std::string tl_mask(const std::vector<uint8_t> & bits) {
+    // hex digits, expert 4*i + b in bit b of digit i
+    static const char * hex = "0123456789abcdef";
+    std::vector<int> digits((bits.size() + 3)/4, 0);
+    for (size_t e = 0; e < bits.size(); ++e) {
+        digits[e/4] |= bits[e] ? 1 << (e%4) : 0;
+    }
+    std::string out;
+    for (int d : digits) { out += hex[d]; }
+    return out;
+}
+
+void l2_tier::tl_begin(int layer, uint32_t seq, const std::vector<int> & ids) {
+    timeline_layer & tl = tl_[(size_t) layer];
+    tl = timeline_layer();
+    tl.open = true;
+    tl.seq = seq;
+    tl.t_seen = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    // the experts of the layer by place before this service: VRAM (L1), host resident, ring occupant, only in the file
+    const int n = geo_.experts(layer);
+    std::vector<uint8_t> demand((size_t) n, 0), vram((size_t) n, 0), host((size_t) n, 0), ring((size_t) n, 0), file((size_t) n, 0);
+    for (int e : ids) {
+        if (e >= 0 && e < n) { demand[(size_t) e] = 1; }
+    }
+    for (int e = 0; e < n; ++e) {
+        const int slot = class_layout() ? cledger_.slot_of(layer, e) : ledger_.slot_of(layer, e);
+        if (vram_[(size_t) layer][(size_t) e] >= 0) { vram[(size_t) e] = 1; }
+        else if (homes_[layer][e].resident())       { host[(size_t) e] = 1; }
+        else if (slot >= 0)                         { ring[(size_t) e] = 1; }
+        else                                        { file[(size_t) e] = 1; }
+    }
+    const sample & item = pending_[layer];
+    std::ostringstream out;
+    out << "{\"kind\":\"expert_timeline\",\"layer\":" << layer << ",\"seq\":" << seq << ",\"ubatch\":" << item.ubatch
+        << ",\"rows\":" << item.rows << ",\"experts\":" << n << ",\"distinct\":" << ids.size()
+        << ",\"slice_bytes\":[" << geo_.class_bytes[geo_.layer_class[layer]][0] << ',' << geo_.class_bytes[geo_.layer_class[layer]][1]
+        << ',' << geo_.class_bytes[geo_.layer_class[layer]][2] << "],\"steady_khz\":" << steady_khz_
+        << ",\"demand\":\"" << tl_mask(demand) << "\",\"vram\":\"" << tl_mask(vram) << "\",\"host\":\"" << tl_mask(host)
+        << "\",\"ring\":\"" << tl_mask(ring) << "\",\"file\":\"" << tl_mask(file) << '"';
+    tl.head = out.str();
+}
+
+void l2_tier::tl_end(int layer, const std::vector<l2_read> & reads, size_t ring_slots, int ring_busy) {
+    timeline_layer & tl = tl_[(size_t) layer];
+    std::ostringstream out;
+    out << ",\"ring_slots\":" << ring_slots << ",\"ring_busy\":" << ring_busy << ",\"reads\":" << reads.size() << ",\"read_ids\":[";
+    bool comma = false;
+    for (const l2_read & r : reads) {
+        if (r.kind != 0) { continue; }
+        out << (comma ? "," : "") << r.expert;
+        comma = true;
+    }
+    out << ']';
+    tl.body = out.str();
+}
+
+void l2_tier::tl_flush(int layer) {
+    timeline_layer & tl = tl_[(size_t) layer];
+    if (!tl.open) { return; }
+    tl.open = false;
+    std::ostringstream out;
+    out << tl.head << tl.body << ",\"host_us\":{\"seen\":" << tl.t_seen << ",\"read\":" << tl.t_read
+        << ",\"kind\":[" << tl.t_kind[0] << ',' << tl.t_kind[1] << ',' << tl.t_kind[2] << "],\"end\":" << tl.t_end
+        << ",\"progress\":[";
+    for (size_t i = 0; i < tl.progress.size(); ++i) {
+        out << (i ? "," : "") << '[' << tl.progress[i].first << ',' << tl.progress[i].second << ']';
+    }
+    out << "]}";
+    const l2_stamp & st = static_cast<const l2_stamp *>(stamp_host_)[2*(size_t) layer + (tl.seq & 1)];
+    if (expert_os::load_acquire(&st.seq) == tl.seq) {
+        out << ",\"gpu_ticks\":{\"publish\":" << st.publish << ",\"enter\":[" << st.enter[0] << ',' << st.enter[1] << ','
+            << st.enter[2] << "],\"pass\":[" << st.pass[0] << ',' << st.pass[1] << ',' << st.pass[2] << "],\"done\":" << st.done << '}';
+    } else {
+        out << ",\"gpu_ticks\":null";   // a later generation answered by the GPU itself took the stamp
+    }
+    out << '}';
+    GGML_LOG_INFO("expert_timeline %s\n", out.str().c_str());
 }
 
 void l2_tier::report(const char * what) { report_counters(what); }

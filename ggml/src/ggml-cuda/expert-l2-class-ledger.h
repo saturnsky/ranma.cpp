@@ -434,6 +434,15 @@ public:
         }
     }
 
+    // Ring slots of a class whose occupant's generation the GPU has not finished yet (not reusable).
+    int ring_busy(int s) const {
+        int n = 0;
+        for (int slot = head_[(size_t) s]; slot >= 0; slot = next_[(size_t) s][(size_t) slot]) {
+            n += reusable(owners_[(size_t) s][(size_t) slot]) ? 0 : 1;
+        }
+        return n;
+    }
+
     // Ring slots of a class that hold an expert.
     int ring_occupants(int s) const {
         int n = 0;
