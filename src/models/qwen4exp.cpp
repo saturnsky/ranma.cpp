@@ -1524,6 +1524,9 @@ public:
 void llm_graph_input_qwen4exp_ple::set_input(const llama_ubatch * ubatch) {
     const auto & hparams = model.hparams;
 
+    const bool timing = llama_prefetch_timing_enabled();   // LLAMA_PREFETCH_TIMING
+    const int64_t t_start = timing ? ggml_time_us() : 0;
+
     // an image arrives as an embd batch, so ubatch->token is null, but every position still needs a row for ggml_get_rows
     // stand in the image token id that the reference hashes, or EOS if the file has no such key
     // gemma3n and gemma4 do the same with a hardcoded row 0 of per_layer_token_embd.
@@ -1564,8 +1567,11 @@ void llm_graph_input_qwen4exp_ple::set_input(const llama_ubatch * ubatch) {
                 hparams.ple_head_offsets.data(), hparams.ple_head_vocab_sizes.data(), idx.data() + i*n_heads);
     }
 
+    const int64_t t_hashed = timing ? ggml_time_us() : 0;
+    llama_prefetch_stats stats;
     const llama_table_pieces & table = model.per_layer_tok_embd_table;
-    llama_prefetch_table_pieces_rows(table.parts, table.part_rows, idx, ple_prefetch);
+    llama_prefetch_table_pieces_rows(table.parts, table.part_rows, idx, ple_prefetch, timing ? &stats : nullptr);
+    const int64_t t_input = timing ? ggml_time_us() : 0;
 
     // global row numbers -> per piece local row numbers and the mask that keeps the piece which holds the row
     std::vector<int32_t> piece_idx;
@@ -1575,6 +1581,12 @@ void llm_graph_input_qwen4exp_ple::set_input(const llama_ubatch * ubatch) {
     ggml_backend_tensor_set(rows, piece_idx.data(), 0, piece_idx.size()*ggml_element_size(rows));
     if (mask) {
         ggml_backend_tensor_set(mask, piece_mask.data(), 0, piece_mask.size()*ggml_element_size(mask));
+    }
+
+    if (timing) {
+        stats.t_hash_us  = t_hashed - t_start;
+        stats.t_input_us = ggml_time_us() - t_input;
+        llama_prefetch_stats_log("ple", -1, n_tokens, stats);
     }
 }
 

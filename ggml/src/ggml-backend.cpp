@@ -2321,6 +2321,55 @@ static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched, struct ggm
     }
 }
 
+// LLAMA_PREFETCH_TIMING=1 (diagnostic, default off; the same switch as the table prefetch timing of libllama): one
+// "sched_split" log line per split with the host time of its input copies (including the waits for the previous
+// backend they contain), of the compute call and, for a CPU split (which computes synchronously), the page faults of the
+// whole process during the call. With the switch off nothing is measured.
+static bool ggml_backend_sched_split_timing(void) {
+    static const bool on = [] {
+        const char * env = getenv("LLAMA_PREFETCH_TIMING");
+        return env != NULL && env[0] != '\0' && strcmp(env, "0") != 0;
+    }();
+    return on;
+}
+
+// page faults of the whole process so far (all threads), -1 when unknown
+static int64_t ggml_backend_sched_page_faults(void) {
+#if defined(_WIN32)
+    // PROCESS_MEMORY_COUNTERS of psapi.h, resolved at run time so that the link line does not change
+    struct counters {
+        DWORD  cb;
+        DWORD  PageFaultCount;
+        SIZE_T other[8];
+    };
+    typedef BOOL (WINAPI * counters_fn)(HANDLE, counters *, DWORD);
+    static const counters_fn fn = reinterpret_cast<counters_fn>(
+        reinterpret_cast<void *>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "K32GetProcessMemoryInfo")));
+    counters pmc = {};
+    pmc.cb = sizeof(pmc);
+    if (fn == NULL || !fn(GetCurrentProcess(), &pmc, sizeof(pmc))) {
+        return -1;
+    }
+    return (int64_t) pmc.PageFaultCount;
+#else
+    return -1;
+#endif
+}
+
+static void ggml_backend_sched_split_timing_log(ggml_backend_sched_t sched, int split_id, const struct ggml_backend_sched_split * split,
+        int64_t t0, int64_t t1, int64_t t2, int64_t f1, int64_t f2) {
+    ggml_backend_t backend = sched->backends[split->backend_id];
+    const bool cpu = ggml_backend_dev_type(ggml_backend_get_device(backend)) == GGML_BACKEND_DEVICE_TYPE_CPU;
+    const int n = split->graph.n_nodes;
+    // the fault counter is 32 bits on Windows: the difference is taken modulo 2^32
+    const long long faults = cpu && f1 >= 0 && f2 >= 0 ? (long long) (uint32_t) (f2 - f1) : -1;
+    GGML_LOG_INFO("sched_split {\"kind\":\"sched_split\",\"ub\":%llu,\"split\":%d,\"backend\":\"%s\",\"inputs\":%d,"
+        "\"nodes\":%d,\"first\":\"%s\",\"last\":\"%s\",\"t_us\":%lld,\"inputs_us\":%lld,\"compute_us\":%lld,\"faults\":%lld}\n",
+        (unsigned long long) ggml_account_current(), split_id, ggml_backend_name(backend), split->n_inputs, n,
+        n > 0 ? split->graph.nodes[0]->name : "", n > 0 ? split->graph.nodes[n - 1]->name : "",
+        (long long) t0, (long long) (t1 - t0), (long long) (t2 - t1), faults);
+}
+
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
@@ -2328,11 +2377,13 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     ggml_backend_sched_staging_begin(sched);
 
     int prev_backend_id = -1;
+    const bool timing = ggml_backend_sched_split_timing();
 
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
+        const int64_t t_split = timing ? ggml_time_us() : 0;
 
         // ensure the previous split's async work has completed before we start
         // this split, the allocator may have reused buffer regions across splits
@@ -2359,6 +2410,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
         // record how far the staged input uploads of this split have progressed on the backend stream
         ggml_backend_sched_staging_end_split(sched, split_backend_id);
+
+        const int64_t t_compute = timing ? ggml_time_us() : 0;
+        const int64_t f_compute = timing ? ggml_backend_sched_page_faults() : -1;
 
         if (!sched->callback_eval) {
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
@@ -2397,6 +2451,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
                 j0 = j1;
             }
+        }
+
+        if (timing) {
+            const int64_t t_done = ggml_time_us();
+            ggml_backend_sched_split_timing_log(sched, split_id, split, t_split, t_compute, t_done, f_compute,
+                ggml_backend_sched_page_faults());
         }
 
         // record the event of this split
