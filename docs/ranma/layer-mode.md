@@ -18,7 +18,8 @@ Before the model loads, from the GGUF metadata and the free memory:
 
 | setting | rule |
 |---|---|
-| width (`-ub`, `-b`) | the widest that fits the measured memory (below), at most the context of one sequence and the widest pass of the expert-major op (`min(E, width * top_k) + width * top_k / 16 + 1 <= 65535` GEMM items). No rate of the link or of the GEMMs is assumed: the width is halved from the top until it fits, then bisected to within 1/16 (at least 512). A prompt shorter than the width runs as one graph of its own length. |
+| width (`-ub`) | the widest that fits the measured memory (below), at most the context of one sequence and the widest pass of the expert-major op (`min(E, width * top_k) + width * top_k / 16 + 1 <= 65535` GEMM items). No rate of the link or of the GEMMs is assumed: the width is halved from the top until it fits, then bisected to within 1/16 (at least 512). A prompt shorter than the width runs as one graph of its own length. |
+| logical batch (`-b`) | the context: a prompt is one call (`llama_decode`) of several ubatches of the width (below) |
 | attention chunk | the largest that fits: the whole width (no chunks) is measured first; only when it does not fit, a chunk between 512 and the width (linear estimate from both ends, then checked) |
 | expert-major rows per pass | the whole width (`width * top_k`), so every expert of a layer is read once per graph; the op's scratch grows with it (about 40 KiB per row on GLM-5.3, 2.5 GiB at width 8192) and is counted in the check |
 | staging buffer | none in one pass (no earlier pass to hide the copies behind); with the expert-major rows below the width, two buffers of `min(64, rows/129)` experts when a mean expert gets at least 129 rows |
@@ -33,11 +34,36 @@ of `-fit` and of `--expert-l1-mib auto`) is at most the free memory. The host co
 the scheduler holds for the life of the context, so it has no budget: the host compute buffer and the growth of the
 process peak during that load (graph metadata) are logged for information only. Each measurement logs one `layer mode: width ..., chunk ...` line; the decision logs `layer mode: on: ...`.
 
-Given values win: `-ub` fixes the width (the chunk is still chosen), `-b` bounds it, and the development switches
-`RANMA_EXPERT_MAJOR_MOE`, `RANMA_ATTN_CHUNK`, `RANMA_EXPERT_MAJOR_STAGE_MIB`, `RANMA_EXPERT_MAJOR_ROWS` and
+Given values win: `-ub` fixes the width (the chunk is still chosen), `-b` bounds it and keeps its value, and the
+development switches `RANMA_EXPERT_MAJOR_STAGE_MIB` and `GGML_CUDA_HOST_DIRECT_MAX_BATCH` keep their values when set.
+The VRAM reserve is `--fit-target`. The mode passes the expert-major MoE op, the attention chunk, the rows per pass and
+the layer-major prefill to the graphs through a process-wide setting (`llama_layer_mode_config`, `src/llama-ext.h`), not
+through environment variables; the layer-major prefill is switched on for DeepSeek-V4 and V4.1 (the models it cuts) and
 the setting is restored when the mode stays off. A prompt batch
+of another slot takes 3000 ms of compute (below).
 `GGML_CUDA_HOST_DIRECT_MAX_BATCH` keep their values when set. The reserves can be changed for development:
 `RANMA_LAYER_MODE_RESERVE_MIB` (4096), `RANMA_LAYER_MODE_HOST_MIB` (from the available memory),
+
+## The logical batch
+
+`-b` is not tied to the width. The memory check runs with `-b` equal to the width, and the context is then built with
+`-b` equal to the context size: no buffer of the context grows with it (the KV cache and the graphs follow `-ub`, the
+output buffer the number of outputs), only the per-token target features a drafter reads, and a drafter turns the
+layer mode off. The ubatches of a long prompt are the same as with `-b` equal to the width; what changes is the end of
+the call:
+
+- DeepSeek-V4.1's exact tail prefill computes the rows the output of a call needs. With one
+  call per width every call ended in a tail of 20 layers and read their experts again; with one call per prompt only
+  the ubatches near its end compute tail rows, the earlier ones write the raw KV of the tail layers and stop.
+- The other models compute every row of every ubatch either way: the same ubatches give the same results.
+- `llama-server` still ends a prompt call where it creates a context checkpoint (at a user message, `4 + n_ubatch`
+  and 4 tokens before the end of the prompt, `--ctx-checkpoints`), so with checkpoints a long prompt is three or four
+  calls instead of one per width.
+- In `llama-server` a prompt fills a batch up to the context only when the batch is empty. A prompt that joins a batch
+  that already holds tokens (the generated tokens of other slots, another slot's prompt) fills it to one ubatch, as
+  before: those tokens would otherwise wait for the whole prompt, and a call of several sequences has no tail end.
+- A call is not interrupted: a request cancelled during its prompt, and the progress reports of a streamed prompt,
+  wait for the end of the call, now the prompt (or the part up to the next checkpoint) instead of one width.
 
 ## The op's scratch during generation
 
@@ -61,8 +87,8 @@ touched; taking the block back copies nothing (the pooled experts' table entries
 With `-np 2` or more and `--slot0-priority` on, a request on slot 0 waits for at most one batch of another slot. A
 wide batch would make that wait long, so in layer mode a prompt batch of a slot other than 0 takes about
 3000 ms of compute: its token count is that time times the rate measured on the
-previous such batches (500 tokens/s before the first one), in steps of 256. Slot 0's own prompt batches keep the
-full width.
+previous such batches (500 tokens/s before the first one), in steps of 256, and may span several ubatches. Slot 0's
+own prompt batches are not held to it (see the logical batch above).
 The 3000 ms is the target that sizes the batch, not a limit: a batch is not stopped when the time is over, so with a slow SSD, a cold
 cache or the first batch (the 500 tokens/s assumption) the wait of slot 0 can exceed 3 s.
 

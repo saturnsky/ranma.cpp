@@ -3913,6 +3913,13 @@ private:
         int32_t n_batch  = llama_n_batch(ctx_tgt);
         int32_t n_ubatch = llama_n_ubatch(ctx_tgt);
 
+        // ranma layer mode: n_batch is the context, so that a prompt is one call and the exact tail of DeepSeek-V4.1 runs
+        // once, at its end (docs/ranma/layer-mode.md). Every token of a call waits for all of its ubatches, and a call
+        // with tokens of several sequences has no such end, so a prompt that joins a batch already holding tokens fills
+        // it to one ubatch only, as with -b = -ub. A given -b is kept.
+        const bool lm_whole = params_base.layer_mode != 0 && !params_base.n_batch_explicit && n_batch > n_ubatch;
+        auto n_batch_fill = [&]() { return lm_whole && batch.size() > 0 ? n_ubatch : n_batch; };
+
         auto & alora_scale       = batch.alora_scale;
         auto & alora_disabled_id = batch.alora_disabled_id;
 
@@ -3921,7 +3928,7 @@ private:
             bool add_ok = true; // false means the batch is full, skip remaining slots
 
             iterate(slots, [&](server_slot & slot) {
-                if (!add_ok || batch.size() >= n_batch) {
+                if (!add_ok || batch.size() >= n_batch_fill()) {
                     return; // batch is full, skip remaining slots
                 }
 
@@ -4498,8 +4505,9 @@ private:
 
                     // add prompt tokens for processing in the current batch
                     // ranma layer mode: the prompt batch of a slot other than 0 is held to the preemption target
+                    const int32_t n_fill       = n_batch_fill();
                     const int32_t n_batch_slot = slot.id != slots.front().id ?
-                        std::min<int32_t>(n_batch, n_tokens_prev + lm_other_prompt_cap(n_batch)) : n_batch;
+                        std::min<int32_t>(n_fill, n_tokens_prev + lm_other_prompt_cap(n_batch)) : n_fill;
                     while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch_slot) {
                         // get next token to process
                         llama_token cur_tok = input_tokens[slot.prompt.n_tokens()];
