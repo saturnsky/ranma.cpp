@@ -1725,6 +1725,55 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     return mparams;
 }
 
+// ranma: diagnostic tensor dump (RANMA_TENSOR_DUMP=<regex>, RANMA_TENSOR_DUMP_FILE=<path>). Every computed tensor whose name
+// matches the regex (std::regex_search) appends its last token row to the file: the last index of its outermost dimension
+// larger than 1 among ne[1..3]. A record is the name (64 bytes), the type (int32), ne[4] (int64), that dimension (int32),
+// a running record number (int64), the row size in bytes (int64) and the row. F32 and F16 contiguous tensors only. The
+// scheduler stops at every matched tensor, so this is slow; it is meant for comparing two runs layer by layer.
+static bool common_tensor_dump_cb(struct ggml_tensor * t, bool ask, void * user_data) {
+    static const std::regex re(getenv("RANMA_TENSOR_DUMP"));
+    static FILE * f = [] {
+        const char * path = getenv("RANMA_TENSOR_DUMP_FILE");
+        return fopen(path != nullptr ? path : "tensor-dump.bin", "wb");
+    }();
+    static int64_t n_rec = 0;
+    GGML_UNUSED(user_data);
+
+    if (ask) {
+        return std::regex_search(t->name, re);
+    }
+    if (f == nullptr || (t->type != GGML_TYPE_F32 && t->type != GGML_TYPE_F16) || !ggml_is_contiguous(t)) {
+        return true;
+    }
+    int32_t dim = -1;
+    for (int32_t d = 3; d >= 1; --d) {
+        if (t->ne[d] > 1) {
+            dim = d;
+            break;
+        }
+    }
+    if (dim < 0) {
+        return true;
+    }
+    const int64_t n_row = (int64_t) t->nb[dim];
+    std::vector<uint8_t> row(n_row);
+    ggml_backend_tensor_get(t, row.data(), (t->ne[dim] - 1)*t->nb[dim], n_row);
+
+    char name[64] = {};
+    snprintf(name, sizeof(name), "%s", t->name);
+    const int32_t type = t->type;
+    fwrite(name, 1, sizeof(name), f);
+    fwrite(&type, sizeof(type), 1, f);
+    fwrite(t->ne, sizeof(int64_t), 4, f);
+    fwrite(&dim, sizeof(dim), 1, f);
+    fwrite(&n_rec, sizeof(n_rec), 1, f);
+    fwrite(&n_row, sizeof(n_row), 1, f);
+    fwrite(row.data(), 1, row.size(), f);
+    fflush(f);
+    n_rec++;
+    return true;
+}
+
 struct llama_context_params common_context_params_to_llama(const common_params & params) {
     auto cparams = llama_context_default_params();
 
@@ -1753,6 +1802,9 @@ struct llama_context_params common_context_params_to_llama(const common_params &
     cparams.ple_prefetch      = params.ple_prefetch;
     cparams.cb_eval           = params.cb_eval;
     cparams.cb_eval_user_data = params.cb_eval_user_data;
+    if (cparams.cb_eval == nullptr && getenv("RANMA_TENSOR_DUMP") != nullptr) {
+        cparams.cb_eval = common_tensor_dump_cb;
+    }
     cparams.offload_kqv       = !params.no_kv_offload;
     cparams.no_perf           = params.no_perf;
     cparams.op_offload        = !params.no_op_offload;
