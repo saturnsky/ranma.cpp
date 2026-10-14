@@ -4,16 +4,22 @@
 
 #include "ggml-backend.h"
 #include "ggml.h"
+#include "ggml-account.h"
 
 #include <algorithm>
 #include <cinttypes>
 #include <cstdint>
+#include <exception>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
 #include <utility>
 #include <vector>
+#include <condition_variable>
+#include <mutex>
+#include <map>
+#include <thread>
 
 #if defined(_WIN32)
 #ifndef NOMINMAX
@@ -26,12 +32,246 @@
 #include <unistd.h>
 #endif
 
+static bool prefetch_enough_rows(size_t n_rows, enum llama_ple_prefetch mode);
+
 bool llama_prefetch_timing_enabled() {
     static const bool on = [] {
         const char * env = getenv("LLAMA_PREFETCH_TIMING");
         return env != nullptr && env[0] != '\0' && strcmp(env, "0") != 0;
     }();
     return on;
+}
+
+struct llama_prefetch_batch::impl {
+    struct task {
+        const ggml_tensor * table;
+        std::vector<int32_t> rows;
+        llama_ple_prefetch mode;
+        bool async;
+        bool ready = false;
+        bool failed = false;
+        llama_prefetch_stats stats;
+    };
+    ggml_backend_sched_t sched;
+    std::vector<std::unique_ptr<task>> tasks;
+    std::vector<std::thread> workers;
+    std::mutex mutex;
+    std::condition_variable ready;
+    size_t next = 0;
+    int64_t waited_us = 0;
+    int64_t n_tokens = 0;
+    bool started = false;
+    bool parallel = false;
+    std::function<void()> before_hint;
+
+    explicit impl(ggml_backend_sched_t sched) : sched(sched) {}
+
+    void run(task & t) noexcept {
+        try {
+            if (before_hint) {
+                before_hint();
+            }
+            llama_prefetch_table_rows(t.table, t.rows, t.mode, llama_prefetch_timing_enabled() ? &t.stats : nullptr);
+        } catch (...) {
+            t.failed = true;
+        }
+        {
+            std::lock_guard<std::mutex> lock(mutex);
+            t.ready = true;
+        }
+        ready.notify_all();
+    }
+
+    void work() noexcept {
+        for (;;) {
+            task * t = nullptr;
+            {
+                std::lock_guard<std::mutex> lock(mutex);
+                while (next < tasks.size() && !parallel && !tasks[next]->async) {
+                    ++next;
+                }
+                if (next == tasks.size()) {
+                    return;
+                }
+                t = tasks[next++].get();
+            }
+            run(*t);
+        }
+    }
+};
+
+llama_prefetch_batch::llama_prefetch_batch(ggml_backend_sched_t sched) : state(new impl(sched)) {}
+
+llama_prefetch_batch::~llama_prefetch_batch() {
+    finish();
+}
+
+void llama_prefetch_batch::add(const ggml_tensor * table, std::vector<int32_t> rows, llama_ple_prefetch mode, bool async) {
+    GGML_ASSERT(!state->started);
+    if (!table || !table->data || !table->buffer || !ggml_backend_buffer_is_host(table->buffer) || !prefetch_enough_rows(rows.size(), mode)) {
+        return;
+    }
+    auto t = std::unique_ptr<impl::task>(new impl::task);
+    t->table = table;
+    t->rows = std::move(rows);
+    t->mode = mode;
+    t->async = async;
+    state->tasks.push_back(std::move(t));
+}
+
+void llama_prefetch_batch::start(bool parallel, std::function<void()> before_hint) {
+    GGML_ASSERT(!state->started);
+    state->started = true;
+    state->parallel = parallel;
+    state->before_hint = std::move(before_hint);
+    size_t count = 0;
+    for (auto & t : state->tasks) {
+        count += parallel || t->async;
+    }
+    const size_t n_workers = parallel ? std::min(count, (size_t) std::max(1u, std::thread::hardware_concurrency())) : std::min(count, size_t(1));
+    try {
+        state->workers.reserve(n_workers);
+        for (size_t i = 0; i < n_workers; ++i) {
+            state->workers.emplace_back([this] { state->work(); });
+        }
+    } catch (...) {
+        // Already-created workers and the caller claim disjoint tasks from the same queue.
+        state->work();
+    }
+    for (auto & t : state->tasks) {
+        if (!t->async && !parallel) {
+            state->run(*t);
+        } else if (!t->async) {
+            wait(t->table);
+        }
+    }
+}
+
+void llama_prefetch_batch::wait(const ggml_tensor * table) {
+    for (auto & t : state->tasks) {
+        if (t->table != table) {
+            continue;
+        }
+        const int64_t begin = ggml_time_us();
+        std::unique_lock<std::mutex> lock(state->mutex);
+        state->ready.wait(lock, [&] { return t->ready; });
+        lock.unlock();
+        if (t->failed) {
+            t->failed = false;
+            try {
+                t->stats = {};
+                llama_prefetch_table_rows(t->table, t->rows, t->mode, llama_prefetch_timing_enabled() ? &t->stats : nullptr);
+            } catch (...) {
+                // A refused hint leaves ordinary demand paging as the final fallback.
+            }
+        }
+        state->waited_us += ggml_time_us() - begin;
+    }
+}
+
+int64_t llama_prefetch_batch::wait_us() const {
+    return state->waited_us;
+}
+
+size_t llama_prefetch_batch::task_count() const {
+    return state->tasks.size();
+}
+
+void llama_prefetch_batch::finish() noexcept {
+    if (state->sched) {
+        ggml_backend_sched_set_cpu_ready_callback(state->sched, nullptr, nullptr);
+    }
+    for (auto & worker : state->workers) {
+        worker.join();
+    }
+    state->workers.clear();
+    if (!state->started) {
+        return;
+    }
+    state->started = false;
+    try {
+        if (ggml_account_current()) {
+            ggml_account_note("table_prefetch_wait_ms", std::to_string(state->waited_us/1000.0).c_str());
+        }
+        if (llama_prefetch_timing_enabled()) {
+            for (auto & t : state->tasks) {
+                llama_prefetch_stats_log("lazy_gather", -1, state->n_tokens, t->stats);
+            }
+            LLAMA_LOG_INFO("table_prefetch {\"kind\":\"table_prefetch_wait\",\"us\":{\"wait\":%" PRId64 "}}\n", state->waited_us);
+        }
+    } catch (...) {
+        // Diagnostic allocation failure must not interrupt teardown.
+    }
+}
+
+void llama_prefetch_batch::prepare(ggml_cgraph * graph, llama_ple_prefetch mode, int64_t n_tokens) {
+    state->n_tokens = n_tokens;
+    if (n_tokens <= 1 || mode == LLAMA_PLE_PREFETCH_OFF) {
+        return;
+    }
+    static const bool async = [] {
+        const char * env = getenv("LLAMA_ENGRAM_PREFETCH_ASYNC");
+        return env == nullptr || atoi(env) != 0;
+    }();
+    static const bool parallel = [] {
+        const char * env = getenv("LLAMA_PREFETCH_PIECES_PARALLEL");
+        return env != nullptr && atoi(env) != 0;
+    }();
+    bool gpu_before = false;
+    std::map<const ggml_tensor *, bool> input_overlap;
+    try {
+        for (int i = 0; i < ggml_graph_n_nodes(graph); ++i) {
+            ggml_tensor * node = ggml_graph_node(graph, i);
+            ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(state->sched, node);
+            const bool cpu = backend && ggml_backend_dev_type(ggml_backend_get_device(backend)) == GGML_BACKEND_DEVICE_TYPE_CPU;
+            if (!cpu && backend && node->op != GGML_OP_NONE && node->view_src == nullptr) {
+                gpu_before = true;
+            }
+            if (!cpu || node->op != GGML_OP_GET_ROWS) {
+                continue;
+            }
+            const ggml_tensor * weight = node->src[0];
+            while (weight->view_src) {
+                weight = weight->view_src;
+            }
+            if (!(weight->flags & GGML_TENSOR_FLAG_LAZY) || !ggml_is_matrix(node->src[0])) {
+                continue;
+            }
+            const ggml_tensor * ids = node->src[1];
+            const ggml_tensor * root = ids;
+            while (root->view_src) {
+                root = root->view_src;
+            }
+            // Computed or device-side IDs cannot be read during input preparation.
+            if (!(root->flags & GGML_TENSOR_FLAG_INPUT) || root->op != GGML_OP_NONE || !root->buffer || !ggml_backend_buffer_is_host(root->buffer) ||
+                ids->type != GGML_TYPE_I32 || !ggml_is_contiguous(ids) || !ids->data) {
+                continue;
+            }
+            // Pieces that share one input ID buffer use the window before the first piece.
+            const auto overlap = input_overlap.emplace(root, gpu_before).first;
+            std::vector<int32_t> rows((size_t) ggml_nelements(ids));
+            ggml_backend_tensor_get(ids, rows.data(), 0, rows.size()*sizeof(int32_t));
+            const bool large = prefetch_enough_rows(rows.size(), LLAMA_PLE_PREFETCH_PREFILL);
+            add(node->src[0], std::move(rows), mode, async && overlap->second && large);
+        }
+    } catch (const std::exception & e) {
+        LLAMA_LOG_WARN("table prefetch preparation: %s; using synchronous fallback\n", e.what());
+        for (auto & t : state->tasks) {
+            t->async = false;
+        }
+    }
+    start(parallel);
+    if (!state->tasks.empty()) {
+        ggml_backend_sched_set_cpu_ready_callback(state->sched, [](ggml_cgraph * split, void * opaque) {
+            auto * batch = static_cast<llama_prefetch_batch *>(opaque);
+            for (int i = 0; i < ggml_graph_n_nodes(split); ++i) {
+                const ggml_tensor * node = ggml_graph_node(split, i);
+                if (node->op == GGML_OP_GET_ROWS) {
+                    batch->wait(node->src[0]);
+                }
+            }
+        }, this);
+    }
 }
 
 #if defined(_WIN32)
@@ -240,6 +480,9 @@ static void prefetch_table_rows_unchecked(const ggml_tensor * table, std::vector
     const int64_t t0 = stats ? ggml_time_us() : 0;
     const int64_t n_rows = (int64_t) sorted.size();
     std::sort(sorted.begin(), sorted.end());
+    sorted.erase(std::remove_if(sorted.begin(), sorted.end(), [table](int32_t row) {
+        return row < 0 || row >= table->ne[1];
+    }), sorted.end());
     sorted.erase(std::unique(sorted.begin(), sorted.end()), sorted.end());
     const int64_t t1 = stats ? ggml_time_us() : 0;
 

@@ -1004,6 +1004,8 @@ struct ggml_backend_sched {
 
     ggml_backend_sched_eval_callback callback_eval;
     void * callback_eval_user_data;
+    void (*callback_cpu_ready)(struct ggml_cgraph *, void *);
+    void * callback_cpu_ready_user_data;
 
     ggml_backend_sched_copy_callback callback_copy;
     void * callback_copy_user_data;
@@ -2462,6 +2464,10 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         // record how far the staged input uploads of this split have progressed on the backend stream
         ggml_backend_sched_staging_end_split(sched, split_backend_id);
 
+        if (sched->callback_cpu_ready && ggml_backend_dev_type(ggml_backend_get_device(split_backend)) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+            sched->callback_cpu_ready(&split->graph, sched->callback_cpu_ready_user_data);
+        }
+
         const int64_t t_compute = sched->tm_on ? ggml_time_us() : 0;
         const int64_t f_compute = timing ? ggml_backend_sched_page_faults() : -1;
         const int64_t wait_inputs = sched->tm_wait - switch_wait, copy_inputs = sched->tm_copy;
@@ -3171,6 +3177,12 @@ void ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backe
     GGML_ASSERT(sched);
     sched->callback_eval = callback;
     sched->callback_eval_user_data = user_data;
+}
+
+void ggml_backend_sched_set_cpu_ready_callback(ggml_backend_sched_t sched, void (*callback)(struct ggml_cgraph *, void *), void * user_data) {
+    GGML_ASSERT(sched);
+    sched->callback_cpu_ready = callback;
+    sched->callback_cpu_ready_user_data = user_data;
 }
 
 void ggml_backend_sched_set_copy_callback(ggml_backend_sched_t sched, ggml_backend_sched_copy_callback callback, void * user_data) {

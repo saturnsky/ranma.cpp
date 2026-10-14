@@ -10,6 +10,7 @@
 #include "llama-io.h"
 #include "llama-memory.h"
 #include "llama-mmap.h"
+#include "llama-prefetch.h"
 #include "llama-model.h"
 #include "llama-moe-cache.h"
 #include "llama-ext.h"
@@ -1820,6 +1821,12 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
 
+    std::unique_ptr<llama_prefetch_batch> prefetch;
+    if (ubatch.n_tokens > 1 && cparams.ple_prefetch != LLAMA_PLE_PREFETCH_OFF && !model.can_prefetch.empty()) {
+        prefetch.reset(new llama_prefetch_batch(sched.get()));
+        prefetch->prepare(res->get_gf(), cparams.ple_prefetch, ubatch.n_tokens);
+    }
+
     const int64_t t_submit = account ? ggml_time_us() : 0;
     if (account) {
         ggml_account_add(GGML_ACCOUNT_BEGIN_MS, (t_input - t_acct)/1000.0 - build_ms);
@@ -1851,6 +1858,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     }
 
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1, (int32_t) ubatch.n_tokens);
+    if (prefetch) {
+        prefetch->finish();
+    }
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;

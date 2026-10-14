@@ -1910,31 +1910,6 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     waux = std::move(ml.waux);
 
-    if (per_layer_tok_embd && ml.lazy.has(per_layer_tok_embd)) {
-        LLAMA_LOG_INFO("%s: enabling prefetch for '%s'\n", __func__, per_layer_tok_embd->name);
-
-        can_prefetch.insert(per_layer_tok_embd);
-    }
-    // a table in pieces: every piece is hinted
-    for (ggml_tensor * piece : per_layer_tok_embd_table.parts) {
-        if (piece && ml.lazy.has(piece)) {
-            LLAMA_LOG_INFO("%s: enabling prefetch for '%s'\n", __func__, piece->name);
-
-            can_prefetch.insert(piece);
-        }
-    }
-
-    // DeepSeek V4.1 engram tables are lazily mapped too: their gathers are prefetched like the per-layer embeddings
-    for (const auto & layer : layers) {
-        for (ggml_tensor * piece : layer.engram_table.parts) {
-            if (piece && ml.lazy.has(piece)) {
-                LLAMA_LOG_INFO("%s: enabling prefetch for '%s'\n", __func__, piece->name);
-
-                can_prefetch.insert(piece);
-            }
-        }
-    }
-
     // Tied NVFP4 output is valid when no separate LM-head scale tensors are present.
     // If sidecar scales exist, the output weight must be an actual output tensor.
     GGML_ASSERT(!(output && tok_embd &&
@@ -1945,6 +1920,10 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     for (auto & [_, ctx_ptr] : ml.ctx_map) {
         for (auto * cur = ggml_get_first_tensor(ctx_ptr.get()); cur != NULL; cur = ggml_get_next_tensor(ctx_ptr.get(), cur)) {
             tensors_by_name.emplace_back(ggml_get_name(cur), cur);
+            if (ml.lazy.has(cur) && !ml.no_alloc) {
+                cur->flags |= GGML_TENSOR_FLAG_LAZY;
+                can_prefetch.insert(cur);
+            }
         }
     }
 

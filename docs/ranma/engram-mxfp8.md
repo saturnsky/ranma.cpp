@@ -42,18 +42,23 @@ the peak memory is a few chunk buffers (about 1.2 GB). The output file grows by 
 
 ## Runtime
 
-`blk.N.engram_embd.weight` (or its pieces `blk.N.engram_embd.p<i>.weight` in the table set) is a lazily mapped tensor. Before the gather, `llm_graph_input_engram::set_input`
-hands the sorted, merged row ranges to the operating system with `llama_prefetch_table_rows()` (the helper of
-the per-layer embedding prefetch, `ple-prefetch.md`). It follows `--ple-prefetch` and its thresholds
+`blk.N.engram_embd.weight` (or its pieces `blk.N.engram_embd.p<i>.weight` in the table set) is a lazily mapped tensor. After graph inputs are prepared, the common `llama_prefetch_batch` path discovers CPU `GET_ROWS` nodes with lazy host weights and host input row IDs.
+It hands sorted, merged row ranges to the operating system with the helper of
+the per-layer embedding prefetch (`ple-prefetch.md`). It follows `--ple-prefetch` and its thresholds
 (256 rows for `prefill`, 16 for `always`; a decode token gathers 24 rows per engram layer). A CPU `GET_ROWS` of
 an engram table with 256 rows or more also runs on the threadpool.
 
-In a prompt ubatch (more than one token) the hint of every engram layer but the first runs on a worker thread, so
-that it overlaps the GPU work of the layers before it instead of delaying the graph (`LLAMA_ENGRAM_PREFETCH_ASYNC=0`
-keeps all hints synchronous). The first engram layer's gather follows too soon for that and keeps the synchronous
-hint. The hint never changes what the gather reads; the job is collected by the next `set_input()` and when the
-input is destroyed. A 7309-token DS4.1F prompt (ds41-serial-probe, 2026-10-14): 12.79 s -> 11.91 s, the same
-content and top-10 hashes with `GGML_CUDA_TOP_K_STABLE_TIES=1`.
+In a prompt ubatch, a gather of at least 256 rows with preceding device computation starts its hint asynchronously, including the first engram. Smaller gathers stay synchronous. The CPU scheduler waits for the hints of the tables in its split after input copies and backend transition waits, before computing the split. This uses a dedicated readiness callback, not the user's eval callback, and does not split or synchronize the graph further. A late hint produces an exposed wait instead of an overlapping hint invocation and gather.
+
+`LLAMA_ENGRAM_PREFETCH_ASYNC=0` keeps hints synchronous. The default is on; the switch now applies to the common lazy-table path, not only engram. Gathers at the front of the graph (including shared Qwen PLE) stay synchronous because there is no preceding device computation to overlap. Single-token input preparation keeps the existing synchronous prefetch calls.
+
+`LLAMA_PREFETCH_PIECES_PARALLEL=1` enables concurrent piece hints. The default is 0 pending measurement. The worker count is bounded by the queued piece count and hardware concurrency; the default uses one worker. Each piece has independent completion state. Parallel hints also apply to synchronous prompt gathers, which wait before submission. Workers own row IDs and are joined before the ubatch submission scope returns, including abort and error returns. Thread creation failure drains unclaimed tasks synchronously; refused OS hints leave ordinary demand paging intact.
+
+`LLAMA_PREFETCH_TIMING=1` logs `table_prefetch` records with `what=lazy_gather` and a `table_prefetch_wait` record with `us.wait`. Accounting records include `table_prefetch_wait_ms`. Piece timings are per-piece work, not a summed parallel wall time. The common path includes the placeholder row 0 that a masked piece gather really reads. Completion means the OS hint call returned, not guaranteed page residency or completion of all OS background I/O (particularly `MADV_WILLNEED`). No pinning or residency promise is added.
+
+The loader marks all lazy tensors with `GGML_TENSOR_FLAG_LAZY` (ranma extension, bit 15). A CPU gather uses the threadpool from 256 rows when its source is a marked host weight, without tensor-name checks. A new model with host input IDs and lazy host tables needs no model-specific prefetch code. Computed or device-side IDs are skipped because they are not yet available during input preparation. Models without lazy gather tables keep their existing execution path. Performance of this gated implementation is not yet measured; the previous ungated later-layer implementation measured 12.79 s -> 11.91 s on a 7309-token DS4.1F prompt.
+
+Gemma4 keeps its existing synchronous PLE hints and may receive a duplicate hint from the common path. These pages have already been hinted, but submitting another hint still has a cost. This implementation accepts that cost to keep the upstream input helper and Gemma4 model source unchanged; Gemma4 performance is not part of this work's validation.
 
 ## Tests
 

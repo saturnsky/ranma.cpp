@@ -1570,7 +1570,9 @@ void llm_graph_input_qwen4exp_ple::set_input(const llama_ubatch * ubatch) {
     const int64_t t_hashed = timing ? ggml_time_us() : 0;
     llama_prefetch_stats stats;
     const llama_table_pieces & table = model.per_layer_tok_embd_table;
-    llama_prefetch_table_pieces_rows(table.parts, table.part_rows, idx, ple_prefetch, timing ? &stats : nullptr);
+    if (n_tokens <= 1) {
+        llama_prefetch_table_pieces_rows(table.parts, table.part_rows, idx, ple_prefetch, timing ? &stats : nullptr);
+    }
     const int64_t t_input = timing ? ggml_time_us() : 0;
 
     // global row numbers -> per piece local row numbers and the mask that keeps the piece which holds the row
