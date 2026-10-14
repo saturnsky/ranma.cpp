@@ -11249,8 +11249,16 @@ struct test_lightning_indexer : public test_case {
 
     const ggml_type type_K;
 
+    // ratio > 0 builds a causal compressed mask for
+    // queries at positions p0.. (query p sees the keys j with (j + 1)*ratio <= p + 1)
+    const int64_t ratio;
+    const int64_t p0;
+
     std::string vars() override {
-        return VARS_TO_STR7(hsk, nh, kv, nb, ns, nm, type_K);
+        if (ratio == 0) {
+            return VARS_TO_STR7(hsk, nh, kv, nb, ns, nm, type_K);
+        }
+        return VARS_TO_STR9(hsk, nh, kv, nb, ns, nm, type_K, ratio, p0);
     }
 
     double max_nmse_err() override {
@@ -11262,8 +11270,9 @@ struct test_lightning_indexer : public test_case {
         return ((2 * hsk + 2) * nh + 1) * kv * nb * ns;
     }
 
-    test_lightning_indexer(int64_t hsk = 128, int64_t nh = 64, int64_t kv = 256, int64_t nb = 128, int64_t ns = 1, int64_t nm = 1, ggml_type type_K = GGML_TYPE_F16)
-        : hsk(hsk), nh(nh), kv(kv), nb(nb), ns(ns), nm(nm), type_K(type_K) {}
+    test_lightning_indexer(int64_t hsk = 128, int64_t nh = 64, int64_t kv = 256, int64_t nb = 128, int64_t ns = 1, int64_t nm = 1, ggml_type type_K = GGML_TYPE_F16,
+            int64_t ratio = 0, int64_t p0 = 0)
+        : hsk(hsk), nh(nh), kv(kv), nb(nb), ns(ns), nm(nm), type_K(type_K), ratio(ratio), p0(p0) {}
 
     ggml_tensor * build_graph(ggml_context * ctx) override {
         ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hsk, nh, nb, ns);
@@ -11290,7 +11299,19 @@ struct test_lightning_indexer : public test_case {
 
     void initialize_tensors(ggml_context * ctx) override {
         for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
-            if (strcmp(t->name, "m") == 0) {
+            if (strcmp(t->name, "m") == 0 && ratio > 0) {
+                std::vector<ggml_fp16_t> data(ggml_nelements(t));
+                for (int64_t i3 = 0; i3 < t->ne[3]; ++i3) {
+                    for (int64_t i1 = 0; i1 < t->ne[1]; ++i1) {
+                        const int64_t pos = p0 + i1;
+                        for (int64_t i0 = 0; i0 < t->ne[0]; ++i0) {
+                            const bool visible = (i0 + 1)*ratio <= pos + 1;
+                            data[(i3*t->ne[1] + i1)*t->ne[0] + i0] = ggml_fp32_to_fp16(visible ? 0.0f : -INFINITY);
+                        }
+                    }
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
+            } else if (strcmp(t->name, "m") == 0) {
                 init_tensor_kq_mask(t);
             } else {
                 init_tensor_uniform(t);
@@ -14839,6 +14860,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // the key sharing tile path for 64/32 heads, random and causal masks, ragged tails
+    for (int nh : { 64, 32 }) {
+        for (auto [kv, nb] : { std::pair{256, 512}, std::pair{520, 37}, std::pair{65, 8} }) {
+            test_cases.emplace_back(new test_lightning_indexer(128, nh, kv, nb, 1, 1, GGML_TYPE_F16));
+            test_cases.emplace_back(new test_lightning_indexer(128, nh, kv, nb, 1, 1, GGML_TYPE_F16, 4, 2*kv));
+            test_cases.emplace_back(new test_lightning_indexer(128, nh, kv, nb, 2, 1, GGML_TYPE_F16, 2, 0));
+        }
+    }
+
     return test_cases;
 }
 #ifdef _MSC_VER
@@ -15535,6 +15565,19 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 512, 1));  // 4h PP-512
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 1024, 1)); // 4h PP-1024
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 64, 1, 1, false, true)); // KDA PP-64
+
+    // lightning_indexer, DeepSeek V4 Flash prefill chunks (64 heads, ratio 4, chunk 2048 of a 7305 token
+    // batch) and DeepSeek V4.1 Flash index sources (32 heads, ratio 2 and 1, whole batch keys)
+    for (int c = 0; c < 4; ++c) {
+        const int64_t nb = c < 3 ? 2048 : 7305 - 3*2048;
+        test_cases.emplace_back(new test_lightning_indexer(128, 64, 512*(c + 1), nb, 1, 1, GGML_TYPE_F16, 4, 2048*c));
+    }
+    for (int64_t r : { 2, 1 }) {
+        for (int c : { 0, 3 }) {
+            const int64_t nb = c < 3 ? 2048 : 7305 - 3*2048;
+            test_cases.emplace_back(new test_lightning_indexer(128, 32, 7305/r, nb, 1, 1, GGML_TYPE_F16, r, 2048*c));
+        }
+    }
 
     // lightning_indexer
     for (int kv : { 256, 4096, 65536 }) {
