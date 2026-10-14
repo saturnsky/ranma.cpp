@@ -8,6 +8,7 @@
 #include "llama-impl.h"
 #include "llama-memory.h"
 #include "llama-moe-cache.h"
+#include "llama-sidecar.h"
 
 #include "ggml-cpp.h"
 #include "ggml-opt.h"
@@ -66,6 +67,9 @@ struct llama_context {
     // Public because the llama_expert_* C functions are the only writers.
     const ggml_expert_iface * expert_iface   = nullptr;
     ggml_backend_t            expert_backend = nullptr;
+
+    // ranma expert sidecar (llama-sidecar.h); null unless RANMA_EXPERT_SIDECAR is set
+    llama_sidecar_ctx_ptr sidecar;
     llama_seq_id              expert_profiled_seq  = -1;
     ggml_expert_bank_id       expert_profiled_bank = GGML_EXPERT_BANK_NONE;
 

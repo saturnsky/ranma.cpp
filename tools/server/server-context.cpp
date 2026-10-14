@@ -12,6 +12,7 @@
 
 #include "build-info.h"
 #include "../../src/llama-ext.h" // staging API: llama_model_n_devices / llama_model_get_device (used by the GPU heartbeat)
+#include "../../src/llama-sidecar.h" // staging API: the expert sidecar (RANMA_EXPERT_SIDECAR)
 #include "common.h"
 #include "fit.h"
 #include "ggml-account.h"
@@ -369,6 +370,9 @@ struct server_slot {
 
     llama_tokens spec_draft;
 
+    // ranma expert sidecar: the task whose REQ_BEGIN was written
+    int32_t sidecar_req = -1;
+
     // draft candidates per token in spec_draft; only draft-simple and draft-mtp fill it
     std::vector<std::vector<llama_token_data>> spec_draft_q;
     llama_tokens spec_prompt;
@@ -714,6 +718,11 @@ struct server_slot {
                 common_speculative_end(spec, id, spec_gen);
             }
             spec_gen.clear();
+
+            if (llama_sidecar_enabled()) {
+                llama_sidecar_event(ctx_tgt, LLAMA_SIDECAR_EVENT_REQ_END, task->id, stats.n_gen, stats.n_draft_tokens,
+                        stats.n_draft_accepted, 0);
+            }
 
             t_last_used = ggml_time_us();
 
@@ -1618,6 +1627,20 @@ private:
         if (!spec && params_base.speculative.has_synth()) {
             SRV_ERR("%s", "synthetic acceptance requires an initialized speculative decoding context\n");
             return false;
+        }
+
+        if (llama_sidecar_enabled()) {
+            llama_sidecar_note("build", llama_build_info());
+            llama_sidecar_note(("ctx_role." + std::to_string(llama_sidecar_ctx_id(ctx_tgt))).c_str(), "target");
+            if (ctx_dft) {
+                llama_sidecar_note(("ctx_role." + std::to_string(llama_sidecar_ctx_id(ctx_dft))).c_str(), "draft");
+                llama_sidecar_set_phase(ctx_dft, -1, LLAMA_SIDECAR_PHASE_DRAFT);
+            }
+            llama_sidecar_note("spec_type", spec ? common_speculative_type_name_str(params_base.speculative.types).c_str() : "none");
+            llama_sidecar_note("expert_profile_dir", params_base.expert_profile_dir.c_str());
+            llama_sidecar_note("expert_l1_mib", std::to_string(params_base.expert_l1_mib).c_str());
+            llama_sidecar_note("expert_l2_mib", std::to_string(params_base.expert_l2_mib).c_str());
+            llama_sidecar_note("expert_cache_draft", params_base.expert_cache_draft ? "on" : "off");
         }
 
         for (int i = 0; i < params_base.n_parallel; i++) {
@@ -4713,6 +4736,43 @@ private:
 
     // returns true = success ; false = retry with smaller batch size
     // throw std::runtime_error on fatal error
+    // ranma expert sidecar: the request and phase of the next target decode call, and the start of a request
+    void sidecar_tag(int32_t off) {
+        int32_t n_prompt = 0;
+        int32_t n_gen    = 0;
+        int32_t id_slot  = -1;
+        bool    multi    = false;
+        for (int i = off; i < off + batch.view.size(); ++i) {
+            const auto & t = batch.tokens[i];
+            (t.is_prompt ? n_prompt : n_gen)++;
+            if (id_slot < 0) {
+                id_slot = t.id_slot;
+            } else if (t.id_slot != id_slot) {
+                multi = true;
+            }
+            if (t.is_prompt && t.id_slot >= 0 && (size_t) t.id_slot < slots.size()) {
+                server_slot & sl = slots[t.id_slot];
+                if (sl.task && sl.sidecar_req != sl.task->id) {
+                    sl.sidecar_req = sl.task->id;
+                    llama_sidecar_event(ctx_tgt, LLAMA_SIDECAR_EVENT_REQ_BEGIN, sl.task->id, sl.id,
+                            (int64_t) sl.task->n_tokens(), sl.stats.n_prompt_cached, 0);
+                }
+            }
+        }
+        server_slot * slot = !multi && id_slot >= 0 && (size_t) id_slot < slots.size() ? &slots[id_slot] : nullptr;
+        const int32_t req = slot && slot->task ? slot->task->id : -1;
+        llama_sidecar_phase phase = LLAMA_SIDECAR_PHASE_MIXED;
+        if (n_gen == 0) {
+            phase = LLAMA_SIDECAR_PHASE_PREFILL;
+        } else if (n_prompt == 0) {
+            phase = slot && !slot->spec_draft.empty() && n_gen > 1 ? LLAMA_SIDECAR_PHASE_VERIFY : LLAMA_SIDECAR_PHASE_DECODE;
+        }
+        llama_sidecar_set_phase(ctx_tgt, req, phase);
+        if (ctx_dft) {
+            llama_sidecar_set_phase(ctx_dft, req, LLAMA_SIDECAR_PHASE_DRAFT);
+        }
+    }
+
     bool decode(int32_t & n_batch, int32_t off) {
         SRV_DBG("n_batch (effective) = %d, off = %d\n", n_batch, off);
 
@@ -4742,6 +4802,10 @@ private:
         bool has_output = false;
         for (int i = off; i < off + batch.view.size(); ++i) {
             has_output |= batch.tokens[i].output;
+        }
+
+        if (llama_sidecar_enabled()) {
+            sidecar_tag(off);
         }
 
         // yield to the queue, so we can still handle metrics tasks while decoding
@@ -5082,6 +5146,12 @@ private:
 
             // --spec-smart: the acceptance of the verified draft positions
             common_speculative_smart_accepted(spec.get(), slot.id, (int32_t) n_accepted);
+
+            if (llama_sidecar_enabled()) {
+                llama_sidecar_event(slot.ctx_tgt, LLAMA_SIDECAR_EVENT_ACCEPT, slot.task ? slot.task->id : -1,
+                        (int64_t) slot.prompt.tokens.pos_next() - (int64_t) n_draft - 1, (int64_t) n_draft, (int64_t) n_accepted,
+                        llama_sidecar_call_seq(slot.ctx_tgt));
+            }
 
             // update how many tokens out of those tested were accepted
             slot.stats.n_draft_accepted += n_accepted;

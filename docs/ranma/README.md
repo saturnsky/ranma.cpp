@@ -109,6 +109,9 @@ Starting settings by model and hardware are in [recipes.md](recipes.md).
   next layer into the decode pool with the copy engine. [expert-prefetch.md](expert-prefetch.md)
 - **Joint cache of models with different expert counts** - a draft model with another expert count (the DSpark
   drafter of DeepSeek V4.1 Flash) joins the target's cache. [expert-cache-joint.md](expert-cache-joint.md)
+- **Expert sidecar (diagnostics)** - `RANMA_EXPERT_SIDECAR=<file>` records the router selections of every decode call
+  in token order, with the server's request and draft/accept events, as a binary file for offline cache-policy
+  replay. Off by default. [expert-sidecar.md](expert-sidecar.md)
 
 ### Graph runtime
 

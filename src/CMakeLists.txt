@@ -42,6 +42,7 @@ set(LLAMA_CORE_SOURCES
     llama-prefetch.cpp
     llama-quant.cpp
     llama-sampler.cpp
+    llama-sidecar.cpp
     llama-vocab.cpp
     llama-weight-aux.cpp
     unicode-data.cpp
