@@ -3304,7 +3304,7 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
         }
 
         // the expert-major MoE stages experts on a side stream of its own
-        if (node->op == GGML_OP_MOE_FFN_HAD && !ggml_cuda_moe_ffn_had_graph_ok()) {
+        if (node->op == GGML_OP_MOE_FFN_HAD && !ggml_cuda_moe_ffn_had_graph_ok(node)) {
             use_cuda_graph = false;
         }
 
@@ -7893,6 +7893,14 @@ static bool ggml_backend_cuda_moe_group_diag(ggml_backend_t backend, const int o
     return ggml_cuda_moe_group_diag(op, a, out);
 }
 
+// ranma: the link bytes of the expert-major op, see ggml_cuda_moe_link_stats (out[6])
+static bool ggml_backend_cuda_moe_link_stats(ggml_backend_t backend, const int enable, uint64_t * out) {
+    if (backend == nullptr || !ggml_backend_is_cuda(backend)) {
+        return false;
+    }
+    return ggml_cuda_moe_link_stats(((ggml_backend_cuda_context *) backend->context)->device, enable, out);
+}
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
@@ -7946,6 +7954,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_cuda_moe_group_diag") == 0) {
         return (void *)ggml_backend_cuda_moe_group_diag;
+    }
+    if (strcmp(name, "ggml_backend_cuda_moe_link_stats") == 0) {
+        return (void *)ggml_backend_cuda_moe_link_stats;
     }
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_cuda_get_features;
