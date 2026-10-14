@@ -965,6 +965,9 @@ struct lx_carry_plan {
     int    slot   = -1;
 };
 
+// the link counters of the backend at the end of the previous call (layer_exec_link deltas)
+uint64_t link_stats_prev[6] = {};
+
 int64_t lx_env_i64(const char * name) {
     const char * env = getenv(name);
     return env != nullptr ? atoll(env) : 0;
@@ -1300,10 +1303,44 @@ int llama_context::layer_exec_decode(llama_memory_context_i * mctx, uint32_t n_t
     } else {
         B = C; // grown below to what the budget leaves
     }
+    // PCIe once (the expert-major op of a group of ubatches, mul-mat-had.cu): the host experts of a layer cross the link
+    // once per group (copied into two staging buffers of `once_slots` experts each) instead of once per tile of rows.
+    //   RANMA_LAYER_EXEC_PCIE_ONCE: exact (T: the down rows of the group, n_used * n_embd F32 per token, and one sum per
+    //     token in slot order: equal to the ubatch-major op), partial (no T: the sums of a token split at the chunks of the
+    //     op, as the multi-chunk op without it; a rounding difference), 0 (off: the host experts are read in place per
+    //     tile). Default (auto): exact when a group of two ubatches fits with T, else partial, else off.
+    //   RANMA_LAYER_EXEC_STAGE_SLOTS: experts per staging buffer. Default: an eighth of the device budget over the two
+    //     buffers, 2 .. 64 (the op's tables), at most half the experts.
+    int    once_mode  = 0; // 0 off, 1 exact, 2 partial
+    int    once_slots = 0;
+    size_t once_eb    = 0; // bytes of one expert (three kinds, 256-aligned each), the largest layer
+    size_t once_t_pt  = 0; // T per token
+    std::string once_env;
+    if (fused) {
+        const char * v = getenv("RANMA_LAYER_EXEC_PCIE_ONCE");
+        once_env = v != nullptr ? v : "auto";
+        for (int il = 0; il < L_all; ++il) {
+            const auto & ly = model.layers[il];
+            size_t eb = 0;
+            for (const ggml_tensor * t : { ly.ffn_up_exps, ly.ffn_gate_exps, ly.ffn_down_exps }) {
+                eb += t != nullptr ? GGML_PAD((size_t) t->nb[2], 256) : 0;
+            }
+            once_eb = std::max(once_eb, eb);
+        }
+        once_t_pt = (size_t) n_used*(size_t) model.hparams.n_embd*sizeof(float);
+        if (once_eb == 0 || once_env == "0" || once_env == "off") {
+            once_env = "off";
+        }
+    }
+    auto once_stage_bytes = [&]() -> size_t {
+        return once_mode != 0 ? (size_t) 2*once_slots*once_eb + 256 : 0;
+    };
     auto moe_extra = [&](int64_t w) -> size_t {
         const int64_t rows = B > 0 ? std::min(B, w) : w;
         const double need = moe_pt*(double) rows;
         size_t extra = need > (double) sched_cur ? (size_t) (need - (double) sched_cur) : 0;
+        // the op's staging buffers and (exact) T, from the device pool
+        extra += once_stage_bytes() + (once_mode == 1 ? once_t_pt*(size_t) w : 0);
         if (fused && op_rows > 0) {
             // the op's scratch for passes wider than the block the expert cache keeps for it comes from the device pool
             extra += ggml_moe_ffn_had_scratch_bytes(w, n_used, op_rows, (int64_t) model.hparams.n_expert, (int64_t) model.hparams.n_embd,
@@ -1338,7 +1375,8 @@ int llama_context::layer_exec_decode(llama_memory_context_i * mctx, uint32_t n_t
         return (dev_budget == 0 || dev_need <= dev_budget) && (host_budget == 0 || host_need <= host_budget);
     };
     int64_t G = K;
-    {
+    auto pick_group = [&]() {
+        G = K;
         const int64_t env = lx_cfg_i64(&llama_layer_mode_config::layer_exec_group_tokens);
         if (env > 0) {
             G = std::min<int64_t>(K, std::max<int64_t>(1, env/C));
@@ -1347,7 +1385,28 @@ int llama_context::layer_exec_decode(llama_memory_context_i * mctx, uint32_t n_t
                 G--;
             }
         }
+    };
+    if (fused && once_env != "off") {
+        const int64_t env_slots = lx_env_i64("RANMA_LAYER_EXEC_STAGE_SLOTS");
+        const int64_t rule      = (int64_t) (dev_budget/8/std::max<size_t>(1, 2*once_eb));
+        once_slots = (int) std::max<int64_t>(2, std::min<int64_t>({ env_slots > 0 ? env_slots : rule, (int64_t) 64,
+            std::max<int64_t>(2, ((int64_t) model.hparams.n_expert + 1)/2) }));
+        const bool want_exact   = once_env == "auto" || once_env == "1" || once_env == "exact";
+        const bool want_partial = once_env == "auto" || once_env == "1" || once_env == "partial";
+        once_mode = 0;
+        if (want_exact) {
+            once_mode = 1;
+            pick_group();
+        }
+        if (want_partial && (once_mode == 0 || G < 2 || !group_fits(G))) {
+            once_mode = 2;
+            pick_group();
+        }
+        if (G < 2 || !group_fits(G)) {
+            once_mode = 0; // nothing staged fits: the op reads its host experts in place
+        }
     }
+    pick_group();
     if (G < 2 || !group_fits(G)) {
         n_outputs = save_n_outputs;
         if (log > 0) {
@@ -1487,6 +1546,12 @@ int llama_context::layer_exec_decode(llama_memory_context_i * mctx, uint32_t n_t
         if (fused && op_rows > 0) {
             LLAMA_LOG_INFO("layer_exec_plan: expert-major op passes of %" PRId64 " rows\n", op_rows);
         }
+    }
+    if (fused && (log > 0 || once_mode != 0)) {
+        // one line per call: the PCIe-once mode the budget allowed (RANMA_LAYER_EXEC_PCIE_ONCE)
+        LLAMA_LOG_INFO("layer_exec_pcie_once: %s (%s), %d experts per staging buffer (%.1f MiB for two), T %.1f KiB per row\n",
+            once_mode == 1 ? "exact" : once_mode == 2 ? "partial" : "off", once_env.c_str(), once_slots,
+            once_stage_bytes()/1048576.0, once_mode == 1 ? once_t_pt/1024.0 : 0.0);
     }
 
     // ---- every group: the memory, graph and inputs of its ubatches, then its layers -----------------------------------
@@ -1839,11 +1904,16 @@ int llama_context::layer_exec_decode(llama_memory_context_i * mctx, uint32_t n_t
                     LLAMA_LOG_ERROR("%s: %s\n", __func__, err.c_str());
                     return abort_batch("cannot copy a MoE region");
                 }
-                if (op_rows > 0) {
+                if (op_rows > 0 || once_mode != 0) {
                     for (int i : r.nodes) {
                         ggml_tensor * t = cp.map.at(gd.node(i));
                         if (t->op == GGML_OP_MOE_FFN_HAD) {
-                            ((int32_t *) t->op_params)[2] = (int32_t) op_rows;
+                            if (op_rows > 0) {
+                                ((int32_t *) t->op_params)[2] = (int32_t) op_rows;
+                            }
+                            // PCIe once: the op takes it only with more rows than one pass (a group of ubatches)
+                            ((int32_t *) t->op_params)[3] = once_mode;
+                            ((int32_t *) t->op_params)[4] = once_slots;
                         }
                     }
                 }
@@ -1900,6 +1970,25 @@ int llama_context::layer_exec_decode(llama_memory_context_i * mctx, uint32_t n_t
             "%.1f MiB read by the segments\n", n_host == 0 ? "device" : n_dev == 0 ? "host" : "mixed",
             mask_dev[0], mask_host[0], mask_dev[1], mask_host[1], mask_dev[2], mask_host[2], rest.c_str(),
             host_masks_held/1048576.0, host_masks_read/1048576.0);
+    }
+    if (fused && (log > 0 || once_mode != 0)) {
+        // one line per call: the link bytes the expert-major ops of the call counted (logical: the in-place reads count a
+        // weight read per tile of host rows; the ubatch-major ops of the tail layers only with RANMA_EXPERT_LINK_COUNT=1)
+        using link_stats_t = bool (*)(ggml_backend_t, int, uint64_t *);
+        auto * fn = (link_stats_t) ggml_backend_reg_get_proc_address(ggml_backend_dev_backend_reg(dev),
+            "ggml_backend_cuda_moe_link_stats");
+        uint64_t st[6] = {};
+        if (fn != nullptr && fn(backend_dev, 0, st)) {
+            uint64_t d[6];
+            for (int i = 0; i < 6; ++i) {
+                d[i] = st[i] - link_stats_prev[i];
+                link_stats_prev[i] = st[i];
+            }
+            LLAMA_LOG_INFO("layer_exec_link: %" PRId64 " tokens, PCIe once %s: experts staged %.1f MiB, read in place %.1f MiB "
+                "(logical), %" PRIu64 " ops counted, %" PRIu64 " PCIe-once ops in %" PRIu64 " chunks, %" PRIu64 " fell back\n",
+                N, once_mode == 1 ? "exact" : once_mode == 2 ? "partial" : "off", d[0]/1048576.0, d[1]/1048576.0, d[2], d[3],
+                d[4], d[5]);
+        }
     }
 
     return 0;
