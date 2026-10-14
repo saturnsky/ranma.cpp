@@ -23,6 +23,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <regex>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -1630,6 +1631,73 @@ bool llama_context::set_adapter_cvec(
     return res;
 }
 
+// ranma: diagnostic ubatch dump (RANMA_UB_DUMP=<regex>, RANMA_UB_DUMP_DIR=<dir>, RANMA_UB_DUMP_POS=<lo>,<hi>). For every
+// ubatch whose positions all lie in [lo, hi], each computed tensor whose name matches the regex is appended whole (its
+// ggml_nbytes span, strides kept) to <dir>/ub-dump.bin, and one text line per record goes to <dir>/ub-dump.idx:
+// rec ub pos0 n_tokens name type ne0 ne1 ne2 ne3 nb0 nb1 nb2 nb3 offset nbytes. Other ubatches run without the eval
+// callback. The scheduler stops at every matched tensor, so this is slow and meant for comparing two runs.
+// RANMA_DEBUG_SMALL_CALL_UB1=<n>: a decode call of 2..n tokens is split into one-token ubatches.
+namespace {
+struct ranma_ub_dump {
+    bool        on = false;
+    std::regex  re;
+    FILE *      bin = nullptr;
+    FILE *      idx = nullptr;
+    int64_t     lo  = 0;
+    int64_t     hi  = -1;
+    int64_t     rec = 0;
+    int64_t     off = 0;
+    int64_t     ub  = 0;
+    int64_t     pos0 = 0;
+    int64_t     n_tokens = 0;
+
+    ranma_ub_dump() {
+        const char * pat = getenv("RANMA_UB_DUMP");
+        const char * pos = getenv("RANMA_UB_DUMP_POS");
+        if (pat == nullptr || pos == nullptr) {
+            return;
+        }
+        long long a = 0, b = -1;
+        if (sscanf(pos, "%lld,%lld", &a, &b) != 2) {
+            return;
+        }
+        lo = a;
+        hi = b;
+        re = std::regex(pat);
+        const char * dir = getenv("RANMA_UB_DUMP_DIR");
+        const std::string d = dir != nullptr ? dir : ".";
+        bin = fopen((d + "/ub-dump.bin").c_str(), "wb");
+        idx = fopen((d + "/ub-dump.idx").c_str(), "w");
+        on  = bin != nullptr && idx != nullptr;
+    }
+};
+
+ranma_ub_dump & ranma_ub_dump_state() {
+    static ranma_ub_dump st;
+    return st;
+}
+
+bool ranma_ub_dump_cb(struct ggml_tensor * t, bool ask, void * user_data) {
+    auto & st = *(ranma_ub_dump *) user_data;
+    if (ask) {
+        return std::regex_search(t->name, st.re);
+    }
+    const size_t n = ggml_nbytes(t);
+    std::vector<uint8_t> buf(n);
+    ggml_backend_tensor_get(t, buf.data(), 0, n);
+    fwrite(buf.data(), 1, n, st.bin);
+    fflush(st.bin);
+    fprintf(st.idx, "%lld %lld %lld %lld %s %d %lld %lld %lld %lld %zu %zu %zu %zu %lld %zu\n",
+            (long long) st.rec, (long long) st.ub, (long long) st.pos0, (long long) st.n_tokens, t->name, (int) t->type,
+            (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2], (long long) t->ne[3],
+            t->nb[0], t->nb[1], t->nb[2], t->nb[3], (long long) st.off, n);
+    fflush(st.idx);
+    st.rec++;
+    st.off += (int64_t) n;
+    return true;
+}
+} // namespace
+
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
     // prefill accounting (RANMA_PREFILL_ACCOUNT): the record is closed on every way out of this function
     struct account_scope {
@@ -1866,6 +1934,25 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             }
         }
         expert_iface->profile_select(expert_backend, row_begin, row_end, expert_profiled_bank);
+    }
+
+    // ranma: diagnostic ubatch dump (RANMA_UB_DUMP), on only for the ubatches inside the position range
+    {
+        auto & dump = ranma_ub_dump_state();
+        if (dump.on) {
+            bool in = ubatch.n_tokens > 0 && ubatch.pos != nullptr;
+            for (uint32_t i = 0; in && i < ubatch.n_tokens; ++i) {
+                in = ubatch.pos[i] >= dump.lo && ubatch.pos[i] <= dump.hi;
+            }
+            if (in) {
+                dump.pos0     = ubatch.pos[0];
+                dump.n_tokens = ubatch.n_tokens;
+                ggml_backend_sched_set_eval_callback(sched.get(), ranma_ub_dump_cb, &dump);
+            } else {
+                ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
+            }
+            dump.ub++;
+        }
     }
 
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1, (int32_t) ubatch.n_tokens);
@@ -2241,7 +2328,18 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
     llama_memory_context_ptr mctx;
 
     while (true) {
-        mctx = memory->init_batch(*balloc, cparams.n_ubatch, embd_all);
+        uint32_t n_ubatch_split = cparams.n_ubatch;
+        {
+            // ranma: diagnostic one-token ubatches for small calls (RANMA_DEBUG_SMALL_CALL_UB1)
+            static const int n_small = [] {
+                const char * e = getenv("RANMA_DEBUG_SMALL_CALL_UB1");
+                return e != nullptr ? atoi(e) : 0;
+            }();
+            if (n_small > 1 && n_tokens_all > 1 && n_tokens_all <= (int64_t) n_small) {
+                n_ubatch_split = 1;
+            }
+        }
+        mctx = memory->init_batch(*balloc, n_ubatch_split, embd_all);
         if (!mctx) {
             return -2;
         }
