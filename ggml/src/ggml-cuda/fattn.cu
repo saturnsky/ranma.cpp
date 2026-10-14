@@ -451,6 +451,32 @@ void ggml_cuda_flash_attn_ext_compact_mask(
 #endif // !defined(GGML_USE_MUSA)
 }
 
+// diagnostic lists for GGML_CUDA_FA_DIAG=list:<i|s|S>:<U> (see fattn-common.cuh): list l gets U rows, then -1.
+// Shuffled: row (a*i + b) mod n_rows with an odd prime a, so the U rows are distinct and each 1 KiB row stays whole;
+// b depends on l/4, so 4 consecutive query tiles (16 rows) share a list.
+static __global__ void ggml_cuda_fa_diag_fill_lists_kernel(
+        int32_t * indices, int32_t * counts, const int32_t n_kv_max, const int32_t U, const bool identity, const int64_t n_rows) {
+    const int64_t l = blockIdx.x;
+    const int64_t b = ((uint64_t(l/4) + 1)*2654435761ull) % uint64_t(n_rows);
+    for (int32_t i = threadIdx.x; i < n_kv_max; i += blockDim.x) {
+        int32_t v = -1;
+        if (i < U) {
+            v = identity ? i : int32_t((int64_t(40503)*i + b) % n_rows);
+        }
+        indices[l*n_kv_max + i] = v;
+    }
+    if (threadIdx.x == 0) {
+        counts[l] = U;
+    }
+}
+
+void ggml_cuda_fa_diag_fill_lists(
+        ggml_backend_cuda_context & ctx, int32_t * indices, int32_t * counts, int64_t n_lists, int32_t n_kv_max,
+        int32_t U, bool identity, int64_t n_rows) {
+    ggml_cuda_fa_diag_fill_lists_kernel<<<dim3(n_lists), dim3(256), 0, ctx.stream()>>>(indices, counts, n_kv_max, U, identity, n_rows);
+    CUDA_CHECK(cudaGetLastError());
+}
+
 bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(const int cc, const ggml_tensor * dst, const int ncols1, const int ncols2) {
 #if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
     GGML_UNUSED_VARS(cc, dst, ncols1, ncols2);
@@ -475,6 +501,250 @@ bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(const int cc, const ggml_
         mask->ne[0] == K->ne[1] && mask->ne[1] >= Q->ne[1] && mask->ne[2] == 1 &&
         K->ne[1] >= std::max<int64_t>(4096, 2*n_gather);
 #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+}
+
+// Whether the 512-wide HIP WMMA kernel (4 query rows x 8 Q heads) should read K/V/mask through the per-tile union
+// lists of the mask compaction instead of scanning the whole K. Prefill of DeepSeek V4 / V4.1 CSA layers: 64 heads of
+// 512 on one K/V head, a window plus top-k mask with n_kv_max (op param 4) visible cells per row.
+//
+// Cost model, in units of one dense WMMA K cell: the dense kernel reads all W cells of K, the list kernel reads the
+// union U of the 4 rows' cells with a per-cell overhead kappa for the indirect rows and the gathered mask (measured:
+// +24..26% for identity lists, +29..40% for whole rows in shuffled order, compaction included; kappa = 7/5). U is not
+// known on the host, so it is estimated as if the 4 rows picked their n_kv_max cells independently and uniformly from
+// the W cells, E[U] = W*(1 - (1 - n_kv_max/W)^4), which credits no overlap between neighbouring tokens (the real
+// selectors overlap far more, so this errs towards the dense kernel). The list kernel is taken when kappa*E[U] <= W,
+// i.e. from W of about 3.7*n_kv_max on.
+//
+// The tile kernel's gather reads the same union at several times the cost per cell of the list WMMA kernel, and its
+// own gate (W >= 2*8*n_kv_max at this shape) only opens where E[U] <= W/4, where the list kernel is always taken.
+// The list kernel runs with F32 VKQ accumulators (see ggml_cuda_flash_attn_ext_wmma_f32acc).
+bool ggml_cuda_flash_attn_ext_wmma_shall_use_sparse(const int device, const ggml_tensor * dst) {
+#if defined(GGML_USE_HIP)
+    const ggml_tensor * Q    = dst->src[0];
+    const ggml_tensor * K    = dst->src[1];
+    const ggml_tensor * V    = dst->src[2];
+    const ggml_tensor * mask = dst->src[3];
+
+    const ggml_cuda_fa_diag diag = ggml_cuda_fa_diag_get();
+    if (diag.mode == 1 || diag.mode == 3) {
+        return false;
+    }
+
+    const int cc = ggml_cuda_info().devices[device].cc;
+    if (!GGML_CUDA_CC_IS_RDNA4(cc) || !amd_wmma_available(cc) || ggml_cuda_info().devices[device].warp_size != 32) {
+        return false;
+    }
+
+    const int32_t n_kv_max = ggml_get_op_params_i32(dst, 4);
+    if (mask == nullptr || n_kv_max <= 0) {
+        return false;
+    }
+
+    float max_bias      = 0.0f;
+    float logit_softcap = 0.0f;
+    memcpy(&max_bias,      (const float *) dst->op_params + 1, sizeof(float));
+    memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
+    if (max_bias != 0.0f || logit_softcap != 0.0f) {
+        return false;
+    }
+
+    // the shape of the WMMA prefill selection in ggml_cuda_get_best_fattn_kernel, GQA 8 keeps the dense kernel
+    const int64_t gqa_ratio = Q->ne[2] / K->ne[2];
+    if (Q->ne[0] != 512 || K->ne[0] != 512 || V->ne[0] != 512 || Q->ne[1] < 16 ||
+        gqa_ratio % 8 != 0 || gqa_ratio <= 8 || K->type != GGML_TYPE_F16 || V->type != GGML_TYPE_F16) {
+        return false;
+    }
+    if (mask->ne[0] != K->ne[1] || mask->ne[1] < Q->ne[1] || mask->ne[2] != 1) {
+        return false;
+    }
+
+    if (diag.mode == 2) {
+        return true;
+    }
+
+    constexpr int    ncols1 = 4;
+    constexpr double kappa  = 7.0/5.0;
+    const double w      = double(K->ne[1]);
+    const double p      = std::min(double(n_kv_max), w)/w;
+    const double union4 = w*(1.0 - std::pow(1.0 - p, ncols1));
+    return kappa*union4 <= w;
+#else
+    GGML_UNUSED_VARS(device, dst);
+    return false;
+#endif // defined(GGML_USE_HIP)
+}
+
+// Whether the RDNA4 WMMA kernel for 512-wide heads with 4 query rows x 8 Q heads accumulates VKQ and rescales it in
+// F32 instead of F16 (2 passes over KV, one per half of DV). By default the index list kernel does (use_sparse) and the
+// dense kernel, which also serves GQA 8 prefill, keeps F16. With F16 accumulators the list kernel's rounding differs
+// enough from the dense kernel's to change the first generated tokens of DeepSeek V4.1 Flash (its error against an F32
+// reference is the same order as the dense kernel's; F32 accumulators bring both to about 1/30 of it).
+// GGML_CUDA_FATTN_WMMA_F32ACC=1 takes F32 for the dense kernel as well, =0 F16 for both (the list kernel then only for
+// diagnosis); read once per process. GGML_CUDA_FA_DIAG "...+f32acc" / "...+f16acc" overrides it per call.
+bool ggml_cuda_flash_attn_ext_wmma_f32acc(bool use_sparse) {
+    static const int env = [] {
+        const char * value = getenv("GGML_CUDA_FATTN_WMMA_F32ACC");
+        return value ? (atoi(value) != 0 ? 1 : 0) : -1;
+    }();
+    const ggml_cuda_fa_diag diag = ggml_cuda_fa_diag_get();
+    if (diag.acc != 0) {
+        return diag.acc == 2;
+    }
+    return env < 0 ? use_sparse : env == 1;
+}
+
+static int ggml_cuda_flash_attn_ext_wmma_sparse_check_mode() {
+    static const int mode = [] {
+        const char * value = getenv("GGML_CUDA_FATTN_WMMA_SPARSE_CHECK");
+        return value ? atoi(value) : 0;
+    }();
+    return mode;
+}
+
+// 1: log, 2: log and hand on the dense kernel's output
+bool ggml_cuda_flash_attn_ext_wmma_sparse_check_enabled() {
+    return ggml_cuda_flash_attn_ext_wmma_sparse_check_mode() != 0;
+}
+
+static uint64_t ggml_cuda_fattn_check_hash_dev(cudaStream_t stream, const void * ptr, size_t nbytes) {
+    std::vector<uint32_t> h((nbytes + 3)/4, 0);
+    CUDA_CHECK(cudaMemcpyAsync(h.data(), ptr, nbytes, cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    uint64_t x = 1469598103934665603ull;
+    for (uint32_t w : h) {
+        x = (x ^ w)*1099511628211ull;
+    }
+    return x;
+}
+
+// diagnostic GGML_CUDA_FATTN_WMMA_SPARSE_CHECK=1: hashes of the inputs and the output of every 512-wide prefill FA call
+// (after the kernel), so that two runs can be compared call by call
+void ggml_cuda_flash_attn_ext_check_hashes(ggml_backend_cuda_context & ctx, const ggml_tensor * dst) {
+    const ggml_tensor * Q = dst->src[0];
+    if (!ggml_cuda_flash_attn_ext_wmma_sparse_check_enabled() || Q->ne[0] != 512 || Q->ne[1] < 16) {
+        return;
+    }
+    cudaStream_t stream = ctx.stream();
+    cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
+    CUDA_CHECK(cudaStreamIsCapturing(stream, &capture_status));
+    if (capture_status != cudaStreamCaptureStatusNone) {
+        return;
+    }
+    static int64_t n_calls = 0;
+    const ggml_tensor * K = dst->src[1];
+    const ggml_tensor * m = dst->src[3];
+    const ggml_tensor * s = dst->src[4];
+    GGML_LOG_INFO("fa check hash %lld: rows %lld W %lld n_kv_max %d q %016llx k %016llx m %016llx s %016llx out %016llx\n",
+        (long long) n_calls++, (long long) Q->ne[1], (long long) K->ne[1], ggml_get_op_params_i32(dst, 4),
+        (unsigned long long) ggml_cuda_fattn_check_hash_dev(stream, Q->data, ggml_nbytes(Q)),
+        (unsigned long long) ggml_cuda_fattn_check_hash_dev(stream, K->data, ggml_nbytes(K)),
+        (unsigned long long) (m ? ggml_cuda_fattn_check_hash_dev(stream, m->data, ggml_nbytes(m)) : 0),
+        (unsigned long long) (s ? ggml_cuda_fattn_check_hash_dev(stream, s->data, ggml_nbytes(s)) : 0),
+        (unsigned long long) ggml_cuda_fattn_check_hash_dev(stream, dst->data, ggml_nbytes(dst)));
+}
+
+// diagnostic: compare the list kernel's output in dst with the dense kernel's output in dense, and recount the 4-row
+// unions without a capacity bound to see whether the bounded lists dropped cells. Synchronizes; skipped while capturing.
+void ggml_cuda_flash_attn_ext_wmma_sparse_check(ggml_backend_cuda_context & ctx, const ggml_tensor * dst, const float * dense) {
+    cudaStream_t stream = ctx.stream();
+    cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
+    CUDA_CHECK(cudaStreamIsCapturing(stream, &capture_status));
+    if (capture_status != cudaStreamCaptureStatusNone) {
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            GGML_LOG_WARN("wmma sparse check: the stream is capturing a graph, nothing is compared; set GGML_CUDA_DISABLE_GRAPHS=1\n");
+        }
+        return;
+    }
+    const ggml_tensor * Q    = dst->src[0];
+    const ggml_tensor * K    = dst->src[1];
+    const ggml_tensor * mask = dst->src[3];
+    const int32_t L    = ggml_get_op_params_i32(dst, 4);
+    const int64_t W    = K->ne[1];
+    const int32_t cap  = (int32_t) std::min<int64_t>(W, 4*int64_t(L));
+    const int64_t n_groups = (Q->ne[1] + 3)/4;
+    const int64_t n_lists  = n_groups*mask->ne[3];
+
+    ggml_cuda_pool_alloc<int32_t> lists(ctx.pool(), size_t(W)*n_lists + n_lists);
+    ggml_cuda_flash_attn_ext_compact_mask(ctx, mask, lists.ptr, lists.ptr + size_t(W)*n_lists, Q->ne[1], 4, (int32_t) W);
+
+    const int64_t n = ggml_nelements(dst);
+    std::vector<float>   a(n), b(n);
+    std::vector<int32_t> counts(n_lists);
+    CUDA_CHECK(cudaMemcpyAsync(a.data(), dst->data, n*sizeof(float), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaMemcpyAsync(b.data(), dense,     n*sizeof(float), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaMemcpyAsync(counts.data(), lists.ptr + size_t(W)*n_lists, n_lists*sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+
+    double se = 0.0, sb = 0.0, maxd = 0.0;
+    int64_t nonfinite = 0, worst = -1;
+    for (int64_t i = 0; i < n; ++i) {
+        if (!std::isfinite(a[i]) || !std::isfinite(b[i])) {
+            nonfinite++;
+            continue;
+        }
+        const double d = double(a[i]) - double(b[i]);
+        se += d*d;
+        sb += double(b[i])*b[i];
+        if (fabs(d) > maxd) {
+            maxd = fabs(d);
+            worst = i;
+        }
+    }
+    int32_t max_count = 0;
+    int64_t over = 0;
+    double  sum_count = 0.0;
+    for (int32_t c : counts) {
+        max_count = std::max(max_count, c);
+        over += c > cap;
+        sum_count += c;
+    }
+    static int64_t n_calls = 0;
+    {
+        uint64_t x = 1469598103934665603ull;
+        const uint32_t * w = (const uint32_t *) b.data();
+        for (int64_t i = 0; i < n; ++i) {
+            x = (x ^ w[i])*1099511628211ull;
+        }
+        GGML_LOG_INFO("wmma sparse check %lld: dense out %016llx\n", (long long) n_calls, (unsigned long long) x);
+    }
+    if (ggml_cuda_flash_attn_ext_wmma_sparse_check_mode() == 3) {
+        // the tile kernel (F32 softmax and accumulators) as the reference for both
+        ggml_cuda_pool_alloc<float> ref(ctx.pool(), n);
+        ggml_tensor ref_dst = *dst;
+        ref_dst.data = ref.ptr;
+        ggml_cuda_flash_attn_ext_tile(ctx, &ref_dst);
+        std::vector<float> r(n);
+        CUDA_CHECK(cudaMemcpyAsync(r.data(), ref.ptr, n*sizeof(float), cudaMemcpyDeviceToHost, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        const int64_t row_len = dst->ne[0]*dst->ne[1];
+        const int64_t n_rows  = n/row_len;
+        double el = 0.0, ed = 0.0, sr = 0.0, bl = 0.0, bd = 0.0;
+        double ll = 0.0, ld = 0.0, lr = 0.0;
+        for (int64_t i = 0; i < n; ++i) {
+            const double dl = double(a[i]) - r[i];
+            const double dd = double(b[i]) - r[i];
+            el += dl*dl; ed += dd*dd; sr += double(r[i])*r[i];
+            bl += dl*r[i]; bd += dd*r[i];
+            if (i/row_len == n_rows - 1) {
+                ll += dl*dl; ld += dd*dd; lr += double(r[i])*r[i];
+            }
+        }
+        GGML_LOG_INFO("wmma sparse check %lld: vs tile: nmse list %.3e dense %.3e, bias list %.3e dense %.3e, last row nmse list %.3e dense %.3e\n",
+            (long long) n_calls, el/sr, ed/sr, bl/sr, bd/sr, ll/std::max(lr, 1e-30), ld/std::max(lr, 1e-30));
+    }
+    if (ggml_cuda_flash_attn_ext_wmma_sparse_check_mode() == 2) {
+        CUDA_CHECK(cudaMemcpyAsync(dst->data, dense, n*sizeof(float), cudaMemcpyDeviceToDevice, stream));
+    }
+    // dst is [DV, heads, rows]: the worst element's row and head
+    const int64_t DV = dst->ne[0];
+    GGML_LOG_INFO("wmma sparse check %lld: rows %lld, W %lld, n_kv_max %d, cap %d, union max %d mean %.0f over %lld, "
+        "nmse %.3e, max abs %.3e (row %lld head %lld), nonfinite %lld\n",
+        (long long) n_calls++, (long long) Q->ne[1], (long long) W, L, cap, max_count, sum_count/std::max<int64_t>(1, n_lists),
+        (long long) over, sb > 0.0 ? se/sb : 0.0, maxd,
+        (long long) (worst >= 0 ? worst/(DV*dst->ne[1]) : -1), (long long) (worst >= 0 ? (worst/DV) % dst->ne[1] : -1),
+        (long long) nonfinite);
 }
 
 template <int DKQ, int DV, int ncols2>
@@ -1029,10 +1299,14 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     // of 8 query rows instead of 4 at ncols2 = 8): that bound weighs the gather against the dense tile kernel, and the
     // WMMA kernel scans a dense K about twice as fast. For 64 heads of 512 and lists of 640 cells the gather and the
     // dense WMMA kernel break even at about 10K (lists shared by neighbouring rows) to 20K cells (independent lists).
-    if (GGML_CUDA_CC_IS_RDNA4(cc) && amd_wmma_available(cc) &&
+    // Where the WMMA kernel itself reads through the index lists (ggml_cuda_flash_attn_ext_wmma_shall_use_sparse) it
+    // beats both.
+    const ggml_cuda_fa_diag fa_diag = ggml_cuda_fa_diag_get();
+    if (fa_diag.mode != 1 && GGML_CUDA_CC_IS_RDNA4(cc) && amd_wmma_available(cc) &&
         Q->ne[0] == 512 && V->ne[0] == 512 && Q->ne[1] >= 16 &&
         gqa_ratio % 8 == 0 && gqa_opt_applies && K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16 &&
-        (gqa_ratio == 8 || !ggml_cuda_fattn_tile_shall_use_sparse(device, dst, 2*(32/8)))) {
+        (gqa_ratio == 8 || fa_diag.mode == 3 || ggml_cuda_flash_attn_ext_wmma_shall_use_sparse(device, dst) ||
+         !ggml_cuda_fattn_tile_shall_use_sparse(device, dst, 2*(32/8)))) {
         return BEST_FATTN_KERNEL_MMA_F16;
     }
 #endif
@@ -1398,6 +1672,9 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
             ggml_cuda_flash_attn_ext_mma_f16(ctx, dst);
             break;
     }
+#if defined(GGML_USE_HIP)
+    ggml_cuda_flash_attn_ext_check_hashes(ctx, dst);
+#endif // defined(GGML_USE_HIP)
 }
 
 bool ggml_cuda_flash_attn_ext_supported(int device, const ggml_tensor * dst) {

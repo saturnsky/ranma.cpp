@@ -6,6 +6,7 @@
 #include "vecdotq.cuh"
 
 #include <cstdint>
+#include <cstring>
 
 #define FATTN_KQ_STRIDE       256
 #define HALF_MAX_HALF         __float2half(65504.0f/2) // Use neg. of this instead of -INFINITY to initialize KQ max vals to avoid NaN upon subtraction.
@@ -728,6 +729,48 @@ void ggml_cuda_flash_attn_ext_compact_mask(
         ggml_backend_cuda_context & ctx, const ggml_tensor * mask, int32_t * indices, int32_t * counts,
         int32_t n_queries, int32_t ncols1, int32_t n_kv_max);
 
+// diagnostic (s2 WMMA gather probe, timing only): GGML_CUDA_FA_DIAG, read on every call so that one process can
+// interleave the variants.
+//   "tile":         RDNA4 512-wide heads at GQA > 8 keep the tile kernel (and its gather where it applies)
+//   "wmma":         RDNA4 512-wide heads at GQA > 8 take the dense WMMA kernel (no index lists, no tile gather)
+//   "list:<k>:<U>": the 512-wide WMMA kernel with 4 query rows reads K/V/mask through per-tile index lists:
+//                   k = r the real union lists (mask compaction), i the identity 0..U-1, s U distinct rows in shuffled
+//                   order (lists shared by 4 consecutive tiles), S = s after the real compaction ran (its cost).
+//                   Synthetic lists give wrong results.
+//   suffix "+f32acc" / "+f16acc" (also alone): the accumulators of that WMMA kernel, overrides GGML_CUDA_FATTN_WMMA_F32ACC.
+struct ggml_cuda_fa_diag {
+    int  mode = 0; // 0 none, 1 tile, 2 list, 3 dense WMMA
+    char kind = 0;
+    int  U    = 0;
+    int  acc  = 0; // 0 GGML_CUDA_FATTN_WMMA_F32ACC, 1 F16, 2 F32
+};
+static ggml_cuda_fa_diag ggml_cuda_fa_diag_get() {
+    ggml_cuda_fa_diag d;
+    const char * env = getenv("GGML_CUDA_FA_DIAG");
+    if (env == nullptr || env[0] == 0) {
+        return d;
+    }
+    char v[64];
+    snprintf(v, sizeof(v), "%s", env);
+    if (char * plus = strchr(v, '+')) {
+        d.acc = strcmp(plus, "+f32acc") == 0 ? 2 : strcmp(plus, "+f16acc") == 0 ? 1 : 0;
+        *plus = 0;
+    }
+    if (strcmp(v, "tile") == 0) {
+        d.mode = 1;
+    } else if (strcmp(v, "wmma") == 0) {
+        d.mode = 3;
+    } else if (strncmp(v, "list:", 5) == 0 && v[5] != 0) {
+        d.mode = 2;
+        d.kind = v[5];
+        d.U    = v[6] == ':' ? atoi(v + 7) : 0;
+    }
+    return d;
+}
+void ggml_cuda_fa_diag_fill_lists(
+        ggml_backend_cuda_context & ctx, int32_t * indices, int32_t * counts, int64_t n_lists, int32_t n_kv_max,
+        int32_t U, bool identity, int64_t n_rows);
+
 template<int D, int ncols1, int ncols2> // D == head size
 __launch_bounds__(D, 1)
 static __global__ void flash_attn_stream_k_fixup_uniform(
@@ -1109,8 +1152,20 @@ void launch_fattn(
 
         const size_t n_lists = size_t(ntiles_x) * mask->ne[3];
 
+        const ggml_cuda_fa_diag diag = ggml_cuda_fa_diag_get();
+        const bool diag_synth = diag.mode == 2 && diag.kind != 'r' && diag.U > 0;
+        if (diag_synth) {
+            n_kv_max = std::min<int64_t>(K->ne[1], std::max<int64_t>(n_kv_max, diag.U));
+        }
+
         KV_max.alloc(size_t(n_kv_max)*n_lists + n_lists);
-        ggml_cuda_flash_attn_ext_compact_mask(ctx, mask, KV_max.ptr, KV_max.ptr + size_t(n_kv_max)*n_lists, Q->ne[1], ncols1, n_kv_max);
+        if (!diag_synth || diag.kind == 'S') {
+            ggml_cuda_flash_attn_ext_compact_mask(ctx, mask, KV_max.ptr, KV_max.ptr + size_t(n_kv_max)*n_lists, Q->ne[1], ncols1, n_kv_max);
+        }
+        if (diag_synth) {
+            ggml_cuda_fa_diag_fill_lists(ctx, KV_max.ptr, KV_max.ptr + size_t(n_kv_max)*n_lists, n_lists, n_kv_max,
+                std::min<int32_t>(diag.U, n_kv_max), diag.kind == 'i', K->ne[1]);
+        }
     }
 
     // Optional optimization where the mask is scanned to determine whether part of the calculation can be skipped.
