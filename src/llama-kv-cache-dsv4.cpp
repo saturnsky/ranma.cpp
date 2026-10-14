@@ -34,14 +34,13 @@ static constexpr uint32_t DSV4_COMP_STATE_VER      = 1;
 
 // ranma: the tail prefill was asked for (RANMA_DSV41_EXACT_TAIL or RANMA_DSV41_TAIL_DIAG, read at each call); only then
 // the cache logs its batches and records
+static bool dsv4_env_on(const char * name) {
+    const char * v = getenv(name);
+    return v != nullptr && atoi(v) != 0;
+}
+
 static bool dsv4_tail_requested() {
-    for (const char * name : { "RANMA_DSV41_EXACT_TAIL", "RANMA_DSV41_TAIL_DIAG" }) {
-        const char * v = getenv(name);
-        if (v != nullptr && atoi(v) != 0) {
-            return true;
-        }
-    }
-    return false;
+    return dsv4_env_on("RANMA_DSV41_EXACT_TAIL") || dsv4_env_on("RANMA_DSV41_TAIL_DIAG");
 }
 
 static uint32_t dsv4_comp_size(uint32_t kv_size, uint32_t ratio) {
@@ -1895,10 +1894,12 @@ bool llama_kv_cache_dsv4::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1
 
         const llama_pos pos_max = kv_raw->seq_pos_max(seq_id);
 
-        // ranma: a removal into the rows a tail prefill left unwritten is refused. Any refused removal of such a
-        // sequence marks it, so that nothing continues from it as it is (the caller restores or clears it next).
+        // ranma: a removal into the rows a tail prefill left unwritten is refused, as one past the compressed rollback
+        // limit. A refusal leaves the memory as it was, which the caller can go on from, except while a call is pending:
+        // that is the cleanup of an aborted or failed ubatch (llama_context::decode), whose positions then stay with
+        // cells nobody wrote, so the sequence is marked and nothing continues from it until it is cleared or restored.
         const auto refuse = [&]() {
-            if (!tail_lo[seq_id].empty()) {
+            if (!tail_lo[seq_id].empty() && tail_pending[seq_id]) {
                 tail_bad[seq_id] = 1;
             }
             return false;
@@ -1921,25 +1922,18 @@ bool llama_kv_cache_dsv4::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1
             return res;
         }
 
-        if (n_rs_seq == 0) {
+        if (!comp_can_rollback(seq_id, p0)) {
             return refuse();
         }
 
         const llama_pos rollback = pos_max - (p0 - 1);
-        if (rollback < 1 || rollback > (llama_pos) n_rs_seq) {
-            return refuse();
-        }
-
-        // pending rollback is single-use: stacked partial removals don't compose
-        if (rs_idx[seq_id] != 0) {
-            return refuse();
-        }
 
         const bool res = kv_raw->seq_rm(seq_id, p0, p1);
         if (res) {
             rs_idx[seq_id] = (uint32_t) rollback;
-        } else {
-            refuse();
+        } else if (!tail_lo[seq_id].empty()) {
+            // the raw cache may have removed part of it
+            tail_bad[seq_id] = 1;
         }
 
         return res;
@@ -2275,6 +2269,45 @@ void llama_kv_cache_dsv4::tail_set_written(llama_seq_id seq_id, int32_t il, llam
     // the run of written cells now starts at p0, unless it already started later
     lo[il] = std::max(lo[il], p0);
     tail_seen = true;
+}
+
+bool llama_kv_cache_dsv4::comp_can_rollback(llama_seq_id seq_id, llama_pos p0) const {
+    const llama_pos pos_max = kv_raw->seq_pos_max(seq_id);
+    if (p0 > pos_max) {
+        return true;
+    }
+    if (n_rs_seq == 0) {
+        return false;
+    }
+
+    const llama_pos rollback = pos_max - (p0 - 1);
+    if (rollback < 1 || rollback > (llama_pos) n_rs_seq) {
+        return false;
+    }
+
+    // pending rollback is single-use: stacked partial removals don't compose
+    return rs_idx[seq_id] == 0;
+}
+
+bool llama_kv_cache_dsv4::seq_can_resume(llama_seq_id seq_id, llama_pos pos) const {
+    // only with the tail prefill asked for; otherwise the caller keeps its generic rules
+    if (!dsv4_env_on("RANMA_DSV41_EXACT_TAIL")) {
+        return false;
+    }
+    if (seq_id < 0 || (uint32_t) seq_id >= n_seq_max || pos <= 0) {
+        return false;
+    }
+    // a refused cleanup, or a call that did not complete
+    if (tail_bad[seq_id] || tail_pending[seq_id]) {
+        return false;
+    }
+
+    const llama_pos pos_max = kv_raw->seq_pos_max(seq_id);
+    if (pos_max < 0 || pos > pos_max + 1) {
+        return false;
+    }
+
+    return tail_can_continue(seq_id, pos - 1) && comp_can_rollback(seq_id, pos);
 }
 
 bool llama_kv_cache_dsv4::tail_can_continue(llama_seq_id seq_id, llama_pos p_end) const {
