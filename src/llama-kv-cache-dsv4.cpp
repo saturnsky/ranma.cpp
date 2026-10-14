@@ -392,7 +392,8 @@ static void dsv4_state_write_k_cache(
     }
 }
 
-static void dsv4_state_read_k_cache(
+// returns the row count of the state
+static uint32_t dsv4_state_read_k_cache(
         llama_io_read_i  & io,
         llama_kv_cache   * kv,
         llama_seq_id       seq_id,
@@ -440,6 +441,8 @@ static void dsv4_state_read_k_cache(
 
         dsv4_state_read_tensor_streams(io, kv->get_k_storage(il), kv_size, n_rows_ref, s0, ns);
     }
+
+    return n_rows_ref;
 }
 
 static std::string dsv4_plan_positions(const std::vector<int32_t> & values) {
@@ -1612,6 +1615,10 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
     // source's slot, which is what the reuse callbacks below do.
     const uint32_t ratio_kv = is_v41 ? std::min(ratio_a, ratio_b) : DSV4_CSA_RATIO;
 
+    state_ratio_csa = ratio_kv;
+    state_ratio_hca = is_v41 ? ratio_b : DSV4_HCA_RATIO;
+    state_ratio_lid = ratio_kv;
+
     const layer_filter_cb filter_csa = [&](int32_t il) {
         if (filter && !filter(il)) {
             return false;
@@ -2108,11 +2115,11 @@ void llama_kv_cache_dsv4::state_write(llama_io_write_i & io, llama_seq_id seq_id
 
         //FIXME : note that we conflate token positions with rows, which is not true for multi-modal case.
         const uint32_t n_rows_csa = seq_id >= 0 ?
-            dsv4_state_n_used_k_rows(pos_max, DSV4_CSA_RATIO, kv_csa->get_size()) : kv_csa->get_size();
+            dsv4_state_n_used_k_rows(pos_max, state_ratio_csa, kv_csa->get_size()) : kv_csa->get_size();
         const uint32_t n_rows_hca = seq_id >= 0 ?
-            dsv4_state_n_used_k_rows(pos_max, DSV4_HCA_RATIO, kv_hca->get_size()) : kv_hca->get_size();
+            dsv4_state_n_used_k_rows(pos_max, state_ratio_hca, kv_hca->get_size()) : kv_hca->get_size();
         const uint32_t n_rows_lid = seq_id >= 0 ?
-            dsv4_state_n_used_k_rows(pos_max, DSV4_CSA_RATIO, kv_lid->get_size()) : kv_lid->get_size();
+            dsv4_state_n_used_k_rows(pos_max, state_ratio_lid, kv_lid->get_size()) : kv_lid->get_size();
 
         dsv4_state_write_k_cache(io, kv_csa.get(), seq_id, flags, n_rows_csa);
         dsv4_state_write_k_cache(io, kv_hca.get(), seq_id, flags, n_rows_hca);
@@ -2168,9 +2175,22 @@ void llama_kv_cache_dsv4::state_read(llama_io_read_i & io, llama_seq_id seq_id, 
     if (!partial_only) {
         clear_compressed(seq_id, true);
 
-        dsv4_state_read_k_cache(io, kv_csa.get(), seq_id, flags);
+        const uint32_t n_rows_csa = dsv4_state_read_k_cache(io, kv_csa.get(), seq_id, flags);
         dsv4_state_read_k_cache(io, kv_hca.get(), seq_id, flags);
-        dsv4_state_read_k_cache(io, kv_lid.get(), seq_id, flags);
+        const uint32_t n_rows_lid = dsv4_state_read_k_cache(io, kv_lid.get(), seq_id, flags);
+
+        // ranma: a V4.1 sequence state of a build that saved the rows by the V4 ratio holds only part of the compressed
+        // rows of its positions; it is refused, and the sequence cleared, instead of continuing from zero rows
+        if (tail_v41 && seq_id >= 0) {
+            const llama_pos pos_max = kv_raw->seq_pos_max(seq_id);
+            if (n_rows_csa < dsv4_state_n_used_k_rows(pos_max, state_ratio_csa, kv_csa->get_size()) ||
+                n_rows_lid < dsv4_state_n_used_k_rows(pos_max, state_ratio_lid, kv_lid->get_size())) {
+                kv_raw->seq_rm(seq_id, -1, -1);
+                clear_compressed(seq_id, true);
+                tail_reset(seq_id);
+                throw std::runtime_error("DSV4 state: the compressed rows of the sequence are incomplete (saved by an older build)");
+            }
+        }
     }
 
     csa_state->state_read(io, seq_id, flags);

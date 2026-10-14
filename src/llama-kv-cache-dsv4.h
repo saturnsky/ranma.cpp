@@ -251,6 +251,12 @@ private:
 
     std::vector<uint32_t> rs_idx;
 
+    // positions per row of the compressed K caches, for the rows a sequence state saves: the CSA and HCA ratios on
+    // DeepSeek-V4, the finest ratio of the shared caches on V4.1 (a coarser source uses fewer of its rows)
+    uint32_t state_ratio_csa = 4;
+    uint32_t state_ratio_hca = 128;
+    uint32_t state_ratio_lid = 4;
+
     std::unique_ptr<llama_kv_cache_iswa> kv_raw;
     std::unique_ptr<llama_kv_cache>      kv_csa;
     std::unique_ptr<llama_kv_cache>      kv_hca;
