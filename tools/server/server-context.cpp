@@ -2860,6 +2860,13 @@ private:
         return true;
     }
 
+    // ranma: the memories of the slot can continue at pos once the positions from pos on are removed, without the
+    // generic SWA rules (llama_memory_seq_can_resume); a draft context has to agree
+    bool slot_can_resume(const server_slot & slot, llama_pos pos) const {
+        return llama_memory_seq_can_resume(llama_get_memory(ctx_tgt), slot.id, pos) &&
+            (ctx_dft == nullptr || llama_memory_seq_can_resume(llama_get_memory(ctx_dft), slot.id, pos));
+    }
+
     // n_tokens_cur: the number of tokens added to the batch for the current slot
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
         const int id_task = slot.task->id;
@@ -2963,6 +2970,10 @@ private:
         cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
         // stash the draft's speculative state with the checkpoint
         common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
+
+        // ranma: a memory that resumes at the end of this state (the DSV4 cache with the tail prefill) is restored to
+        // that end only, see the checkpoint search in update_slots()
+        cur.end_only = pos_max >= 0 && slot_can_resume(slot, pos_max + 1);
 
         SLT_TRC(slot,
                 "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
@@ -4178,7 +4189,26 @@ private:
                                     SLT_WRN(slot, "%s\n", st1.str().c_str());
                                 }
 
-                                if (pos_min >= pos_min_thold) {
+                                // the reason for the reuse below, logged with LLAMA_SERVER_SLOTS_DEBUG
+                                std::string reuse_why = "the memory reaches back to the threshold, no checkpoint needed";
+                                const llama_pos pos_max_mem = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
+
+                                // ranma: a memory that can resume where the prefix match ends, or where the memory
+                                // itself ends if that is before, continues there instead of taking the threshold
+                                // rule. Not for an identical prompt, where one token is processed again for the
+                                // logits [TAG_PROMPT_LOGITS].
+                                bool resumed = false;
+                                if (has_new_tokens) {
+                                    const llama_pos q = std::min<llama_pos>(pos_next, pos_max_mem + 1);
+                                    if (slot_can_resume(slot, q)) {
+                                        resumed  = true;
+                                        reuse_why = string_format("the memory resumes at %d (match to %d)", q, pos_next);
+                                        pos_next = q;
+                                        n_past   = std::min(slot.prompt.tokens.size_up_to_pos(q), (size_t) n_past);
+                                    }
+                                }
+
+                                if (!resumed && pos_min >= pos_min_thold) {
                                     // search for a context checkpoint
                                     const auto it = std::find_if(
                                         slot.prompt.checkpoints.rbegin(),
@@ -4186,6 +4216,12 @@ private:
                                         [&](const auto & cur) {
                                             // guarantee that a checkpoint will result in at least one token being processed [TAG_PROMPT_LOGITS]
                                             SLT_TRC(slot, "checking checkpoint with [%d, %d] against %d...\n", cur.pos_min, cur.pos_max, pos_min_thold);
+                                            // ranma: a state that continues only at its end, with the prefix up to it
+                                            // matching and still in the memory; it leaves at least one token to process
+                                            if (cur.end_only) {
+                                                return cur.pos_max + 1 <= pos_next - (has_new_tokens ? 0 : 1) &&
+                                                    cur.pos_max <= pos_max_mem;
+                                            }
                                             // workaround for [TAG_CHECKPOINTS_FIX_POS_MIN]
                                             if (cur.pos_max > pos_next) {
                                                 return false;
@@ -4213,7 +4249,7 @@ private:
                                         // restore the draft's speculative state
                                         common_speculative_set_state(spec.get(), slot.id, it->data_spec);
 
-                                        pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
+                                        pos_next = it->end_only ? it->pos_max + 1 : std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
                                         n_past   = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) it->n_tokens);
 
                                         // the memory now holds exactly this checkpoint's state
@@ -4221,6 +4257,9 @@ private:
                                         slot.ckpt_restored_id_task = slot.task->id;
 
                                         SLT_TRC(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB)\n", it->pos_min, it->pos_max, it->n_tokens, n_past, (float) it->size() / 1024 / 1024);
+
+                                        reuse_why = string_format("restored the %scheckpoint [%d, %d] of n_tokens = %" PRId64,
+                                                it->end_only ? "end-only " : "", it->pos_min, it->pos_max, it->n_tokens);
                                     }
 
                                     if (do_reset) {
@@ -4228,7 +4267,16 @@ private:
                                                 "https://github.com/ggml-org/llama.cpp/pull/13194#issuecomment-2868343055");
                                         pos_next = 0;
                                         n_past = 0;
+
+                                        reuse_why = slot.prompt.checkpoints.empty() ? "no checkpoint, full prompt re-processing"
+                                                                                    : "no checkpoint fits, full prompt re-processing";
                                     }
+                                }
+
+                                if (slots_debug) {
+                                    SLT_WRN(slot, "prompt reuse: memory [%d, %d], threshold %d, %zu checkpoints, n_past = %d, pos_next = %d: %s\n",
+                                            pos_min, pos_max_mem, pos_min_thold,
+                                            slot.prompt.checkpoints.size(), n_past, pos_next, reuse_why.c_str());
                                 }
                             }
 
@@ -4236,7 +4284,8 @@ private:
                                 // erase any checkpoints with pos_max > pos_next
                                 for (auto it = slot.prompt.checkpoints.begin(); it != slot.prompt.checkpoints.end();) {
                                     const auto & cur = *it;
-                                    if (cur.pos_max > pos_next) {
+                                    // ranma: an end-only state continues at pos_max + 1, which has to be at most pos_next
+                                    if (cur.pos_max > pos_next || (cur.end_only && cur.pos_max + 1 > pos_next)) {
                                         SLT_TRC(slot, "erased invalidated context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_swa = %d, pos_next = %d, size = %.3f MiB)\n", cur.pos_min, cur.pos_max, cur.n_tokens, n_swa, pos_next, (float) cur.size() / 1024 / 1024);
                                         it = slot.prompt.checkpoints.erase(it);
                                     } else {
@@ -4328,7 +4377,7 @@ private:
                         }
                         common_speculative_set_state(spec.get(), slot.id, ckpt.data_spec);
 
-                        const llama_pos pos_next = std::max(ckpt.pos_min + 1, ckpt.pos_max);
+                        const llama_pos pos_next = ckpt.end_only ? ckpt.pos_max + 1 : std::max(ckpt.pos_min + 1, ckpt.pos_max);
                         const int32_t   n_past   = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) ckpt.n_tokens);
 
                         SLT_WRN(slot, "memory_seq_rm [%d, end) refused after n_tokens = %d were kept - falling back to the context checkpoint with n_tokens = %" PRId64 "\n",
