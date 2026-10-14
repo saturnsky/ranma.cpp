@@ -7949,6 +7949,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     if (strcmp(name, GGML_EXPERT_HOST_DIRECT_PROC_NAME) == 0) {
         return (void *)ggml_backend_cuda_expert_host_direct;
     }
+    if (strcmp(name, GGML_EXPERT_SIDECAR_PROC_NAME) == 0) {
+        return (void *)ggml_backend_cuda_expert_sidecar;
+    }
 #endif
     if (strcmp(name, "ggml_backend_cuda_graph_counts") == 0) {
         // ranma: diagnostics of the graph calls (captures and direct calls), see ggml_backend_cuda_graph_counts

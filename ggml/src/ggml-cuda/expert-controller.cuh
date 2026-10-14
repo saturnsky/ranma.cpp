@@ -15,6 +15,7 @@
 #include "expert-l1.cuh"
 
 #include "ggml-expert.h"
+#include "ggml-expert-sidecar.h"
 
 #if defined(GGML_USE_HIP)
 
@@ -62,6 +63,9 @@ bool ggml_cuda_expert_is_exclusive_buffer_type(ggml_backend_buffer_type_t buft);
 
 // The versioned function table answered for GGML_EXPERT_IFACE_PROC_NAME.
 const ggml_expert_iface * ggml_backend_cuda_expert_iface(void);
+
+// The table answered for GGML_EXPERT_SIDECAR_PROC_NAME (ggml-expert-sidecar.h).
+const ggml_expert_sidecar_iface * ggml_backend_cuda_expert_sidecar(void);
 
 // Index of a CUDA/HIP device object, -1 for devices of other backends (defined in ggml-cuda.cu).
 int ggml_backend_cuda_dev_index(ggml_backend_dev_t dev);
