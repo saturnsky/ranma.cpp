@@ -443,4 +443,20 @@ if (WIN32 AND GGML_HIP)
     target_compile_definitions(test-expert-ub-pool-gpu PRIVATE GGML_USE_HIP GGML_HIP_NO_VMM)
     target_include_directories(test-expert-ub-pool-gpu PRIVATE ../ggml/src ../ggml/src/ggml-cuda)
     target_link_libraries(test-expert-ub-pool-gpu PRIVATE ggml-base hip::device hip::host)
+
+    # peer-to-peer reads (NVMe -> GPU_UPLOAD staging -> D3D12 copy -> imported VRAM) against host reads of real GGUF ranges
+    add_executable(test-expert-p2p-gpu EXCLUDE_FROM_ALL test-expert-p2p-gpu.cu)
+    set_source_files_properties(test-expert-p2p-gpu.cu PROPERTIES LANGUAGE CXX)
+    target_compile_features(test-expert-p2p-gpu PRIVATE cxx_std_17)
+    target_compile_definitions(test-expert-p2p-gpu PRIVATE GGML_USE_HIP)
+    target_include_directories(test-expert-p2p-gpu PRIVATE ../ggml/src ../ggml/src/ggml-cuda)
+    target_link_libraries(test-expert-p2p-gpu PRIVATE hip::device hip::host)
+
+    # model-free bandwidth, limits and contention probe of the P2P engine against the host path
+    add_executable(test-expert-p2p-bench EXCLUDE_FROM_ALL test-expert-p2p-bench.cu)
+    set_source_files_properties(test-expert-p2p-bench.cu PROPERTIES LANGUAGE CXX)
+    target_compile_features(test-expert-p2p-bench PRIVATE cxx_std_17)
+    target_compile_definitions(test-expert-p2p-bench PRIVATE GGML_USE_HIP)
+    target_include_directories(test-expert-p2p-bench PRIVATE ../ggml/src ../ggml/src/ggml-cuda)
+    target_link_libraries(test-expert-p2p-bench PRIVATE hip::device hip::host)
 endif()
