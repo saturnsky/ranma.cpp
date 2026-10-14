@@ -279,12 +279,14 @@ static void prefetch_stats_begin(llama_prefetch_stats * stats) {
     if (stats) {
         stats->page_size     = llama_page_size();
         stats->faults_before = llama_process_page_faults();
+        stats->t_begin_us    = ggml_time_us();
     }
 }
 
 static void prefetch_stats_end(llama_prefetch_stats * stats) {
     if (stats) {
         stats->faults_after = llama_process_page_faults();
+        stats->t_end_us     = ggml_time_us();
     }
 }
 
@@ -352,6 +354,8 @@ void llama_prefetch_stats_log(const char * what, int layer, int64_t n_tokens, co
         ",\"sort\":%" PRId64 ",\"ranges\":%" PRId64 ",\"os\":%" PRId64 ",\"input\":%" PRId64 ",\"pages_diag\":%" PRId64 "}",
         what, layer, n_tokens, st.skipped ? "true" : "false", st.page_size, faults,
         st.t_hash_us, st.t_split_us, st.t_sort_us, st.t_ranges_us, st.t_os_us, st.t_input_us, st.t_pages_us);
+    out += buf;
+    snprintf(buf, sizeof(buf), ",\"at_us\":[%" PRId64 ",%" PRId64 "]", st.t_begin_us, st.t_end_us);
     out += buf;
     // columns of "pieces" and "sum": rows, unique_rows, row_ranges, row_bytes, page_bytes, page_ranges, page_runs, unique_pages
     llama_prefetch_piece_stats sum;
