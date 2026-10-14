@@ -11,6 +11,7 @@
 #include <cinttypes>
 #include <cmath>
 #include <cstdlib>
+#include <cstring>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -49,7 +50,18 @@
 // is the last layer that has to see every row (the last KV source, whose compressor projects every row, or the last
 // engram layer); it reads all rows for that and computes the tail like the layers after it. The layers before it run
 // over the whole ubatch, so that nothing a later ubatch or a later layer reads is missing, except the raw KV of the
-// tail layers outside their K rows (see dsv41_tail_plan_make for the risk this carries).
+// tail layers outside their K rows, which the cache records (see dsv41_tail_plan_make).
+//
+// The output need not be in the ubatch. When the batch has one output, its last token (llama_kv_cache_dsv4_context::
+// get_batch_out), every ubatch of it computes the rows of the tail that fall into it: with the output d rows past the
+// end of the ubatch, layer l has K_l - d input rows and O_l - d query rows, clamped to [0, n]. The rows before them that
+// an earlier ubatch of the batch computed are in the raw cache already. A layer whose query rows all lie past the ubatch
+// only writes the raw KV of its rows (and the KV source on il_first), the layers after it are not built, and a ubatch
+// without the output has no logits.
+//
+// A batch without outputs plans the same rows, as if its last token were the output, and builds no head: its call end
+// is the state the next call continues from, which needs the raw KV of the last W rows of every layer and nothing else
+// of the tail. The last layer still computes its one query row, which nothing reads.
 //
 // mode EXACT: a tail layer makes and writes the raw KV of its K rows; the query, the indexer, the attention, the
 // hyper-connections and the FFN run over its O rows. The math is that of the whole graph for the output row and the raw
@@ -77,14 +89,25 @@ struct dsv41_tail_plan {
     bool    requested = false;   // the env asked for a tail mode
     int32_t il_first  = -1;
     int64_t n_tokens  = 0;
+    int64_t n_past    = 0;       // the output is this many rows past the last row of the ubatch (0: the last row)
+    bool    out       = true;    // the batch asks for the output; false: the tail ends a call without outputs
     int64_t c         = 0;       // the query chunk size of a chunked graph, 0 unchunked
     std::vector<dsv41_tail_rows> rows; // [n_layer], 0 before il_first
     // chunked graph: per layer from il_first, the chunks of its query rows in ubatch rows [i0, i0 + n) with the raw
     // columns [j0, j0 + nj) they read (all raw cells without the raw chunk); baked into the graph's views
     std::vector<std::vector<llm_graph_chunk_window>> q_chunks;
     const char * reason = nullptr;     // why the plan is off
+    // RANMA_DSV41_TAIL_POISON: the raw cells a tail layer leaves unwritten in this ubatch are written with this value
+    bool  poison_on = false;
+    float poison    = 0.0f;
 
     bool active() const { return mode != OFF; }
+
+    // the ubatch computes the output row (the last row of the tail, with or without logits)
+    bool has_output() const { return n_past == 0; }
+
+    // the graph has a head and logits: the ubatch computes the output row and the batch asks for it
+    bool has_logits() const { return n_past == 0 && out; }
 
     // the query rows of layer il: the attention of DIAG runs over all its input rows
     int64_t n_q(int il) const { return mode == EXACT ? rows[il].n_o : rows[il].n_k; }
@@ -93,7 +116,11 @@ struct dsv41_tail_plan {
         if (!active() || !o.active()) {
             return active() == o.active();
         }
-        if (mode != o.mode || il_first != o.il_first || n_tokens != o.n_tokens || c != o.c || rows.size() != o.rows.size()) {
+        if (mode != o.mode || il_first != o.il_first || n_tokens != o.n_tokens || has_output() != o.has_output() ||
+                out != o.out || c != o.c || rows.size() != o.rows.size()) {
+            return false;
+        }
+        if (poison_on != o.poison_on || (poison_on && !(poison == o.poison || (std::isnan(poison) && std::isnan(o.poison))))) {
             return false;
         }
         for (size_t il = 0; il < rows.size(); ++il) {
@@ -118,24 +145,44 @@ static int32_t dsv41_tail_mode_env() {
     return dsv41_tail_plan::OFF;
 }
 
+// env: RANMA_DSV41_TAIL_POISON (diagnostic, default 0): 1 or nan writes NaN, any other number that value, into the raw
+// cells of the ubatch rows a tail layer leaves unwritten. A read of such a cell that its mask does not hide then shows
+// in the output. A masked read can show too where a kernel multiplies a masked score by the value (0 * NaN), so a NaN
+// result is checked again with a finite value.
+static bool dsv41_tail_poison_env(float & value) {
+    const char * v = getenv("RANMA_DSV41_TAIL_POISON");
+    if (v == nullptr || *v == '\0' || strcmp(v, "0") == 0) {
+        return false;
+    }
+    if (strcmp(v, "1") == 0 || strcmp(v, "nan") == 0 || strcmp(v, "NAN") == 0) {
+        value = NAN;
+    } else {
+        value = strtof(v, nullptr);
+    }
+    return true;
+}
+
 // The plan of one ubatch. Anything outside what the tail covers runs the whole graph:
 //   - one sequence of token rows at consecutive positions, with one position per row;
-//   - one output, the last row, and no embeddings or layer inputs extracted;
-//   - a standard sliding window on every tail layer, and a ubatch longer than K_(il_first).
+//   - no embeddings or layer inputs extracted, and a standard sliding window on every tail layer;
+//   - EXACT in a batch whose one output is its last token, or that has no outputs (llama_kv_cache_dsv4_context::
+//     get_batch_out): the output is in this ubatch or later, a ubatch without logits has no backend sampler, and the
+//     tail leaves some row of the ubatch out;
+//   - otherwise one output, the last row of the ubatch, and a ubatch longer than K_(il_first) (DIAG always).
 // A chunked graph (ch.c > 0) chunks the query rows of every tail layer by the same size, the first chunk at the first
 // query row; each chunk keeps its rows of the ubatch, so the masks, positions, compressed keys and raw windows are those
 // of the same rows in the whole graph. mctx gives the raw windows and the cell count.
-// The earlier ubatches of a prompt run in full, so a tail ubatch only has to rebuild what it computes itself.
+// The ubatches of the batch before the first tail ubatch, and the batches before it, run in full.
 //
-// Risk: the raw KV of a tail layer is written for its K rows only. Every layer writes at least its last W rows, so
-// decoding on from the end of the ubatch reads written cells, but a cache that is later cut back to a position inside
-// this ubatch (prompt cache reuse, a context checkpoint taken inside it) would read stale cells. Nothing records that
-// yet; see the design notes before turning this on for a server.
+// The raw KV of a tail layer is written for its K rows only. Every layer writes at least its last W rows before the
+// output, so decoding on from the output reads written cells. llm_graph_input_dsv41_tail::set_input records the rows
+// left out in the cache, which refuses to continue, remove back or save a state where that would read them.
 static dsv41_tail_plan dsv41_tail_plan_make(
         const llama_model_deepseek41 & pmodel,
         const llama_cparams & cparams,
         const llama_ubatch & ubatch,
         int64_t n_outputs,
+        bool has_samplers,
         const llama_memory_context_i * mctx,
         const dsv41_tail_chunking & ch) {
     const auto & hparams = pmodel.hparams;
@@ -159,7 +206,7 @@ static dsv41_tail_plan dsv41_tail_plan_make(
     if (mode == dsv41_tail_plan::OFF) {
         return off("not requested");
     }
-    if (cparams.embeddings) {
+    if (cparams.embeddings || cparams.embeddings_nextn) {
         return off("embeddings");
     }
     for (bool b : cparams.embeddings_layer_inp) {
@@ -187,8 +234,36 @@ static dsv41_tail_plan dsv41_tail_plan_make(
             return off("positions not consecutive");
         }
     }
-    if (n_outputs != 1 || ubatch.output == nullptr || !ubatch.output[n - 1]) {
-        return off("output not the last row alone");
+    // EXACT: the one output of the batch, its last token, may lie past this ubatch; a batch without outputs ends at its
+    // last token all the same
+    llama_seq_id out_seq = -1;
+    llama_pos    out_pos = -1;
+    bool         out_has = false;
+    const bool batch_out = mode == dsv41_tail_plan::EXACT && mctx != nullptr &&
+        static_cast<const llama_kv_cache_dsv4_context *>(mctx)->get_batch_out(out_seq, out_pos, out_has) &&
+        out_seq == ubatch.seq_id_unq[0] && out_pos >= ubatch.pos[n - 1];
+
+    plan.n_past = batch_out ? out_pos - ubatch.pos[n - 1] : 0;
+    plan.out    = batch_out ? out_has : true;
+
+    if (plan.n_past == 0 && plan.out) {
+        if (n_outputs != 1 || ubatch.output == nullptr || !ubatch.output[n - 1]) {
+            return off("output not the last row alone");
+        }
+    } else if (plan.n_past == 0) {
+        if (n_outputs != 0) {
+            return off("outputs in a batch that asked for none");
+        }
+        if (has_samplers) {
+            return off("backend samplers on a ubatch without the output");
+        }
+    } else {
+        if (n_outputs != 0) {
+            return off("output not the last token of the batch");
+        }
+        if (has_samplers) {
+            return off("backend samplers on a ubatch without the output");
+        }
     }
 
     const int32_t n_layer = (int32_t) hparams.n_layer();
@@ -218,14 +293,29 @@ static dsv41_tail_plan dsv41_tail_plan_make(
         r.n_k = r.n_o + n_swa - 1;
     }
 
-    // a ubatch no longer than the tail gains nothing at its first layer; it runs in full, explicitly
-    if (n <= plan.rows[il_first].n_k) {
-        return off("ubatch not longer than the tail");
+    if (!batch_out) {
+        // a ubatch no longer than the tail gains nothing at its first layer; it runs in full, explicitly
+        if (n <= plan.rows[il_first].n_k) {
+            return off("ubatch not longer than the tail");
+        }
+    } else {
+        // the rows of the tail in this ubatch, the output n_past rows past its end
+        bool narrowed = false;
+        for (int32_t il = il_first; il < n_layer; ++il) {
+            auto & r = plan.rows[il];
+            r.n_k = std::clamp<int64_t>(r.n_k - plan.n_past, 0, n);
+            r.n_o = std::clamp<int64_t>(r.n_o - plan.n_past, 0, n);
+            narrowed = narrowed || r.n_k < n || r.n_o < n;
+        }
+        if (!narrowed) {
+            return off("the tail covers the ubatch");
+        }
     }
 
-    plan.mode     = mode;
-    plan.il_first = il_first;
-    plan.reason   = nullptr;
+    plan.mode      = mode;
+    plan.il_first  = il_first;
+    plan.reason    = nullptr;
+    plan.poison_on = dsv41_tail_poison_env(plan.poison);
 
     if (ch.c > 0) {
         GGML_ASSERT(mctx != nullptr);
@@ -237,6 +327,9 @@ static dsv41_tail_plan dsv41_tail_plan_make(
         for (int32_t il = il_first; il < n_layer; ++il) {
             const int64_t n_q = plan.n_q(il);
             const int64_t q0  = n - n_q;
+            if (n_q == 0) {
+                break;
+            }
 
             // one chunk where the query rows fit in one (always on the last layer)
             const llm_graph_chunks chunks(n_q, ch.c);
@@ -274,6 +367,15 @@ static void dsv41_tail_log(const dsv41_tail_plan & plan) {
         msg = format("%s: %" PRId64 " rows, tail from layer %d (K %" PRId64 ", O %" PRId64 "), sum K %" PRId64 ", sum O %" PRId64,
                 plan.mode == dsv41_tail_plan::DIAG ? "diag" : "exact", plan.n_tokens, plan.il_first,
                 plan.rows[plan.il_first].n_k, plan.rows[plan.il_first].n_o, sum_k, sum_o);
+        if (!plan.has_output()) {
+            msg += format(", output %" PRId64 " rows on", plan.n_past);
+        }
+        if (!plan.out) {
+            msg += ", no output";
+        }
+        if (plan.poison_on) {
+            msg += format(", poison %g", plan.poison);
+        }
         if (plan.c > 0) {
             size_t n_chunks = 0;
             for (const auto & qc : plan.q_chunks) {
@@ -303,10 +405,26 @@ public:
         pmodel(pmodel), plan(std::move(plan)), mctx(mctx), chunking(chunking) {}
     virtual ~llm_graph_input_dsv41_tail() = default;
 
+    // the raw rows the graph leaves unwritten go to the cache record, before the graph runs: an interrupted ubatch
+    // counts as written by the plan, which only leaves more rows out than a whole one would.
     // RANMA_DSV4_RAW_NKV_CHECK: the raw windows of the query chunks against the host mask, as the chunk mask input
     // checks those of the ubatch chunks
     void set_input(const llama_ubatch * ubatch) override {
-        if (!plan.active() || chunking.ops.window == nullptr || chunking.ops.check == nullptr) {
+        if (!plan.active()) {
+            return;
+        }
+
+        const auto * mctx_dsv4 = static_cast<const llama_kv_cache_dsv4_context *>(mctx);
+        const int64_t   n     = ubatch->n_tokens;
+        const llama_pos p_end = ubatch->pos[n - 1];
+        for (int32_t il = plan.il_first; il < (int32_t) plan.rows.size(); ++il) {
+            const int64_t n_k = plan.rows[il].n_k;
+            if (n_k < n) {
+                mctx_dsv4->set_raw_written(ubatch->seq_id_unq[0], il, p_end + 1 - (llama_pos) n_k);
+            }
+        }
+
+        if (chunking.ops.window == nullptr || chunking.ops.check == nullptr) {
             return;
         }
         std::vector<llm_graph_chunk_window> windows;
@@ -318,7 +436,8 @@ public:
 
     bool can_reuse(const llm_graph_params & params) override {
         mctx = params.mctx;
-        return dsv41_tail_plan_make(pmodel, params.cparams, params.ubatch, params.n_outputs, mctx, chunking).same_graph(plan);
+        return dsv41_tail_plan_make(pmodel, params.cparams, params.ubatch, params.n_outputs, !params.samplers.empty(), mctx,
+                chunking).same_graph(plan);
     }
 
     const llama_model_deepseek41 & pmodel;
@@ -1865,6 +1984,104 @@ struct dsv41_tail_builder {
         return dsv41_join_rows(ctx0, outs, llm_graph_chunks(n_q, plan.c));
     }
 
+    // RANMA_DSV41_TAIL_POISON: the raw cells of the ubatch rows before the K rows of layer il, which the plan leaves
+    // unwritten, get the poison value, through the write indices of their tokens
+    void poison(llm_graph_input_dsv4_raw * inp_attn, int il) const {
+        const int64_t n_skip = g.n_tokens - plan.rows[il].n_k;
+        if (!plan.poison_on || n_skip <= 0) {
+            return;
+        }
+
+        const llama_kv_cache_dsv4_raw_context * mctx_raw = inp_attn->mctx;
+
+        ggml_tensor * k_idxs = inp_attn->get_k_idxs();
+        GGML_ASSERT(k_idxs->ne[0] == g.n_tokens && (int64_t) mctx_raw->get_n_write() == g.n_tokens);
+        k_idxs = llm_graph_rows(g.ctx0, k_idxs, 0, 0, n_skip);
+
+        ggml_tensor * p = ggml_fill(g.ctx0,
+                ggml_new_tensor_3d(g.ctx0, GGML_TYPE_F32, g.hparams.n_embd_head_k(), 1, n_skip), plan.poison);
+        g.cb(p, "tail_poison", il);
+
+        ggml_build_forward_expand(g.gf, mctx_raw->cpy_k(g.ctx0, p, k_idxs, il));
+    }
+
+    // a tail layer none of whose query rows is in the ubatch (the output lies in a later one): the KV source over every
+    // row on il_first, and the raw KV of its K rows, which the queries of the later ubatches read. Nothing else.
+    void write_only(
+            const llama_model & model,
+            llm_graph_input_dsv4 * inp_dsv4,
+            ggml_tensor * cur,
+            ggml_tensor * inp_pos,
+            int il) {
+        ggml_context * ctx0 = g.ctx0;
+        const auto & hparams = g.hparams;
+
+        const auto & layer = model.layers[il];
+        llm_graph_input_dsv4_raw * inp_attn = inp_dsv4->get_raw();
+
+        const int64_t n_embd_head      = hparams.n_embd_head_k();
+        const int64_t n_embd_head_rope = hparams.n_rot();
+        const int64_t ratio            = hparams.dsv4_compress_ratios[il];
+
+        const int64_t n_tokens = g.n_tokens;
+        const int64_t n_in     = cur->ne[1];
+        const int64_t n_k      = plan.rows[il].n_k;
+
+        GGML_ASSERT(hparams.is_swa(il));
+        GGML_ASSERT(plan.n_q(il) == 0 && n_k <= n_in && n_in <= n_tokens);
+        GGML_ASSERT(il == plan.il_first ? n_in == n_tokens : (n_in == n_k && n_k > 0));
+
+        if (ratio != 0 && hparams.dsv41_is_kv_source(il)) {
+            const bool use_csa = (uint32_t) ratio == inp_dsv4->mctx->get_csa_state()->get_ratio();
+
+            const llm_graph_input_dsv4::comp_input * inp_comp = use_csa ? &inp_dsv4->get_csa() : &inp_dsv4->get_hca();
+
+            const llama_dsv4_comp_state * comp_state = use_csa
+                ? inp_dsv4->mctx->get_csa_state()
+                : inp_dsv4->mctx->get_hca_state();
+
+            GGML_ASSERT(inp_comp->kq_mask && "a compressed layer needs a plan for its ratio");
+
+            if (inp_comp->state_pos) {
+                GGML_ASSERT(n_in == n_tokens && "a KV source of the tail compresses every row");
+                g.build_kv_source(model, inp_dsv4, *inp_comp, comp_state, cur, il);
+            }
+        }
+
+        poison(inp_attn, il);
+
+        if (n_k == 0) {
+            return;
+        }
+
+        const dsv41_rope_cfg rc = g.rope_cfg(il);
+
+        ggml_tensor * cur_k = llm_graph_rows(ctx0, cur,     1, n_in - n_k,     n_k);
+        ggml_tensor * pos_k = llm_graph_rows(ctx0, inp_pos, 0, n_tokens - n_k, n_k);
+
+        ggml_tensor * kv = g.build_lora_mm(layer.wkv, cur_k);
+        kv = g.build_norm(kv, layer.attn_kv_norm, nullptr, LLM_NORM_RMS, il);
+        kv = ggml_reshape_3d(ctx0, kv, n_embd_head, 1, n_k);
+        kv = ggml_rope_ext(ctx0, kv, pos_k, nullptr, n_embd_head_rope, g.rope_type, rc.n_ctx_orig,
+                rc.base, rc.scale, rc.ext_factor, rc.attn_factor, rc.beta_fast, rc.beta_slow);
+        kv = ggml_rope_set_offset(kv, n_embd_head - n_embd_head_rope);
+        g.cb(kv, "kv", il);
+
+        if (inp_attn->self_k_rot) {
+            kv = llama_mul_mat_hadamard(ctx0, kv, inp_attn->self_k_rot);
+        }
+        ggml_build_forward_expand(g.gf, kv);
+
+        const llama_kv_cache_dsv4_raw_context * mctx_raw = inp_attn->mctx;
+
+        // as in attention(): row i of the write indices is token i
+        ggml_tensor * k_idxs = inp_attn->get_k_idxs();
+        GGML_ASSERT(k_idxs->ne[0] == n_tokens && (int64_t) mctx_raw->get_n_write() == n_tokens);
+        k_idxs = llm_graph_rows(ctx0, k_idxs, 0, n_tokens - n_k, n_k);
+
+        ggml_build_forward_expand(g.gf, mctx_raw->cpy_k(ctx0, kv, k_idxs, il));
+    }
+
     ggml_tensor * attention(
             const llama_model & model,
             llm_graph_input_dsv4 * inp_dsv4,
@@ -1985,6 +2202,7 @@ struct dsv41_tail_builder {
         k_idxs = llm_graph_rows(ctx0, k_idxs, 0, n_tokens - n_k, n_k);
 
         ggml_build_forward_expand(g.gf, mctx_raw->cpy_k(ctx0, kv, k_idxs, il));
+        poison(inp_attn, il);
 
         ggml_tensor * raw_k = mctx_raw->get_k(ctx0, il);
         g.cb(raw_k, "raw_k", il);
@@ -2066,7 +2284,7 @@ llama_model_deepseek41::graph::graph(const llama_model & model, const llm_graph_
         // a graph of one chunk (llm_graph_chunk_mask_one) reads every raw cell, like build_attention_v41_chunked; so do its tail layers
         if (inp_cm->windows.empty()) { tail_chunking.ops.window = nullptr; }
     }
-    const dsv41_tail_plan tail = dsv41_tail_plan_make(pmodel, cparams, ubatch, n_outputs, mctx, tail_chunking);
+    const dsv41_tail_plan tail = dsv41_tail_plan_make(pmodel, cparams, ubatch, n_outputs, !samplers.empty(), mctx, tail_chunking);
     dsv41_tail_log(tail);
     if (tail.requested) {
         res->add_input(std::make_unique<llm_graph_input_dsv41_tail>(pmodel, tail, mctx, tail_chunking));
@@ -2108,6 +2326,19 @@ llama_model_deepseek41::graph::graph(const llama_model & model, const llm_graph_
         // incoming mix collapses the n_in rows for the attention, the attention mixes are made for its output rows
         const bool in_tail = tail.active() && il >= tail.il_first;
         GGML_ASSERT(!in_tail || il == tail.il_first || pmodel.engram_index(il) < 0);
+
+        // the output lies in a later ubatch and no query row of this layer is in this one: the KV source and the raw
+        // KV of its rows, and the layers after it have no rows at all
+        if (in_tail && tail.n_q(il) == 0) {
+            cur = build_hc_pre(inpL, pre_mix, il);
+            cb(cur, "hc_attn_pre", il);
+
+            cur = build_norm(cur, model.layers[il].attn_norm, nullptr, LLM_NORM_RMS, il);
+            cb(cur, "attn_norm", il);
+
+            tail_attn.write_only(model, inp_dsv4, cur, inp_pos, il);
+            break;
+        }
 
         const int64_t n_in  = inpL->ne[2];
         const int64_t n_att = in_tail ? tail.n_q(il) : n_in;
@@ -2204,6 +2435,13 @@ llama_model_deepseek41::graph::graph(const llama_model & model, const llm_graph_
         res->t_layer_inp[n_layer] = dsv41_hc_mean(ctx0, inpL);
         cb(res->t_layer_inp[n_layer], "layer_inp", n_layer);
         ggml_build_forward_expand(gf, res->t_layer_inp[n_layer]);
+    }
+
+    if (tail.active() && !tail.has_logits()) {
+        // a ubatch before the one with the output, or the end of a call without outputs: the caches are written, there
+        // are no logits
+        GGML_ASSERT(n_outputs == 0);
+        return;
     }
 
     if (tail.active()) {

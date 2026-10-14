@@ -5,6 +5,7 @@
 
 #include <map>
 #include <memory>
+#include <string>
 #include <unordered_map>
 #include <vector>
 
@@ -159,7 +160,52 @@ public:
     // ranma: the smallest ubatch that reads the narrow raw window; a smaller one reads the whole raw cache
     uint32_t get_raw_nkv_min_tokens() const;
 
+    // ranma: the tail prefill of DeepSeek-V4.1 writes the raw KV of a decoder layer only for
+    // the rows that the output of its batch depends on. Per sequence and layer, the first position of the run of
+    // written raw cells that ends at the last position of the sequence; a sequence is continuable at p_end when every
+    // layer has its sliding window before p_end + 1 written. A removal, a decode or a state save that would read an
+    // unwritten cell is refused, and a refused removal marks the sequence broken until it is cleared or restored.
+    void tail_set_written(llama_seq_id seq_id, int32_t il, llama_pos p0);
+    bool tail_can_continue(llama_seq_id seq_id, llama_pos p_end) const;
+
+    // ranma: the calls of the sequences of a batch begin with the first ubatch applied and end once the last one
+    // computed; a call that never ends (an aborted or failed ubatch) leaves its sequences pending
+    void tail_call_begin(const std::vector<llama_ubatch> & ubatches);
+    void tail_call_end(const std::vector<llama_ubatch> & ubatches, const char * what);
+
 private:
+    uint32_t tail_n_swa   = 0;
+    uint32_t tail_n_layer = 0;
+    bool     tail_seen    = false;                // a tail ran on this cache, so a restored state is not trusted further back
+    std::vector<std::vector<llama_pos>> tail_lo;  // [n_seq_max][n_layer], empty: every cell written
+    std::vector<uint8_t>                tail_bad; // [n_seq_max] a refused removal left unknown cells
+    std::vector<llama_pos>              tail_end; // [n_seq_max] the end of the last call that completed, -1 none
+    std::vector<uint8_t>                tail_pending; // [n_seq_max] a call began and has not completed
+
+    void tail_reset(llama_seq_id seq_id);         // -1: every sequence
+
+    // the record of a sequence in a saved state (DSV4_STATE_MODE_TAIL): its end, and the first written position of
+    // each layer (empty: every cell written)
+    struct tail_state_rec {
+        llama_seq_id           seq_id = -1;
+        llama_pos              end    = 0;
+        std::vector<llama_pos> lo;
+    };
+
+    void tail_state_write(llama_io_write_i & io, llama_seq_id seq_id) const;
+    std::vector<tail_state_rec> tail_state_read(llama_io_read_i & io) const;
+
+    // -1: every sequence. recs: the records of the state, if it has them; partial: the state had no global payload, so
+    // the memory had to hold the prefix up to its end before (pos_max_before, per sequence)
+    void tail_after_restore(llama_seq_id seq_id, const std::vector<tail_state_rec> * recs, bool partial,
+            const std::vector<llama_pos> & pos_max_before);
+    bool tail_check_batch(const llama_batch_allocr & balloc) const;
+
+    // diagnostics, logged when the tail prefill is asked for: the cells a sequence has written, and a batch with its
+    // end contract and the record of its sequences
+    std::string tail_describe(llama_seq_id seq_id) const;
+    void tail_log_batch(const llama_batch_allocr & balloc, llama_seq_id out_seq, llama_pos out_pos, bool out_has) const;
+
     // joint raw + compressed K storage, allocated before the sub-caches so that they can view it
     struct kall_layer {
         ggml_tensor * joint    = nullptr;
@@ -440,8 +486,24 @@ public:
     const comp_plan & get_hca_plan(const llama_ubatch & ubatch) const;
     const comp_plan & get_lid_plan(const llama_ubatch & ubatch) const;
 
+    // ranma: the tail prefill. The end contract of a batch of one sequence of tokens at consecutive positions whose
+    // only output, if any, is its last token: the sequence, the position of the last token and whether the batch asks
+    // for its output, else false. The ubatches of such a batch can compute only what the state at its end depends on.
+    bool get_batch_out(llama_seq_id & seq_id, llama_pos & pos, bool & has_output) const;
+    void set_batch_out(llama_seq_id seq_id, llama_pos pos, bool has_output);
+
+    // the graph of the current ubatch writes the raw KV of layer il for the positions from p0 on (see
+    // llama_kv_cache_dsv4::tail_set_written)
+    void set_raw_written(llama_seq_id seq_id, int32_t il, llama_pos p0) const;
+
 private:
     size_t i_next = 0;
+
+    llama_kv_cache_dsv4 * kv = nullptr;
+
+    llama_seq_id out_seq = -1;
+    llama_pos    out_pos = -1;
+    bool         out_has = false;
 
     std::vector<llama_ubatch> ubatches;
 

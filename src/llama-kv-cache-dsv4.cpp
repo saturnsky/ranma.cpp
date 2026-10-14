@@ -25,8 +25,24 @@ static constexpr uint32_t DSV4_STATE_MAGIC         = 0x34565344; // DSV4
 static constexpr uint32_t DSV4_STATE_VERSION       = 1;
 static constexpr uint32_t DSV4_STATE_MODE_FULL     = 0;
 static constexpr uint32_t DSV4_STATE_MODE_PARTIAL  = 1;
+// ranma: or'ed into the mode, a block of tail prefill records follows it (llama_kv_cache_dsv4::tail_state_write). A
+// state without it, which a cache without the tail prefill or a build before the records wrote, is read as before.
+static constexpr uint32_t DSV4_STATE_MODE_TAIL     = 0x100;
+static constexpr uint32_t DSV4_STATE_TAIL_VER      = 1;
 static constexpr uint32_t DSV4_K_CACHE_STATE_VER   = 2;
 static constexpr uint32_t DSV4_COMP_STATE_VER      = 1;
+
+// ranma: the tail prefill was asked for (RANMA_DSV41_EXACT_TAIL or RANMA_DSV41_TAIL_DIAG, read at each call); only then
+// the cache logs its batches and records
+static bool dsv4_tail_requested() {
+    for (const char * name : { "RANMA_DSV41_EXACT_TAIL", "RANMA_DSV41_TAIL_DIAG" }) {
+        const char * v = getenv(name);
+        if (v != nullptr && atoi(v) != 0) {
+            return true;
+        }
+    }
+    return false;
+}
 
 static uint32_t dsv4_comp_size(uint32_t kv_size, uint32_t ratio) {
     return std::max<uint32_t>(1, (kv_size + ratio - 1)/ratio);
@@ -1458,6 +1474,13 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
     n_rs_seq(n_rs_seq),
     rs_idx(n_seq_max, 0) {
 
+    tail_n_swa   = model.hparams.n_swa;
+    tail_n_layer = model.hparams.n_layer();
+    tail_lo     .assign(n_seq_max, {});
+    tail_bad    .assign(n_seq_max, 0);
+    tail_end    .assign(n_seq_max, -1);
+    tail_pending.assign(n_seq_max, 0);
+
     const layer_filter_cb filter_raw = [&](int32_t il) {
         if (filter && !filter(il)) {
             return false;
@@ -1713,6 +1736,38 @@ llama_memory_context_ptr llama_kv_cache_dsv4::init_batch(
     const bool comp_per_seq = csa_state->get_n_stream() > 1;
     const bool has_coupled = dsv4_batch_has_coupled(balloc.get_batch());
 
+    // ranma: a batch that would read raw cells a tail prefill left unwritten fails, so that the caller starts over
+    if (!tail_check_batch(balloc)) {
+        return std::make_unique<llama_kv_cache_dsv4_context>(LLAMA_MEMORY_STATUS_FAILED_COMPUTE);
+    }
+
+    // ranma: the end contract of the tail prefill, a batch of one sequence at consecutive positions whose only output,
+    // if any, is its last token. A batch without outputs ends there too: its state is what the next call continues from.
+    llama_seq_id out_seq = -1;
+    llama_pos    out_pos = -1;
+    bool         out_has = false;
+    {
+        const llama_batch & batch = balloc.get_batch();
+        const int32_t   n         = batch.n_tokens;
+        const uint32_t  n_outputs = balloc.get_n_outputs();
+
+        bool ok = n > 0 && batch.token != nullptr && batch.embd == nullptr &&
+            batch.pos != nullptr && batch.n_seq_id != nullptr && batch.seq_id != nullptr && batch.logits != nullptr &&
+            (n_outputs == 0 || (n_outputs == 1 && batch.logits[n - 1] != 0));
+        for (int32_t i = 0; ok && i < n; ++i) {
+            ok = batch.n_seq_id[i] == 1 && batch.seq_id[i][0] == batch.seq_id[0][0] && batch.pos[i] == batch.pos[0] + i;
+        }
+        if (ok) {
+            out_seq = batch.seq_id[0][0];
+            out_pos = batch.pos[n - 1];
+            out_has = n_outputs == 1;
+        }
+    }
+
+    if (dsv4_tail_requested()) {
+        tail_log_batch(balloc, out_seq, out_pos, out_has);
+    }
+
     const auto make_context = [&](std::vector<llama_ubatch> ubatches) -> llama_memory_context_ptr {
         auto ubatches_raw = dsv4_build_raw_write_ubatches(ubatches);
 
@@ -1728,13 +1783,16 @@ llama_memory_context_ptr llama_kv_cache_dsv4::init_batch(
 
         auto sinfos_raw_swa_read = dsv4_build_raw_read_sinfos(sinfos_raw_swa_write, ubatches);
 
-        return std::make_unique<llama_kv_cache_dsv4_context>(
+        auto ctx = std::make_unique<llama_kv_cache_dsv4_context>(
                 this,
                 std::move(sinfos_raw_base_write),
                 std::move(sinfos_raw_swa_write),
                 std::move(sinfos_raw_swa_read),
                 std::move(ubatches),
                 std::move(ubatches_raw));
+        ctx->set_batch_out(out_seq, out_pos, out_has);
+
+        return ctx;
     };
 
     // Match llama_kv_cache_iswa splitting when DSV4 compressed state does not
@@ -1820,6 +1878,7 @@ bool llama_kv_cache_dsv4::get_can_shift() const {
 }
 
 void llama_kv_cache_dsv4::clear(bool data) {
+    tail_reset(-1);
     kv_raw->clear(data);
     clear_compressed(-1, true); // DSV4 compressed buffers must never expose stale/uninit rows
 }
@@ -1835,6 +1894,22 @@ bool llama_kv_cache_dsv4::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1
         }
 
         const llama_pos pos_max = kv_raw->seq_pos_max(seq_id);
+
+        // ranma: a removal into the rows a tail prefill left unwritten is refused. Any refused removal of such a
+        // sequence marks it, so that nothing continues from it as it is (the caller restores or clears it next).
+        const auto refuse = [&]() {
+            if (!tail_lo[seq_id].empty()) {
+                tail_bad[seq_id] = 1;
+            }
+            return false;
+        };
+
+        if (p0 <= pos_max && !tail_can_continue(seq_id, p0 - 1)) {
+            LLAMA_LOG_WARN("%s: seq_id = %d, removal from pos %d refused: the tail prefill left raw cells before it unwritten\n",
+                    __func__, seq_id, p0);
+            return refuse();
+        }
+
         if (p0 > pos_max) {
             bool res = true;
 
@@ -1847,22 +1922,24 @@ bool llama_kv_cache_dsv4::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1
         }
 
         if (n_rs_seq == 0) {
-            return false;
+            return refuse();
         }
 
         const llama_pos rollback = pos_max - (p0 - 1);
         if (rollback < 1 || rollback > (llama_pos) n_rs_seq) {
-            return false;
+            return refuse();
         }
 
         // pending rollback is single-use: stacked partial removals don't compose
         if (rs_idx[seq_id] != 0) {
-            return false;
+            return refuse();
         }
 
         const bool res = kv_raw->seq_rm(seq_id, p0, p1);
         if (res) {
             rs_idx[seq_id] = (uint32_t) rollback;
+        } else {
+            refuse();
         }
 
         return res;
@@ -1872,6 +1949,7 @@ bool llama_kv_cache_dsv4::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1
 
     if (res) {
         clear_compressed(seq_id, true);
+        tail_reset(seq_id);
     }
 
     return res;
@@ -1891,6 +1969,14 @@ void llama_kv_cache_dsv4::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_ds
 
     if (seq_id_src != seq_id_dst) {
         rs_idx[seq_id_dst] = 0;
+
+        // ranma: the copy has the same cells, written or not
+        if (seq_id_src >= 0 && (uint32_t) seq_id_src < n_seq_max && seq_id_dst >= 0 && (uint32_t) seq_id_dst < n_seq_max) {
+            tail_lo     [seq_id_dst] = tail_lo     [seq_id_src];
+            tail_bad    [seq_id_dst] = tail_bad    [seq_id_src];
+            tail_end    [seq_id_dst] = tail_end    [seq_id_src];
+            tail_pending[seq_id_dst] = tail_pending[seq_id_src];
+        }
     }
 }
 
@@ -1906,15 +1992,32 @@ void llama_kv_cache_dsv4::seq_keep(llama_seq_id seq_id) {
 
         kv_raw->seq_rm(id, -1, -1);
         clear_compressed(id, true);
+        tail_reset(id);
+    }
+}
+
+// ranma: moved positions no longer match those a tail prefill recorded; such a sequence is not continued
+static void dsv4_tail_mark_moved(const std::vector<std::vector<llama_pos>> & tail_lo, std::vector<uint8_t> & tail_bad,
+        llama_seq_id seq_id) {
+    for (size_t s = 0; s < tail_lo.size(); ++s) {
+        if ((seq_id < 0 || (size_t) seq_id == s) && !tail_lo[s].empty()) {
+            tail_bad[s] = 1;
+        }
     }
 }
 
 void llama_kv_cache_dsv4::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p1, llama_pos shift) {
     kv_raw->seq_add(seq_id, p0, p1, shift);
+    if (shift != 0) {
+        dsv4_tail_mark_moved(tail_lo, tail_bad, seq_id);
+    }
 }
 
 void llama_kv_cache_dsv4::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, int d) {
     kv_raw->seq_div(seq_id, p0, p1, d);
+    if (d != 1) {
+        dsv4_tail_mark_moved(tail_lo, tail_bad, seq_id);
+    }
 }
 
 llama_pos llama_kv_cache_dsv4::seq_pos_min(llama_seq_id seq_id) const {
@@ -1966,13 +2069,33 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_kv_cache_dsv4::memory_breakdo
 void llama_kv_cache_dsv4::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
     const bool partial_only = flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY;
 
+    // ranma: a state is restored to continue from its last position; one that cannot be is not saved
+    for (uint32_t s = 0; s < n_seq_max; ++s) {
+        if ((seq_id < 0 || (uint32_t) seq_id == s) &&
+                !tail_can_continue((llama_seq_id) s, kv_raw->seq_pos_max((llama_seq_id) s))) {
+            throw std::runtime_error("DSV4 state: the tail prefill of this sequence did not complete");
+        }
+    }
+
+    // ranma: the records of the tail prefill go with the state when it ran on one of its sequences or is asked for,
+    // so that a restore knows which raw cells are written; otherwise the state is as upstream writes it
+    bool with_tail = dsv4_tail_requested();
+    for (uint32_t s = 0; s < n_seq_max && !with_tail; ++s) {
+        with_tail = (seq_id < 0 || (uint32_t) seq_id == s) && !tail_lo[s].empty();
+    }
+
     const uint32_t magic   = DSV4_STATE_MAGIC;
     const uint32_t version = DSV4_STATE_VERSION;
-    const uint32_t mode    = partial_only ? DSV4_STATE_MODE_PARTIAL : DSV4_STATE_MODE_FULL;
+    const uint32_t mode    = (partial_only ? DSV4_STATE_MODE_PARTIAL : DSV4_STATE_MODE_FULL) |
+        (with_tail ? DSV4_STATE_MODE_TAIL : 0);
 
     io.write(&magic,   sizeof(magic));
     io.write(&version, sizeof(version));
     io.write(&mode,    sizeof(mode));
+
+    if (with_tail) {
+        tail_state_write(io, seq_id);
+    }
 
     kv_raw->state_write(io, seq_id, flags);
 
@@ -2013,6 +2136,10 @@ void llama_kv_cache_dsv4::state_read(llama_io_read_i & io, llama_seq_id seq_id, 
     }
 
     io.read(&mode, sizeof(mode));
+
+    const bool with_tail = mode & DSV4_STATE_MODE_TAIL;
+    mode &= ~DSV4_STATE_MODE_TAIL;
+
     if (mode != DSV4_STATE_MODE_FULL && mode != DSV4_STATE_MODE_PARTIAL) {
         throw std::runtime_error("DSV4 state mode mismatch");
     }
@@ -2020,6 +2147,16 @@ void llama_kv_cache_dsv4::state_read(llama_io_read_i & io, llama_seq_id seq_id, 
     const bool partial_only = mode == DSV4_STATE_MODE_PARTIAL;
     if (partial_only != !!(flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY)) {
         throw std::runtime_error("DSV4 state flags mismatch");
+    }
+
+    // ranma: the tail records come before anything is restored, so that a mismatch leaves the memory as it was
+    std::vector<tail_state_rec> recs;
+    if (with_tail) {
+        recs = tail_state_read(io);
+    }
+    std::vector<llama_pos> pos_max_before(n_seq_max, -1);
+    for (uint32_t s = 0; s < n_seq_max; ++s) {
+        pos_max_before[s] = kv_raw->seq_pos_max((llama_seq_id) s);
     }
 
     kv_raw->state_read(io, seq_id, flags);
@@ -2042,6 +2179,8 @@ void llama_kv_cache_dsv4::state_read(llama_io_read_i & io, llama_seq_id seq_id, 
     } else {
         std::fill(rs_idx.begin(), rs_idx.end(), 0);
     }
+
+    tail_after_restore(seq_id, with_tail ? &recs : nullptr, partial_only, pos_max_before);
 }
 
 llama_kv_cache_iswa * llama_kv_cache_dsv4::get_raw() const {
@@ -2078,6 +2217,276 @@ uint32_t llama_kv_cache_dsv4::get_n_rs_seq() const {
 
 uint32_t llama_kv_cache_dsv4::get_raw_nkv_min_tokens() const {
     return raw_nkv_min_tokens;
+}
+
+std::string llama_kv_cache_dsv4::tail_describe(llama_seq_id seq_id) const {
+    if (tail_bad[seq_id]) {
+        return "broken (a refused removal)";
+    }
+    const auto & lo = tail_lo[seq_id];
+    if (lo.empty()) {
+        return "every cell written";
+    }
+    // runs of layers whose written cells start at the same position; -1: every cell of the layer
+    std::string res = "written from";
+    for (size_t il = 0; il < lo.size(); ) {
+        size_t il_end = il + 1;
+        while (il_end < lo.size() && lo[il_end] == lo[il]) {
+            ++il_end;
+        }
+        if (lo[il] >= 0) {
+            res += il_end - il == 1 ? format(" l%zu:%d", il, lo[il]) : format(" l%zu-%zu:%d", il, il_end - 1, lo[il]);
+        }
+        il = il_end;
+    }
+    return res;
+}
+
+void llama_kv_cache_dsv4::tail_log_batch(const llama_batch_allocr & balloc, llama_seq_id out_seq, llama_pos out_pos, bool out_has) const {
+    const uint32_t n_tokens = balloc.get_n_tokens();
+    for (uint32_t s = 0; s < n_seq_max; ++s) {
+        const llama_pos p0 = balloc.seq_pos_min((llama_seq_id) s);
+        if (p0 < 0) {
+            continue;
+        }
+        const llama_pos p1 = balloc.seq_pos_max((llama_seq_id) s);
+
+        const std::string end = (llama_seq_id) s == out_seq ? format("end %d, %s", out_pos + 1, out_has ? "output" : "no output") :
+            std::string("none");
+        const std::string msg = format("seq %u: batch [%d, %d) of %u tokens, %u outputs, contract %s; memory to %d, raw %s",
+                s, p0, p1 + 1, n_tokens, balloc.get_n_outputs(), end.c_str(),
+                kv_raw->seq_pos_max((llama_seq_id) s) + 1, tail_describe((llama_seq_id) s).c_str());
+        // a decode of one token per sequence is logged at debug level only
+        if (n_tokens > 1) {
+            LLAMA_LOG_INFO("%s: %s\n", __func__, msg.c_str());
+        } else {
+            LLAMA_LOG_DEBUG("%s: %s\n", __func__, msg.c_str());
+        }
+    }
+}
+
+void llama_kv_cache_dsv4::tail_set_written(llama_seq_id seq_id, int32_t il, llama_pos p0) {
+    GGML_ASSERT(seq_id >= 0 && (uint32_t) seq_id < n_seq_max && il >= 0 && (uint32_t) il < tail_n_layer);
+
+    auto & lo = tail_lo[seq_id];
+    if (lo.empty()) {
+        lo.assign(tail_n_layer, -1);
+    }
+    // the run of written cells now starts at p0, unless it already started later
+    lo[il] = std::max(lo[il], p0);
+    tail_seen = true;
+}
+
+bool llama_kv_cache_dsv4::tail_can_continue(llama_seq_id seq_id, llama_pos p_end) const {
+    if (seq_id < 0 || (uint32_t) seq_id >= n_seq_max || p_end < 0) {
+        return true;
+    }
+    if (tail_bad[seq_id]) {
+        return false;
+    }
+    // the next position reads the cells [p_end + 2 - n_swa, p_end] of every layer besides its own
+    const llama_pos need = std::max<llama_pos>(0, p_end + 2 - (llama_pos) tail_n_swa);
+    for (llama_pos p : tail_lo[seq_id]) {
+        if (p > need) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void llama_kv_cache_dsv4::tail_reset(llama_seq_id seq_id) {
+    for (uint32_t s = 0; s < n_seq_max; ++s) {
+        if (seq_id < 0 || (uint32_t) seq_id == s) {
+            tail_lo[s].clear();
+            tail_bad[s]     = 0;
+            tail_end[s]     = -1;
+            tail_pending[s] = 0;
+        }
+    }
+}
+
+// the sequences of the ubatches of one batch, each once
+static std::vector<llama_seq_id> dsv4_ubatches_seqs(const std::vector<llama_ubatch> & ubatches, uint32_t n_seq_max) {
+    std::vector<uint8_t> seen(n_seq_max, 0);
+    std::vector<llama_seq_id> res;
+    for (const llama_ubatch & ubatch : ubatches) {
+        for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+            for (int32_t k = 0; k < ubatch.n_seq_id[i]; ++k) {
+                const llama_seq_id s = ubatch.seq_id[i][k];
+                if (s >= 0 && (uint32_t) s < n_seq_max && !seen[s]) {
+                    seen[s] = 1;
+                    res.push_back(s);
+                }
+            }
+        }
+    }
+    return res;
+}
+
+void llama_kv_cache_dsv4::tail_call_begin(const std::vector<llama_ubatch> & ubatches) {
+    for (llama_seq_id s : dsv4_ubatches_seqs(ubatches, n_seq_max)) {
+        tail_pending[s] = 1;
+    }
+}
+
+void llama_kv_cache_dsv4::tail_call_end(const std::vector<llama_ubatch> & ubatches, const char * what) {
+    const bool log = dsv4_tail_requested();
+    for (llama_seq_id s : dsv4_ubatches_seqs(ubatches, n_seq_max)) {
+        tail_pending[s] = 0;
+        tail_end[s]     = kv_raw->seq_pos_max(s) + 1;
+        if (log) {
+            LLAMA_LOG_INFO("%s: seq %d: call to %d complete (%s), raw %s\n", __func__, s, tail_end[s],
+                    what, tail_describe(s).c_str());
+        }
+    }
+}
+
+// the block: version, layer count, record count, then per record its sequence, its end, the count of its first written
+// positions (0 or the layer count) and those positions
+void llama_kv_cache_dsv4::tail_state_write(llama_io_write_i & io, llama_seq_id seq_id) const {
+    std::vector<tail_state_rec> recs;
+    for (uint32_t s = 0; s < n_seq_max; ++s) {
+        const llama_pos pos_max = kv_raw->seq_pos_max((llama_seq_id) s);
+        if ((seq_id >= 0 && (uint32_t) seq_id != s) || pos_max < 0) {
+            continue;
+        }
+        recs.push_back({ (llama_seq_id) s, pos_max + 1, tail_lo[s] });
+    }
+
+    const uint32_t ver     = DSV4_STATE_TAIL_VER;
+    const uint32_t n_layer = tail_n_layer;
+    const uint32_t n_rec   = (uint32_t) recs.size();
+
+    io.write(&ver,     sizeof(ver));
+    io.write(&n_layer, sizeof(n_layer));
+    io.write(&n_rec,   sizeof(n_rec));
+    for (const auto & r : recs) {
+        const int32_t  s    = r.seq_id;
+        const int32_t  end  = r.end;
+        const uint32_t n_lo = (uint32_t) r.lo.size();
+
+        io.write(&s,    sizeof(s));
+        io.write(&end,  sizeof(end));
+        io.write(&n_lo, sizeof(n_lo));
+        for (llama_pos p : r.lo) {
+            const int32_t v = p;
+            io.write(&v, sizeof(v));
+        }
+    }
+}
+
+std::vector<llama_kv_cache_dsv4::tail_state_rec> llama_kv_cache_dsv4::tail_state_read(llama_io_read_i & io) const {
+    uint32_t ver     = 0;
+    uint32_t n_layer = 0;
+    uint32_t n_rec   = 0;
+
+    io.read(&ver,     sizeof(ver));
+    io.read(&n_layer, sizeof(n_layer));
+    io.read(&n_rec,   sizeof(n_rec));
+
+    if (ver != DSV4_STATE_TAIL_VER) {
+        throw std::runtime_error("DSV4 state: tail record version mismatch");
+    }
+    if (n_layer != tail_n_layer || n_rec > n_seq_max) {
+        throw std::runtime_error("DSV4 state: tail records of another model or cache");
+    }
+
+    std::vector<tail_state_rec> recs(n_rec);
+    for (auto & r : recs) {
+        int32_t  s    = -1;
+        int32_t  end  = 0;
+        uint32_t n_lo = 0;
+
+        io.read(&s,    sizeof(s));
+        io.read(&end,  sizeof(end));
+        io.read(&n_lo, sizeof(n_lo));
+        if (s < 0 || (uint32_t) s >= n_seq_max || (n_lo != 0 && n_lo != n_layer)) {
+            throw std::runtime_error("DSV4 state: tail record out of range");
+        }
+
+        r.seq_id = s;
+        r.end    = end;
+        r.lo.resize(n_lo);
+        for (auto & p : r.lo) {
+            int32_t v = 0;
+            io.read(&v, sizeof(v));
+            p = v;
+        }
+    }
+    return recs;
+}
+
+void llama_kv_cache_dsv4::tail_after_restore(llama_seq_id seq_id, const std::vector<tail_state_rec> * recs, bool partial,
+        const std::vector<llama_pos> & pos_max_before) {
+    for (uint32_t s = 0; s < n_seq_max; ++s) {
+        if (seq_id >= 0 && (uint32_t) seq_id != s) {
+            continue;
+        }
+        tail_lo[s].clear();
+        tail_bad[s]     = 0;
+        tail_pending[s] = 0;
+
+        const llama_pos pos_max = kv_raw->seq_pos_max((llama_seq_id) s);
+        tail_end[s] = pos_max >= 0 ? pos_max + 1 : -1;
+        if (pos_max < 0) {
+            continue;
+        }
+
+        // the record of this sequence: the one saved for it, or the only one when it was restored into another id
+        const tail_state_rec * rec = nullptr;
+        if (recs != nullptr) {
+            for (const auto & r : *recs) {
+                if (r.seq_id == (llama_seq_id) s || (seq_id >= 0 && recs->size() == 1)) {
+                    rec = &r;
+                }
+            }
+        }
+
+        if (rec != nullptr && rec->end == pos_max + 1) {
+            // the state says which cells are written
+            tail_lo[s] = rec->lo;
+            tail_seen  = tail_seen || !rec->lo.empty();
+        } else if (rec != nullptr || tail_seen || dsv4_tail_requested()) {
+            // a state without records (or with one that does not fit) was continuable at its end (see state_write);
+            // where a tail may have run, nothing is known further back, so only the window of that end counts as
+            // written
+            tail_lo[s].assign(tail_n_layer, std::max<llama_pos>(0, pos_max + 1 - (llama_pos) tail_n_swa));
+        }
+
+        // a partial state keeps the global KV of the memory, which held the prefix to its end only if it reached as far
+        if (partial && rec != nullptr && pos_max_before[s] < pos_max) {
+            LLAMA_LOG_ERROR("%s: seq_id = %u: a partial state to %d restored over a memory to %d, whose global KV it "
+                    "lacks; the sequence cannot continue until it is cleared\n", __func__, s, pos_max + 1, pos_max_before[s] + 1);
+            tail_bad[s] = 1;
+        }
+
+        if (dsv4_tail_requested()) {
+            LLAMA_LOG_INFO("%s: seq_id = %u: %s state to %d restored (%s), raw %s\n", __func__, s,
+                    partial ? "partial" : "full", pos_max + 1,
+                    rec == nullptr ? "no records" : rec->end == pos_max + 1 ? "records" : "records of another end",
+                    tail_describe((llama_seq_id) s).c_str());
+        }
+    }
+}
+
+bool llama_kv_cache_dsv4::tail_check_batch(const llama_batch_allocr & balloc) const {
+    for (uint32_t s = 0; s < n_seq_max; ++s) {
+        if (tail_lo[s].empty() && !tail_bad[s]) {
+            continue;
+        }
+        const llama_pos p0 = balloc.seq_pos_min((llama_seq_id) s);
+        if (p0 < 0) {
+            continue;
+        }
+        const llama_pos p_end = std::min(p0 - 1, kv_raw->seq_pos_max((llama_seq_id) s));
+        if (!tail_can_continue((llama_seq_id) s, p_end)) {
+            LLAMA_LOG_ERROR("%s: seq_id = %u cannot continue at pos %d: a tail prefill left raw cells it reads unwritten "
+                    "(an interrupted or partly removed tail batch); clear the sequence and process it again\n",
+                    __func__, s, p0);
+            return false;
+        }
+    }
+    return true;
 }
 
 const std::vector<uint32_t> & llama_kv_cache_dsv4::get_rs_idx() const {
@@ -2637,6 +3046,7 @@ llama_kv_cache_dsv4_context::llama_kv_cache_dsv4_context(
     hca_state(kv->get_hca_state()),
     lid_state(kv->get_lid_state()),
     status(ctx_raw->get_status()) {
+    this->kv = kv;
     kv->reset_rs_idx_for_ubatches(this->ubatches);
 }
 
@@ -2651,6 +3061,10 @@ bool llama_kv_cache_dsv4_context::next() {
     ctx_lid->next();
 
     if (++i_next >= ubatches.size()) {
+        // ranma: the last ubatch computed, so the call is complete (see tail_call_end)
+        if (kv != nullptr && !ubatches.empty()) {
+            kv->tail_call_end(ubatches, out_seq < 0 ? "no end contract" : out_has ? "output" : "no output");
+        }
         return false;
     }
 
@@ -2674,6 +3088,9 @@ bool llama_kv_cache_dsv4_context::apply() {
         csa_state->apply_copies(sc_info_csa);
         hca_state->apply_copies(sc_info_hca);
         lid_state->apply_copies(sc_info_lid);
+    } else if (i_next == 0 && kv != nullptr) {
+        // ranma: the call begins with its first ubatch
+        kv->tail_call_begin(ubatches);
     }
 
     return res;
@@ -2681,6 +3098,24 @@ bool llama_kv_cache_dsv4_context::apply() {
 
 llama_memory_status llama_kv_cache_dsv4_context::get_status() const {
     return status;
+}
+
+bool llama_kv_cache_dsv4_context::get_batch_out(llama_seq_id & seq_id, llama_pos & pos, bool & has_output) const {
+    seq_id     = out_seq;
+    pos        = out_pos;
+    has_output = out_has;
+    return out_seq >= 0;
+}
+
+void llama_kv_cache_dsv4_context::set_batch_out(llama_seq_id seq_id, llama_pos pos, bool has_output) {
+    out_seq = seq_id;
+    out_pos = pos;
+    out_has = has_output;
+}
+
+void llama_kv_cache_dsv4_context::set_raw_written(llama_seq_id seq_id, int32_t il, llama_pos p0) const {
+    GGML_ASSERT(kv != nullptr);
+    kv->tail_set_written(seq_id, il, p0);
 }
 
 const llama_ubatch & llama_kv_cache_dsv4_context::get_ubatch() const {
