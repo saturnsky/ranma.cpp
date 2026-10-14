@@ -43,7 +43,7 @@
 // candidate_block_size (16384 tokens on the ratio 1 stream) every block is kept, so nothing is
 // built there. The carry holds one entry per block, not per position. See build_candidate_keep().
 
-// ranma: the tail prefill (RANMA_DSV41_EXACT_TAIL, RANMA_DSV41_TAIL_DIAG). When a ubatch of one sequence asks for the logits of its last row
+// ranma: the tail prefill (RANMA_DSV41_TAIL_DIAG). When a ubatch of one sequence asks for the logits of its last row
 // alone, the layers from il_first on compute only the rows that row still depends on through the sliding window. With
 // a window of W rows and the last layer L, the query rows of layer l are O_L = 1 and O_l = K_(l+1), and its input and
 // raw KV rows are K_l = O_l + W - 1 = W + (L - l)(W - 1). Rows are tails of the ubatch, counted from its end. il_first
@@ -132,17 +132,16 @@ struct dsv41_tail_plan {
     }
 };
 
-// env: RANMA_DSV41_EXACT_TAIL (default 0), RANMA_DSV41_TAIL_DIAG (default 0; EXACT_TAIL wins), read at each graph build
+// env, read at each graph build: RANMA_DSV41_TAIL_DIAG (default 0).
+// The tail is always on: against the whole graph the output differs by rounding only. Every layer before il_first is bit
+// equal, and the first tensors that differ are the query and raw KV projections of il_first, whose inputs are bit equal
+// and whose matrix products see fewer rows (ds41-exact-tail/RESULT.ko.md).
 static int32_t dsv41_tail_mode_env() {
-    const char * exact = getenv("RANMA_DSV41_EXACT_TAIL");
-    if (exact != nullptr && atoi(exact) != 0) {
-        return dsv41_tail_plan::EXACT;
-    }
     const char * diag = getenv("RANMA_DSV41_TAIL_DIAG");
     if (diag != nullptr && atoi(diag) != 0) {
         return dsv41_tail_plan::DIAG;
     }
-    return dsv41_tail_plan::OFF;
+    return dsv41_tail_plan::EXACT;
 }
 
 // env: RANMA_DSV41_TAIL_POISON (diagnostic, default 0): 1 or nan writes NaN, any other number that value, into the raw
@@ -2275,7 +2274,7 @@ llama_model_deepseek41::graph::graph(const llama_model & model, const llm_graph_
         ggml_build_forward_expand(gf, inp_attn->self_kq_mask);
     }
 
-    // ranma: the tail prefill (RANMA_DSV41_EXACT_TAIL, RANMA_DSV41_TAIL_DIAG). Its last layer computes the output row alone, so there is
+    // ranma: the tail prefill (RANMA_DSV41_TAIL_DIAG). Its last layer computes the output row alone, so there is
     // nothing to gather and no output ids. A chunked graph chunks the query rows of its tail layers by its chunk size.
     dsv41_tail_chunking tail_chunking;
     if (inp_cm != nullptr) {

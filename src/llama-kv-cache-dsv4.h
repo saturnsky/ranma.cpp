@@ -182,6 +182,7 @@ public:
     void tail_call_end(const std::vector<llama_ubatch> & ubatches, const char * what);
 
 private:
+    bool     tail_v41     = false;                // DeepSeek-V4.1, which has the tail prefill
     uint32_t tail_n_swa   = 0;
     uint32_t tail_n_layer = 0;
     bool     tail_seen    = false;                // a tail ran on this cache, so a restored state is not trusted further back

@@ -177,6 +177,7 @@ set(LLAMA_CONTEXT_TEST_SRC
     llama-context/test-util.cpp
 )
 llama_build(${LLAMA_CONTEXT_TEST_SRC})
+llama_build(test-dsv41-ckpt-split.cpp) # ranma: DS4.1 call split and partial checkpoint restore on a tiny random model (CPU)
 
 if (NOT WIN32 OR NOT BUILD_SHARED_LIBS)
     # these tests are disabled on Windows because they use internal functions not exported with LLAMA_API (when building with shared libraries)
