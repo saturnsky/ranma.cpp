@@ -32,15 +32,24 @@ static constexpr uint32_t DSV4_STATE_TAIL_VER      = 1;
 static constexpr uint32_t DSV4_K_CACHE_STATE_VER   = 2;
 static constexpr uint32_t DSV4_COMP_STATE_VER      = 1;
 
-// ranma: the tail prefill was asked for (RANMA_DSV41_EXACT_TAIL or RANMA_DSV41_TAIL_DIAG, read at each call); only then
-// the cache logs its batches and records
+// ranma: the tail prefill is on (always for DeepSeek-V4.1, never for the other models of this cache) or its diagnostic
+// is asked for (RANMA_DSV41_TAIL_DIAG); only then the cache keeps its records. Its per-call log lines are written at
+// info level only with the diagnostic, at debug level otherwise
 static bool dsv4_env_on(const char * name) {
     const char * v = getenv(name);
     return v != nullptr && atoi(v) != 0;
 }
 
-static bool dsv4_tail_requested() {
-    return dsv4_env_on("RANMA_DSV41_EXACT_TAIL") || dsv4_env_on("RANMA_DSV41_TAIL_DIAG");
+static bool dsv4_tail_diag() {
+    return dsv4_env_on("RANMA_DSV41_TAIL_DIAG");
+}
+
+static bool dsv4_exact_tail_on(bool v41) {
+    return v41;
+}
+
+static bool dsv4_tail_requested(bool v41) {
+    return dsv4_exact_tail_on(v41) || dsv4_env_on("RANMA_DSV41_TAIL_DIAG");
 }
 
 static uint32_t dsv4_comp_size(uint32_t kv_size, uint32_t ratio) {
@@ -1473,6 +1482,7 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
     n_rs_seq(n_rs_seq),
     rs_idx(n_seq_max, 0) {
 
+    tail_v41     = model.arch == LLM_ARCH_DEEPSEEK41;
     tail_n_swa   = model.hparams.n_swa;
     tail_n_layer = model.hparams.n_layer();
     tail_lo     .assign(n_seq_max, {});
@@ -1763,7 +1773,7 @@ llama_memory_context_ptr llama_kv_cache_dsv4::init_batch(
         }
     }
 
-    if (dsv4_tail_requested()) {
+    if (dsv4_tail_requested(tail_v41)) {
         tail_log_batch(balloc, out_seq, out_pos, out_has);
     }
 
@@ -2073,7 +2083,7 @@ void llama_kv_cache_dsv4::state_write(llama_io_write_i & io, llama_seq_id seq_id
 
     // ranma: the records of the tail prefill go with the state when it ran on one of its sequences or is asked for,
     // so that a restore knows which raw cells are written; otherwise the state is as upstream writes it
-    bool with_tail = dsv4_tail_requested();
+    bool with_tail = dsv4_tail_requested(tail_v41);
     for (uint32_t s = 0; s < n_seq_max && !with_tail; ++s) {
         with_tail = (seq_id < 0 || (uint32_t) seq_id == s) && !tail_lo[s].empty();
     }
@@ -2250,8 +2260,8 @@ void llama_kv_cache_dsv4::tail_log_batch(const llama_batch_allocr & balloc, llam
         const std::string msg = format("seq %u: batch [%d, %d) of %u tokens, %u outputs, contract %s; memory to %d, raw %s",
                 s, p0, p1 + 1, n_tokens, balloc.get_n_outputs(), end.c_str(),
                 kv_raw->seq_pos_max((llama_seq_id) s) + 1, tail_describe((llama_seq_id) s).c_str());
-        // a decode of one token per sequence is logged at debug level only
-        if (n_tokens > 1) {
+        // a decode of one token per sequence is logged at debug level only, as is any batch without the diagnostic
+        if (n_tokens > 1 && dsv4_tail_diag()) {
             LLAMA_LOG_INFO("%s: %s\n", __func__, msg.c_str());
         } else {
             LLAMA_LOG_DEBUG("%s: %s\n", __func__, msg.c_str());
@@ -2291,7 +2301,7 @@ bool llama_kv_cache_dsv4::comp_can_rollback(llama_seq_id seq_id, llama_pos p0) c
 
 bool llama_kv_cache_dsv4::seq_can_resume(llama_seq_id seq_id, llama_pos pos) const {
     // only with the tail prefill asked for; otherwise the caller keeps its generic rules
-    if (!dsv4_env_on("RANMA_DSV41_EXACT_TAIL")) {
+    if (!dsv4_exact_tail_on(tail_v41)) {
         return false;
     }
     if (seq_id < 0 || (uint32_t) seq_id >= n_seq_max || pos <= 0) {
@@ -2363,7 +2373,7 @@ void llama_kv_cache_dsv4::tail_call_begin(const std::vector<llama_ubatch> & ubat
 }
 
 void llama_kv_cache_dsv4::tail_call_end(const std::vector<llama_ubatch> & ubatches, const char * what) {
-    const bool log = dsv4_tail_requested();
+    const bool log = dsv4_tail_diag();
     for (llama_seq_id s : dsv4_ubatches_seqs(ubatches, n_seq_max)) {
         tail_pending[s] = 0;
         tail_end[s]     = kv_raw->seq_pos_max(s) + 1;
@@ -2479,7 +2489,7 @@ void llama_kv_cache_dsv4::tail_after_restore(llama_seq_id seq_id, const std::vec
             // the state says which cells are written
             tail_lo[s] = rec->lo;
             tail_seen  = tail_seen || !rec->lo.empty();
-        } else if (rec != nullptr || tail_seen || dsv4_tail_requested()) {
+        } else if (rec != nullptr || tail_seen || dsv4_tail_requested(tail_v41)) {
             // a state without records (or with one that does not fit) was continuable at its end (see state_write);
             // where a tail may have run, nothing is known further back, so only the window of that end counts as
             // written
@@ -2493,7 +2503,7 @@ void llama_kv_cache_dsv4::tail_after_restore(llama_seq_id seq_id, const std::vec
             tail_bad[s] = 1;
         }
 
-        if (dsv4_tail_requested()) {
+        if (dsv4_tail_diag()) {
             LLAMA_LOG_INFO("%s: seq_id = %u: %s state to %d restored (%s), raw %s\n", __func__, s,
                     partial ? "partial" : "full", pos_max + 1,
                     rec == nullptr ? "no records" : rec->end == pos_max + 1 ? "records" : "records of another end",
