@@ -69,9 +69,35 @@ struct llm_graph_rows_cache {
     std::vector<entry> entries;
 };
 
-// the chunk results joined along dim by a balanced concat tree; meant for the compact per-token results
-// (attention output, selection indices), never for an [n_kv, n_tokens] mask
-ggml_tensor * llm_graph_join(ggml_context * ctx, const std::vector<ggml_tensor *> & parts, int dim);
+// The chunk results joined along dim into one tensor of n_total rows, written as each chunk is made: add() copies
+// the rows of a chunk into the joined tensor and expands that copy right away, so the result of a chunk dies with its
+// copy and the allocator reuses it for the next chunk. Collecting every chunk result for one join at the end kept all
+// of them alive together and left a hole per chunk between them, which ran the allocator out of free blocks at about
+// 85 chunks (GGML_ASSERT "out of free blocks" in ggml-alloc.c).
+// Meant for the compact per-token results (attention output, selection indices, candidate keeps), never for an
+// [n_kv, n_tokens] mask. The chunks come in row order (the first one at row 0); the dims above dim must be 1.
+// F32 and F16 rows are copied with set_rows, I32 rows with an in-place set. Only copies: the values are those of the chunks.
+struct llm_graph_join_acc {
+    llm_graph_join_acc(ggml_context * ctx, ggml_cgraph * gf, int dim, int64_t n_total);
+
+    // the rows [i0, i0 + part->ne[dim]) of the result
+    void add(ggml_tensor * part, int64_t i0);
+
+    // the joined tensor, after the last add
+    ggml_tensor * get() const;
+
+    bool empty() const { return acc == nullptr; }
+
+private:
+    ggml_context * ctx;
+    ggml_cgraph  * gf;
+    int            dim;
+    int64_t        n_total;
+    int64_t        n_added = 0;
+
+    int64_t ne[GGML_MAX_DIMS] = { 0, 0, 0, 0 }; // the shape of the result
+    ggml_tensor * acc = nullptr;                // the result so far, [row size, n_total] for F32/F16
+};
 
 struct llama_ubatch;
 
