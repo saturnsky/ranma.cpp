@@ -52,8 +52,8 @@ static l2_stamp * stamp_at(void * device, int layer) {
 // The bitmap and the flags are built in shared memory and then stored: PCIe has no atomic OR, and on
 // some hosts an atomicOr on the mapped mailbox is lost.
 static __global__ void l2_publish_kernel(l2_mailbox * m, uint32_t * demand, const uint32_t * serve,
-        const int32_t * ids, int rows, int used, int stride, int experts, const uint32_t * pooled, l2_acct * acct,
-        uint64_t key, l2_stamp * stamp) {
+        const int32_t * ids, int rows, int used, int stride, int experts, const uint32_t * pooled, const uint32_t * restored,
+        l2_acct * acct, uint64_t key, l2_stamp * stamp) {
     extern __shared__ uint32_t demand_shared[];
     __shared__ uint32_t need, invalid;
     const int words = (experts + 31)/32;
@@ -70,6 +70,8 @@ static __global__ void l2_publish_kernel(l2_mailbox * m, uint32_t * demand, cons
         if ((unsigned) e < (unsigned) experts) {
             // a served expert the decode pool holds (its ring admission) is read from its position: not demanded
             if (pooled != nullptr && (pooled[e/32] & (1u << (e%32))) != 0) { continue; }
+            // an expert the prefill lend restored into its VRAM slot is read there
+            if (restored != nullptr && (restored[e/32] & (1u << (e%32))) != 0) { continue; }
             atomicOr(demand_shared + e/32, 1u << (e%32));
             if (serve[e/32] & (1u << (e%32))) { need = 1; }
         } else {
@@ -1663,7 +1665,8 @@ void l2_tier::publish_and_wait(int layer, const ggml_tensor * ids, cudaStream_t 
         demand_device_ + size_t(layer)*bitmap_words(), serve_device_ + size_t(layer)*bitmap_words(),
         (const int32_t *) ids->data, (int) ids->ne[1], (int) ids->ne[0],
         (int) (ids->nb[1]/sizeof(int32_t)), geo_.n_experts,
-        pool_bits_dev_ != nullptr ? pool_bits_dev_ + size_t(layer)*bitmap_words() : (const uint32_t *) nullptr, acct, acct_key,
+        pool_bits_dev_ != nullptr ? pool_bits_dev_ + size_t(layer)*bitmap_words() : (const uint32_t *) nullptr,
+        restored_dev_ != nullptr ? restored_dev_ + size_t(layer)*bitmap_words() : (const uint32_t *) nullptr, acct, acct_key,
         stamp_at(stamp_device_, layer));
     if (staged()) {
         // The worker decides from the same row count. A mismatch would still be safe: every kind

@@ -9,6 +9,7 @@
 #include "llama.h"
 
 #include <array>
+#include <functional>
 #include <list>
 #include <set>
 #include <sstream>
@@ -696,8 +697,9 @@ struct common_params {
     // layer by layer, its width, attention chunk and buffers sized automatically before the model loads
     int32_t layer_mode               = 0;
     int32_t layer_mode_preempt_ms    = 0;     // set by the layer mode: target time of a prompt batch of a slot other than 0
-    int32_t layer_mode_l1_carve_mib  = 0;     // set by the layer mode: part of --expert-l1-mib its buffers take
-    int32_t layer_mode_scratch_mib   = 0;     // set by the layer mode: the expert-major op's scratch block (lent to decode)
+    bool    layer_mode_lend          = false; // set by the layer mode: the prompt buffers are lent from L1 and L2 (expert cache)
+    size_t  layer_mode_lend_scratch[3] = {0, 0, 0}; // set by the layer mode: the op's three scratch blocks of a prompt ubatch
+    std::function<void(int64_t, size_t[3])> layer_mode_lend_scratch_of; // set by the layer mode: the same blocks for n tokens
     int32_t n_ctx_checkpoints   = 32;    // max number of context checkpoints per slot
     int32_t kv_unified_per_slot = 0;     // max context per parallel slot; 0 = unset
     int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints

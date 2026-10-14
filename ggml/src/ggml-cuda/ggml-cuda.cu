@@ -801,6 +801,7 @@ struct ggml_backend_cuda_buffer_context {
     int device;
     void * dev_ptr = nullptr;
     std::string name;
+    bool owned = true; // ranma: false for memory the buffer only wraps (ggml_backend_cuda_buffer_wrap)
 
     ggml_backend_cuda_buffer_context(int device, void * dev_ptr) :
         device(device), dev_ptr(dev_ptr),
@@ -808,7 +809,9 @@ struct ggml_backend_cuda_buffer_context {
     }
 
     ~ggml_backend_cuda_buffer_context() {
-        CUDA_CHECK(cudaFree(dev_ptr));
+        if (owned) {
+            CUDA_CHECK(cudaFree(dev_ptr));
+        }
     }
 };
 
@@ -1010,6 +1013,17 @@ static const ggml_backend_buffer_type_i ggml_backend_cuda_buffer_type_interface 
     /* .get_alloc_size_n    = */ NULL,
     /* .is_host             = */ NULL,
 };
+
+// ranma: a device buffer over memory the caller owns (the expert cache's prefill lend); freeing it frees nothing.
+ggml_backend_buffer_t ggml_backend_cuda_buffer_wrap(int device, void * ptr, size_t size) {
+    ggml_backend_buffer_type_t buft = ggml_backend_cuda_buffer_type(device);
+    if (buft == nullptr || ptr == nullptr) {
+        return nullptr;
+    }
+    ggml_backend_cuda_buffer_context * ctx = new ggml_backend_cuda_buffer_context(device, ptr);
+    ctx->owned = false;
+    return ggml_backend_buffer_init(buft, ggml_backend_cuda_buffer_interface, ctx, size);
+}
 
 ggml_backend_buffer_type_t ggml_backend_cuda_buffer_type(int device) {
     static std::mutex mutex;
@@ -6227,8 +6241,8 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_cuda_set_device(cuda_ctx->device);
 
 #if defined(GGML_USE_HIP)
-    // ranma: the expert-major MoE op (MOE_FFN_HAD) takes its scratch block back from the decode pool before the graph
-    // runs or is captured; the first graph of each op count and width is logged (the layers that took the op)
+    // ranma: a prompt graph with the expert-major MoE op (MOE_FFN_HAD) borrows the op's scratch from the expert cache
+    // (prefill lend) before it runs or is captured; the first graph of each op count and width is logged
     {
         int n_op = 0;
         int64_t n_tok = 0;
@@ -6247,7 +6261,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                     (long long) n_tok);
             }
         }
-        ggml_cuda_expert_graph_begin(*cuda_ctx, n_op);
+        ggml_cuda_expert_graph_begin(*cuda_ctx, n_op, n_tok);
     }
 #endif // defined(GGML_USE_HIP)
 

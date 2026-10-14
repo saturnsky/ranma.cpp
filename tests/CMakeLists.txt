@@ -391,6 +391,8 @@ target_include_directories(test-expert-geometry PRIVATE ${PROJECT_SOURCE_DIR}/gg
 llama_build_and_test(test-moe-once-schedule.cpp) # the PCIe-once expert-major op against a simulated device
 llama_build_and_test(test-expert-plan.cpp)
 target_include_directories(test-expert-plan PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src/ggml-cuda)
+llama_build_and_test(test-expert-lend.cpp) # the prefill lend against a simulated arena and ledger
+target_include_directories(test-expert-lend PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src/ggml-cuda)
 llama_build_and_test(test-expert-exclusive.cpp)
 target_include_directories(test-expert-exclusive PRIVATE ${PROJECT_SOURCE_DIR}/ggml/src/ggml-cuda)
 llama_build_and_test(test-expert-score.cpp)

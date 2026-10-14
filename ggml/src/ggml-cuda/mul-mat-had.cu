@@ -2885,9 +2885,15 @@ bool ggml_cuda_moe_group_diag(const int op, const int a, double * out) {
 }
 
 bool ggml_cuda_moe_ffn_had_graph_ok(const ggml_tensor * op) {
-    // the PCIe-once op (op_params[3], the layer-major prefill) stages on a side stream and reads its plan back
+    // the PCIe-once op (op_params[3], the layer-major prefill) stages on a side stream and reads its plan back; with the
+    // prefill lend the op's buffers are those of the current lease (a captured graph would keep an old one)
+#if defined(GGML_USE_HIP)
+    const bool lend = ggml_cuda_expert_lend_on();
+#else
+    const bool lend = false;
+#endif
     return mmh_moe_stage_bytes() == 0 && mmh_moe_group_diag_group() == 0 && mmh_moe_stream_group() == 0 &&
-        (op == nullptr || ggml_get_op_params_i32(op, 3) == 0) && !mmh_moe_link_on();
+        (op == nullptr || ggml_get_op_params_i32(op, 3) == 0) && !mmh_moe_link_on() && !lend;
 }
 
 #if defined(GGML_USE_HIP) && !defined(cudaEventElapsedTime)
@@ -3408,23 +3414,42 @@ void ggml_cuda_moe_ffn_had(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
             streamed ? s_group : stage_cap, max_rank, streamed ? s_ring*(s_stride[0] + s_stride[1] + s_stride[2]) : 0);
     };
     ggml_moe_ffn_had_layout lay = layout();
-    // the expert cache's scratch block when there is one (lent to the decode pool between prompt graphs), else the pool
+    // the expert cache's prefill lend when the graph holds one (three blocks in L1 slot ranges), else the pool
     ggml_cuda_pool_alloc<char> block(ctx.pool());
+    char * blk = nullptr;
+    char * sblk[3] = { nullptr, nullptr, nullptr };
+    bool split = false;
 #if defined(GGML_USE_HIP)
-    char * blk = (char *) ggml_cuda_expert_op_scratch(ctx, lay.bytes);
-    // the PCIe-once op: the staging lists grow the route area, so fewer rows per chunk keep it in the block (its chunks
+    auto lent_split = [&]() {
+        const ggml_moe_ffn_had_layout sl = ggml_moe_ffn_had_layout_split(n_rows, R, n_exp, n_embd, n_ff, max_items_v, max_items_r,
+            c_max, streamed ? s_group : stage_cap, max_rank, streamed ? s_ring*(s_stride[0] + s_stride[1] + s_stride[2]) : 0);
+        char * b[3];
+        for (int i = 0; i < 3; ++i) {
+            b[i] = (char *) ggml_cuda_expert_lent(ctx, GGML_EXPERT_LEND_SCRATCH0 + i, sl.split[i]);
+            if (b[i] == nullptr) {
+                return false;
+            }
+        }
+        lay = sl;
+        for (int i = 0; i < 3; ++i) {
+            sblk[i] = b[i];
+        }
+        return true;
+    };
+    split = lent_split();
+    // the PCIe-once op: the staging lists grow the route area, so fewer rows per chunk keep it in the lend (its chunks
     // only bound the work at a time: the experts are still copied once, and the exact sum does not depend on them)
-    while (blk == nullptr && once && R > std::max<int64_t>(1, R0/4)) {
+    while (!split && once && R > std::max<int64_t>(1, R0/4)) {
         R = std::max<int64_t>(std::max<int64_t>(1, R0/4), R - std::max<int64_t>(1, R0/16));
         plan_chunks();
         if (stage_cap == 0) {
             break;
         }
         lay = layout();
-        blk = (char *) ggml_cuda_expert_op_scratch(ctx, lay.bytes);
+        split = lent_split();
     }
-    if (blk == nullptr && R != R0) {
-        R = R0; // no block (or none that fits): the pool at the rows of the op
+    if (!split && R != R0) {
+        R = R0; // no lend (or none that fits): the pool at the rows of the op
         plan_chunks();
         lay = layout();
     }
@@ -3432,32 +3457,52 @@ void ggml_cuda_moe_ffn_had(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         once = false;
         g_mmh_moe_once_fallback++;
     }
-#else
-    char * blk = nullptr;
 #endif // defined(GGML_USE_HIP)
     GGML_ASSERT(max_items_v <= GGML_MOE_FFN_HAD_MAX_ITEMS && max_items_r <= GGML_MOE_FFN_HAD_MAX_ITEMS);
     const bool once_exact = once && once_req == 1;
     const bool sdma       = once || stage_sdma; // the PCIe-once op copies with the copy engine
-    if (blk == nullptr) {
+    if (!split) {
         blk = block.alloc(lay.bytes);
+        sblk[0] = sblk[1] = sblk[2] = blk;
     }
-    int   * route  = (int   *) (blk + lay.route);
-    int   * items  = (int   *) (blk + lay.items);
-    int   * iota   = (int   *) (blk + lay.iota);
-    half  * xh     = (half  *) (blk + lay.xh);
-    float * rscale = (float *) (blk + lay.rscale);
-    float * vu     = (float *) (blk + lay.vu);
-    float * vg     = (float *) (blk + lay.vg);
-    float * vy     = (float *) (blk + lay.vy);
-    float * lz     = (float *) (blk + lay.lz);
+    int   * route  = (int   *) (sblk[0] + lay.route);
+    int   * items  = (int   *) (sblk[0] + lay.items);
+    int   * iota   = (int   *) (sblk[0] + lay.iota);
+    half  * xh     = (half  *) (sblk[0] + lay.xh);
+    float * rscale = (float *) (sblk[0] + lay.rscale);
+    float * vu     = (float *) (sblk[1] + lay.vu);
+    float * vg     = (float *) (sblk[1] + lay.vg);
+    float * vy     = (float *) (sblk[2] + lay.vy);
+    float * lz     = (float *) (sblk[0] + lay.lz);
+    char  * ring_base  = sblk[0] + lay.ring;
+    const size_t ring_room = (split ? lay.split[0] : lay.bytes) - lay.ring;
     // the PCIe-once op: its two staging buffers and (exact) T from the pool, returned at the end of the op (the compute
     // stream waits for the copies there, so a later user of the pool memory comes after them)
-    ggml_cuda_pool_alloc<char>  once_buf(ctx.pool());
-    ggml_cuda_pool_alloc<float> once_t(ctx.pool());
+    // (the prefill lend gives them when the holder borrowed them: GGML_EXPERT_LEND_STAGE and GGML_EXPERT_LEND_STAGE1, one
+    // piece each, and GGML_EXPERT_LEND_T; the two staging buffers come both from the lend or both from the pool)
+    ggml_cuda_pool_alloc<char>  once_buf_pool(ctx.pool());
+    ggml_cuda_pool_alloc<float> once_t_pool(ctx.pool());
+    struct { char * ptr[2] = { nullptr, nullptr }; } once_buf;
+    struct { float * ptr = nullptr; } once_t;
+    const size_t stage_half = once ? (size_t) stage_cap*ss.koff[3] : 0;
     if (once) {
-        once_buf.alloc((size_t) 2*stage_cap*ss.koff[3]);
+#if defined(GGML_USE_HIP)
+        char * s0 = (char *) ggml_cuda_expert_lent(ctx, GGML_EXPERT_LEND_STAGE,  stage_half);
+        char * s1 = (char *) ggml_cuda_expert_lent(ctx, GGML_EXPERT_LEND_STAGE1, stage_half);
+        if (s0 != nullptr && s1 != nullptr) {
+            once_buf.ptr[0] = s0;
+            once_buf.ptr[1] = s1;
+        }
         if (once_exact) {
-            once_t.alloc((size_t) (n_rows*n_embd));
+            once_t.ptr = (float *) ggml_cuda_expert_lent(ctx, GGML_EXPERT_LEND_T, (size_t) (n_rows*n_embd)*sizeof(float));
+        }
+#endif // defined(GGML_USE_HIP)
+        if (once_buf.ptr[0] == nullptr) {
+            once_buf.ptr[0] = once_buf_pool.alloc(2*stage_half);
+            once_buf.ptr[1] = once_buf.ptr[0] + stage_half;
+        }
+        if (once_exact && once_t.ptr == nullptr) {
+            once_t.ptr = once_t_pool.alloc((size_t) (n_rows*n_embd));
         }
         g_mmh_moe_once_ops++;
     }
@@ -3522,7 +3567,7 @@ void ggml_cuda_moe_ffn_had(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
             CUDA_CHECK(cudaGetLastError());
             // the GEMMs take the op's table where the tier's would be; without the cache a table of no VRAM slots
             if (p[i].w_cache == nullptr || p[i].w_slots == nullptr) {
-                p[i].w_cache = once ? once_buf.ptr : sd->buf;
+                p[i].w_cache = once ? once_buf.ptr[0] : sd->buf;
                 p[i].w_slots = sd->no_slots;
             }
             p[i].w_host_addresses = tab[i];
@@ -3549,10 +3594,11 @@ void ggml_cuda_moe_ffn_had(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     ggml_cuda_pstamp_moe(stream, rt.n_chunks, n_tokens, n_used, n_rows, R, mt_v, mt_r, streamed ? 2 : sd != nullptr ? 1 : 0,
         remote);
 
-    char * buf0 = once ? once_buf.ptr : sd ? sd->buf : nullptr;
-    char * buf1 = once ? once_buf.ptr + (size_t) stage_cap*ss.koff[3] : sd ? sd->buf + (sd->bytes/2)/256*256 : nullptr;
+    char * buf0 = once ? once_buf.ptr[0] : sd ? sd->buf : nullptr;
+    char * buf1 = once ? once_buf.ptr[1] : sd ? sd->buf + (sd->bytes/2)/256*256 : nullptr;
     if (once && g_mmh_moe_once_poison.exchange(0) != 0) {
-        CUDA_CHECK(cudaMemsetAsync(once_buf.ptr, 0x55, (size_t) 2*stage_cap*ss.koff[3], stream));
+        CUDA_CHECK(cudaMemsetAsync(once_buf.ptr[0], 0x55, stage_half, stream));
+        CUDA_CHECK(cudaMemsetAsync(once_buf.ptr[1], 0x55, stage_half, stream));
         if (once_exact) {
             CUDA_CHECK(cudaMemsetAsync(once_t.ptr, 0x55, (size_t) (n_rows*n_embd)*sizeof(float), stream));
         }
@@ -3640,7 +3686,7 @@ void ggml_cuda_moe_ffn_had(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         CUDA_CHECK(cudaGetLastError());
         if (g_mmh_moe_stream_poison) {
             g_mmh_moe_stream_poison = 0;
-            CUDA_CHECK(cudaMemsetAsync(blk + lay.ring, 0x55, lay.bytes - lay.ring, stream));
+            CUDA_CHECK(cudaMemsetAsync(ring_base, 0x55, ring_room, stream));
         }
         const int64_t t_sync = ggml_time_us();
         CUDA_CHECK(cudaStreamSynchronize(stream)); // the one synchronize of the op: the routing for the host
@@ -3683,7 +3729,7 @@ void ggml_cuda_moe_ffn_had(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         int n_copied = 0;
         int64_t ring_base[3];
         {
-            const uint64_t base = (uint64_t) (uintptr_t) (blk + lay.ring);
+            const uint64_t base = (uint64_t) (uintptr_t) ring_base;
             ring_base[0] = (int64_t) base;
             ring_base[1] = ring_base[0] + s_ring*s_stride[0];
             ring_base[2] = ring_base[1] + s_ring*s_stride[1];
@@ -3728,7 +3774,7 @@ void ggml_cuda_moe_ffn_had(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
         // the GEMMs read a copied expert through the tables (the cache selection needs an arena and a slot table)
         for (int i = 0; i < 3; ++i) {
             if (p[i].w_cache == nullptr || p[i].w_slots == nullptr) {
-                p[i].w_cache = blk + lay.ring;
+                p[i].w_cache = ring_base;
                 p[i].w_slots = sv->no_slots;
             }
             p[i].w_host_addresses = tab[i];

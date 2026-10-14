@@ -545,6 +545,59 @@ void l1_arena::set_static_capacities(const std::vector<int> & capacities) {
     capacities_ = capacities;
 }
 
+bool l1_arena::publish_overlay(const std::vector<slot_entry> & extra) {
+    if (!allocated()) {
+        return false;
+    }
+    std::vector<std::vector<int32_t>> t = host_slots_;
+    for (const slot_entry & x : extra) {
+        if (x.layer < 0 || x.layer >= geo_.n_layers || x.expert < 0 || x.expert >= geo_.n_experts) {
+            return false;
+        }
+        t[(size_t) x.layer][(size_t) x.expert] = x.slot;
+    }
+    return publish_tables(t);
+}
+
+bool l1_arena::stage_aux(const std::vector<slot_entry> & entries) {
+    if (!allocated() || !aux_on_) {
+        return allocated();
+    }
+    std::vector<std::vector<int32_t>> t((size_t) geo_.n_layers, std::vector<int32_t>((size_t) geo_.n_experts, -1));
+    for (const slot_entry & x : entries) {
+        if (x.layer < 0 || x.layer >= geo_.n_layers || x.expert < 0 || x.expert >= geo_.n_experts) {
+            return false;
+        }
+        t[(size_t) x.layer][(size_t) x.expert] = x.slot;
+    }
+    if (!sync_aux(t)) {
+        return false;
+    }
+    CUDA_CHECK(cudaStreamSynchronize(copy_stream_));
+    return true;
+}
+
+bool l1_arena::zero_heads(int cls, int first, int count, const size_t bytes[3]) {
+    if (!allocated() || cls < 0 || (size_t) cls >= class_data_.size() || first < 0 || count <= 0) {
+        return count == 0;
+    }
+    ggml_cuda_set_device(device_);
+    for (int k = 0; k < geometry::n_kinds; ++k) {
+        const size_t b = geo_.class_bytes[cls][k];
+        const size_t w = std::min(bytes[k], b);
+        if (b == 0 || w == 0) {
+            continue;
+        }
+#if defined(GGML_USE_HIP)
+        CUDA_CHECK(hipMemset2DAsync(gpu_slice(cls, k, first), b, 0, w, (size_t) count, copy_stream_));
+#else
+        CUDA_CHECK(cudaMemset2DAsync(gpu_slice(cls, k, first), b, 0, w, (size_t) count, copy_stream_));
+#endif
+    }
+    CUDA_CHECK(cudaStreamSynchronize(copy_stream_));
+    return true;
+}
+
 bool l1_arena::evacuate(const std::vector<evac_op> & ops, double & ms) {
     const auto t0 = std::chrono::steady_clock::now();
     ms = 0.0;

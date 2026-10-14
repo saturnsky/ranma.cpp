@@ -285,6 +285,9 @@ public:
         pool_bits_dev_  = device;
         return true;
     }
+    // The prefill lend's restored experts (expert-lend.h): a bitmap [layer*words + word] the restore kernel sets for an
+    // expert it copied back into its VRAM slot; the publish kernel leaves such an expert out of the demand.
+    void set_restored_bits(const uint32_t * device) { restored_dev_ = device; }
     void publish_and_wait(int layer, const ggml_tensor * ids, cudaStream_t stream);
     // Staged service only: orders the kernel that reads `kind` of `layer` after that kind's reads.
     // A no-op for the first kind, which the route waits for, and for a layer routed unstaged.
@@ -448,6 +451,7 @@ private:
     bool verify_     = false;
     bool any_ssd_    = false;
     bool served_only_ = false;
+    const uint32_t * restored_dev_ = nullptr;     // set_restored_bits; null = none
     const uint32_t * pool_bits_host_ = nullptr;   // set_pool_bits; null = no ring admission
     const uint32_t * pool_bits_dev_  = nullptr;
     bool pool_owned(int layer, int expert) const {

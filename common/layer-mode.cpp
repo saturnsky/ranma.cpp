@@ -8,9 +8,11 @@
 #include "gguf.h"
 
 #include "../src/llama-ext.h"
+#include "../ggml/src/ggml-cuda/expert-lend.h"
 #include "../ggml/src/ggml-cuda/moe-ffn-had-layout.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdlib>
 #include <cstring>
@@ -86,6 +88,7 @@ struct lm_model {
     uint64_t exps_bytes   = 0;    // the routed expert weights of those layers, three kinds
     uint64_t exps_all     = 0;    // every routed expert weight, MTP blocks included (the expert cache holds them all)
     uint64_t expert_bytes = 0;    // largest staging slot: one expert of the largest layer, three kinds, each padded to 256 B
+    uint64_t kind_bytes[3] = { 0, 0, 0 }; // one expert of the largest layer per kind (up, gate, down): an L1 slot of that kind
     bool     exl3         = true; // every routed expert weight is EXL3
     bool     merged       = false; // gate and up merged (the expert-major op does not take it)
 };
@@ -149,6 +152,7 @@ static bool lm_read_model(const std::string & path, lm_model & m, std::string & 
     }
     std::map<int, uint64_t> layer_bytes;  // trunk and MTP layers: routed bytes
     std::map<int, uint64_t> layer_expert; // one expert of the layer, each kind padded to 256 B
+    std::map<int, std::array<uint64_t, 3>> layer_kind; // one expert of the layer per kind
     std::set<int> mtp;                    // blocks with NextN tensors (an MTP head)
     for (size_t f = 0; f < paths.size(); ++f) {
         gguf_context_ptr other;
@@ -186,6 +190,10 @@ static bool lm_read_model(const std::string & path, lm_model & m, std::string & 
             m.exl3 = m.exl3 && ggml_is_exl3(gguf_get_tensor_type(g, i));
             layer_bytes[il] += bytes;
             layer_expert[il] += (bytes/std::max<int64_t>(m.n_expert, 1) + 255)/256*256;
+            if (k != "gate_up_exps") {
+                const int ki = k == "up_exps" ? 0 : k == "gate_exps" ? 1 : 2;
+                layer_kind[il][(size_t) ki] += bytes/std::max<int64_t>(m.n_expert, 1);
+            }
         }
     }
     for (const auto & [il, bytes] : layer_bytes) {
@@ -195,6 +203,9 @@ static bool lm_read_model(const std::string & path, lm_model & m, std::string & 
         }
         m.exps_bytes  += bytes;
         m.expert_bytes = std::max(m.expert_bytes, layer_expert[il]);
+        for (int k = 0; k < 3; ++k) {
+            m.kind_bytes[k] = std::max(m.kind_bytes[k], layer_kind[il][(size_t) k]);
+        }
         m.n_moe_layers++;
     }
     if (m.n_moe_layers == 0 || m.n_expert <= 0 || m.n_used <= 0 || m.n_embd <= 0 || m.n_ff_exp <= 0) {
@@ -361,7 +372,7 @@ void common_layer_mode_apply(common_params & params) {
     // rank rows of the LoRA deltas
     // the ring of the streamed op (one chunk, no LoRA): two groups of slots (or RANMA_EXPERT_MAJOR_STREAM_MIB), at most the
     // experts that can have more rows than the host tile the op picks for the width (rows / (tile + 1))
-    auto ring_bytes = [&](int64_t w) -> int64_t {
+    auto ring_bytes = [=](int64_t w) -> int64_t {
         if (!stream || rows_of(w) < w*m.n_used || max_rank > 0) {
             return 0;
         }
@@ -375,10 +386,35 @@ void common_layer_mode_apply(common_params & params) {
         const int64_t slots = std::min<int64_t>({ 2*stream_group, (int64_t) m.n_expert, rows/(tile + 1) });
         return slots > 0 ? (slots*(int64_t) m.expert_bytes + MiB - 1)/MiB*MiB : 0;
     };
-    auto scratch_bytes = [&](int64_t w) -> int64_t {
+    // the op's scratch of one prompt ubatch, as the three blocks the prefill lend places in L1 (moe-ffn-had-layout.h). The
+    // layer-major prefill borrows its own buffers for each call (src/llama-layer-exec.cpp).
+    auto scratch_split = [=](int64_t w, size_t out[3]) {
         const int64_t ring = ring_bytes(w);
-        return (int64_t) ggml_moe_ffn_had_scratch_bytes(w, m.n_used, rows_of(w), m.n_expert, m.n_embd, m.n_ff_exp,
-            rows_of(w) < w*m.n_used ? LM_STAGE_SLOTS : 0, max_rank, ring > 0 ? stream_group : 0, ring);
+        ggml_moe_ffn_had_scratch_split(w, m.n_used, rows_of(w), m.n_expert, m.n_embd, m.n_ff_exp,
+            rows_of(w) < w*m.n_used ? LM_STAGE_SLOTS : 0, max_rank, out, ring > 0 ? stream_group : 0, ring);
+    };
+    auto scratch_bytes = [&](int64_t w) -> int64_t {
+        size_t b[3];
+        scratch_split(w, b);
+        return (int64_t) (b[0] + b[1] + b[2]);
+    };
+    // The prefill lend puts the blocks into the top slots of the L1 arena of each kind, after the lowest ranked experts
+    // left. Estimated before the load with the largest layer's experts in one size class, the exclusive exchange spares kept.
+    auto lend_fits = [&](int64_t w) {
+        size_t b[3];
+        scratch_split(w, b);
+        const uint64_t per = m.kind_bytes[0] + m.kind_bytes[1] + m.kind_bytes[2];
+        if (per == 0) {
+            return false;
+        }
+        const int64_t slots = std::max<int64_t>(0, l1/(int64_t) per - (params.expert_cache_mode == "exclusive" ? 8 : 0));
+        std::vector<size_t> regions;
+        for (int k = 0; k < 3; ++k) {
+            const size_t span = (size_t) slots*m.kind_bytes[k];
+            regions.push_back(span > 4096 ? span - 4096 : 0);
+        }
+        std::vector<ggml_cuda_expert::lend_fit> fit;
+        return ggml_cuda_expert::lend_pack({ b[0], b[1], b[2] }, regions, 256, fit);
     };
     // staging (two buffers): only experts with at least stage_min rows of a chunk are staged, at most R/stage_min of them.
     // The streamed op of one chunk does not stage: its ring is in the scratch block.
@@ -411,11 +447,6 @@ void common_layer_mode_apply(common_params & params) {
     const bool    chunked   = !(params.n_parallel > 1 && !params.kv_unified);
     const int32_t ub_prev   = params.n_ubatch;
     const int32_t b_prev    = params.n_batch;
-    // the buffers come out of the L1 budget when it is at least twice as large, else on top of it
-    auto carve_bytes = [&](int64_t w) {
-        const int64_t buffers = stage_bytes(w) + scratch_bytes(w);
-        return l1 >= 2*buffers ? buffers : (int64_t) 0;
-    };
 
     auto set_width = [&](int64_t w) {
         params.n_ubatch = (int32_t) w;
@@ -461,17 +492,19 @@ void common_layer_mode_apply(common_params & params) {
             return e;
         }
         const common_device_memory_data & d = dm[0];
-        const int64_t buffers = stage_bytes(w) + scratch_bytes(w);
-        const int64_t carve   = carve_bytes(w);
+        // the op's buffers are lent from L1 (the prefill lend), not added to it
+        const int64_t buffers = scratch_bytes(w);
+        const bool    lent    = lend_fits(w);
         e.dev_free = d.free;
-        e.dev_need = (int64_t) (d.model + d.context + d.compute) + reserve + l1 + (buffers - carve);
+        e.dev_need = (int64_t) (d.model + d.context + d.compute) + reserve + l1;
         e.host     = (int64_t) dm.back().compute + meta;
-        e.ok       = e.dev_need <= e.dev_free;
-        LOG_INF("layer mode: width %lld, chunk %lld: GPU model %zu + KV %zu + compute %zu + L1 %lld + buffers %lld + reserve "
-            "%lld = %lld of %lld MiB free; host compute %zu + graph %lld MiB (not a limit) -> %s\n", (long long) w,
+        e.ok       = e.dev_need <= e.dev_free && lent;
+        LOG_INF("layer mode: width %lld, chunk %lld: GPU model %zu + KV %zu + compute %zu + L1 %lld + reserve %lld = %lld of %lld "
+            "MiB free; op buffers %lld MiB lent from L1: %s; host compute %zu + graph %lld MiB (not a limit) -> %s\n", (long long) w,
             (long long) std::min(c, w), d.model/MiB, d.context/MiB, d.compute/MiB, (long long) (l1/MiB),
-            (long long) (buffers/MiB), (long long) (reserve/MiB), (long long) (e.dev_need/MiB), (long long) (e.dev_free/MiB),
-            dm.back().compute/MiB, (long long) (meta/MiB), e.ok ? "fits" : "does not fit");
+            (long long) (reserve/MiB), (long long) (e.dev_need/MiB), (long long) (e.dev_free/MiB), (long long) (buffers/MiB),
+            lent ? "fits" : "does not fit", dm.back().compute/MiB, (long long) (meta/MiB),
+            e.ok ? "fits" : "does not fit");
         return e;
     };
 
@@ -566,27 +599,31 @@ void common_layer_mode_apply(common_params & params) {
     lm_cfg.attn_chunk        = c >= ub ? 0 : c;
     lm_cfg.expert_major_rows = rows_of(ub);
     llama_layer_mode_set_config(lm_cfg);
-    const int64_t stage = stage_bytes(ub);
-    if (!env_stage && stage > 0) {
-        lm_setenv("RANMA_EXPERT_MAJOR_STAGE_MIB", std::to_string(stage/MiB));
-    }
+    // the op's chunk staging is a VRAM block of its own (RANMA_EXPERT_MAJOR_STAGE_MIB): the layer mode does not set it,
+    // its buffers come out of the prefill lend only
+    const int64_t stage = env_stage ? stage_bytes(ub) : 0;
     if (stream && !env_ring) {
         // the op sizes its ring from this (0: no ring, the op keeps its other path)
         lm_setenv("RANMA_EXPERT_MAJOR_STREAM_MIB", std::to_string(ring_bytes(ub)/MiB));
     }
-    params.layer_mode_l1_carve_mib = (int32_t) ((carve_bytes(ub) + MiB - 1)/MiB);
-    // the op's scratch is one fixed block of the expert cache, lent to the decode pool between prompt graphs
-    params.layer_mode_scratch_mib  = (int32_t) ((scratch_bytes(ub) + MiB - 1)/MiB);
+    // the op's scratch of a prompt ubatch is lent from L1 while the prompt runs (ggml_expert_config::lend_scratch)
+    params.layer_mode_lend = true;
+    {
+        scratch_split(ub, params.layer_mode_lend_scratch);
+        // a call borrows the blocks of its own width (copies only: the lambda outlives this function)
+        params.layer_mode_lend_scratch_of = [scratch_split](int64_t w, size_t out[3]) { scratch_split(std::max<int64_t>(w, 1), out); };
+    }
     if (params.layer_mode_preempt_ms <= 0) {
         params.layer_mode_preempt_ms = LM_PREEMPT_MS;
     }
     expert_host_direct_auto(params.n_ubatch);
 
     LOG_INF("layer mode: on: -ub %d -b %d, attention chunk %s, expert-major MoE %s (rows %lld), staging %lld MiB, scratch "
-        "%lld MiB (stream ring %lld MiB), %d MiB of them from the L1 budget, host-direct up to %d tokens, other slots' prompt "
-        "batches about %d ms\n",
+        "%lld MiB (stream ring %lld MiB) lent from L1 while a prompt runs (blocks %zu/%zu/%zu MiB), host-direct up to %d tokens, "
+        "other slots' prompt batches about %d ms\n",
         params.n_ubatch, params.n_batch, c >= ub ? "off (whole width)" : std::to_string(c).c_str(),
         "on", (long long) std::min<int64_t>(rows_of(ub), ub*m.n_used),
         (long long) (stage/MiB), (long long) (scratch_bytes(ub)/MiB), (long long) (ring_bytes(ub)/MiB),
-        params.layer_mode_l1_carve_mib, params.n_ubatch, params.layer_mode_preempt_ms);
+        params.layer_mode_lend_scratch[0] >> 20, params.layer_mode_lend_scratch[1] >> 20, params.layer_mode_lend_scratch[2] >> 20,
+        params.n_ubatch, params.layer_mode_preempt_ms);
 }
