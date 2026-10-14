@@ -2439,6 +2439,8 @@ void common_prompt_checkpoint::clear() {
     pos_min = 0;
     pos_max = 0;
 
+    end_only = false;
+
     data_tgt.clear();
     data_dft.clear();
     data_spec.clear();

@@ -1364,6 +1364,10 @@ struct common_prompt_checkpoint {
     llama_pos pos_min;
     llama_pos pos_max;
 
+    // ranma: the state continues only at its end, pos_max + 1 (llama_memory_seq_can_resume said so when it was made);
+    // it is used where that end is at most the next position to process, and restored to exactly that end
+    bool end_only = false;
+
     std::vector<uint8_t> data_tgt;
     std::vector<uint8_t> data_dft;
 
