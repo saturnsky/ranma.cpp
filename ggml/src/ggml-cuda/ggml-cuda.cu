@@ -4978,6 +4978,47 @@ static int ggml_cuda_try_fuse_hc_mixes(ggml_backend_cuda_context * cuda_ctx, ggm
     return 0;
 }
 
+
+#if defined(GGML_USE_HIP)
+static int ggml_cuda_try_fuse_hc_pre_norm(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * graph, int i) {
+    if (i + 2 >= graph->n_nodes) {
+        return 0;
+    }
+    ggml_tensor * pre = graph->nodes[i];
+    ggml_tensor * norm = graph->nodes[i + 1];
+    ggml_tensor * mul = graph->nodes[i + 2];
+    if (pre->op != GGML_OP_DSV4_HC_PRE || norm->op != GGML_OP_RMS_NORM || mul->op != GGML_OP_MUL ||
+            norm->src[0] != pre || mul->src[0] != norm || ggml_get_op_params_i32(pre, 1) != 0) {
+        return 0;
+    }
+    const ggml_tensor * x = pre->src[0], * w = pre->src[1], * gamma = mul->src[1];
+    if (x->type != GGML_TYPE_F32 || w->type != GGML_TYPE_F32 || gamma->type != GGML_TYPE_F32 ||
+            pre->type != GGML_TYPE_F32 || norm->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32 ||
+            x->ne[1] != 4 || x->ne[3] != 1 || x->nb[0] != sizeof(float) ||
+            pre->ne[0] != x->ne[0] || pre->ne[1] != x->ne[2] ||
+            pre->ne[0] > INT_MAX || ggml_nelements(pre) != pre->ne[0]*pre->ne[1] ||
+            !ggml_are_same_shape(pre, norm) || !ggml_are_same_shape(pre, mul) ||
+            !ggml_is_contiguous(pre) || !ggml_is_contiguous(norm) || !ggml_is_contiguous(mul) ||
+            !ggml_is_contiguous(gamma) || gamma->ne[0] != pre->ne[0] ||
+            ggml_nelements(gamma) != pre->ne[0] || w->ne[0] != 4 || w->ne[1] != pre->ne[1] ||
+            ggml_nelements(w) != 4*pre->ne[1]) {
+        return 0;
+    }
+    if ((pre->ne[0] + 32)*sizeof(float) > ggml_cuda_info().devices[cuda_ctx->device].smpb) {
+        return 0;
+    }
+    const int out = i + 2;
+    if (!ggml_can_fuse_subgraph(graph, i, {GGML_OP_DSV4_HC_PRE, GGML_OP_RMS_NORM, GGML_OP_MUL}, {out}) ||
+            !ggml_cuda_check_fusion_memory_ranges(graph, i, 3, &out, 1) ||
+            ggml_cuda_fusion_ranges_overlap(mul, x) || ggml_cuda_fusion_ranges_overlap(mul, w) ||
+            ggml_cuda_fusion_ranges_overlap(mul, gamma)) {
+        return 0;
+    }
+    ggml_cuda_op_hc_pre_norm_mul(*cuda_ctx, pre, norm, mul);
+    return 2;
+}
+#endif
+
 // try and fuse nodes and return the number of nodes to skip
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
@@ -5005,6 +5046,15 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             return nodes_to_skip;
         }
     }
+
+#if defined(GGML_USE_HIP)
+    {
+        const int skipped = ggml_cuda_try_fuse_hc_pre_norm(cuda_ctx, cgraph, i);
+        if (skipped > 0) {
+            return skipped;
+        }
+    }
+#endif
 
     ggml_tensor * node = cgraph->nodes[i];
 

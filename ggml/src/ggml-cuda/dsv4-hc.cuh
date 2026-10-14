@@ -1,5 +1,9 @@
 #include "common.cuh"
 #include "ggml.h"
+#if defined(GGML_USE_HIP)
+void ggml_cuda_op_hc_pre_norm_mul(ggml_backend_cuda_context & ctx,
+        const ggml_tensor * pre, const ggml_tensor * norm, ggml_tensor * mul);
+#endif
 
 void ggml_cuda_op_dsv4_hc_comb(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 void ggml_cuda_op_dsv4_hc_coef(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
