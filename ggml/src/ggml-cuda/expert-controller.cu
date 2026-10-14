@@ -13,6 +13,7 @@
 #include "expert-plan.h"
 #include "expert-profiler.cuh"
 #include "expert-redraw.h"
+#include "expert-sidecar.cuh"
 #include "expert-profile-store.h"
 #include "expert-storage.h"
 #include "expert-ub-pool.cuh"
@@ -830,6 +831,7 @@ public:
         n_banks_.store(0, std::memory_order_release);
         lend_free_locked();
         free_ub_pool_locked();
+        sidecar_free_locked();
         // the worker must stop before the arenas it reads into go away
         tier_.reset();
         free_stage_locked();
@@ -1304,6 +1306,9 @@ public:
         if (member < 0 || joint < 0 || joint >= geo_.n_layers || geo_.layer_class[joint] < 0) {
             return;
         }
+        if (sc_on_.load(std::memory_order_acquire)) {
+            sidecar_launch_ids(ctx, member, (int) joint, ids);
+        }
         if (stage_dev_ != nullptr && stage_index_[(size_t) joint] >= 0) {
             // VRAM staging of an early-route layer: its matmuls read the table only after the
             // staging of this graph's hint (if any) is final
@@ -1355,6 +1360,194 @@ public:
             ggml_cuda_kernel_launch(lend_space_copy_kernel, cp, (const lend_restore_desc *) lend_desc_dev_, lend_space_, (int) joint,
                 lend_tickets_dev_, lend_live_dev_);
         }
+    }
+
+    // ---- the expert sidecar (expert-sidecar.cuh, ggml-expert-sidecar.h) -----------------------------
+
+    bool sidecar_configure(int32_t rows_decode, int32_t rows_prefill) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (state_ != state_t::installed || geo_.n_layers <= 0) {
+            return false;
+        }
+        if (sc_on_.load(std::memory_order_acquire)) {
+            return true;
+        }
+        sc_rows_decode_  = (uint32_t) std::max(1, rows_decode);
+        sc_rows_prefill_ = (uint32_t) std::max(0, rows_prefill);
+        // ids per record: the larger row cap for up to 16 selections per row
+        sc_rec_ids_ = std::max(sc_rows_decode_, sc_rows_prefill_)*16u;
+        const size_t payload = std::max((size_t) sc_rec_ids_*sizeof(uint16_t), (size_t) geo_.n_experts*sizeof(uint32_t));
+        sc_rec_bytes_ = (sizeof(sidecar_rec) + payload + 15) & ~(size_t) 15;
+        sc_n_layers_  = geo_.n_layers;
+        const size_t n_recs = (size_t) GGML_EXPERT_SIDECAR_BANKS*(size_t) sc_n_layers_;
+        ggml_cuda_set_device(device_);
+        if (hipHostMalloc(&sc_host_, n_recs*sc_rec_bytes_, hipHostMallocMapped | hipHostMallocCoherent) != hipSuccess) {
+            (void) hipGetLastError();
+            sc_host_ = nullptr;
+            GGML_LOG_WARN("expert cache: sidecar records (%zu KiB) not allocated; sidecar off\n", n_recs*sc_rec_bytes_/1024);
+            return false;
+        }
+        memset(sc_host_, 0, n_recs*sc_rec_bytes_);
+        if (hipHostGetDevicePointer(&sc_host_dev_, sc_host_, 0) != hipSuccess ||
+                cudaMalloc((void **) &sc_cur_, max_members*sizeof(sidecar_cur)) != cudaSuccess ||
+                cudaMalloc((void **) &sc_state_, n_recs*sizeof(sidecar_state)) != cudaSuccess) {
+            (void) hipGetLastError();
+            sidecar_free_locked();
+            GGML_LOG_WARN("expert cache: sidecar device state not allocated; sidecar off\n");
+            return false;
+        }
+        CUDA_CHECK(cudaMemset(sc_cur_, 0, max_members*sizeof(sidecar_cur)));
+        CUDA_CHECK(cudaMemset(sc_state_, 0, n_recs*sizeof(sidecar_state)));
+        CUDA_CHECK(cudaDeviceSynchronize());
+        sc_tickets_ = {};
+        sc_calls_   = {};
+        sc_epoch_   = 0;
+        sc_on_.store(true, std::memory_order_release);
+        GGML_LOG_INFO("expert cache: sidecar on, %u/%u rows per layer and call (decode/prefill), %zu KiB of records\n",
+            sc_rows_decode_, sc_rows_prefill_, n_recs*sc_rec_bytes_/1024);
+        return true;
+    }
+
+    uint32_t sidecar_begin(ggml_backend_t backend, ggml_expert_sidecar_mode mode, bool prefill) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!sc_on_.load(std::memory_order_acquire) || state_ != state_t::installed || backend == nullptr ||
+                !ggml_backend_is_cuda(backend)) {
+            return 0;
+        }
+        ggml_backend_cuda_context * cctx = (ggml_backend_cuda_context *) backend->context;
+        const int member = member_of(cctx);
+        if (member < 0 || (size_t) member >= max_members || cctx->device != device_) {
+            return 0;
+        }
+        const uint32_t rows = prefill ? sc_rows_prefill_ : sc_rows_decode_;
+        if (mode == GGML_EXPERT_SIDECAR_IDS && rows == 0) {
+            mode = GGML_EXPERT_SIDECAR_NONE;
+        }
+        sc_epoch_ = sc_epoch_ + 1 == 0 ? 1 : sc_epoch_ + 1;
+        const uint32_t bank = sc_calls_[(size_t) member]++ % GGML_EXPERT_SIDECAR_BANKS;
+        sc_tickets_[(size_t) member][bank] = { sc_epoch_, (uint32_t) mode, rows };
+        ggml_cuda_set_device(device_);
+        const ggml_cuda_kernel_launch_params launch(dim3(1), dim3(1), 0, cctx->stream());
+        ggml_cuda_kernel_launch(sidecar_begin_kernel, launch, sc_cur_ + member, sc_epoch_, bank, (uint32_t) mode, rows);
+        return sc_epoch_;
+    }
+
+    size_t sidecar_end(ggml_backend_t backend, uint32_t ticket, bool tier, void * buf, size_t cap,
+            int32_t * n_blocks, bool * truncated) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (n_blocks != nullptr) { *n_blocks = 0; }
+        if (truncated != nullptr) { *truncated = false; }
+        if (!sc_on_.load(std::memory_order_acquire) || ticket == 0 || backend == nullptr || !ggml_backend_is_cuda(backend)) {
+            return 0;
+        }
+        const int member = member_of(backend->context);
+        if (member < 0 || (size_t) member >= max_members || (size_t) member >= members_.size()) {
+            return 0;
+        }
+        int bank = -1;
+        for (int b = 0; b < GGML_EXPERT_SIDECAR_BANKS; ++b) {
+            if (sc_tickets_[(size_t) member][(size_t) b].epoch == ticket) {
+                bank = b;
+            }
+        }
+        if (bank < 0) {
+            return 0;
+        }
+        const sidecar_ticket tk = sc_tickets_[(size_t) member][(size_t) bank];
+        if (tk.mode == (uint32_t) GGML_EXPERT_SIDECAR_NONE) {
+            return 0;
+        }
+        std::atomic_thread_fence(std::memory_order_seq_cst);
+        const member_state & mb = members_[(size_t) member];
+        const auto * vram  = l1_ ? &l1_->host_slots() : nullptr;
+        const auto * homes = tier_ ? &tier_->locations() : nullptr;
+        std::vector<uint8_t> & out = sc_out_;
+        out.clear();
+        int32_t blocks = 0;
+        bool cut = false;
+        auto put = [&out](const void * p, size_t n) {
+            const size_t at = out.size();
+            out.resize(at + n);
+            memcpy(out.data() + at, p, n);
+        };
+        auto pad4 = [&out]() { out.resize((out.size() + 3) & ~(size_t) 3, 0); };
+        for (int l = 0; l < mb.geo.n_layers; ++l) {
+            const int joint = mb.offset + l;
+            if (joint < 0 || joint >= sc_n_layers_) {
+                continue;
+            }
+            const char * base = (const char *) sc_host_ + ((size_t) bank*(size_t) sc_n_layers_ + (size_t) joint)*sc_rec_bytes_;
+            const volatile sidecar_rec * rec = (const volatile sidecar_rec *) base;
+            if (rec->epoch != ticket) {
+                continue;
+            }
+            const uint32_t rows     = (uint32_t) std::max(0, (int) rec->rows);
+            const uint32_t launches = (uint32_t) std::max(0, (int) rec->launches);
+            const int      n_used   = rec->n_used;
+            const uint16_t lay      = (uint16_t) l;
+            if (tk.mode == (uint32_t) GGML_EXPERT_SIDECAR_IDS) {
+                if (n_used <= 0 || n_used > 0xFFFF) {
+                    continue;
+                }
+                const uint32_t stored = std::min(rows, std::min(tk.rows, sc_rec_ids_/(uint32_t) n_used));
+                cut |= stored < rows;
+                const uint16_t k = (uint16_t) n_used;
+                put(&lay, 2); put(&k, 2); put(&rows, 4); put(&stored, 4); put(&launches, 4);
+                const uint16_t * ids = (const uint16_t *) (base + sizeof(sidecar_rec));
+                put(ids, (size_t) stored*k*sizeof(uint16_t));
+                pad4();
+                if (tier) {
+                    for (size_t i = 0; i < (size_t) stored*k; ++i) {
+                        const int e = ids[i];
+                        uint8_t t = 255;
+                        if (e != 0xFFFF && homes && (size_t) joint < homes->size() && (size_t) e < (*homes)[joint].size()) {
+                            const expert_storage st = (*homes)[joint][e].storage;
+                            t = st == expert_storage::vram ? 0 : st == expert_storage::file ? 2 : 1;
+                        } else if (e != 0xFFFF && vram && (size_t) joint < vram->size() && (size_t) e < (*vram)[joint].size()) {
+                            t = (*vram)[joint][e] >= 0 ? 0 : 1;
+                        }
+                        out.push_back(t);
+                    }
+                    pad4();
+                }
+            } else {
+                const int n_e = geo_.experts(joint);
+                if (n_e <= 0 || n_e > sidecar_max_hist) {
+                    continue;
+                }
+                const uint16_t ne16 = (uint16_t) n_e;
+                const uint32_t zero = 0;
+                put(&lay, 2); put(&ne16, 2); put(&rows, 4); put(&zero, 4); put(&launches, 4);
+                put(base + sizeof(sidecar_rec), (size_t) n_e*sizeof(uint32_t));
+            }
+            blocks++;
+        }
+        if (out.size() <= cap && buf != nullptr) {
+            memcpy(buf, out.data(), out.size());
+            if (n_blocks != nullptr) { *n_blocks = blocks; }
+            if (truncated != nullptr) { *truncated = cut; }
+        }
+        return out.size();
+    }
+
+    // Hot path, only while the sidecar is on: one single-block kernel per routed layer of the cached models.
+    void sidecar_launch_ids(ggml_backend_cuda_context & ctx, int member, int joint, const ggml_tensor * ids) {
+        if ((size_t) member >= max_members || joint >= sc_n_layers_) {
+            return;
+        }
+        const ggml_cuda_kernel_launch_params launch(dim3(1), dim3(256), 0, ctx.stream());
+        ggml_cuda_kernel_launch(sidecar_ids_kernel, launch, (const int32_t *) ids->data, (int) ids->ne[1],
+            (int) (ids->nb[1]/sizeof(int32_t)), (int) ids->ne[0], geo_.experts(joint), (const sidecar_cur *) (sc_cur_ + member),
+            sc_state_, (char *) sc_host_dev_, sc_rec_bytes_, sc_n_layers_, joint, sc_rec_ids_);
+    }
+
+    void sidecar_free_locked() {
+        sc_on_.store(false, std::memory_order_release);
+        if (sc_state_ != nullptr) { (void) cudaFree(sc_state_); sc_state_ = nullptr; }
+        if (sc_cur_ != nullptr) { (void) cudaFree(sc_cur_); sc_cur_ = nullptr; }
+        if (sc_host_ != nullptr) { (void) hipHostFree(sc_host_); sc_host_ = nullptr; }
+        sc_host_dev_ = nullptr;
+        sc_n_layers_ = 0;
     }
 
     // ---- the decode pool (expert-ub-pool.cuh) ----------------------------------------------------
@@ -6568,6 +6761,19 @@ private:
     ub_pool_config ub_cfg_;
     std::unique_ptr<ub_pool> ub_;
     std::atomic<bool> ub_on_{ false };      // the step runs; read by profile_ids without the mutex
+    // expert sidecar (expert-sidecar.cuh); the pointers are fixed while sc_on_
+    std::atomic<bool> sc_on_{ false };
+    sidecar_cur *   sc_cur_      = nullptr; // VRAM [max_members]
+    sidecar_state * sc_state_    = nullptr; // VRAM [banks][joint layer]
+    void *          sc_host_     = nullptr; // mapped host records [banks][joint layer], sc_rec_bytes_ each
+    void *          sc_host_dev_ = nullptr;
+    size_t   sc_rec_bytes_ = 0;
+    uint32_t sc_rec_ids_ = 0, sc_rows_decode_ = 0, sc_rows_prefill_ = 0, sc_epoch_ = 0;
+    int      sc_n_layers_ = 0;
+    struct sidecar_ticket { uint32_t epoch = 0; uint32_t mode = 0; uint32_t rows = 0; };
+    std::array<std::array<sidecar_ticket, GGML_EXPERT_SIDECAR_BANKS>, max_members> sc_tickets_{};
+    std::array<uint32_t, max_members> sc_calls_{};
+    std::vector<uint8_t> sc_out_;
     std::vector<uint8_t> ub_layer_;         // [joint layer] has positions; fixed while ub_on_
     int ub_member_ = 0, ub_rows_ = 1, ub_n_layers_ = 0;
     uint64_t * ub_tables_ = nullptr;        // the pool's own address tables [layer][kind][expert], or null
@@ -6972,6 +7178,28 @@ static const ggml_expert_iface g_expert_iface = {
 
 const ggml_expert_iface * ggml_backend_cuda_expert_iface(void) {
     return &g_expert_iface;
+}
+
+static bool sc_iface_configure(int32_t rows_decode, int32_t rows_prefill) {
+    return instance().sidecar_configure(rows_decode, rows_prefill);
+}
+static uint32_t sc_iface_begin(ggml_backend_t backend, enum ggml_expert_sidecar_mode mode, bool prefill) {
+    return instance().sidecar_begin(backend, mode, prefill);
+}
+static size_t sc_iface_end(ggml_backend_t backend, uint32_t ticket, bool tier, void * buf, size_t cap,
+        int32_t * n_blocks, bool * truncated) {
+    return instance().sidecar_end(backend, ticket, tier, buf, cap, n_blocks, truncated);
+}
+
+static const ggml_expert_sidecar_iface g_sidecar_iface = {
+    /* .version   = */ GGML_EXPERT_SIDECAR_VERSION,
+    /* .configure = */ sc_iface_configure,
+    /* .begin     = */ sc_iface_begin,
+    /* .end       = */ sc_iface_end,
+};
+
+const ggml_expert_sidecar_iface * ggml_backend_cuda_expert_sidecar(void) {
+    return &g_sidecar_iface;
 }
 
 #endif // GGML_USE_HIP
