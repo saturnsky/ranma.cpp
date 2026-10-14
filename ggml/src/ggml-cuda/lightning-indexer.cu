@@ -397,7 +397,7 @@ static __global__ void lightning_indexer_kernel_vec(
 // staged in half precision and the queries of every head in float, each thread owns KEYS_PER_THREAD
 // keys for one token, a warp shares its token so the query reads are broadcasts, and every key
 // element is widened once for all heads, so no dot product needs a cross thread reduction
-template <int WARPS_PER_BLOCK, int K_VECS_PER_BLOCK, int64_t N_EMBD, int64_t N_HEAD, ggml_type TYPE_K>
+template <int WARPS_PER_BLOCK, int K_VECS_PER_BLOCK, int64_t N_EMBD, int64_t N_HEAD, ggml_type TYPE_K, bool SKIP_MASKED = false>
 static __global__ void lightning_indexer_kernel_tile(
         const float * Q, const char * K, const float * W, const half * M, float * dst,
         int64_t n_stream, int64_t n_batch, int64_t n_kv,
@@ -424,6 +424,31 @@ static __global__ void lightning_indexer_kernel_tile(
     const int start_kv    = blockIdx.x * K_VECS_PER_BLOCK;
     const int start_batch = blockIdx.y * TOKENS_PER_BLOCK;
     const int i_stream    = blockIdx.z;
+
+    if constexpr (SKIP_MASKED) {
+        // a tile whose mask is -inf everywhere (the causal upper triangle) scores -inf, write the
+        // mask and skip the products
+        bool masked = true;
+        for (int i = tid; i < TOKENS_PER_BLOCK * K_VECS_PER_BLOCK; i += THREADS_PER_BLOCK) {
+            const int r  = i / K_VECS_PER_BLOCK;
+            const int kv = start_kv + i % K_VECS_PER_BLOCK;
+            if (start_batch + r < n_batch && kv < n_kv) {
+                const half * m_row = (const half *) ((const char *) M + (start_batch + r)*nbm1 + (i_stream%nem3)*nbm3);
+                masked = masked && __half2float(m_row[kv]) == -INFINITY;
+            }
+        }
+        if (__syncthreads_and(masked)) {
+            for (int i = tid; i < TOKENS_PER_BLOCK * K_VECS_PER_BLOCK; i += THREADS_PER_BLOCK) {
+                const int r  = i / K_VECS_PER_BLOCK;
+                const int kv = start_kv + i % K_VECS_PER_BLOCK;
+                if (start_batch + r < n_batch && kv < n_kv) {
+                    float * dst_base = (float *) ((char *) dst + (start_batch + r)*nb1 + i_stream*nb3);
+                    dst_base[kv] = -INFINITY;
+                }
+            }
+            return;
+        }
+    }
 
     // the row padding keeps the keys of consecutive threads in distinct banks
     __shared__ half2 k_shared[K_VECS_PER_BLOCK][N_EMBD_H2 + 1];
@@ -463,9 +488,9 @@ static __global__ void lightning_indexer_kernel_tile(
 
     // phase 2 - stage the weights of every head, tokens past n_batch are zero
 
-    if (tid < N_HEAD * TOKENS_PER_BLOCK) {
-        const int h = tid / TOKENS_PER_BLOCK;
-        const int r = tid % TOKENS_PER_BLOCK;
+    for (int i = tid; i < N_HEAD * TOKENS_PER_BLOCK; i += THREADS_PER_BLOCK) {
+        const int h = i / TOKENS_PER_BLOCK;
+        const int r = i % TOKENS_PER_BLOCK;
         w_shared[h][r] = start_batch + r < n_batch ?
             ((const float *) ((const char *) W + (start_batch + r)*nbw1 + i_stream*nbw3))[h] : 0.0f;
     }
@@ -566,6 +591,11 @@ static __global__ void lightning_indexer_kernel_tile(
         );                                                                                  \
     } else
 
+#define LIGHTNING_INDEXER_TILE_CASE(n_embd, n_head, K, type_K, skip)                                             if (K->type == (type_K)) {                                                                                          lightning_indexer_kernel_tile<WARPS_PER_BLOCK, K_VECS_PER_BLOCK, n_embd, n_head, type_K, skip>                      <<<grid, block, 0, ctx.stream()>>>(                                                                             q_d, k_d, w_d, m_d, dst_d,                                                                                      n_stream, n_batch, n_kv,                                                                                        nb1, nb2, nb3,                                                                                                  nbq1, nbq2, nbq3,                                                                                               nbk1, nbk2, nbk3,                                                                                               nbw1, nbw2, nbw3,                                                                                               nbm1, nbm2, nbm3,                                                                                               nem3                                                                                                        );                                                                                                              return;                                                                                                     }
+
+// 64/32 head prefill batches are scored with the key sharing tile kernel, skipping tiles whose mask is -inf
+// everywhere.
+
 void ggml_cuda_lightning_indexer(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * q = dst->src[0];
     const ggml_tensor * k = dst->src[1];
@@ -614,6 +644,23 @@ void ggml_cuda_lightning_indexer(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
     const int device = ggml_cuda_get_device();
     const int cc     = ggml_cuda_info().devices[device].cc;
+
+    if (n_embd == 128 && (n_head == 64 || n_head == 32) && n_batch >= LIGHTNING_INDEXER_TILE_TOKENS &&
+            k->type == GGML_TYPE_F16) {
+        constexpr int WARPS_PER_BLOCK = 8;
+        constexpr int K_VECS_PER_BLOCK = 64;
+
+        dim3 block(32, WARPS_PER_BLOCK);
+        int num_kv_blocks = (n_kv + (K_VECS_PER_BLOCK) - 1) / (K_VECS_PER_BLOCK);
+        int num_batch_blocks = (n_batch + LIGHTNING_INDEXER_TILE_TOKENS - 1) / LIGHTNING_INDEXER_TILE_TOKENS;
+        dim3 grid(num_kv_blocks, num_batch_blocks, n_stream);
+
+        if (n_head == 64) {
+            LIGHTNING_INDEXER_TILE_CASE(128, 64, k, GGML_TYPE_F16, true)
+        } else {
+            LIGHTNING_INDEXER_TILE_CASE(128, 32, k, GGML_TYPE_F16, true)
+        }
+    }
 
     if (n_embd == 128 && n_head == 64) {
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
