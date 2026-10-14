@@ -10347,6 +10347,109 @@ struct test_flash_attn_ext_large_logits : public test_flash_attn_ext {
     }
 };
 
+// ranma: diagnostic for the sparse vs dense flash attention error against the CPU reference. A 0/-inf mask with
+// n_kv_max visible cells per row, sinks, and a scalable Q; the error is printed as NMSE and as the largest element error.
+struct test_flash_attn_ext_diag : public test_flash_attn_ext {
+    float q_range;
+
+    test_flash_attn_ext_diag(int64_t hs, int64_t gqa, int64_t kv, int64_t nb, int64_t n_kv_max, float q_range)
+        : test_flash_attn_ext(hs, hs, 1, {gqa, 1}, kv, nb, true, true, 0.0f, 0.0f, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16,
+                              {0, 1, 2, 3}, true, false, n_kv_max), q_range(q_range) {}
+
+    std::string vars() override {
+        return test_flash_attn_ext::vars() + ",q_range=" + std::to_string(q_range);
+    }
+
+    double max_nmse_err() override { return 1.0; }
+
+    double err(const float * a, const float * b, size_t n) override {
+        double se = 0.0, sr = 0.0, maxd = 0.0, maxrel = 0.0;
+        for (size_t i = 0; i < n; i++) {
+            sr += (double) a[i]*a[i];
+        }
+        const double rms = sqrt(sr/n);
+        for (size_t i = 0; i < n; i++) {
+            const double d = fabs((double) a[i] - b[i]);
+            se += d*d;
+            maxd = std::max(maxd, d);
+            if (fabs(a[i]) > 0.1*rms) {
+                maxrel = std::max(maxrel, d/fabs(a[i]));
+            }
+        }
+        if ((int64_t) n == hsv*nh*nr23[0]*nb) printf("DIAG kv=%lld nb=%lld q=%g nmse=%.3e max_abs/rms=%.3e max_rel=%.3e rms=%.3e\n", (long long) kv, (long long) nb, (double) q_range, se/sr, maxd/rms, maxrel, rms);
+        return se/sr;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 gen(0xD1A6);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "s") == 0) {
+                init_tensor_uniform(t, -3.0f, 3.0f);
+            } else if (strcmp(t->name, "q") == 0) {
+                init_tensor_uniform(t, -q_range, q_range);
+            } else if (strcmp(t->name, "m") == 0) {
+                const int64_t ne0 = t->ne[0];
+                std::vector<float> f(ggml_nelements(t), -INFINITY);
+                std::vector<ggml_fp16_t> h(f.size());
+                std::vector<int32_t> order(ne0);
+                for (int64_t i = 0; i < ne0; i++) { order[i] = i; }
+                for (int64_t row = 0; row < ggml_nrows(t); row++) {
+                    std::shuffle(order.begin(), order.end(), gen);
+                    for (int64_t i = 0; i < n_kv_max; i++) { f[row*ne0 + order[i]] = 0.0f; }
+                }
+                ggml_fp32_to_fp16_row(f.data(), h.data(), h.size());
+                ggml_backend_tensor_set(t, h.data(), 0, h.size()*sizeof(ggml_fp16_t));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
+// ranma: index-list edge cases of the 512-wide HIP WMMA gather (4 query rows share one list). The mask rows of each
+// group of 4 consecutive queries follow a pattern by group: 0 none visible (empty list; the sinks keep the rows
+// defined), 1 only the first row sees n_kv_max cells, 2 the 4 rows see disjoint cells (every listed cell has one
+// reader), 3 all rows see the same 5 cells (a list shorter than one K tile), others the default sparse mask rows.
+struct test_flash_attn_ext_list_edges : public test_flash_attn_ext {
+    using test_flash_attn_ext::test_flash_attn_ext;
+
+    std::string vars() override {
+        return test_flash_attn_ext::vars() + ",edges=1";
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        test_flash_attn_ext::initialize_tensors(ctx);
+        ggml_tensor * t = ggml_get_tensor(ctx, "m");
+        const int64_t ne0 = t->ne[0];
+        const int64_t ne1 = t->ne[1];
+        std::vector<ggml_fp16_t> h(ggml_nelements(t));
+        ggml_backend_tensor_get(t, h.data(), 0, ggml_nbytes(t));
+        std::mt19937 gen(0xED6E);
+        std::vector<int32_t> order(ne0);
+        for (int64_t i = 0; i < ne0; i++) { order[i] = i; }
+        const ggml_fp16_t ninf = ggml_fp32_to_fp16(-INFINITY);
+        for (int64_t row0 = 0; row0 < ggml_nrows(t); row0 += ne1) {
+            for (int64_t g = 0; g*4 < ne1 && g < 8; ++g) {
+                const int kind = int(g % 4);
+                std::shuffle(order.begin(), order.end(), gen);
+                for (int64_t r = 0; r < 4 && g*4 + r < ne1; ++r) {
+                    ggml_fp16_t * m = h.data() + (row0 + g*4 + r)*ne0;
+                    std::fill(m, m + ne0, ninf);
+                    if (kind == 1 && r == 0) {
+                        for (int64_t i = 0; i < n_kv_max; i++) { m[order[i]] = ggml_fp32_to_fp16(-0.0625f*(i % 5)); }
+                    } else if (kind == 2) {
+                        const int64_t n = std::min<int64_t>(n_kv_max, ne0/4);
+                        for (int64_t i = 0; i < n; i++) { m[order[r*n + i]] = ggml_fp32_to_fp16(-0.0625f*(i % 3)); }
+                    } else if (kind == 3) {
+                        for (int64_t i = 0; i < 5; i++) { m[order[i]] = ggml_fp32_to_fp16(-0.125f*(i + r)); }
+                    }
+                }
+            }
+        }
+        ggml_backend_tensor_set(t, h.data(), 0, ggml_nbytes(t));
+    }
+};
+
 // ranma: the attention of a DeepSeek V4 CSA layer (sparse: the n_swa window and the top-k compressed rows) or HCA layer
 // (dense over every column) over a raw window [k_lo, k_lo + n_raw) of a raw cache of n_raw_cache cells
 // (the visible raw cells, src/llama-kv-cache-dsv4.cpp), built as in src/models/deepseek4.cpp. K is a view of one joint
@@ -10393,6 +10496,7 @@ struct test_dsv4_raw_attn : public test_case {
     bool        comp_first = false;
     int64_t     gqa_kv     = 1;
     std::string tile;
+    std::string diag; // GGML_CUDA_FA_DIAG for this case ("" = unset), see ggml-cuda/fattn-common.cuh
 
     std::vector<ggml_tensor *> chain;
     std::vector<ggml_tensor *> fa_nodes, mask_nodes, kcat_nodes, join_nodes;
@@ -10420,6 +10524,9 @@ struct test_dsv4_raw_attn : public test_case {
         }
         if (part != 0 || comp_first || gqa_kv != 1 || !tile.empty()) {
             ss << ",part=" << part << ",comp_first=" << comp_first << ",gqa_kv=" << gqa_kv << ",tile=" << (tile.empty() ? "def" : tile);
+        }
+        if (!diag.empty()) {
+            ss << ",diag=" << diag;
         }
         return ss.str();
     }
@@ -10629,8 +10736,10 @@ struct test_dsv4_raw_attn : public test_case {
         join_nodes.clear();
 #ifdef _WIN32
         _putenv_s("GGML_HIP_FATTN_TILE512", tile.c_str());
+        _putenv_s("GGML_CUDA_FA_DIAG", diag.c_str());
 #else
         setenv("GGML_HIP_FATTN_TILE512", tile.c_str(), 1);
+        setenv("GGML_CUDA_FA_DIAG", diag.c_str(), 1);
 #endif
 
         ggml_tensor * joint = ggml_new_tensor_2d(ctx, GGML_TYPE_F16, hs, n_raw_cache + n_comp);
@@ -10869,6 +10978,392 @@ struct test_dsv4_win_fa : public test_case {
                 init_tensor_uniform(t);
             }
         }
+    }
+};
+
+// ranma DS4.1F FA probe (TBO_DS41_FA=1), timing only: the FA nodes of one DeepSeek V4.1 Flash compressed layer for a
+// 7305-token ubatch in chunks of 2048 query rows (raw chunk 2048, deepseek41.cpp build_attention_v41_chunked):
+// K of a chunk = its raw window (256-aligned, RAW_NKV=used 7424 cells) followed by the whole compressed width
+// (ratio 2: 3840 rows, ratio 1: 7424), mask = the window's causal SWA rows then the top-k rows of each token. Inputs are
+// made directly (no mask build, no K concat), so only the FA kernels are timed.
+//   mode 0: n_kv_max = min(nj, n_swa) + top_k (the model; the tile kernel gathers above its threshold)
+//   mode 1: n_kv_max = 0 (dense; GQA 64 % 8 -> RDNA4 WMMA)
+//   mode 2: upper bound of a gather in front of a dense kernel: every block of blk tokens gets a K of only the cells
+//           it uses (raw window of the block + the union of the block's top-k rows), random values, padded to 256
+//   mode 3: dense over a K of only uw cells per chunk (all visible), the "same width" control of the list probe
+// sel: the top-k of grp consecutive tokens are drawn from one shuffled order (grp 1 = independent random lists; a larger
+// grp approximates the overlap of neighbouring tokens' selections).
+// diag: GGML_CUDA_FA_DIAG for this case (set in build_graph; "" = unset), see ggml-cuda/fattn-common.cuh.
+struct test_ds41_fa : public test_case {
+    const int64_t ratio;
+    const int     mode;
+    const int64_t grp;
+    const int64_t blk;
+    const int64_t p0;
+    const std::string diag;
+    const int64_t uw;
+    const int64_t hs = 512, nh = 64, n_tokens = 7305, n_swa = 128, top_k = 512, chunk = 2048, n_cells = 7424;
+
+    std::vector<ggml_tensor *> fa_nodes;
+    std::vector<std::vector<int32_t>> sel; // per token, the selected compressed rows
+
+    std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "DS41_FA"; }
+    std::string vars() override {
+        std::ostringstream ss;
+        ss << "ratio=" << ratio << ",p0=" << p0 << ",n_comp=" << n_comp() << ",mode=" << (mode == 0 ? "sparse" : mode == 1 ? "dense" : mode == 2 ? "gather" : "dense_uw") << ",grp=" << grp;
+        if (mode == 2) {
+            ss << ",blk=" << blk << ",w=" << gather_w();
+        }
+        if (mode == 3) {
+            ss << ",uw=" << uw;
+        }
+        if (!diag.empty()) {
+            ss << ",diag=" << diag;
+        }
+        if (mode == 0 && diag == "list:r") {
+            ss << ",u4=" << union4_mean();
+        }
+        return ss.str();
+    }
+    bool run_whole_graph() override { return true; }
+    std::vector<ggml_tensor *> perf_nodes(ggml_tensor * out) override { GGML_UNUSED(out); return fa_nodes; }
+    int perf_max_reps() override { return 8; }
+    uint64_t op_flops(ggml_tensor * t) override { GGML_UNUSED(t); return 0; }
+
+    int64_t n_comp() const { return (((p0 + n_tokens)/ratio) + 255)/256*256; }
+    // p: the ubatch row; its position is p0 + p
+    int64_t n_vis(int64_t p) const { return std::min<int64_t>((p0 + p + 1)/ratio, n_comp()); }
+    int64_t n_pad() const { return mode == 2 ? (n_tokens + blk - 1)/blk*blk : n_tokens; }
+
+    test_ds41_fa(int64_t ratio, int mode, int64_t grp, int64_t blk = 16, int64_t p0 = 0, std::string diag = "", int64_t uw = 0)
+        : ratio(ratio), mode(mode), grp(grp), blk(blk), p0(p0), diag(std::move(diag)), uw(uw) {
+        std::mt19937 gen(0xD541 + (uint32_t) grp);
+        sel.resize(n_pad());
+        std::vector<int32_t> order;
+        for (int64_t i = 0; i < n_pad(); ++i) {
+            const int64_t g0 = i/grp*grp;
+            if (i == g0) {
+                const int64_t nv = n_vis(std::min<int64_t>(g0 + grp, n_pad()) - 1);
+                order.resize(nv);
+                for (int64_t j = 0; j < nv; ++j) { order[j] = (int32_t) j; }
+                std::shuffle(order.begin(), order.end(), gen);
+            }
+            const int64_t nv = n_vis(i);
+            for (int32_t r : order) {
+                if ((int64_t) sel[i].size() == top_k) { break; }
+                if (r < nv) { sel[i].push_back(r); }
+            }
+        }
+    }
+
+    struct win { int64_t i0, n, lo, nr; };
+    std::vector<win> chunks() const {
+        std::vector<win> res;
+        for (int64_t i0 = 0; i0 < n_tokens; i0 += chunk) {
+            const int64_t n    = std::min(chunk, n_tokens - i0);
+            if (p0 > 0) {
+                // a later ubatch: the window starts n_swa rows before the chunk (lo is relative to p0)
+                res.push_back({ i0, n, i0 - n_swa, (n + n_swa + 255)/256*256 });
+                continue;
+            }
+            const int64_t c_lo = std::max<int64_t>(0, i0 - n_swa + 1);
+            const int64_t c_hi = i0 + n;
+            const int64_t lo   = c_lo/256*256;
+            const int64_t hi   = std::min<int64_t>(n_cells, (c_hi + 255)/256*256);
+            res.push_back({ i0, n, lo, hi - lo });
+        }
+        return res;
+    }
+    // the union of the selections of block b, sorted
+    std::vector<int32_t> blk_union(int64_t b) const {
+        std::vector<int32_t> u;
+        for (int64_t i = b*blk; i < (b + 1)*blk; ++i) { u.insert(u.end(), sel[i].begin(), sel[i].end()); }
+        std::sort(u.begin(), u.end());
+        u.erase(std::unique(u.begin(), u.end()), u.end());
+        return u;
+    }
+    // mean size of the per-tile union of 4 query rows (window cells + selected rows), what list:r reads
+    int64_t union4_mean() const {
+        int64_t sum = 0, n = 0;
+        for (const win & c : chunks()) {
+            for (int64_t i = 0; i < c.n; i += 4) {
+                std::vector<int64_t> u;
+                for (int64_t p = c.i0 + i; p < std::min(c.i0 + i + 4, c.i0 + c.n); ++p) {
+                    for (int64_t j = 0; j < c.nr; ++j) {
+                        const int64_t cp = c.lo + j;
+                        if (cp + p0 >= 0 && cp < n_tokens && cp <= p && p - cp < n_swa) { u.push_back(j); }
+                    }
+                    for (int32_t r : sel[p]) { u.push_back(c.nr + r); }
+                }
+                std::sort(u.begin(), u.end());
+                sum += std::unique(u.begin(), u.end()) - u.begin();
+                ++n;
+            }
+        }
+        return n ? sum/n : 0;
+    }
+    int64_t gather_w() const {
+        int64_t m = 0;
+        for (int64_t b = 0; b < n_pad()/blk; ++b) { m = std::max<int64_t>(m, (int64_t) blk_union(b).size()); }
+        return (blk + n_swa - 1 + m + 255)/256*256;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+#ifdef _WIN32
+        _putenv_s("GGML_CUDA_FA_DIAG", diag.c_str());
+#else
+        setenv("GGML_CUDA_FA_DIAG", diag.c_str(), 1);
+#endif
+        fa_nodes.clear();
+        ggml_tensor * q = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, hs, n_pad(), nh);
+        ggml_set_name(q, "q");
+        ggml_tensor * sinks = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, nh);
+        ggml_set_name(sinks, "s");
+        ggml_tensor * out = nullptr;
+        if (mode == 2) {
+            const int64_t nb = n_pad()/blk;
+            const int64_t w  = gather_w();
+            ggml_tensor * qb = ggml_view_4d(ctx, q, hs, blk, nh, nb, q->nb[1], q->nb[2], q->nb[1]*blk, 0);
+            ggml_tensor * k  = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, hs, w, 1, nb);
+            ggml_set_name(k, "k");
+            ggml_tensor * m  = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, w, blk, 1, nb);
+            ggml_set_name(m, "gmask");
+            out = ggml_flash_attn_ext(ctx, qb, k, k, m, 1.0f/sqrtf((float) hs), 0.0f, 0.0f);
+            ggml_flash_attn_ext_add_sinks(out, sinks);
+            ggml_flash_attn_ext_set_n_kv_max(out, 0);
+            ggml_prec_set_acc(out, GGML_PREC_F32);
+            fa_nodes.push_back(out);
+        } else {
+            int ic = 0;
+            for (const win & c : chunks()) {
+                const int64_t w = mode == 3 ? uw : c.nr + n_comp();
+                ggml_tensor * qc = ggml_view_3d(ctx, q, hs, c.n, nh, q->nb[1], q->nb[2], q->nb[1]*c.i0);
+                ggml_tensor * k  = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, hs, w, 1);
+                ggml_format_name(k, "k%d", ic);
+                ggml_tensor * m  = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, w, c.n, 1, 1);
+                ggml_format_name(m, "cmask%d", ic);
+                ggml_tensor * o = ggml_flash_attn_ext(ctx, qc, k, k, m, 1.0f/sqrtf((float) hs), 0.0f, 0.0f);
+                ggml_flash_attn_ext_add_sinks(o, sinks);
+                ggml_flash_attn_ext_set_n_kv_max(o, mode == 0 ? (int32_t) (std::min(c.nr, n_swa) + top_k) : 0);
+                ggml_prec_set_acc(o, GGML_PREC_F32);
+                fa_nodes.push_back(o);
+                out = o;
+                ++ic;
+            }
+        }
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        const ggml_fp16_t keep = ggml_fp32_to_fp16(0.0f);
+        const ggml_fp16_t drop = ggml_fp32_to_fp16(-INFINITY);
+        const std::vector<win> cs = chunks();
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (t->op != GGML_OP_NONE) {
+                continue;
+            }
+            if (strcmp(t->name, "s") == 0) {
+                init_tensor_uniform(t, -4.0f, 4.0f);
+            } else if (strncmp(t->name, "cmask", 5) == 0) {
+                const win & c = cs[atoi(t->name + 5)];
+                const int64_t w = t->ne[0];
+                std::vector<ggml_fp16_t> data(w*c.n, mode == 3 ? keep : drop);
+                for (int64_t i = 0; i < c.n && mode != 3; ++i) {
+                    const int64_t p = c.i0 + i;
+                    ggml_fp16_t * row = data.data() + i*w;
+                    for (int64_t j = 0; j < c.nr; ++j) {
+                        const int64_t cp = c.lo + j;
+                        if (cp + p0 >= 0 && cp < n_tokens && cp <= p && p - cp < n_swa) { row[j] = keep; }
+                    }
+                    for (int32_t r : sel[p]) { row[c.nr + r] = keep; }
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(ggml_fp16_t));
+            } else if (strcmp(t->name, "gmask") == 0) {
+                const int64_t w    = t->ne[0];
+                const int64_t nraw = blk + n_swa - 1;
+                std::vector<ggml_fp16_t> data(w*blk*(n_pad()/blk), drop);
+                for (int64_t b = 0; b < n_pad()/blk; ++b) {
+                    const std::vector<int32_t> u = blk_union(b);
+                    for (int64_t i = 0; i < blk; ++i) {
+                        const int64_t p = b*blk + i;
+                        ggml_fp16_t * row = data.data() + p*w;
+                        for (int64_t j = 0; j < nraw; ++j) {
+                            const int64_t cp = b*blk - (n_swa - 1) + j;
+                            if (cp + p0 >= 0 && cp <= p && p - cp < n_swa) { row[j] = keep; }
+                        }
+                        for (int32_t r : sel[p]) {
+                            row[nraw + (std::lower_bound(u.begin(), u.end(), r) - u.begin())] = keep;
+                        }
+                    }
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, data.size()*sizeof(ggml_fp16_t));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
+// ranma DS4.1F FA accuracy probe (TBO_DS41_FA_ACC=1): the FA input pattern of a DeepSeek V4.1 Flash compressed layer at
+// the end of a chunk, against an FP64 reference (the CPU backend accumulates F16 V in F16, so it is no reference here).
+// K = V = a raw window of n_raw cells followed by n_comp compressed rows; the nb query rows are the last positions of the
+// window, each sees its causal SWA cells (n_swa) and top_k compressed rows (grp 1: independent random rows, grp > 1:
+// grp consecutive rows share one selection); sinks; Q uniform in [-q_range, q_range]. K uniform in [-1, 1], or with dup > 0
+// near-duplicate rows (dup random rows + noise of 1/64, as repeated text): many near-equal logits, so the running max grows
+// in small steps. Inputs are deterministic, so the printed output hash compares builds. diag: GGML_CUDA_FA_DIAG for this
+// case (see ggml-cuda/fattn-common.cuh).
+struct test_ds41_fa_acc : public test_case {
+    const int64_t n_comp;
+    const int64_t nb;
+    const float   q_range;
+    const int64_t grp;
+    const int64_t dup;
+    const std::string diag;
+    const int64_t hs = 512, nh = 64, n_raw = 2304, n_swa = 128, top_k = 512;
+
+    std::vector<float> q_h, k_h, s_h, m_h; // host copies of the inputs (k as rounded to F16)
+    std::vector<double> ref;               // [hs, nh, nb]
+
+    std::string op_desc(ggml_tensor * t) override { GGML_UNUSED(t); return "DS41_FA_ACC"; }
+    std::string vars() override {
+        std::ostringstream ss;
+        ss << "n_comp=" << n_comp << ",nb=" << nb << ",q=" << q_range << ",grp=" << grp << ",dup=" << dup << ",diag=" << diag;
+        return ss.str();
+    }
+    double max_nmse_err() override { return 1.0; }
+
+    test_ds41_fa_acc(int64_t n_comp, int64_t nb, float q_range, int64_t grp, int64_t dup, std::string diag)
+        : n_comp(n_comp), nb(nb), q_range(q_range), grp(grp), dup(dup), diag(std::move(diag)) {}
+
+    int64_t W() const { return n_raw + n_comp; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+#ifdef _WIN32
+        _putenv_s("GGML_CUDA_FA_DIAG", diag.c_str());
+#else
+        setenv("GGML_CUDA_FA_DIAG", diag.c_str(), 1);
+#endif
+        ggml_tensor * q = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, hs, nb, nh);
+        ggml_set_name(q, "q");
+        ggml_tensor * k = ggml_new_tensor_3d(ctx, GGML_TYPE_F16, hs, W(), 1);
+        ggml_set_name(k, "k");
+        ggml_tensor * m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, W(), nb, 1, 1);
+        ggml_set_name(m, "m");
+        ggml_tensor * sinks = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, nh);
+        ggml_set_name(sinks, "s");
+        ggml_tensor * out = ggml_flash_attn_ext(ctx, q, k, k, m, 1.0f/sqrtf((float) hs), 0.0f, 0.0f);
+        ggml_flash_attn_ext_add_sinks(out, sinks);
+        ggml_flash_attn_ext_set_n_kv_max(out, (int32_t) (n_swa + top_k));
+        ggml_prec_set_acc(out, GGML_PREC_F32);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 gen(0xACC0 + (uint32_t) (n_comp + 7*nb + 31*grp + 131*dup) + (uint32_t) (q_range*1000.0f));
+        std::uniform_real_distribution<float> uq(-q_range, q_range), uk(-1.0f, 1.0f), us(-4.0f, 4.0f);
+        const int64_t w = W();
+        q_h.resize(hs*nb*nh);
+        for (float & x : q_h) { x = uq(gen); }
+        std::vector<ggml_fp16_t> k16(hs*w);
+        k_h.resize(hs*w);
+        std::vector<float> base(hs*std::max<int64_t>(dup, 1));
+        for (float & x : base) { x = uk(gen); }
+        for (int64_t j = 0; j < w; ++j) {
+            const float * b = base.data() + (dup > 0 ? int64_t(gen() % dup)*hs : 0);
+            for (int64_t e = 0; e < hs; ++e) {
+                const float x = dup > 0 ? b[e] + uk(gen)/64.0f : uk(gen);
+                k16[j*hs + e] = ggml_fp32_to_fp16(x);
+                k_h[j*hs + e] = ggml_fp16_to_fp32(k16[j*hs + e]);
+            }
+        }
+        s_h.resize(nh);
+        for (float & x : s_h) { x = us(gen); }
+        m_h.assign(w*nb, -INFINITY);
+        std::vector<int32_t> order(n_comp);
+        for (int64_t i = 0; i < nb; ++i) {
+            const int64_t p = n_raw - nb + i;
+            for (int64_t j = 0; j < n_raw; ++j) {
+                if (j <= p && p - j < n_swa) { m_h[i*w + j] = 0.0f; }
+            }
+            if (i % grp == 0) {
+                for (int64_t j = 0; j < n_comp; ++j) { order[j] = (int32_t) j; }
+                std::shuffle(order.begin(), order.end(), gen);
+            }
+            for (int64_t j = 0; j < top_k; ++j) { m_h[i*w + n_raw + order[j]] = 0.0f; }
+        }
+        std::vector<ggml_fp16_t> m16(m_h.size());
+        ggml_fp32_to_fp16_row(m_h.data(), m16.data(), m16.size());
+
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "q") == 0) {
+                ggml_backend_tensor_set(t, q_h.data(), 0, q_h.size()*sizeof(float));
+            } else if (strcmp(t->name, "k") == 0) {
+                ggml_backend_tensor_set(t, k16.data(), 0, k16.size()*sizeof(ggml_fp16_t));
+            } else if (strcmp(t->name, "m") == 0) {
+                ggml_backend_tensor_set(t, m16.data(), 0, m16.size()*sizeof(ggml_fp16_t));
+            } else if (strcmp(t->name, "s") == 0) {
+                ggml_backend_tensor_set(t, s_h.data(), 0, s_h.size()*sizeof(float));
+            } else if (t->op == GGML_OP_NONE) {
+                init_tensor_uniform(t);
+            }
+        }
+
+        // FP64 reference over the visible cells
+        const double scale = 1.0/sqrt((double) hs);
+        ref.assign(hs*nh*nb, 0.0);
+        std::vector<int64_t> vis;
+        std::vector<double> l, acc(hs);
+        for (int64_t i = 0; i < nb; ++i) {
+            vis.clear();
+            for (int64_t j = 0; j < w; ++j) {
+                if (m_h[i*w + j] == 0.0f) { vis.push_back(j); }
+            }
+            l.resize(vis.size());
+            for (int64_t h = 0; h < nh; ++h) {
+                const float * qr = q_h.data() + (h*nb + i)*hs;
+                double mx = s_h[h];
+                for (size_t c = 0; c < vis.size(); ++c) {
+                    const float * kr = k_h.data() + vis[c]*hs;
+                    double d = 0.0;
+                    for (int64_t e = 0; e < hs; ++e) { d += (double) qr[e]*kr[e]; }
+                    l[c] = d*scale;
+                    mx = std::max(mx, l[c]);
+                }
+                double sum = exp(s_h[h] - mx);
+                std::fill(acc.begin(), acc.end(), 0.0);
+                for (size_t c = 0; c < vis.size(); ++c) {
+                    const double pw = exp(l[c] - mx);
+                    sum += pw;
+                    const float * vr = k_h.data() + vis[c]*hs;
+                    for (int64_t e = 0; e < hs; ++e) { acc[e] += pw*vr[e]; }
+                }
+                for (int64_t e = 0; e < hs; ++e) { ref[(i*nh + h)*hs + e] = acc[e]/sum; }
+            }
+        }
+    }
+
+    // a: backend under test, b: CPU backend; both against the FP64 reference
+    double err(const float * a, const float * b, size_t n) override {
+        if ((int64_t) n != hs*nh*nb) {
+            return 0.0;
+        }
+        double sr = 0.0, ea = 0.0, ba = 0.0, eb = 0.0, bb = 0.0, maxd = 0.0;
+        uint64_t x = 1469598103934665603ull;
+        for (size_t i = 0; i < n; ++i) {
+            const double r = ref[i];
+            const double da = a[i] - r, db = b[i] - r;
+            sr += r*r; ea += da*da; ba += da*r; eb += db*db; bb += db*r;
+            maxd = std::max(maxd, fabs(da));
+            uint32_t u;
+            memcpy(&u, a + i, sizeof(u));
+            x = (x ^ u)*1099511628211ull;
+        }
+        printf("ACC n_comp=%lld nb=%lld q=%g grp=%lld dup=%lld diag=%s: nmse %.3e bias %+.3e max_abs/rms %.3e | cpu nmse %.3e bias %+.3e | out %016llx\n",
+            (long long) n_comp, (long long) nb, (double) q_range, (long long) grp, (long long) dup, diag.c_str(), ea/sr, ba/sr, maxd/sqrt(sr/n),
+            eb/sr, bb/sr, (unsigned long long) x);
+        return ea/sr;
     }
 };
 
@@ -12000,6 +12495,34 @@ static const ggml_type other_types[] = {
 static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     std::vector<std::unique_ptr<test_case>> test_cases;
     std::default_random_engine rng(0);
+
+    // TBO_DS41_FA_ACC=1: accuracy of the 512-wide HIP FA kernels on the DS4.1F input pattern against FP64 (one process,
+    // the variants per call through GGML_CUDA_FA_DIAG): the tile kernel, the dense WMMA and the list WMMA with F16 and
+    // F32 VKQ accumulators; TBO_DS41_FA_ACC_DIAG = comma-separated list of the variants instead
+    if (getenv("TBO_DS41_FA_ACC") != nullptr && atoi(getenv("TBO_DS41_FA_ACC")) != 0) {
+        std::vector<std::string> diags = { "tile", "wmma+f16acc", "wmma+f32acc", "list:r+f16acc", "list:r+f32acc" };
+        if (const char * v = getenv("TBO_DS41_FA_ACC_DIAG")) {
+            diags.clear();
+            std::stringstream ss(v);
+            for (std::string d; std::getline(ss, d, ',');) {
+                diags.push_back(d);
+            }
+        }
+        for (int64_t n_comp : { 3840, 7424 }) {
+            for (int64_t nb : { 17, 64 }) {
+                for (float q_range : { 1.0f, 8.0f }) {
+                    for (int64_t grp : { 1, 16 }) {
+                        for (int64_t dup : { 0, 16 }) {
+                            for (const std::string & d : diags) {
+                                test_cases.emplace_back(new test_ds41_fa_acc(n_comp, nb, q_range, grp, dup, d));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return test_cases;
+    }
 
     // unary ops
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32, GGML_TYPE_BF16}) {
@@ -14448,6 +14971,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 1, { 8, 1}, 4096, 4, true, false, 8.0f, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false,  512));
 
+    if (getenv("RANMA_FA_DIAG")) {
+        for (int64_t kv : { 2304, 4096, 7424, 16384, 20480, 40960 }) {
+            for (float qr : { 1.0f, 8.0f }) {
+                for (int64_t nb : { 16, 64 }) {
+                    test_cases.emplace_back(new test_flash_attn_ext_diag(512, 64, kv, nb, 640, qr));
+                }
+            }
+        }
+    }
+
     // sparse mask with large batch size
     test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, { 8, 1}, 4096, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false,  512));
     test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, { 8, 1}, 4096, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 2048));
@@ -14466,6 +14999,24 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(512, 512, 2, {32, 1},  512, 32, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16));
     test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, 1}, 4096, 64, true, true,  0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false,  256));
     test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, 1}, 4096, 64, true, true,  0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false,  320));
+
+    // 512-wide heads at GQA 16/64 with a sparse mask wide enough for the HIP WMMA kernel to read through the 4-row
+    // index lists: with and without sinks, batches that 4 does not divide, two
+    // sequences, permuted (non-contiguous) Q/K/V, large logits, and the list edge cases (empty, one reader, disjoint,
+    // shorter than a K tile)
+    for (int64_t nr2 : { 16, 64 }) {
+        for (int64_t nb : { 16, 17, 64, 75 }) {
+            test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {nr2, 1}, 4096, nb, true, true, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 256));
+        }
+        test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {nr2, 1}, 4096, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 640));
+        test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {nr2, 2}, 3072, 33, true, true, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 300));
+        test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {nr2, 1}, 4096, 64, true, true, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 2, 1, 3}, true, false, 256));
+        test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {nr2, 1}, 4096, 64, true, true, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, false, false, 256));
+        test_cases.emplace_back(new test_flash_attn_ext_large_logits(512, 512, 1, {nr2, 1}, 4096, 64, true, true, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 256));
+        for (int64_t nb : { 32, 30 }) {
+            test_cases.emplace_back(new test_flash_attn_ext_list_edges(512, 512, 1, {nr2, 1}, 4096, nb, true, true, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 256));
+        }
+    }
 
     // DSV4 raw window (the visible raw cells): the window as a concatenation and as a view of the joint storage, for CSA
     // (sparse) and HCA (dense), each against the attention over the whole raw cache. args: csa, n_tokens, p0,
@@ -14886,6 +15437,102 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_dsv4_hc_mixes(16384, n_tokens, true, 1e-6f, 64));
     }
 
+
+    // TBO_DS41_FA=1: the FA of one DS4.1F compressed layer (ratio 2 / 1) for the 7305-token chunk-2048 prompt: tile gather
+    // (the model), dense WMMA, and the gather-in-front upper bound, for independent (grp 1) and shared (grp 16) top-k lists.
+    // One process; the list runs twice in the same order.
+    if (getenv("TBO_DS41_FA") != nullptr && atoi(getenv("TBO_DS41_FA")) != 0) {
+        const char * sel_env = getenv("TBO_DS41_FA_SET");
+        const std::string sel = sel_env ? sel_env : "12";
+        for (int pass = 0; pass < 2; ++pass) {
+            if (sel.find('1') != std::string::npos) {
+                for (int64_t ratio : { 2, 1 }) {
+                    for (int64_t grp : { 1, 16 }) {
+                        test_cases.emplace_back(new test_ds41_fa(ratio, 0, grp));
+                        test_cases.emplace_back(new test_ds41_fa(ratio, 1, grp));
+                        test_cases.emplace_back(new test_ds41_fa(ratio, 2, grp, 16));
+                        if (grp > 1) {
+                            test_cases.emplace_back(new test_ds41_fa(ratio, 2, grp, 64));
+                        }
+                    }
+                }
+            }
+            // (3) WMMA gather probe (GGML_CUDA_FA_DIAG): the whole-K dense WMMA, the tile gather, WMMA over the real
+            //     4-row union lists, and for U = 768 / 2048 / the independent list width (3584 / 5376): dense over U
+            //     cells, WMMA over identity lists, over shuffled whole rows, and shuffled after the real compaction
+            if (sel.find('3') != std::string::npos) {
+                for (int64_t ratio : { 2, 1 }) {
+                    test_cases.emplace_back(new test_ds41_fa(ratio, 1, 1));
+                    for (int64_t grp : { 1, 16 }) {
+                        test_cases.emplace_back(new test_ds41_fa(ratio, 0, grp, 16, 0, "tile"));
+                        test_cases.emplace_back(new test_ds41_fa(ratio, 0, grp, 16, 0, "list:r"));
+                    }
+                    for (int64_t U : { int64_t(768), int64_t(2048), ratio == 2 ? int64_t(3584) : int64_t(5376) }) {
+                        test_cases.emplace_back(new test_ds41_fa(ratio, 3, 1, 16, 0, "", U));
+                        for (const char * k : { "i", "s", "S" }) {
+                            test_cases.emplace_back(new test_ds41_fa(ratio, 0, 1, 16, 0, std::string("list:") + k + ":" + std::to_string(U)));
+                        }
+                    }
+                }
+            }
+            // (4) the dispatch of the WMMA index lists: the whole-K dense WMMA, the
+            //     default selection, the tile gather and the forced list WMMA for DS4.1F ratio 2 / 1; then the DS4F CSA
+            //     layer (7305 tokens in chunks of 2048, compressed rows first, independent top-k lists) as the whole
+            //     chain and with the FA repeated (part 1: FA = (9*t_part1 - t_chain)/8), default / dense WMMA / list
+            if (sel.find('4') != std::string::npos) {
+                for (int64_t ratio : { 2, 1 }) {
+                    test_cases.emplace_back(new test_ds41_fa(ratio, 1, 1));
+                    for (int64_t grp : { 1, 16 }) {
+                        for (const char * d : { "", "tile", "list:r" }) {
+                            test_cases.emplace_back(new test_ds41_fa(ratio, 0, grp, 16, 0, d));
+                        }
+                    }
+                }
+                for (const char * d : { "", "wmma", "list:r" }) {
+                    for (int part : { 0, 1 }) {
+                        auto * t = new test_dsv4_raw_attn(true, 7305, 0, 16384, 0, 7424, 2048, false, 512, 64, 128, 512, 2048, true);
+                        t->part       = part;
+                        t->comp_first = true;
+                        t->diag       = d;
+                        test_cases.emplace_back(t);
+                    }
+                }
+            }
+            // (5) F16 / F32 VKQ accumulators (GGML_CUDA_FA_DIAG "+f16acc" / "+f32acc") of the dense and the list WMMA
+            //     kernel: DS4.1F ratio 2 / 1 and the DS4F CSA layer as in (4)
+            if (sel.find('5') != std::string::npos) {
+                for (int64_t ratio : { 2, 1 }) {
+                    for (int64_t grp : { 1, 16 }) {
+                        for (const char * d : { "wmma+f16acc", "wmma+f32acc", "list:r+f16acc", "list:r+f32acc" }) {
+                            if (grp > 1 && d[0] == 'w') {
+                                continue; // the dense kernel does not depend on the lists
+                            }
+                            test_cases.emplace_back(new test_ds41_fa(ratio, 0, grp, 16, 0, d));
+                        }
+                    }
+                }
+                for (const char * d : { "wmma+f16acc", "wmma+f32acc", "list:r+f16acc", "list:r+f32acc" }) {
+                    for (int part : { 0, 1 }) {
+                        auto * t = new test_dsv4_raw_attn(true, 7305, 0, 16384, 0, 7424, 2048, false, 512, 64, 128, 512, 2048, true);
+                        t->part       = part;
+                        t->comp_first = true;
+                        t->diag       = d;
+                        test_cases.emplace_back(t);
+                    }
+                }
+            }
+            // (2) a later 7305-token ubatch of a longer prompt (ratio 1): the compressed width grows with p0
+            if (sel.find('2') != std::string::npos) {
+                for (int64_t p0 : { 4096, 12288, 24576, 57344 }) {
+                    for (int64_t grp : { 1, 16 }) {
+                        test_cases.emplace_back(new test_ds41_fa(1, 0, grp, 16, p0));
+                        test_cases.emplace_back(new test_ds41_fa(1, 1, grp, 16, p0));
+                    }
+                }
+            }
+        }
+        return test_cases;
+    }
 
     // TBO_S2_PROBE=1: falsification probes for the DS4F layer-mode attention. One process, the list twice in the same order. For the 7305-token chunk-2048 chain of one CSA / HCA layer:
     //   (1) the chain split into FA / masks / K concat / join: part p repeats only that group 8 more times on top of one
