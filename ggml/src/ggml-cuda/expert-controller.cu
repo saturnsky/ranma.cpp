@@ -655,6 +655,12 @@ public:
         log_members_locked("at model load");
         allocate_ub_pool_locked();
         lend_setup_locked();
+        // the layer mode (it turns the lend on) moves the experts outside L1 once per layer; with none outside L1 its
+        // lends only evict experts. Said once; nothing changes.
+        if (cfg_.lend && resident_slices_locked() == total_slices_locked()) {
+            GGML_LOG_WARN("expert cache: every routed expert fits in L1 (%zu slices), so the layer mode has no experts to move "
+                          "and its prompts only evict experts from L1; --layer-mode off is recommended\n", total_slices_locked());
+        }
         return true;
     }
 
