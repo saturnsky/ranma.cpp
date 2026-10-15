@@ -136,6 +136,10 @@ struct l2_install_stats {
     // the unified policy: demotions from VRAM that joined the rings; the reseed's reads and its host time
     size_t unified_demoted = 0, reseed_slices = 0, reseed_bytes = 0;
     double reseed_ms = 0.0;
+    // demotions from VRAM: copied into the rings (slices, bytes) and dropped to the file (no copy)
+    size_t d2h_slices = 0, d2h_bytes = 0, dropped = 0, dropped_bytes = 0;
+    // the one-pass demotions (expert-l2-relabel.h): kept in an empty, a released, an evicted slot; needless evictions
+    size_t kept_empty = 0, kept_released = 0, kept_evicting = 0, needless = 0;
 };
 
 // Class arena addresses. Lent residents use the common location map. With the class layout the
@@ -253,7 +257,7 @@ public:
     // file promotions the rings do not hold, straight into their final slot, copies to and from VRAM
     // through `l1`. The worker must be stopped and the device idle. Publish with set_homes(..., true).
     bool install_relabel(const install_transaction & tx, const expert_locations & before, l1_arena & l1,
-                         l2_install_stats & stats, std::string & reason);
+                         l2_install_stats & stats, std::string & reason, const l2_demotion_policy * demote = nullptr);
     // Reads a batch of install slices. With the class layout a `direct` read goes straight into its
     // host resident slot, every other read into a ring slot of its storage class that this picks,
     // and `slot` comes back as the storage slot read into.

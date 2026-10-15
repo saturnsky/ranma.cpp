@@ -808,34 +808,49 @@ inline install_transaction plan_install(const geometry & geo,
             }
         } else if (unequal) {
             // Exclusive, unequal exchange: a demotion needs a free host slot (or goes to the file) and
-            // frees its VRAM slot; a promotion needs a free VRAM slot and frees its host source. Each
-            // batch first runs the demotions that find a host destination, then the promotions that
-            // find a free VRAM slot, so the counts of the two sides may differ.
+            // frees its VRAM slot; a promotion needs a free VRAM slot and frees its host source. The two
+            // alternate, one demotion then one promotion, so each promotion can release the source a later
+            // demotion takes (expert-l2-relabel.h: a one-pass demotion takes the ring slot a promotion read);
+            // the counts of the two sides may differ. A demotion without a host slot waits for the next batch.
             std::vector<bool> busy(before.gpu[c], false);
             for (auto item : outgoing) { busy[previous_gpu[item.first][item.second]] = true; }
             size_t pi = 0, di = 0;
             for (int batch = 0; pi < incoming.size() || di < outgoing.size(); ++batch) {
                 bool progress = false;
-                for (; di < outgoing.size(); ++di, progress = true) {
-                    const auto item = outgoing[di];
-                    const int g = previous_gpu[item.first][item.second];
-                    if (want_h[item.first][item.second]) {
-                        if (!fill_host(item.first, item.second, batch, {expert_storage::vram, g})) { break; }
-                    } else if (!has_file) {
-                        return fail("demotion has no destination");
+                bool d_blocked = false, p_blocked = false;
+                while (!(d_blocked || di >= outgoing.size()) || !(p_blocked || pi >= incoming.size())) {
+                    if (!d_blocked && di < outgoing.size()) {
+                        const auto item = outgoing[di];
+                        const int g = previous_gpu[item.first][item.second];
+                        if (want_h[item.first][item.second]) {
+                            d_blocked = !fill_host(item.first, item.second, batch, {expert_storage::vram, g});
+                        } else if (!has_file) {
+                            return fail("demotion has no destination");
+                        }
+                        if (!d_blocked) {
+                            busy[g] = false;
+                            ++di;
+                            progress = true;
+                            p_blocked = false;   // a VRAM slot is free now
+                        }
                     }
-                    busy[g] = false;
-                }
-                size_t slot = 0;
-                for (; pi < incoming.size(); ++pi, progress = true) {
-                    while (slot < gpu_taken.size() && (gpu_taken[slot] || busy[slot])) { ++slot; }
-                    if (slot == gpu_taken.size()) { break; }
-                    const auto item = incoming[pi];
-                    const auto source = previous_host[item.first][item.second];
-                    if (!source.resident() && !has_file) { return fail("promotion has no source"); }
-                    emit(item.first, item.second, batch, source, {expert_storage::vram, int(slot)});
-                    out.gpu_slots[item.first][item.second] = int(slot); gpu_taken[slot] = true;
-                    release_source(item.first, item.second);
+                    if (!p_blocked && pi < incoming.size()) {
+                        size_t slot = 0;
+                        while (slot < gpu_taken.size() && (gpu_taken[slot] || busy[slot])) { ++slot; }
+                        if (slot == gpu_taken.size()) {
+                            p_blocked = true;
+                        } else {
+                            const auto item = incoming[pi];
+                            const auto source = previous_host[item.first][item.second];
+                            if (!source.resident() && !has_file) { return fail("promotion has no source"); }
+                            emit(item.first, item.second, batch, source, {expert_storage::vram, int(slot)});
+                            out.gpu_slots[item.first][item.second] = int(slot); gpu_taken[slot] = true;
+                            release_source(item.first, item.second);
+                            ++pi;
+                            progress = true;
+                            d_blocked = false;   // a host slot may be free now
+                        }
+                    }
                 }
                 if (!progress) { return fail("exclusive exchange has no free slot"); }
             }

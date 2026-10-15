@@ -1832,6 +1832,7 @@ public:
         }
         lend_last_moves_ = ev.ops.size();
         lend_last_d2h_   = install_last_d2h_;
+        lend_last_dropped_ = install_last_dropped_;
         GGML_UNUSED(held);
         return true;
     }
@@ -1924,6 +1925,7 @@ public:
         }
         lend_last_d2h_ = 0;
         lend_last_moves_ = 0;
+        lend_last_dropped_ = 0;
         if (more && !lend_evict_locked(plan)) {
             return false;
         }
@@ -1988,10 +1990,11 @@ public:
         // the bytes to host are the install's own copies out of VRAM (its d2h), the moves its relocations in VRAM
         GGML_LOG_INFO("expert cache: prefill lend %llu (%s): %.1f MiB VRAM in %zu pieces from %d lent L1 slots (%s per class kept), "
                       "%zu experts evicted now (%.1f MiB, the lowest ranked: scores %llu..%llu, %zu kept residents, %zu moved down, "
-                      "%.1f MiB copied to host), nothing from host memory in %.1f ms\n",
+                      "%.1f MiB copied to host, %zu dropped to the file), nothing from host memory in %.1f ms\n",
             (unsigned long long) (lend_counts_.acquires + lend_counts_.retakes), expl ? "layer-major" : "ubatch op",
             dev_bytes/1048576.0, n_dev, held_slots, split_text(plan.limit).c_str(), new_victims, ev_bytes/1048576.0,
-            (unsigned long long) lo, (unsigned long long) hi_score, residents, lend_last_moves_, lend_last_d2h_/1048576.0, ms);
+            (unsigned long long) lo, (unsigned long long) hi_score, residents, lend_last_moves_, lend_last_d2h_/1048576.0,
+            lend_last_dropped_, ms);
         lend_log_packing_locked(lend_counts_.acquires + lend_counts_.retakes, req, plan, plan.victims);
         return true;
     }
@@ -2067,6 +2070,7 @@ public:
         lend_holder_stream_ = cctx->stream();
         lend_last_d2h_ = 0;
         lend_last_moves_ = sp.moves.size();
+        lend_last_dropped_ = 0;
         // the pieces, and the zero head of the first lent slot (MMQ reads past the last row of the slot below it)
         lend_pieces_.clear();
         size_t di = 0, dev_bytes = 0, n_dev = 0;
@@ -4483,13 +4487,15 @@ private:
             /*unequal =*/ unequal_ && cfg_.mode == GGML_EXPERT_MODE_EXCLUSIVE);
         if (!tx.valid) { abort_locked(("install transaction: " + tx.reason).c_str()); }
         install_last_d2h_ = tx.d2h_bytes;
+        install_last_dropped_ = 0;
         std::string reason;
         // Class layout: the moves run as relabels of the storage slots (the rings keep their
         // contents); the separate ring of direct tier users goes through the mover.
         const bool relabel = tier_->relabel_installs();
         l2_install_stats moved;
         if (relabel) {
-            if (!tier_->install_relabel(tx, l1_->locations(), *l1_, moved, reason)) {
+            const l2_demotion_policy demote = demotion_policy_locked(plan.scores);
+            if (!tier_->install_relabel(tx, l1_->locations(), *l1_, moved, reason, &demote)) {
                 abort_locked(("install relabel: " + reason).c_str());
             }
             // the unified policy: the rings start every plan from its profile
@@ -4497,6 +4503,9 @@ private:
                     !tier_->reseed_unified(plan.scores, tx.gpu_slots, tier_->unified_reseed() == 2, moved, reason)) {
                 abort_locked(("unified reseed: " + reason).c_str());
             }
+            // the bytes actually copied out of VRAM (a dropped demotion copies nothing)
+            install_last_d2h_ = moved.d2h_bytes;
+            install_last_dropped_ = moved.dropped;
         } else {
             if (!l1_->execute(tx)) { abort_locked("the install mover refused a move"); }
             for (const auto & move : tx.moves) for (int k = 0; k < geometry::n_kinds; ++k) {
@@ -4528,9 +4537,12 @@ private:
         const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
         std::string relabel_text;
         if (unified) {
-            char text[224];
-            snprintf(text, sizeof(text), " unified: %zu demotions into the rings, reseed-read %zu slices / %zu MiB in %.1f ms",
-                moved.unified_demoted, moved.reseed_slices, moved.reseed_bytes/(1024*1024), moved.reseed_ms);
+            char text[512];
+            snprintf(text, sizeof(text), " unified: %zu demotions into the rings (%zu slices / %zu MiB copied: %zu into empty "
+                     "slots, %zu into released slots, %zu over a lower valued occupant, %zu needless evictions), %zu dropped to the "
+                     "file (%zu MiB not copied), reseed-read %zu slices / %zu MiB in %.1f ms", moved.unified_demoted, moved.d2h_slices,
+                moved.d2h_bytes/(1024*1024), moved.kept_empty, moved.kept_released, moved.kept_evicting, moved.needless,
+                moved.dropped, moved.dropped_bytes/(1024*1024), moved.reseed_slices, moved.reseed_bytes/(1024*1024), moved.reseed_ms);
             relabel_text = text;
         }
         if (relabel) {
@@ -4546,8 +4558,8 @@ private:
                       "h2d=%zu slices / %zu MiB d2h=%zu slices / %zu MiB ssd=%zu slices / %zu MiB%s in %.1f ms\n",
             id, bank_label_locked(plan.bank), cfg_.mode == GGML_EXPERT_MODE_INCLUSIVE ? "inclusive" : "exclusive",
             prompt ? "prompt" : "decode", repartition ? " (changed)" : "", tx.retained_gpu, tx.retained_host,
-            tx.h2d_slices, tx.h2d_bytes/(1024*1024), tx.d2h_slices, tx.d2h_bytes/(1024*1024),
-            tx.ssd_slices, tx.ssd_bytes/(1024*1024), relabel_text.c_str(), ms);
+            tx.h2d_slices, tx.h2d_bytes/(1024*1024), relabel ? moved.d2h_slices : tx.d2h_slices,
+            (relabel ? moved.d2h_bytes : tx.d2h_bytes)/(1024*1024), tx.ssd_slices, tx.ssd_bytes/(1024*1024), relabel_text.c_str(), ms);
         if (cfg_.log_mask & GGML_EXPERT_LOG_L2) {
             // ssd_bytes: every move from the file, as before; read_bytes: what was actually read
             // (equal to ssd_bytes without relabel installs)
@@ -4555,11 +4567,13 @@ private:
                           "\"h2d_bytes\":%zu,\"d2h_bytes\":%zu,\"ssd_bytes\":%zu,\"ring_before\":%d,\"ring_after\":%d,"
                           "\"relabel\":%d,\"read_slices\":%zu,\"read_bytes\":%zu,\"relabel_slices\":%zu,\"relabel_bytes\":%zu,"
                           "\"ring_copy_slices\":%zu,\"ring_copy_bytes\":%zu,\"ring_occupants_before\":%zu,\"ring_kept\":%zu,"
-                          "\"ring_occupants_after\":%zu,\"demoted_to_ring\":%zu,\"read_batches\":%d}\n",
-                bank_label_locked(plan.bank), id, ms, tx.h2d_bytes, tx.d2h_bytes, tx.ssd_bytes, ring_before, tier_->ring_count(),
+                          "\"ring_occupants_after\":%zu,\"demoted_to_ring\":%zu,\"read_batches\":%d,\"kept_empty\":%zu,"
+                          "\"kept_released\":%zu,\"kept_evicting\":%zu,\"needless_evictions\":%zu,\"dropped\":%zu,\"dropped_bytes\":%zu}\n",
+                bank_label_locked(plan.bank), id, ms, tx.h2d_bytes, relabel ? moved.d2h_bytes : tx.d2h_bytes, tx.ssd_bytes, ring_before, tier_->ring_count(),
                 relabel ? 1 : 0, moved.read_slices, moved.read_bytes, moved.relabel_slices, moved.relabel_bytes,
                 moved.ring_copy_slices, moved.ring_copy_bytes, moved.ring_before, moved.ring_kept, moved.ring_after,
-                moved.demoted, moved.batches);
+                moved.demoted, moved.batches, moved.kept_empty, moved.kept_released, moved.kept_evicting, moved.needless,
+                moved.dropped, moved.dropped_bytes);
         }
         if (id != GGML_EXPERT_PLAN_NONE) {
             finish_plan_locked(id);
@@ -4567,6 +4581,50 @@ private:
         verify_all_locked();
         if (joint_) { log_members_locked("after install"); }
         return true;
+    }
+
+    // The demotions from VRAM of an install (expert-l2-relabel.h): one pass to the final place, valued by the install's
+    // profile `scores` (the reseed's value: selections x the bytes a choice saves reading; empty = all equal); an L2 of -1
+    // never drops. RANMA_EXPERT_TEST_DROP (diagnostic, off by default): "all" drops every demotion of a unified class,
+    // "L:E,L:E,..." the listed experts; a dropped expert keeps only the file as its source.
+    l2_demotion_policy demotion_policy_locked(const std::vector<uint64_t> & scores) {
+        if (!drop_test_read_) {
+            drop_test_read_ = true;
+            const char * v = getenv("RANMA_EXPERT_TEST_DROP");
+            if (v != nullptr && *v != '\0' && strcmp(v, "0") != 0) {
+                const size_t E = (size_t) geo_.n_experts;
+                drop_test_.assign((size_t) geo_.n_layers*E, strcmp(v, "all") == 0 ? 1 : 0);
+                for (const char * p = v; strcmp(v, "all") != 0 && *p != '\0';) {
+                    char * end = nullptr;
+                    const long l = strtol(p, &end, 10);
+                    if (end == p || *end != ':') { break; }
+                    const long e = strtol(end + 1, &end, 10);
+                    if (l >= 0 && l < geo_.n_layers && e >= 0 && (size_t) e < E) { drop_test_[(size_t) l*E + (size_t) e] = 1; }
+                    p = *end == ',' ? end + 1 : end;
+                }
+                size_t n = 0;
+                for (uint8_t d : drop_test_) { n += d; }
+                GGML_LOG_WARN("expert cache: RANMA_EXPERT_TEST_DROP=%s: %zu experts are dropped to the file when they leave VRAM "
+                              "(diagnostic)\n", v, n);
+            }
+        }
+        l2_demotion_policy p;
+        p.one_pass = true;
+        p.keep_all = l2_auto_;
+        if (scores.size() >= (size_t) geo_.n_layers*(size_t) geo_.n_experts) {
+            const std::vector<uint64_t> * sc = &scores;
+            const geometry * geo = &geo_;
+            p.value = [sc, geo](int l, int e) {
+                const int cls = geo->layer_class[l];
+                return cls < 0 ? 0.0 : double((*sc)[(size_t) l*(size_t) geo->n_experts + (size_t) e])*double(geo->class_total_bytes(cls));
+            };
+        }
+        if (!drop_test_.empty()) {
+            const std::vector<uint8_t> * d = &drop_test_;
+            const size_t E = (size_t) geo_.n_experts;
+            p.force_drop = [d, E](int l, int e) { return (*d)[(size_t) l*E + (size_t) e] != 0; };
+        }
+        return p;
     }
 
     void report_tier_plan_locked(const char * what) const {
@@ -5796,7 +5854,10 @@ private:
     cudaStream_t lend_holder_stream_ = nullptr;
     cudaStream_t lend_stream_ = nullptr;           // the lend's own copies (tables, heads)
     std::vector<size_t> lend_guard_;               // [class*3 + kind] zero bytes at the start of a lent slot
+    size_t lend_last_dropped_ = 0, install_last_dropped_ = 0;   // demotions of the last eviction / tier install dropped to the file
     size_t lend_last_d2h_ = 0, lend_last_moves_ = 0;   // the last eviction install's VRAM -> host bytes and its moves
+    bool drop_test_read_ = false;
+    std::vector<uint8_t> drop_test_;               // RANMA_EXPERT_TEST_DROP (diagnostic), empty = off
     size_t install_last_d2h_ = 0;                  // the VRAM -> host bytes of the last tier install (its d2h)
     int32_t * lend_restore_dev_ = nullptr;         // [layer][expert]
     uint32_t * lend_bits_dev_ = nullptr;           // [layer][words]
