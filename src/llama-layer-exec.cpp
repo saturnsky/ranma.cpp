@@ -1139,7 +1139,8 @@ int llama_context::layer_exec_decode(llama_memory_context_i * mctx, uint32_t n_t
         }
         n_outputs = 1;
         llm_graph_result_ptr res(new llm_graph_result(graph_max_nodes((uint32_t) n)));
-        const auto gparams = graph_params(res.get(), ub, mc, LLM_GRAPH_TYPE_DEFAULT);
+        auto gparams = graph_params(res.get(), ub, mc, LLM_GRAPH_TYPE_DEFAULT);
+        gparams.layer_exec = true;
         res->reset();
         ggml_backend_sched_reset(sc);
         if (model.build_graph(gparams) == nullptr) {
@@ -1927,7 +1928,8 @@ int llama_context::layer_exec_decode(llama_memory_context_i * mctx, uint32_t n_t
             n_outputs = n_out;
 
             c.res.reset(new llm_graph_result(graph_max_nodes(ub.n_tokens)));
-            const auto gparams = graph_params(c.res.get(), ub, mctx, LLM_GRAPH_TYPE_DEFAULT);
+            auto gparams = graph_params(c.res.get(), ub, mctx, LLM_GRAPH_TYPE_DEFAULT);
+            gparams.layer_exec = true;
             c.res->reset();
             ggml_backend_sched_reset(sc);
             ggml_cgraph * gf = model.build_graph(gparams);

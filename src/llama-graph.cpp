@@ -1161,6 +1161,13 @@ bool llm_graph_input_dsv4::can_reuse(const llm_graph_params & params) {
     }
     // the raw K views start at k_lo, a window of the same width elsewhere in the cache needs a new graph
     res &= inp_raw->k_lo == raw_ctx->get_k_lo();
+    // the staged raw cells are a window of the cache, another window needs a new graph
+    if (inp_raw->stage_n != 0) {
+        uint32_t lo = 0;
+        uint32_t n  = 0;
+        raw_ctx->get_chunk_window(0, params.ubatch.n_tokens, lo, n);
+        res &= inp_raw->stage_lo == lo && inp_raw->stage_n == n;
+    }
 
     res &= dsv4_can_reuse_comp_input(inp_csa, plan_csa, params.ubatch.n_tokens, n_stream);
     res &= dsv4_can_reuse_comp_input(inp_hca, plan_hca, params.ubatch.n_tokens, n_stream);
@@ -1686,6 +1693,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     cb_func          (params.cb),
     res              (params.res),
     expert_pred_mask { params.expert_pred_mask[0], params.expert_pred_mask[1] },
+    layer_exec       (params.layer_exec),
     ctx0             (res->get_ctx()),
     gf               (res->get_gf()) {
         res->set_params(params);

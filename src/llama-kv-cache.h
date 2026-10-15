@@ -232,6 +232,9 @@ public:
     // the caller does not read), the view then covers rows [n_skip, n_skip + n_kv_all)
     ggml_tensor * get_k_joint(ggml_context * ctx, int32_t il, uint32_t n_prefix, uint32_t n_kv_all, uint32_t n_skip = 0) const;
 
+    // ranma: the row of the joint K storage of the layer where its K starts, 0 without joint storage
+    uint32_t get_k_joint_prefix(int32_t il) const;
+
     // store k_cur and v_cur in the cache based on the provided head location
     ggml_tensor * cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const;
     ggml_tensor * cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il, const slot_info & sinfo) const;

@@ -610,6 +610,11 @@ public:
     // ranma: the first raw cell the graph reads (llama_kv_cache_dsv4_raw_context::get_k_lo), baked into its K views
     uint32_t k_lo = 0;
 
+    // ranma: DeepSeek-V4.1 copies only the raw cells [stage_lo, stage_lo + stage_n) that the ubatch can see into its
+    // staged K (llama_kv_cache_dsv4::init_kall_v41), baked into the graph; stage_n = 0 when nothing was staged
+    uint32_t stage_lo = 0;
+    uint32_t stage_n  = 0;
+
     const llama_cparams cparams;
 
     const llama_kv_cache_dsv4_raw_context * mctx;
@@ -841,6 +846,9 @@ struct llm_graph_params {
     // version of that choice (ggml_expert_iface::prefetch_layers)
     uint64_t expert_pred_mask[2] = { 0, 0 };
     uint32_t expert_pred_version = 0;
+
+    // ranma: the graph is cut into layer segments (llama-layer-exec.h), in which a state is written in one segment only
+    bool layer_exec = false;
 
     // return true if the "other" params would result in a graph with the same topology as with the current params
     //   having the same topology allows us to reuse the graph in some cases
@@ -1088,6 +1096,8 @@ struct llm_graph_context {
     llm_graph_result * res;
 
     uint64_t expert_pred_mask[2];   // see llm_graph_params
+
+    const bool layer_exec;          // see llm_graph_params
 
     ggml_context * ctx0 = nullptr;
     ggml_cgraph  * gf   = nullptr;
