@@ -941,6 +941,54 @@ bool test_file_only_restore() {
     return true;
 }
 
+// The eager restore after a plan install: the space keeps its pinned copies, the wanted list of the new plan (each
+// expert once, by layer) is served as a route: an expert only the file holds is read into the ring first, and the
+// copies wait until every kind of the generation is in place (a staged service); only the new wanted experts are copied.
+bool test_eager_install() {
+    const int E = 8, K = 0, A = 1, F = 2, G = 3;
+    // the space of 4 slots holds K, pinned; the new plan wants K (kept), A (in the ring) and F, G (file only)
+    sim_space sp;
+    sp.open(20, 4);
+    std::vector<std::vector<int32_t>> dev(1, std::vector<int32_t>((size_t) E, -1));
+    sp.own[0] = K; sp.pin[0] = 1; dev[0][(size_t) K] = 20;
+    std::vector<lend_restore> wanted;
+    for (int e : { A, F, A, G }) { lend_restore r; r.layer = 0; r.expert = e; r.cls = 0; wanted.push_back(r); }
+    const auto by = lend_eager_batches(wanted, 1);
+    CHECK(by.size() == 1 && by[0] == std::vector<int32_t>({ A, F, G }));   // each once, K not in it
+    l2_class_ledger ring;
+    ring.reset(1, E, { 0 }, { 4 });
+    for (int i = 0; i < 4; ++i) { CHECK(ring.make_ring(0, i)); }
+    CHECK(ring.service(0, { A }, 1, [](int, int) { return false; }).ok);   // A sits in the ring already
+    ring.set_done(0, 1);
+    // the route: the tier reads F and G (three kinds each), A is a hit
+    const l2_service sv = ring.service(0, std::vector<int>(by[0].begin(), by[0].end()), 2, [&](int, int e) { return dev[0][(size_t) e] >= 0; });
+    CHECK(sv.ok && sv.hits == 1 && sv.misses == 2 && sv.reads.size() == 6);
+    // a staged generation: only kind 0 in place, the copies wait (nothing is copied yet)
+    uint32_t kind_ready[3] = { 2, 1, 1 };
+    std::vector<int32_t> want((size_t) E, -1);
+    for (int e : by[0]) { want[(size_t) e] = 1; }
+    std::vector<uint32_t> last_miss((size_t) E, lend_never);
+    uint32_t step = 0;
+    lend_space_copy out[lend_space_max_ids];
+    auto readable = [&](int e) { return ring.slot_of(0, e) >= 0 && lend_space_sources_ready(1, kind_ready, 2); };
+    int n = lend_space_step(by[0].data(), 1, (int) by[0].size(), (int) by[0].size(), E, 0, dev[0].data(), want.data(),
+        last_miss.data(), &step, 8, sp.first, sp.n, sp.own.data(), sp.pin.data(), sp.stamp.data(), &sp.clock, readable, out,
+        lend_space_max_ids, nullptr, false);
+    CHECK(n == 0);
+    // every kind in place: A, F, G are copied and pinned, K stays where it is
+    kind_ready[1] = kind_ready[2] = 2;
+    n = lend_space_step(by[0].data(), 1, (int) by[0].size(), (int) by[0].size(), E, 0, dev[0].data(), want.data(),
+        last_miss.data(), &step, 8, sp.first, sp.n, sp.own.data(), sp.pin.data(), sp.stamp.data(), &sp.clock, readable, out,
+        lend_space_max_ids, nullptr, false);
+    CHECK(n == 3);
+    for (int i = 0; i < n; ++i) {
+        CHECK(out[i].wanted == 1 && out[i].evicted < 0 && out[i].j != 0);
+        dev[0][(size_t) out[i].expert] = sp.first + out[i].j;
+    }
+    CHECK(sp.own[0] == K && sp.pin[0] == 1 && sp.pinned() == 4);
+    return true;
+}
+
 bool test_pack_edges() {
     std::vector<lend_fit> f;
     CHECK(lend_pack({}, {}, 256, f));
@@ -966,6 +1014,7 @@ int main(int argc, char ** argv) {
     test_space_cold();
     test_space_staged();
     test_file_only_restore();
+    test_eager_install();
     int n = 0;
     for (int i = 0; i < seeds; ++i) {
         const uint32_t seed = 1000u + (uint32_t) i;
