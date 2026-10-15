@@ -1330,6 +1330,36 @@ static int unified_tests() {
         CHECK((off.order(0) == std::vector<int>{4, 5, 6, 7, 3, 2, 1, 0}) && off.probation_count(0) == 0 && off.check(why));
         printf("PASS: unified policy: residents dissolve into the rings in score order, sink and adopt\n");
     }
+    // ---- dissolve: equal scores by the tie count, then spread over the layers --------------------------
+    {
+        // 3 layers of one class, 4 residents each: layer l, expert e in slot 4*l + e
+        bool made = true;
+        auto make = [&]() {
+            l2_class_ledger ledger;
+            ledger.reset(3, 16, {0, 0, 0}, {12}, 3);
+            for (int l = 0; l < 3; ++l) {
+                for (int e = 0; e < 4; ++e) { made = ledger.set_resident(0, 4*l + e, l, e) && made; }
+            }
+            ledger.set_unified(policy);
+            return ledger;
+        };
+        // all equal: a round robin over the layers from the front, lower expert first
+        l2_class_ledger a = make();
+        CHECK(a.dissolve([](int, int) { return 0.0; }) == 12 && a.check(why));
+        CHECK((a.order(0) == std::vector<int>{0, 4, 8, 1, 5, 9, 2, 6, 10, 3, 7, 11}));
+        l2_class_ledger a2 = make();
+        CHECK(a2.dissolve([](int, int) { return 0.0; }) == 12 && a2.order(0) == a.order(0));   // deterministic
+        // the lower tie count first (layer 2 here), the rest still spread over the layers it leaves
+        l2_class_ledger b = make();
+        CHECK(b.dissolve([](int, int) { return 0.0; }, [](int l, int) { return uint64_t(l == 2 ? 0 : 5); }) == 12 && b.check(why));
+        CHECK((b.order(0) == std::vector<int>{8, 9, 10, 11, 0, 4, 1, 5, 2, 6, 3, 7}));
+        // the score comes first: a lower score goes before every lower tie count, and higher scores stay at the end
+        l2_class_ledger c = make();
+        CHECK(c.dissolve([](int l, int e) { return l == 0 && e == 3 ? -1.0 : l == 1 && e == 0 ? 7.0 : 0.0; },
+                         [](int l, int) { return uint64_t(l == 2 ? 0 : 5); }) == 12 && c.check(why));
+        CHECK((made && c.order(0) == std::vector<int>{3, 8, 9, 10, 11, 5, 0, 6, 1, 7, 2, 4}));
+        printf("PASS: unified policy: dissolve orders equal scores by the tie count, then over the layers\n");
+    }
     // ---- the policy off is the plain ring, also after it was on --------------------------------------
     {
         const std::vector<int> storage = {0, 1, 0, 1};

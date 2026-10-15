@@ -4534,8 +4534,9 @@ private:
         if (!tx.valid) { abort_locked(("unified host policy: " + tx.reason).c_str()); }
         l2_install_stats moved;
         std::string reason;
+        const std::vector<uint64_t> ties = prompt_tie_counts_locked();
         if (!tier_->install_relabel(tx, l1_->locations(), *l1_, moved, reason) ||
-                !tier_->reseed_unified(tier_scores_, tx.gpu_slots, true, moved, reason)) {
+                !tier_->reseed_unified(tier_scores_, tx.gpu_slots, true, moved, reason, nullptr, &ties)) {
             abort_locked(("unified host policy: " + reason).c_str());
         }
         const expert_locations homes = unified_homes_locked(hold, &tx.host);
@@ -5211,8 +5212,9 @@ private:
                 abort_locked(("install relabel: " + reason).c_str());
             }
             // the unified policy: the rings start every plan from its profile
+            const std::vector<uint64_t> ties = unified && tier_->unified_reseed() > 0 ? prompt_tie_counts_locked() : std::vector<uint64_t>();
             if (unified && tier_->unified_reseed() > 0 &&
-                    !tier_->reseed_unified(plan.scores, tx.gpu_slots, tier_->unified_reseed() == 2, moved, reason)) {
+                    !tier_->reseed_unified(plan.scores, tx.gpu_slots, tier_->unified_reseed() == 2, moved, reason, nullptr, &ties)) {
                 abort_locked(("unified reseed: " + reason).c_str());
             }
             // the bytes actually copied out of VRAM (a dropped demotion copies nothing)
@@ -6271,6 +6273,20 @@ private:
     // times its weight (the relative cost of reading one of its bytes from host memory). The
     // greedy then ranks every (model, layer, expert) by weighted frequency per byte. A cache of one
     // model uses its scores unchanged.
+    // The counts of the prompt bank (the prefill profile), which order equal scores in the L2 rings: of two experts the
+    // decode profile scores alike, the one the prompts use less goes first. Empty while no prompt bank has records
+    // (at load the caller has not opened its banks yet): the rings then spread equal scores over the layers only.
+    std::vector<uint64_t> prompt_tie_counts_locked() const {
+        std::vector<uint64_t> out;
+        for (const bank_state & b : banks_) {
+            if (b.prompt && b.any_usable() && b.total_selections() != 0) {
+                joint_scores_locked(b, out);
+                break;
+            }
+        }
+        return out;
+    }
+
     void joint_scores_locked(const bank_state & b, std::vector<uint64_t> & out) const {
         if (!joint_) {
             if (!b.stores.empty() && b.stores[0] && b.usable[0]) {

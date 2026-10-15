@@ -423,11 +423,18 @@ struct l2_reseed_read {
 // layer; `vram` [layer][expert] slot or -1 (VRAM residents are not candidates). With `fill`, the
 // candidates the ring of a class can hold (best first) that it does not hold yet take, in score order,
 // its empty slots first and then the slots of the lowest scored occupants outside that set; the caller
-// reads them in. Either way every class list is laid out again in score order (dissolve). Nothing may
-// compute meanwhile. `scope` (per storage class, null = all) limits it to those classes.
+// reads them in. Either way every class list is laid out again in score order (dissolve), equal scores
+// by the lower `tie(layer, expert)` and then spread over the layers. Nothing may compute meanwhile.
+// `scope` (per storage class, null = all) limits it to those classes.
 template <typename Score>
 inline std::vector<l2_reseed_read> plan_unified_reseed(l2_class_ledger & ledger, const std::vector<int> & experts_of,
         const std::vector<std::vector<int32_t>> & vram, Score score, bool fill, const std::vector<uint8_t> * scope = nullptr) {
+    return plan_unified_reseed(ledger, experts_of, vram, score, [](int, int) { return uint64_t(0); }, fill, scope);
+}
+
+template <typename Score, typename Tie>
+inline std::vector<l2_reseed_read> plan_unified_reseed(l2_class_ledger & ledger, const std::vector<int> & experts_of,
+        const std::vector<std::vector<int32_t>> & vram, Score score, Tie tie, bool fill, const std::vector<uint8_t> * scope = nullptr) {
     std::vector<l2_reseed_read> out;
     const int layers = (int) experts_of.size();
     if (fill) {
@@ -480,7 +487,7 @@ inline std::vector<l2_reseed_read> plan_unified_reseed(l2_class_ledger & ledger,
             }
         }
     }
-    ledger.dissolve(score, scope);
+    ledger.dissolve(score, tie, scope);
     return out;
 }
 

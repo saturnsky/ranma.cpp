@@ -249,8 +249,11 @@ public:
     // no profile: nothing is read and the order stays) that are not VRAM residents of `vram`, reading what it
     // lacks when `fill`, and lays the rings out in score order. The worker must be stopped and the device idle.
     // `scope` (per storage class, null = the classes the policy applies to) limits it to those classes.
+    // Equal scores go by the lower count in `ties` (e.g. the prompt profile, same layout as `counts`; null or
+    // short = none) and are then spread over the layers (l2_class_ledger::dissolve).
     bool reseed_unified(const std::vector<uint64_t> & counts, const std::vector<std::vector<int32_t>> & vram, bool fill,
-                        l2_install_stats & stats, std::string & reason, const std::vector<uint8_t> * scope = nullptr);
+                        l2_install_stats & stats, std::string & reason, const std::vector<uint8_t> * scope = nullptr,
+                        const std::vector<uint64_t> * ties = nullptr);
     // The least ring slots a storage class has under the unified policy (every slot of its arena).
     int  class_slots(int s) const { return cledger_.ring_count(s); }
     // Runs the moves of `tx` (host locations `before` -> tx.host) by relabeling slots: reads only the

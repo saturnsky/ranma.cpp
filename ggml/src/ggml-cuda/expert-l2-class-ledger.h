@@ -26,6 +26,7 @@
 // one above.
 
 #include "expert-l2-ledger.h"
+#include "expert-plan.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -150,11 +151,19 @@ public:
 
     // Every resident slot joins the ring of its class in place, with its expert if it has one, and
     // each class list is laid out again: empty slots at the least recently used end, then the
-    // occupants from the lowest to the highest `score(layer, expert)`, ties in slot order. Only while
+    // occupants from the lowest to the highest `score(layer, expert)`. Equal scores go by the lower
+    // `tie(layer, expert)` first (e.g. the expert's count in the prompt profile), and what is still
+    // equal is spread over the layers (sort_balancing_ties): the victims a class takes from the least
+    // recently used end come from every layer evenly instead of from the first layers. Only while
     // nothing computes (every occupant is reusable at once). Returns the residents that joined.
     // `only` (per storage class, null = all) restricts it to those classes; the others keep their lists.
     template <typename Score>
     int dissolve(Score score, const std::vector<uint8_t> * only = nullptr) {
+        return dissolve(score, [](int, int) { return uint64_t(0); }, only);
+    }
+
+    template <typename Score, typename Tie>
+    int dissolve(Score score, Tie tie, const std::vector<uint8_t> * only = nullptr) {
         int joined = 0;
         for (int s = 0; s < storages(); ++s) {
             if (only != nullptr && !(*only)[(size_t) s]) { continue; }
@@ -171,8 +180,9 @@ public:
                     map_[(size_t) o.layer][(size_t) o.expert] = int(slot);
                 }
             }
+            struct held_item { double score; uint64_t tie; int layer, expert, slot; };
             std::vector<int> empties;
-            std::vector<std::pair<double, int>> held;
+            std::vector<held_item> held;
             for (size_t slot = 0; slot < row.size(); ++slot) {
                 owner & o = row[slot];
                 if (o.role != slot_role::ring) { continue; }
@@ -180,16 +190,17 @@ public:
                     empties.push_back(int(slot));
                 } else {
                     o.seq = done_[(size_t) o.layer];   // nothing computes
-                    held.push_back({double(score(o.layer, o.expert)), int(slot)});
+                    held.push_back({double(score(o.layer, o.expert)), uint64_t(tie(o.layer, o.expert)), o.layer, o.expert, int(slot)});
                 }
             }
-            std::stable_sort(held.begin(), held.end(),
-                [](const std::pair<double, int> & a, const std::pair<double, int> & b) { return a.first < b.first; });
+            detail::sort_balancing_ties(held, layers_, [](const held_item & a, const held_item & b) {
+                return a.score != b.score ? a.score < b.score : a.tie < b.tie;
+            });
             head_[(size_t) s] = tail_[(size_t) s] = -1;
             for (size_t slot = 0; slot < row.size(); ++slot) { prev_[(size_t) s][slot] = next_[(size_t) s][slot] = -1; }
             if (uni_.on) { unified_clear_lists(s); }
             for (int slot : empties) { link_tail(s, slot); }
-            for (const auto & item : held) { link_tail(s, item.second); }
+            for (const auto & item : held) { link_tail(s, item.slot); }
             if (uni_.on) { rebalance(s); }
         }
         ustats_.dissolved += (uint64_t) joined;
