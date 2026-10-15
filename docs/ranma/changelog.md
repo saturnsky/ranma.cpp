@@ -7,6 +7,17 @@ The series is rebuilt for every release and follow-up fixes are folded into the 
 release does not show a fix as a separate change. This file is where the fixes between releases are recorded.
 The refs and the release cycle are described in [releases.md](releases.md).
 
+## Next release (not tagged yet)
+
+### Removed
+
+- `LLAMA_DRAFT_SHARE_COMPUTE` (and its alias `LLAMA_MTP_SHARE_COMPUTE`): a drafting context always shares its
+  target's compute buffers when it can ([expert-cache-ub-pool.md](expert-cache-ub-pool.md)).
+- The redraw of the VRAM size-class split at plan installs (`RANMA_EXPERT_L1_REDRAW_BENEFIT`,
+  `RANMA_EXPERT_L1_REDRAW_MOVE`, off unless set) and its HIP virtual memory arenas: the size-class split stays
+  as the load sets it. The host address table and the chunked host arenas that exclusive mode with an unlimited
+  host tier had for it go as well.
+
 ## ranma_20261013
 
 Upstream base: `3d65c90d0`, tagged 2026-10-13
