@@ -24,6 +24,16 @@
 // and empties the ring copies of the VRAM promotions; plan_unified_reseed then brings each class's
 // ring to the best experts of a profile and lays it out in score order.
 //
+// A dropped demotion (l2_demotion_policy, unified classes only): a demotion from VRAM that is not copied at all. The
+// expert keeps no ring slot and no home; its source is the file, which the tier reads when a demand needs it.
+//
+// The one-pass demotion (l2_demotion_policy::one_pass, unified classes only): a demotion goes straight to its final
+// place. It keeps its copy (one D2H) in an empty ring slot, else in the ring slot of an expert an earlier move of this
+// transaction promoted to VRAM (that copy is no longer needed and its read was queued first), else in the slot of the
+// occupant of the lowest value, which it evicts. When the ring has neither an empty nor a released slot and the
+// demoted expert is worth less than every occupant, it is dropped. An occupant is never evicted while an empty or
+// released slot is left. `keep_all` (an L2 of -1, sized to hold every expert) never drops.
+//
 // A storage class can stay out of the policy for a while (`active`, per storage class, null = all): a
 // joint cache whose later model has not bound yet keeps that model's classes as residents and rings, and
 // they join the policy when it has (l2_tier::unify_storages). Every function below leaves the inactive
@@ -32,7 +42,9 @@
 #include "expert-l2-class-ledger.h"
 #include "expert-plan.h"
 
+#include <array>
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -44,7 +56,16 @@ struct l2_install_step {
     int  dst     = -1;     // storage slot that becomes the home of a host destination
     bool read    = false;  // read the file first: into `dst` for a host destination, into `src` for a VRAM one
     bool relabel = false;  // host destination whose ring slot already held the expert: nothing moves
+    bool drop    = false;  // a demotion from VRAM that is not copied: the expert stays in the file only
     int  batch   = -1;     // moves from the file: the read batch
+};
+
+// What happens to the demotions from VRAM of a unified class.
+struct l2_demotion_policy {
+    std::function<bool(int, int)> force_drop;    // (layer, expert): drop this demotion (diagnostic)
+    bool one_pass = false;                        // the one-pass place (above); off: the least recently used ring slot
+    bool keep_all = false;                        // never drop (an L2 of -1)
+    std::function<double(int, int)> value;       // (layer, expert): the profile value of keeping it; null: all equal
 };
 
 struct l2_install_plan {
@@ -57,6 +78,10 @@ struct l2_install_plan {
     size_t reads       = 0;   // moves read from the file
     size_t demoted     = 0;   // residents that stayed in their slot as ring occupants
     int    batches     = 0;
+    size_t dropped     = 0;   // demotions from VRAM not copied (l2_install_step::drop)
+    // one-pass demotions kept in an empty slot, in a released slot, over an evicted occupant of a lower value; and
+    // evictions made while an empty or released slot was left (0 by the rule)
+    size_t kept_empty = 0, kept_released = 0, kept_evicting = 0, needless = 0;
 };
 
 // `home_slot` [size class][logical slot] is the storage slot of every logical host slot; `before` and
@@ -65,7 +90,7 @@ struct l2_install_plan {
 inline l2_install_plan plan_relabel_install(l2_class_ledger & ledger, std::vector<std::vector<int>> & home_slot,
         const std::vector<int> & layer_class, const std::vector<int> & storage_of,
         const expert_locations & before, const expert_locations & after, const std::vector<install_move> & moves,
-        bool unified = false, const std::vector<uint8_t> * active = nullptr) {
+        bool unified = false, const std::vector<uint8_t> * active = nullptr, const l2_demotion_policy * demote = nullptr) {
     l2_install_plan out;
     // whether the unified policy applies to a size class / a storage class
     auto uni_s = [&](int s) { return unified && (active == nullptr || (*active)[(size_t) s] != 0); };
@@ -173,6 +198,45 @@ inline l2_install_plan plan_relabel_install(l2_class_ledger & ledger, std::vecto
         out.evicted.insert(out.evicted.end(), r.evicted.begin(), r.evicted.end());
         return r;
     };
+    std::vector<std::vector<uint8_t>> dropped((size_t) classes);
+    for (int c = 0; c < classes; ++c) { dropped[(size_t) c].assign(home_slot[(size_t) c].size(), 0); }
+    // the ring slots whose copy an earlier move promoted to VRAM: [storage class] (slot, layer, expert)
+    std::vector<std::vector<std::array<int, 3>>> released((size_t) ledger.storages());
+    auto value = [&](int l, int e) { return demote != nullptr && demote->value ? demote->value(l, e) : 0.0; };
+    // the one-pass place of a demotion of (layer, expert) in storage class s: a ring slot, or -1 to drop it
+    auto place_demotion = [&](int s, int layer, int expert) -> int {
+        int empty = -1, low = -1;
+        double low_v = 0.0;
+        for (int slot : ledger.order(s)) {
+            int l = -1, e = -1;
+            if (!ledger.reusable_slot(s, slot)) { continue; }
+            if (!ledger.occupant(s, slot, l, e)) {
+                if (empty < 0) { empty = slot; }
+                continue;
+            }
+            const double v = value(l, e);
+            if (low < 0 || v < low_v) { low = slot; low_v = v; }
+        }
+        if (empty >= 0) {
+            ++out.kept_empty;
+            return empty;
+        }
+        auto & rel = released[(size_t) s];
+        while (!rel.empty()) {
+            const std::array<int, 3> r = rel.back();
+            rel.pop_back();
+            if (ledger.owns(r[0], r[1], r[2]) && ledger.reusable_slot(s, r[0])) {
+                ++out.kept_released;
+                return r[0];
+            }
+        }
+        if (low < 0 || (!demote->keep_all && value(layer, expert) < low_v)) {
+            return -1;
+        }
+        ++out.kept_evicting;
+        out.needless += empty >= 0 || !rel.empty() ? 1 : 0;
+        return low;
+    };
     out.steps.resize(moves.size());
     for (size_t k = 0; k < moves.size(); ++k) {
         const install_move & m = moves[k];
@@ -200,6 +264,28 @@ inline l2_install_plan plan_relabel_install(l2_class_ledger & ledger, std::vecto
                 if (!ledger.relabel_to_ring(s, step.src, true, false)) { return fail("a host source is not a resident slot"); }
                 home_slot[(size_t) c][(size_t) i] = -1;
             }
+        } else if (m.from.storage == expert_storage::vram && uni_c(c) && demote != nullptr && demote->force_drop &&
+                demote->force_drop(m.layer, m.expert)) {
+            // dropped: no copy, no home; the file serves it
+            step.drop = true;
+            dropped[(size_t) c][(size_t) m.to.slot] = 1;
+            ++out.dropped;
+        } else if (m.from.storage == expert_storage::vram && uni_c(c) && demote != nullptr && demote->one_pass) {
+            // to host, in one pass: its final ring slot, or the file
+            const int t = place_demotion(s, m.layer, m.expert);
+            if (t < 0) {
+                if (demote->keep_all) {
+                    return fail("no ring slot of storage class " + std::to_string(s) + " for a demotion an L2 of -1 keeps");
+                }
+                step.drop = true;
+                dropped[(size_t) c][(size_t) m.to.slot] = 1;
+                ++out.dropped;
+                continue;
+            }
+            const l2_relabel r = home(s, t, m.layer, m.expert);
+            if (!r.ok) { return fail(r.reason); }
+            step.dst = t;
+            home_slot[(size_t) c][(size_t) m.to.slot] = t;
         } else if (m.from.storage == expert_storage::vram) {
             // to host: copied back into a ring slot that becomes the home
             const int t = take(s);
@@ -236,6 +322,7 @@ inline l2_install_plan plan_relabel_install(l2_class_ledger & ledger, std::vecto
                 if (held && !busy[(size_t) s][(size_t) q]) {
                     step.src = q;
                     ++out.ring_copies;
+                    if (uni_c(c)) { released[(size_t) s].push_back({q, m.layer, m.expert}); }
                 } else {
                     step.src = take(s);
                     if (step.src < 0) { return fail("no ring slot of storage class " + std::to_string(s) + " for a promotion to VRAM"); }
@@ -282,7 +369,7 @@ inline l2_install_plan plan_relabel_install(l2_class_ledger & ledger, std::vecto
             const int slot = home_slot[(size_t) c][i];
             const int want = new_of[(size_t) c][i];
             if (uni_c(c) && slot < 0) {
-                if (want >= 0) { return fail("a host resident of the new plan has no home"); }
+                if (want >= 0 && !dropped[(size_t) c][i]) { return fail("a host resident of the new plan has no home"); }
                 continue;
             }
             int l = -1, e = -1;

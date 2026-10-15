@@ -20,6 +20,7 @@
 #include <cstdlib>
 #include <map>
 #include <set>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -1426,12 +1427,14 @@ static int unified_tests() {
 // With `active` (per storage class) the classes outside it are the ones of a model that has not bound yet:
 // their layers keep their VRAM slices and host residents, and the whole install leaves their lists alone.
 static bool unified_install(relabel_world & w, const std::vector<uint64_t> & score, int reseed, l2_install_plan & plan,
-        size_t & reads, int & demoted, const std::vector<uint8_t> * active = nullptr) {
+        size_t & reads, int & demoted, const std::vector<uint8_t> * active = nullptr, const l2_demotion_policy * demote = nullptr,
+        bool unequal = false, const std::function<void(expert_slot_table &)> & edit = nullptr) {
     const int E = relabel_world::experts, L = relabel_world::layers;
     auto in_policy = [&](int s) { return active == nullptr || (*active)[(size_t) s] != 0; };
     auto held = [&](int l) { return !in_policy(w.storage_of[(size_t) w.geo.layer_class[l]]); };
     expert_slot_table gs, hs;
     w.choose(score, gs, hs);
+    if (edit) { edit(gs); }
     hs.assign(L, {});
     std::vector<int> room = w.layout.host;
     for (int l = 0; l < L; ++l) {
@@ -1452,9 +1455,9 @@ static bool unified_install(relabel_world & w, const std::vector<uint64_t> & sco
         }
     }
     const install_transaction tx = plan_install(w.geo, gs, hs, w.gpu, w.host, w.vram_caps, w.layout, w.layout, w.spares,
-        {false, w.spare}, true, true);
+        {false, w.spare}, true, true, unequal);
     if (!tx.valid) { return w.fail("plan_install: " + tx.reason); }
-    plan = plan_relabel_install(w.ledger, w.home_slot, w.geo.layer_class, w.storage_of, w.host, tx.host, tx.moves, true, active);
+    plan = plan_relabel_install(w.ledger, w.home_slot, w.geo.layer_class, w.storage_of, w.host, tx.host, tx.moves, true, active, demote);
     if (!plan.ok) { return w.fail("relabel: " + plan.reason); }
     for (size_t k = 0; k < tx.moves.size(); ++k) {
         const install_move & m = tx.moves[k];
@@ -1467,6 +1470,11 @@ static bool unified_install(relabel_world & w, const std::vector<uint64_t> & sco
             w.vram[m.cls][(size_t) m.to.slot] = key;
         } else if (m.from.storage == expert_storage::vram) {
             if (w.vram[m.cls][(size_t) m.from.slot] != key) { return w.fail("VRAM model"); }
+            if (st.drop) {
+                // nothing is copied: the expert keeps no ring slot
+                if (st.dst >= 0 || w.ledger.slot_of(m.layer, m.expert) >= 0) { return w.fail("a dropped demotion has a slot"); }
+                continue;
+            }
             w.content[s][(size_t) st.dst] = key;
         } else {
             return w.fail("a host source under the unified policy");
@@ -1579,6 +1587,141 @@ static int unified_install_tests() {
         CHECK(unified_install(w, scores({{0*E + 6, 1001}}), 1, plan, reads, demoted) && reads == 0);
         printf("PASS: unified install: VRAM promotions leave no ring copy, demotions join the ring at the probation point\n");
     }
+    // ---- a dropped demotion: no copy, no slot; the file is its source ----------------------------------
+    {
+        relabel_world w({6, 5}, false);
+        w.load(scores({}));
+        w.ledger.set_unified(policy);
+        for (int s = 0; s < 2; ++s) { w.ledger.set_probation_min(s, 2); }
+        l2_install_plan plan;
+        size_t reads = 0;
+        int demoted = 0;
+        CHECK(unified_install(w, scores({}), 2, plan, reads, demoted));
+        CHECK(w.gpu[0][5] >= 0 && w.ledger.slot_of(0, 5) < 0);
+        l2_demotion_policy drop;
+        drop.force_drop = [](int l, int e) { return l == 0 && e == 5; };
+        if (!unified_install(w, scores({{0*E + 6, 1001}}), 0, plan, reads, demoted, nullptr, &drop)) {
+            fprintf(stderr, "FAIL line %d: %s\n", __LINE__, w.error.c_str());
+            return 1;
+        }
+        CHECK(w.gpu[0][5] < 0 && w.ledger.slot_of(0, 5) < 0 && plan.dropped == 1 && demoted == 0);
+        // the next demand of the dropped expert is a miss the tier reads from the file
+        const uint32_t g = ++w.seq[0];
+        const l2_service got = w.ledger.service(0, {5}, g, [&](int l, int e) { return w.gpu[l][e] >= 0; });
+        CHECK(got.ok && got.misses == 1 && got.reads.size() == 3);
+        printf("PASS: unified install: a dropped demotion is not copied, keeps no ring slot, and its next demand reads the file\n");
+    }
+    // ---- the one-pass demotion: an empty slot, else a released one, else the lowest value or the file ----
+    {
+        auto occupants = [](const relabel_world & w) {
+            std::set<int> out;
+            for (int s = 0; s < 2; ++s) {
+                for (int slot = 0; slot < w.ledger.slots(s); ++slot) {
+                    int l = -1, e = -1;
+                    if (w.ledger.occupant(s, slot, l, e)) { out.insert(l*E + e); }
+                }
+            }
+            return out;
+        };
+        // (a) a full ring and a swap of three experts: the demotions take the slots of the promoted ring copies and evict
+        // nothing; without the one-pass rule they evict three occupants (the 2026-10-15 install order problem)
+        for (int one_pass = 1; one_pass >= 0; --one_pass) {
+            relabel_world w({6, 5}, false);
+            w.load(scores({}));
+            w.ledger.set_unified(policy);
+            for (int s = 0; s < 2; ++s) { w.ledger.set_probation_min(s, 2); }
+            l2_install_plan plan;
+            size_t reads = 0;
+            int demoted = 0;
+            CHECK(unified_install(w, scores({}), 2, plan, reads, demoted));
+            int empty = 0;
+            for (int slot = 0; slot < w.ledger.slots(0); ++slot) { int l, e; empty += w.ledger.occupant(0, slot, l, e) ? 0 : 1; }
+            CHECK(empty == 0);   // the reseed filled the ring of storage class 0
+            const std::vector<uint64_t> sc = scores({{0*E + 6, 2000}, {0*E + 7, 1990}, {0*E + 8, 1980}});
+            CHECK(w.ledger.slot_of(0, 6) >= 0 && w.ledger.slot_of(0, 7) >= 0 && w.ledger.slot_of(0, 8) >= 0);
+            const std::set<int> before = occupants(w);
+            l2_demotion_policy pol;
+            pol.one_pass = one_pass != 0;
+            pol.value = [&](int l, int e) { return double(sc[(size_t) (l*E + e)]); };
+            if (!unified_install(w, sc, 0, plan, reads, demoted, nullptr, &pol)) {
+                fprintf(stderr, "FAIL line %d: %s\n", __LINE__, w.error.c_str());
+                return 1;
+            }
+            int lost = 0;
+            for (int key : before) {
+                const int l = key/E, e = key%E;
+                lost += w.ledger.slot_of(l, e) < 0 && w.gpu[l][e] < 0 ? 1 : 0;
+            }
+            CHECK(demoted == 3 && plan.ring_copies == 3 && plan.dropped == 0);
+            if (one_pass) {
+                CHECK(plan.kept_released == 3 && plan.kept_empty == 0 && plan.kept_evicting == 0 && plan.needless == 0 && lost == 0);
+            } else {
+                CHECK(lost == 3);
+            }
+        }
+        // (b) a full ring, one demotion and no promotion (an unequal exchange, as a lend's eviction): dropped when it is
+        // worth less than every occupant, kept over the lowest valued occupant otherwise; an L2 of -1 keeps it
+        for (int mode = 0; mode < 3; ++mode) {
+            relabel_world w({6, 5}, false);
+            w.load(scores({}));
+            w.ledger.set_unified(policy);
+            for (int s = 0; s < 2; ++s) { w.ledger.set_probation_min(s, 2); }
+            l2_install_plan plan;
+            size_t reads = 0;
+            int demoted = 0;
+            CHECK(unified_install(w, scores({}), 2, plan, reads, demoted));
+            CHECK(w.gpu[0][5] >= 0);
+            // layer 0 expert 5 leaves VRAM; its value: 0 (mode 0, 2) or above every occupant (mode 1)
+            std::vector<uint64_t> sc = scores({});
+            sc[(size_t) (0*E + 5)] = mode == 1 ? 5000 : 0;
+            int low_key = -1;
+            double low_v = 0;
+            for (int slot : w.ledger.order(0)) {
+                int l = -1, e = -1;
+                if (w.ledger.occupant(0, slot, l, e) && (low_key < 0 || double(sc[(size_t) (l*E + e)]) < low_v)) {
+                    low_key = l*E + e; low_v = double(sc[(size_t) (l*E + e)]);
+                }
+            }
+            const std::set<int> before = occupants(w);
+            l2_demotion_policy pol;
+            pol.one_pass = true;
+            pol.keep_all = mode == 2;
+            pol.value = [&](int l, int e) { return double(sc[(size_t) (l*E + e)]); };
+            auto drop5 = [](expert_slot_table & gs) { gs[0].erase(std::find(gs[0].begin(), gs[0].end(), 5)); };
+            if (!unified_install(w, scores({}), 0, plan, reads, demoted, nullptr, &pol, true, drop5)) {
+                fprintf(stderr, "FAIL line %d: %s\n", __LINE__, w.error.c_str());
+                return 1;
+            }
+            CHECK(w.gpu[0][5] < 0 && plan.ring_copies == 0 && plan.needless == 0);
+            if (mode == 0) {
+                CHECK(plan.dropped == 1 && demoted == 0 && w.ledger.slot_of(0, 5) < 0 && occupants(w) == before);
+            } else {
+                CHECK(plan.dropped == 0 && plan.kept_evicting == 1 && demoted == 1 && w.ledger.slot_of(0, 5) >= 0);
+                CHECK(w.ledger.slot_of(low_key/E, low_key%E) < 0);   // the lowest valued occupant went
+            }
+        }
+        // (c) a ring with empty slots: the demotion takes one and evicts nothing
+        {
+            relabel_world w({6, 5}, false);
+            w.load(scores({}));
+            w.ledger.set_unified(policy);
+            for (int s = 0; s < 2; ++s) { w.ledger.set_probation_min(s, 2); }
+            l2_install_plan plan;
+            size_t reads = 0;
+            int demoted = 0;
+            CHECK(unified_install(w, scores({}), 0, plan, reads, demoted));
+            const std::set<int> before = occupants(w);
+            l2_demotion_policy pol;
+            pol.one_pass = true;
+            pol.value = [](int, int) { return 0.0; };   // worth nothing: still kept while a slot is empty
+            auto drop5 = [](expert_slot_table & gs) { gs[0].erase(std::find(gs[0].begin(), gs[0].end(), 5)); };
+            CHECK(unified_install(w, scores({}), 0, plan, reads, demoted, nullptr, &pol, true, drop5));
+            CHECK(plan.kept_empty == 1 && plan.kept_evicting == 0 && plan.dropped == 0 && w.ledger.slot_of(0, 5) >= 0);
+            for (int key : before) { CHECK(w.ledger.slot_of(key/E, key%E) >= 0); }
+        }
+        printf("PASS: unified install: one-pass demotions take an empty slot, else a released one, else the lowest value "
+               "or the file; an L2 of -1 never drops\n");
+    }
     // ---- random plans, demands and reseed modes ---------------------------------------------------
     {
         for (int round = 0; round < 3; ++round) {
@@ -1596,7 +1739,11 @@ static int unified_install_tests() {
                 if (next()%10 == 0) {
                     std::vector<uint64_t> sc = scores({});
                     for (auto & v : sc) { v = 1 + next()%1000; }
-                    CHECK(unified_install(w, sc, int(next()%3), plan, reads, demoted));
+                    l2_demotion_policy pol;
+                    pol.one_pass = round == 2;
+                    pol.value = [&](int l, int e) { return double(sc[(size_t) (l*E + e)]); };
+                    CHECK(unified_install(w, sc, int(next()%3), plan, reads, demoted, nullptr, &pol, next()%2 == 0));
+                    CHECK(plan.needless == 0);
                     continue;
                 }
                 const int layer = int(next()%relabel_world::layers);

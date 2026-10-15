@@ -791,7 +791,7 @@ bool l2_tier::read_install(std::vector<l2_read> & reads, std::string & reason) {
 }
 
 bool l2_tier::install_relabel(const install_transaction & tx, const expert_locations & before, l1_arena & l1,
-        l2_install_stats & stats, std::string & reason) {
+        l2_install_stats & stats, std::string & reason, const l2_demotion_policy * demote) {
     GGML_ASSERT(relabel_installs() && !worker_running() && mapped_);
     std::lock_guard<std::mutex> lock(io_mutex_);
     stats = {};
@@ -808,7 +808,7 @@ bool l2_tier::install_relabel(const install_transaction & tx, const expert_locat
     }
     stats.ring_before = occupants.size();
     const l2_install_plan plan = plan_relabel_install(cledger_, home_slot_, geo_.layer_class, storage_.storage_of,
-        before, tx.host, tx.moves, unified(), unified_active());
+        before, tx.host, tx.moves, unified(), unified_active(), demote);
     if (!plan.ok) {
         reason = plan.reason;
         return false;
@@ -862,6 +862,13 @@ bool l2_tier::install_relabel(const install_transaction & tx, const expert_locat
             continue;
         }
         const l2_install_step & step = plan.steps[k];
+        if (step.drop) {
+            // a dropped demotion: nothing is copied, the file is its only source
+            ++stats.dropped;
+            stats.dropped_bytes += geo_.class_total_bytes(m.cls);
+            ++k;
+            continue;
+        }
         for (int kind = 0; kind < geometry::n_kinds; ++kind) {
             const bool ok = m.from.storage == expert_storage::host ?
                 l1.write_gpu_slice(m.cls, kind, m.to.slot, payload(m.layer, kind, step.src), false) :
@@ -871,7 +878,11 @@ bool l2_tier::install_relabel(const install_transaction & tx, const expert_locat
                 return false;
             }
         }
-        if (m.from.storage == expert_storage::vram) { copied_back.push_back(k); }
+        if (m.from.storage == expert_storage::vram) {
+            copied_back.push_back(k);
+            ++stats.d2h_slices;
+            stats.d2h_bytes += geo_.class_total_bytes(m.cls);
+        }
         ++k;
     }
     if (!l1.sync_copies()) {
@@ -895,6 +906,10 @@ bool l2_tier::install_relabel(const install_transaction & tx, const expert_locat
     counters_.install_ring_copy_bytes += stats.ring_copy_bytes;
     stats.demoted = plan.demoted;
     stats.batches = plan.batches;
+    stats.kept_empty    = plan.kept_empty;
+    stats.kept_released = plan.kept_released;
+    stats.kept_evicting = plan.kept_evicting;
+    stats.needless      = plan.needless;
     if (unified()) {
         // every copy completed above: the ring copies of the VRAM promotions can go, the demotions join the rings
         stats.unified_demoted = (size_t) settle_unified(cledger_, home_slot_, tx.gpu_slots, unified_active(), &storage_.storage_of);

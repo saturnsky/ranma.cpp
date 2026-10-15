@@ -434,6 +434,12 @@ public:
         }
     }
 
+    // Whether a ring slot of a class is free of any lease (an install may take it).
+    bool reusable_slot(int s, int slot) const {
+        return valid_slot(s, slot) && owners_[(size_t) s][(size_t) slot].role == slot_role::ring &&
+            reusable(owners_[(size_t) s][(size_t) slot]);
+    }
+
     // Ring slots of a class whose occupant's generation the GPU has not finished yet (not reusable).
     int ring_busy(int s) const {
         int n = 0;
