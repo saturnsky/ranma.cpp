@@ -1448,6 +1448,15 @@ bool llama_kv_cache::has_k_joint() const {
     return k_joint_used;
 }
 
+uint32_t llama_kv_cache::get_k_joint_prefix(int32_t il) const {
+    const auto it = map_layer_ids.find(il);
+    if (it == map_layer_ids.end() || layers[it->second].k_joint == nullptr) {
+        return 0;
+    }
+
+    return layers[it->second].k_joint_prefix;
+}
+
 ggml_tensor * llama_kv_cache::get_k_joint(ggml_context * ctx, int32_t il, uint32_t n_prefix, uint32_t n_kv_all, uint32_t n_skip) const {
     const auto it = map_layer_ids.find(il);
     if (it == map_layer_ids.end()) {

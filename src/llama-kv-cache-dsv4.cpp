@@ -1301,6 +1301,12 @@ void llama_kv_cache_dsv4::init_kall(
                  uint32_t   n_ubatch) {
     raw_nkv_min_tokens = DSV4_RAW_NKV_MIN_TOKENS;
 
+    // ranma: DeepSeek-V4.1 shares the compressed cells of a KV source with the layers that read them, so they cannot sit
+    // behind the raw cells of every one of those layers; init_kall_v41 lays them out instead
+    if (model.arch == LLM_ARCH_DEEPSEEK41) {
+        return;
+    }
+
     if (!dsv4_kall_view_enabled()) {
         LLAMA_LOG_INFO("%s: DSV4 joint raw+compressed K layout disabled (LLAMA_DSV4_KALL_VIEW=0)\n", __func__);
         return;
@@ -1462,6 +1468,123 @@ void llama_kv_cache_dsv4::init_kall(
             __func__, raw_nkv_min_tokens);
 }
 
+// ranma: DeepSeek-V4.1 attends over [raw window | compressed cells] like V4, but the compressed cells of a KV source are
+// read by the layers after it as well, so they cannot sit behind the raw cells of each of those layers (init_kall).
+// Instead each KV source gets one allocation of n_stage cells (the size of the raw cache) followed by its n_cmp
+// compressed cells. A reading layer copies the raw cells it reads into the end of the staging area and attends over a
+// view of [staging | compressed]: the copy is the raw window instead of the raw window and every compressed cell, and
+// the compressed cells are stored once. The values and their order are those of the concat it replaces.
+// LLAMA_DSV4_KALL_VIEW=0 keeps the concat.
+void llama_kv_cache_dsv4::init_kall_v41(
+        const llama_model & model,
+                ggml_type   type_k,
+                     bool   offload,
+                 uint32_t   n_seq_max,
+                 uint32_t   n_stage,
+                 uint32_t   n_cmp) {
+    if (!dsv4_kall_view_enabled()) {
+        LLAMA_LOG_INFO("%s: DSV4.1 staged raw+compressed K layout disabled (LLAMA_DSV4_KALL_VIEW=0)\n", __func__);
+        return;
+    }
+
+    // one stream: the joint view has a single stride
+    if (n_seq_max != 1) {
+        LLAMA_LOG_INFO("%s: DSV4.1 staged raw+compressed K layout disabled (n_seq_max = %u > 1)\n", __func__, n_seq_max);
+        return;
+    }
+
+    if (model.hparams.no_alloc || n_stage == 0 || n_cmp == 0) {
+        return;
+    }
+
+    struct ggml_backend_buft_comparator {
+        bool operator()(const ggml_backend_buffer_type_t & lhs, const ggml_backend_buffer_type_t & rhs) const {
+            return strcmp(ggml_backend_buft_name(lhs), ggml_backend_buft_name(rhs)) < 0;
+        }
+    };
+
+    std::map<ggml_backend_buffer_type_t, ggml_context_ptr, ggml_backend_buft_comparator> ctx_map;
+
+    std::vector<std::pair<int32_t, ggml_context *>> plan;
+
+    for (uint32_t il = 0; il < model.hparams.n_layer(); ++il) {
+        if (!model.hparams.dsv41_is_kv_source(il) || !hparams_csa.has_kv(il)) {
+            continue;
+        }
+
+        // the staging area takes raw rows and the view is shaped from the compressed hparams
+        GGML_ASSERT(hparams_raw.n_embd_k_gqa(il)  == hparams_csa.n_embd_k_gqa(il));
+        GGML_ASSERT(hparams_raw.n_embd_head_k(il) == hparams_csa.n_embd_head_k(il));
+        GGML_ASSERT(hparams_raw.n_head_kv(il)     == hparams_csa.n_head_kv(il));
+
+        ggml_backend_buffer_type_t buft = offload ? ggml_backend_dev_buffer_type(model.dev_layer(il)) : ggml_backend_cpu_buffer_type();
+
+        auto it = ctx_map.find(buft);
+        if (it == ctx_map.end()) {
+            ggml_init_params params = {
+                /*.mem_size   =*/ size_t(4u*model.hparams.n_layer()*ggml_tensor_overhead()),
+                /*.mem_buffer =*/ NULL,
+                /*.no_alloc   =*/ true,
+            };
+
+            ggml_context * ctx = ggml_init(params);
+            if (!ctx) {
+                throw std::runtime_error("failed to create ggml context for the DSV4.1 staged K storage");
+            }
+
+            it = ctx_map.emplace(buft, ctx).first;
+        }
+
+        ggml_context * ctx = it->second.get();
+
+        ggml_tensor * joint = ggml_new_tensor_3d(ctx, type_k, hparams_csa.n_embd_k_gqa(il), n_stage + n_cmp, 1);
+        ggml_format_name(joint, "cache_kall_l%d", il);
+
+        auto & kl = kall_layers[il];
+        kl.joint = joint;
+        kl.stage = true;
+
+        plan.emplace_back((int32_t) il, ctx);
+    }
+
+    if (plan.empty()) {
+        return;
+    }
+
+    for (auto & [buft, ctx] : ctx_map) {
+        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft);
+        if (!buf) {
+            throw std::runtime_error("failed to allocate buffer for the DSV4.1 staged K storage");
+        }
+
+        LLAMA_LOG_INFO("%s: %10s DSV4.1 staged K buffer size = %8.2f MiB\n", __func__,
+                ggml_backend_buffer_name(buf), ggml_backend_buffer_get_size(buf)/1024.0/1024.0);
+
+        // the staging cells outside the copied window are masked, but they are read: keep them finite
+        ggml_backend_buffer_clear(buf, 0);
+        ctxs_bufs_kall.emplace_back(std::move(ctx), buf);
+    }
+
+    for (const auto & [il, ctx] : plan) {
+        auto & kl = kall_layers[il];
+
+        ggml_tensor * joint = kl.joint;
+
+        kl.view_cmp = ggml_view_3d(ctx, joint, joint->ne[0], n_cmp, 1,
+                joint->nb[1], joint->nb[1]*n_cmp, n_stage*joint->nb[1]);
+        ggml_format_name(kl.view_cmp, "cache_kall_cmp_l%d", il);
+
+        if (ggml_backend_view_init(kl.view_cmp) != GGML_STATUS_SUCCESS) {
+            throw std::runtime_error("failed to initialize the DSV4.1 staged K views");
+        }
+    }
+
+    kall_raw_size = n_stage;
+
+    LLAMA_LOG_INFO("%s: DSV4.1 staged raw+compressed K layout enabled for %d KV sources, staging = %u cells\n",
+            __func__, (int) plan.size(), n_stage);
+}
+
 llama_kv_cache_dsv4::llama_kv_cache_dsv4(
         const llama_model & model,
                 ggml_type   type_k,
@@ -1524,7 +1647,7 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
     const llama_kv_cache::layer_k_storage_cb kall_raw_cb =
             [this](int32_t il, uint32_t n_embd_k_gqa, uint32_t kv_size_l, uint32_t n_stream_l) -> llama_kv_cache::k_storage_info {
         auto it = kall_layers.find(il);
-        if (it == kall_layers.end()) {
+        if (it == kall_layers.end() || it->second.stage) {
             return {};
         }
 
@@ -1543,7 +1666,7 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
     const llama_kv_cache::layer_k_storage_cb kall_cmp_cb =
             [this](int32_t il, uint32_t n_embd_k_gqa, uint32_t kv_size_l, uint32_t n_stream_l) -> llama_kv_cache::k_storage_info {
         auto it = kall_layers.find(il);
-        if (it == kall_layers.end() || !it->second.raw_ok) {
+        if (it == kall_layers.end() || (!it->second.raw_ok && !it->second.stage)) {
             return {};
         }
 
@@ -1692,6 +1815,11 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
         : layer_reuse_cb(nullptr);
 
     const bool unified_compressed = false;
+
+    if (is_v41) {
+        init_kall_v41(model, type_k, offload, n_seq_max, kv_raw->get_swa()->get_size(),
+                GGML_PAD(dsv4_comp_size(kv_size, ratio_kv), 256u));
+    }
 
     LLAMA_LOG_INFO("%s: creating DSV4 CSA compressed KV cache, ratio = %u, size = %u cells\n",
             __func__, ratio_a, dsv4_comp_size(kv_size, ratio_kv));
@@ -3002,6 +3130,10 @@ ggml_tensor * llama_kv_cache_dsv4_comp_context::get_k(ggml_context * ctx, int32_
 ggml_tensor * llama_kv_cache_dsv4_comp_context::get_k_joint(ggml_context * ctx, int32_t il, uint32_t raw_lo, uint32_t n_raw, uint32_t n_comp) const {
     // the compressed cells start right after the raw cache, so [raw_lo, raw_lo + n_raw) has to end there
     return kv->get_k_joint(ctx, il, raw_lo + n_raw, n_raw + n_comp, raw_lo);
+}
+
+uint32_t llama_kv_cache_dsv4_comp_context::get_k_joint_prefix(int32_t il) const {
+    return kv->get_k_joint_prefix(il);
 }
 
 ggml_tensor * llama_kv_cache_dsv4_comp_context::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const {

@@ -1479,7 +1479,41 @@ ggml_tensor * llama_model_deepseek41::graph::build_attention_v41(
             comp_k->nb[1], comp_k->nb[2], comp_k->nb[3], 0);
     cb(comp_k, "comp_k", il);
 
-    ggml_tensor * k_all = ggml_concat(ctx0, raw_k, comp_k, 2);
+    // ranma: [raw | compressed] without copying the compressed cells: the raw cells go into the staging area in front of
+    // the compressed cells of the KV source (llama_kv_cache_dsv4::init_kall_v41), and attention reads a view of both.
+    // Only the window of raw cells the ubatch can see is copied; the staging cells outside it hold rows of an earlier
+    // layer, which the mask drops for every token just as it drops the raw cells there. Without the staging area
+    // (several sequences, LLAMA_DSV4_KALL_VIEW=0) the graph concatenates as before, and so does a graph of the
+    // layer-major prefill: the layers that read one KV source would write its staging area in several segments.
+    ggml_tensor * k_all = nullptr;
+    if (!layer_exec) {
+        const auto *   comp_ctx = inp_dsv4->mctx->get_csa();
+        const uint32_t n_stage  = comp_ctx->get_k_joint_prefix(il);
+        const uint32_t n_raw    = (uint32_t) raw_k->ne[2];
+
+        if (raw_k->ne[3] == 1 && n_stage >= n_raw && n_raw > 0) {
+            ggml_tensor * stage = comp_ctx->get_k_joint(ctx0, il, n_stage - n_raw, n_raw, 0);
+            k_all = comp_ctx->get_k_joint(ctx0, il, n_stage - n_raw, n_raw, (uint32_t) n_comp);
+            GGML_ASSERT(stage != nullptr && k_all != nullptr);
+            GGML_ASSERT(stage->ne[0] == raw_k->ne[0] && stage->ne[1] == raw_k->ne[1]);
+
+            uint32_t w_lo = 0;
+            uint32_t w_n  = 0;
+            mctx_raw->get_chunk_window(0, (uint32_t) nt, w_lo, w_n);
+            inp_attn->stage_lo = w_lo;
+            inp_attn->stage_n  = w_n;
+
+            const int64_t j0 = (int64_t) w_lo - (int64_t) mctx_raw->get_k_lo();
+            GGML_ASSERT(j0 >= 0 && j0 + (int64_t) w_n <= (int64_t) n_raw);
+
+            ggml_build_forward_expand(gf, ggml_cpy(ctx0,
+                    llm_graph_rows(ctx0, raw_k, 2, j0, w_n),
+                    llm_graph_rows(ctx0, stage, 2, j0, w_n)));
+        }
+    }
+    if (k_all == nullptr) {
+        k_all = ggml_concat(ctx0, raw_k, comp_k, 2);
+    }
     cb(k_all, "k_all", il);
 
     ggml_tensor * raw_mask  = inp_attn->get_kq_mask();

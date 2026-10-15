@@ -223,6 +223,10 @@ private:
 
         // set once the raw cache has accepted the joint storage for this layer
         bool raw_ok = false;
+
+        // ranma: DeepSeek-V4.1 - a staging area for the raw K of a reading layer instead of the raw cache of the layer
+        // (init_kall_v41); view_raw stays null and the raw cache keeps its own storage
+        bool stage = false;
     };
 
     uint32_t kall_raw_size = 0;
@@ -237,6 +241,15 @@ private:
                      uint32_t   kv_size,
                      uint32_t   n_seq_max,
                      uint32_t   n_ubatch);
+
+    // ranma: DeepSeek-V4.1 - see the definition
+    void init_kall_v41(
+            const llama_model & model,
+                    ggml_type   type_k,
+                         bool   offload,
+                     uint32_t   n_seq_max,
+                     uint32_t   n_stage,
+                     uint32_t   n_cmp);
 
     std::vector<std::pair<ggml_context_ptr, ggml_backend_buffer_ptr>> ctxs_bufs_kall;
     std::unordered_map<int32_t, kall_layer> kall_layers;
@@ -381,6 +394,10 @@ public:
     // raw/compressed K storage of the layer. returns nullptr when the layer has no joint storage or when the raw cells
     // do not end where the compressed ones start (then the caller has to concat)
     ggml_tensor * get_k_joint(ggml_context * ctx, int32_t il, uint32_t raw_lo, uint32_t n_raw, uint32_t n_comp) const;
+
+    // ranma: the number of cells in front of the compressed cells of the layer in its joint K storage, 0 without one.
+    // DeepSeek-V4.1 keeps a staging area there (see llama_kv_cache_dsv4::init_kall_v41)
+    uint32_t get_k_joint_prefix(int32_t il) const;
 
     ggml_tensor * build_input_k_rot(ggml_context * ctx) const;
     void set_input_k_rot(ggml_tensor * dst) const;
