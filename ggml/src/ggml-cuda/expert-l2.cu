@@ -923,7 +923,7 @@ bool l2_tier::install_relabel(const install_transaction & tx, const expert_locat
 }
 
 bool l2_tier::reseed_unified(const std::vector<uint64_t> & counts, const std::vector<std::vector<int32_t>> & vram, bool fill,
-        l2_install_stats & stats, std::string & reason, const std::vector<uint8_t> * scope) {
+        l2_install_stats & stats, std::string & reason, const std::vector<uint8_t> * scope, const std::vector<uint64_t> * ties) {
     GGML_ASSERT(unified() && !worker_running() && mapped_);
     if (scope == nullptr) { scope = unified_active(); }
     const auto t0 = std::chrono::steady_clock::now();
@@ -941,7 +941,13 @@ bool l2_tier::reseed_unified(const std::vector<uint64_t> & counts, const std::ve
     };
     std::vector<int> experts_of((size_t) geo_.n_layers, 0);
     for (int l = 0; l < geo_.n_layers; ++l) { experts_of[(size_t) l] = geo_.layer_class[l] >= 0 ? geo_.experts(l) : 0; }
-    const std::vector<l2_reseed_read> plan = plan_unified_reseed(cledger_, experts_of, vram, score, fill, scope);
+    // equal scores: the lower count of the tie profile first, then spread over the layers
+    const size_t n_counts = (size_t) geo_.n_layers*(size_t) geo_.n_experts;
+    const bool has_ties = ties != nullptr && ties->size() >= n_counts;
+    auto tie = [&](int l, int e) {
+        return has_ties ? (*ties)[(size_t) l*(size_t) geo_.n_experts + (size_t) e] : uint64_t(0);
+    };
+    const std::vector<l2_reseed_read> plan = plan_unified_reseed(cledger_, experts_of, vram, score, tie, fill, scope);
     // distinct slots: one batch of reads is safe; chunks keep the queue's descriptor count small
     constexpr size_t chunk = 128;
     for (size_t i = 0; i < plan.size(); i += chunk) {

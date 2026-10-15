@@ -18544,7 +18544,6 @@ int main(int argc, char ** argv) {
 
     // load and enumerate backends
     ggml_backend_load_all();
-
     if (sf_mode) {
         return sf_main(backend_filter);
     }
