@@ -265,6 +265,8 @@ static std::vector<std::string> g_mask_modes;
 static int g_carried_max = 0; // the most carried tensors a layer-major prefill planned (layer_exec_plan)
 static int g_groups_max = 0;
 static int g_bundles = 0;     // layer-major prefills that ran the MoE in bundles
+static int g_split   = 0;     // layer-major prefills whose width rule split the batch into narrower ubatches
+static int g_edges_cut = 0;   // layer-major prefills whose edge slots were lent in pieces of ubatches (layer_exec_lend)
 
 static void log_cb(ggml_log_level level, const char * text, void * /*user*/) {
     if (strstr(text, "layer_exec_decode: ") != nullptr && strstr(text, " tokens in ") != nullptr) {
@@ -278,6 +280,17 @@ static void log_cb(ggml_log_level level, const char * text, void * /*user*/) {
     if (const char * m = strstr(text, "layer_exec_masks: ")) {
         m += strlen("layer_exec_masks: ");
         g_mask_modes.emplace_back(m, strcspn(m, ","));
+    }
+    if (const char * le = strstr(text, "layer_exec_lend: ")) {
+        int n_pc = 0, n_cut = 0, n_slots = 0;
+        size_t n_edge = 0;
+        if (sscanf(le, "layer_exec_lend: %d pieces: %zu of the segment edges (%d of %d slot", &n_pc, &n_edge, &n_cut, &n_slots) == 4 &&
+                n_cut > 0 && n_edge > (size_t) n_slots) {
+            g_edges_cut++;
+        }
+    }
+    if (strstr(text, "layer_exec_passes: ") != nullptr && strstr(text, "ubatch 768 of the context's 1024") != nullptr) {
+        g_split++;
     }
     if (strstr(text, "layer_exec_plan: ") != nullptr) {
         if (const char * c = strstr(text, " carried)")) {
@@ -556,10 +569,28 @@ int main(int argc, char ** argv) {
         }
     }
 
+    // the width rule splits the batch again: 3000 tokens in ubatches of 1024, passes of at most 1536 tokens, are two passes
+    // of two ubatches of 768; the ubatch loop in ubatches of 768 gives the same logits bit for bit
+    if (only[0] == 0) {
+        cfg_t a; a.n_ubatch = 768; a.n_batch = 4096;
+        cfg_t b = a; b.n_ubatch = 1024; b.layer = true; b.group = "1536";
+        logits_t ra, rb;
+        const int split0 = g_split;
+        const bool ok = scenario(a, toks, 3000, 3000, 4, ra) && scenario(b, toks, 3000, 3000, 4, rb);
+        const char * what = "layer-major split again: n=3000 ub=1024 group=1536 vs ubatches of 768";
+        if (!ok || g_split == split0) {
+            printf("%s: %s\n", what, ok ? "the batch was not split again" : "decode failed");
+            n_fail++;
+        } else {
+            report(what, compare(ra, rb), true);
+        }
+    }
+
     // the cases above must have exercised the V4.1 parts: a carried tensor, groups, bundles
     if (only[0] == 0) {
-        printf("coverage: carried tensors %d, groups up to %d, bundled prefills %d\n", g_carried_max, g_groups_max, g_bundles);
-        if (g_carried_max < 1 || g_groups_max < 2 || g_bundles < 1) {
+        printf("coverage: carried tensors %d, groups up to %d, bundled prefills %d, edge slots lent per ubatch %d\n", g_carried_max,
+               g_groups_max, g_bundles, g_edges_cut);
+        if (g_carried_max < 1 || g_groups_max < 2 || g_bundles < 1 || g_edges_cut < 1) {
             printf("coverage missing\n");
             n_fail++;
         }

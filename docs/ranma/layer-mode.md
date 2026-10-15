@@ -82,6 +82,32 @@ touched; taking the block back copies nothing (the pooled experts' table entries
   (`expert-major MoE: N MOE_FFN_HAD nodes in a graph of T tokens`), and with `RANMA_EXPERT_UB_POOL_LOG=1` one line per
   take-back with the pooled experts it dropped and the running counts of lends, take-backs and dropped experts.
 
+## The pieces of the prefill lend
+
+The layer-major prefill borrows its VRAM buffers from L1 (`expert-lend.h`): the lowest ranked
+L1 experts leave and the top slots of their size class hold the buffers. A class lends its gate, up and down arenas
+together (one slot number holds one expert in each), so each lent region is one kind of those slots and the largest
+indivisible piece sets how many slots a lend takes; what the other regions do not use is lent but empty. The pieces
+are therefore kept small:
+
+- The segment edges are lent per ubatch: the segments read and write the rows of one ubatch at a time, so an edge
+  slot is cut into pieces of whole ubatches (as many pieces as a lend takes, 48 in all). The slot of the router input
+  stays one piece (the MoE of a layer reads it over every row of the pass), and so do the carried tensors and the MoE
+  output. DeepSeek-V4.1 Flash: the hyper-connection state (80 KiB per token, 4.6 GiB at 59885 tokens) becomes pieces
+  of 640 MiB.
+- The two staging buffers of the PCIe-once op are two pieces (`GGML_EXPERT_LEND_STAGE`, `GGML_EXPERT_LEND_STAGE1`);
+  the op takes both from the lend or both from its pool.
+- Of the residents that tie at the rank the lend stopped in (same tier and score, e.g. every resident of a cold
+  cache), only those of the classes the pieces need leave: the others are given back, the class of the largest experts
+  first. Residents of a lower tier or score than the tie still leave first.
+
+Each lend logs one `prefill lend N packing:` line after its summary: every piece (role, MiB, class.kind), the use and
+capacity of every lent region, the evicted residents per class and the tied victims given back. The pieces are
+packed largest first by first fit, and by worst fit (into the region with the most room) when first fit leaves one
+out. Replayed with the pieces of the 2026-10-15/17 logs (`tests/test-expert-lend.cpp`, P6): DeepSeek-V4.1 Flash at
+59885 tokens 1109 -> 888 slots (an exact packing would take 875), the joint cache with its DSpark draft at 7309
+tokens 415 -> 304.
+
 ## Slot 0 priority
 
 With `-np 2` or more and `--slot0-priority` on, a request on slot 0 waits for at most one batch of another slot. A

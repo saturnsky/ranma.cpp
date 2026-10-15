@@ -1,7 +1,7 @@
 // The prefill lend of the expert cache (ggml/src/ggml-cuda/expert-lend.h) against a simulated arena:
 //   P1: the pieces evict the lowest ranked L1 residents first and take contiguous ranges at the top of each class;
 //       nothing is lent from host memory;
-//   P2: a width (the rows of one pass) is the largest the lend holds; more rows run in more passes;
+//   P2: the width rule: the fewest passes whose pieces L1 holds (all of them in L1), in equal shares;
 //   P3: the release does not refill; a decode launch restores an evicted expert only when it reads it, into its own
 //       lent slot, and a later lend takes the restore space back.
 //       lent slot, and a later lend takes the restore space back.
@@ -259,7 +259,6 @@ bool test_checker_sees_wrong_rank() {
     return true;
 }
 
-// ---- P2: the width of a pass is what the lend holds; more rows run in more passes ----
 // The last tie: a cold joint cache (every score 0). The draft's class ranks first (its layers are the later ones), but
 // the target's regions hold every piece: the plan gives the draft's victims back and evicts the target's only.
 bool test_untie_example() {
@@ -310,7 +309,7 @@ static int replay_lend(const char * what, const std::vector<int> & slots, const 
     for (size_t c = 0; c < cls.size(); ++c) { b += p.evict[c]*3.0*kind[c]/1048576.0; }
     printf("test-expert-lend: replay %s: %zu pieces %.1f MiB, %d slots (%s per class) %.1f MiB, %d given back\n", what,
            pieces.size(), a, n, per.c_str(), b, p.untied);
-    CHECK(p.ok && n == expect);
+    CHECK(p.ok && (expect < 0 || n == expect));
     return n;
 }
 
@@ -321,6 +320,26 @@ static const std::vector<size_t> P_JOINT  = { 598753280, 149688320, 14968832, 14
 bool test_replay() {
     // single model, 59885 tokens, partial: 1109 slots (the logs of d64-e and t1)
     replay_lend("DS4.1F 59885 tokens", { 2000 }, { K41 }, { 0 }, P_SINGLE, 1109);
+    // the HC state (80 KiB per token) lent per ubatch of 8192 (7 of 8192, one of 2541 tokens): 883
+    auto split_hc = [](const std::vector<size_t> & p, int64_t n, int64_t ub) {
+        std::vector<size_t> out;
+        for (int64_t r0 = 0; r0 < n; r0 += ub) { out.push_back((size_t) std::min(ub, n - r0)*80*1024); }
+        out.insert(out.end(), p.begin() + 1, p.end());
+        return out;
+    };
+    auto split_stage = [](std::vector<size_t> p) {
+        for (size_t i = 0; i < p.size(); ++i) {
+            if (p[i] == (size_t) 128*3*K41 + 256) {
+                p.erase(p.begin() + (ptrdiff_t) i);
+                p.insert(p.begin() + (ptrdiff_t) i, { (size_t) 64*3*K41 + 256, (size_t) 64*3*K41 + 256 });
+                break;
+            }
+        }
+        return p;
+    };
+    replay_lend("DS4.1F 59885 tokens, HC state per ubatch", { 2000 }, { K41 }, { 0 }, split_hc(P_SINGLE, 59885, 8192), 883);
+    replay_lend("DS4.1F 59885 tokens, HC state per ubatch, two staging pieces", { 2000 }, { K41 }, { 0 },
+                split_stage(split_hc(P_SINGLE, 59885, 8192)), -1);
     // joint (J-on), 7309 tokens, exact: the log took 385 target + 30 draft slots; the tie gives the 30 back
     replay_lend("joint 7309 tokens", { 1427, 306, 30 }, { K41, 2949120, 5898240 }, { 100, 0, 200 }, P_JOINT, 385);
     // the two staging buffers as two pieces of 64 experts + 256 bytes each (in place of one of 128): 57 target slots less
@@ -328,41 +347,94 @@ bool test_replay() {
     joint2.erase(joint2.begin() + 7);
     joint2.insert(joint2.begin() + 7, { (size_t) 64*3*K41 + 256, (size_t) 64*3*K41 + 256 });
     replay_lend("joint 7309 tokens, two staging pieces", { 1427, 306, 30 }, { K41, 2949120, 5898240 }, { 100, 0, 200 }, joint2, 328);
+    replay_lend("joint 7309 tokens, two staging pieces, HC state per ubatch of 2048", { 1427, 306, 30 },
+                { K41, 2949120, 5898240 }, { 100, 0, 200 }, split_hc(joint2, 7309, 2048), -1);
     return true;
 }
 
+// ---- P2: the width rule: the fewest passes the L1 holds, equal shares, every piece in L1 ----
 bool test_width(uint32_t seed) {
     std::mt19937 rng(seed);
-    sim_l1 s = make_l1(rng, 1, 8, 64, false);
+    sim_l1 s = make_l1(rng, 1 + (int) (rng() % 2), 8, 64, false);
     const std::vector<int> limit = s.slots;
     const auto cls = s.classes(limit);
-    const int64_t C = 512 + (int64_t) (rng() % 4)*512;          // ubatch
-    const int64_t K = 2 + (int64_t) (rng() % 30);               // ubatches of the prompt
+    const int64_t C = rng() % 3 == 0 ? 64 + (int64_t) (rng() % 4)*32 : 512 + (int64_t) (rng() % 4)*512;   // the context's ubatch
+    const int64_t N = C + 1 + (int64_t) (rng() % (uint32_t) (30*C));                                    // more than one ubatch
+    const int64_t unit = std::min<int64_t>(C, 256);
     const size_t per_row[4] = { 32 + rng() % 64, 32 + rng() % 64, 16 + rng() % 32, 64 + rng() % 128 };   // edges, y, T
-    auto request = [&](int64_t g) {
-        const int64_t w = g*C;
+    const size_t fixed = rng() % 2 ? (size_t) (rng() % 200000) : 0;                                      // the op's scratch
+    auto request = [&](int64_t w) {
         std::vector<size_t> pc;
         for (size_t b : per_row) { pc.push_back(b*(size_t) w); }
+        pc.push_back(fixed);
         return pc;
     };
-    auto fits = [&](int64_t g) { return plan_l1_lend(cls, request(g), 256).ok; };
-    int64_t G = K;
-    while (G > 1 && !fits(G)) { --G; }
-    if (G < 2 && !fits(G)) {
-        return true;   // nothing fits this L1: the caller falls back to the ubatch loop
+    int n_fits = 0;
+    auto fits = [&](int64_t w) { n_fits++; return plan_l1_lend(cls, request(w), 256).ok; };
+    const lend_width r = lend_width_rule(N, C, unit, 0, fits);
+    const int64_t K = (N + C - 1)/C;
+    CHECK(n_fits <= 64);   // a search, not a scan
+    if (r.P == 0) {
+        // nothing fits, or not fewer passes than the ubatches
+        if (r.W_max > 0) { CHECK(plan_l1_lend(cls, request(r.W_max), 256).ok); }
+        return true;
     }
-    CHECK(fits(G));
-    CHECK(G == K || !fits(G + 1));                 // the widest
-    const int64_t passes = (K + G - 1)/G;
-    CHECK(passes == 1 || G < K);
-    n_multi_pass += passes > 1 ? 1 : 0;
-    CHECK(passes*G >= K && (passes - 1)*G < K);    // every ubatch in exactly one pass, each pass loads an expert once
+    // every piece of a pass in L1 (nothing in host memory: the plan has L1 regions only)
+    const lend_l1_plan p = plan_l1_lend(cls, request(r.W), 256);
+    CHECK(p.ok);
+    for (const auto & f : p.fits) { CHECK(f.region >= -1 && f.region < (int) p.regions.size()); }
+    if (r.P == 1) {
+        CHECK(r.W == N && r.C == C && r.W_max == N);
+        return true;
+    }
+    n_multi_pass++;
+    // W_max is the widest: a unit more does not fit
+    CHECK(r.W_max % unit == 0 && plan_l1_lend(cls, request(r.W_max), 256).ok);
+    CHECK(r.W_max + unit >= N || !plan_l1_lend(cls, request(r.W_max + unit), 256).ok);
+    // the fewest passes: ceil(N / W_max), more only when the rounding pushed those passes over what fits
+    const int64_t P0 = (N + r.W_max - 1)/r.W_max;
+    CHECK(r.P >= P0 && r.P < K);
+    for (int64_t P = P0; P < r.P; ++P) {
+        const int64_t w0 = (N + P - 1)/P, g = (w0 + C - 1)/C;
+        const int64_t c = std::min<int64_t>(C, ((w0 + g - 1)/g + unit - 1)/unit*unit);
+        CHECK(!plan_l1_lend(cls, request(g*c), 256).ok);
+    }
+    // equal shares: ubatches of at most the context's, in units, a pass of g of them covers ceil(N / P)
+    CHECK(r.C <= C && (r.C % unit == 0 || r.C == C) && r.W == r.g*r.C);
+    CHECK(r.W <= r.W_max || r.P > P0);
+    CHECK(r.P*r.W >= N && r.W < (N + r.P - 1)/r.P + r.g*unit);
+    // the ubatches of C cover N in exactly P passes of g
+    const int64_t K2 = (N + r.C - 1)/r.C;
+    CHECK((K2 + r.g - 1)/r.g == r.P);
     // a narrower width never needs more L1
-    const lend_l1_plan wide = plan_l1_lend(cls, request(G), 256);
-    if (G > 1) {
-        const lend_l1_plan narrow = plan_l1_lend(cls, request(G - 1), 256);
-        CHECK(narrow.ok && narrow.victims.size() <= wide.victims.size());
+    const lend_l1_plan narrow = plan_l1_lend(cls, request(std::max<int64_t>(1, r.W - unit)), 256);
+    CHECK(narrow.ok && narrow.victims.size() <= p.victims.size());
+    return true;
+}
+
+// the examples of the rule's decision (2026-10-15): N 32445, W_max 27648 -> two passes of 16223 (16384 in units of
+// 256); W_max 10000 -> four passes of 8112 (8192)
+bool test_width_examples() {
+    for (const int64_t cap : { (int64_t) 27648, (int64_t) 10000 }) {
+        const lend_width r = lend_width_rule(32445, 4096, 256, 0, [&](int64_t w) { return w <= cap; });
+        if (cap == 27648) {
+            CHECK(r.W_max == 27648 && r.P == 2 && r.g == 4 && r.C == 4096 && r.W == 16384);
+        } else {
+            CHECK(r.W_max == 9984 && r.P == 4 && r.g == 2 && r.C == 4096 && r.W == 8192);
+        }
     }
+    // a wide ubatch is split again: 59885 tokens in ubatches of 24576, at most 30000 per pass -> two passes of two
+    // ubatches of 15104
+    const lend_width r = lend_width_rule(59885, 24576, 256, 0, [&](int64_t w) { return w <= 30208; });
+    CHECK(r.P == 2 && r.g == 2 && r.C == 15104 && r.W == 30208);
+    // the rounding pushes the pass over the cap: one pass more (three passes are not fewer than three ubatches)
+    const lend_width q = lend_width_rule(59885, 24576, 256, 0, [&](int64_t w) { return w <= 30000; });
+    CHECK(q.P == 0 && q.W_max == 29952);
+    // all fit: one pass in the context's ubatches; forced widths replace the search
+    const lend_width one = lend_width_rule(1000, 128, 128, 0, [&](int64_t) { return true; });
+    CHECK(one.P == 1 && one.C == 128 && one.W == 1000);
+    const lend_width forced = lend_width_rule(1000, 128, 128, 256, [&](int64_t) { return false; });
+    CHECK(forced.P == 4 && forced.g == 2 && forced.C == 128);
     return true;
 }
 
@@ -526,6 +598,7 @@ int main(int argc, char ** argv) {
     test_checker_sees_wrong_rank();
     test_untie_example();
     test_replay();
+    test_width_examples();
     int n = 0;
     for (int i = 0; i < seeds; ++i) {
         const uint32_t seed = 1000u + (uint32_t) i;
