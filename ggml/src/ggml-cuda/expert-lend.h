@@ -501,6 +501,18 @@ inline std::vector<lend_restore> plan_restore(const std::vector<lend_resident> &
     return out;
 }
 
+// The wanted list of an eager restore by layer (expert-controller.cu feeds each layer's list to the restore kernels as a
+// route, lend_space_max_ids at a time), each expert once.
+inline std::vector<std::vector<int32_t>> lend_eager_batches(const std::vector<lend_restore> & wanted, int n_layers) {
+    std::vector<std::vector<int32_t>> by((size_t) std::max(n_layers, 0));
+    for (const lend_restore & r : wanted) {
+        if (r.layer < 0 || r.layer >= n_layers) { continue; }
+        auto & row = by[(size_t) r.layer];
+        if (std::find(row.begin(), row.end(), r.expert) == row.end()) { row.push_back(r.expert); }
+    }
+    return by;
+}
+
 static constexpr uint32_t lend_never = 0xFFFFFFFFu;   // last miss of an expert that never missed
 
 // Admission: a wanted expert always; with the LRU part off (`lru` false, RANMA_EXPERT_LEND_LRU=0) nothing else; any

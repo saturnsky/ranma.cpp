@@ -1520,6 +1520,14 @@ public:
             // diagnostic: RANMA_EXPERT_LEND_LRU=0 turns the LRU part off (wanted experts only)
             const char * v = getenv("RANMA_EXPERT_LEND_LRU");
             lend_space_.lru = v != nullptr && strcmp(v, "0") == 0 ? 0 : 1;
+            // diagnostic: RANMA_EXPERT_LEND_RESTORE=eager copies the wanted experts the L2 holds into the space when the
+            // prompt ends, before the first decode launch (the restore kernels, fed with the wanted lists)
+            const char * r = getenv("RANMA_EXPERT_LEND_RESTORE");
+            lend_eager_ = r != nullptr && strcmp(r, "eager") == 0;
+            if (lend_eager_) {
+                lend_space_.lru = 0;   // eager restores fill the space with the plan: no LRU part
+                CUDA_CHECK(cudaMalloc((void **) &lend_eager_ids_, L*lend_space_max_ids*sizeof(int32_t)));
+            }
         }
         lend_space_n_ = n_slots;
         CUDA_CHECK(cudaHostAlloc((void **) &lend_live_host_, sizeof(lend_live), cudaHostAllocMapped));
@@ -1544,9 +1552,10 @@ public:
         lend_upload_space_locked({}, false);
         GGML_LOG_INFO("expert cache: prefill lend on: prompt buffers from the lowest ranked L1 experts (%s slots per class), "
                       "none from host memory; after a prompt the lent slots are a restore space: the decode copies an evicted "
-                      "expert of its plan in when it reads it, other misses use the rest as an LRU cache (%s; temporary "
+                      "expert of its plan in %s, other misses use the rest as an LRU cache (%s; temporary "
                       "policy) (launches of up to %d rows)\n", split_text(lend_.slots).c_str(),
-            lend_space_.lru ? (std::string("ghost:") + std::to_string(lend_space_.ghost)).c_str() : "off: RANMA_EXPERT_LEND_LRU=0",
+            lend_eager_ ? "when the prompt ends (RANMA_EXPERT_LEND_RESTORE=eager)" : "when it reads it",
+            lend_space_.lru ? (std::string("ghost:") + std::to_string(lend_space_.ghost)).c_str() : lend_eager_ ? "off: eager" : "off: RANMA_EXPERT_LEND_LRU=0",
             lend_rows_);
         lend_on_.store(true, std::memory_order_release);
     }
@@ -1569,6 +1578,9 @@ public:
         if (lend_tickets_dev_)  { (void) cudaFree(lend_tickets_dev_); }
         if (lend_live_host_)    { (void) cudaFreeHost(lend_live_host_); }
         if (lend_stream_)       { (void) cudaStreamDestroy(lend_stream_); }
+        if (lend_eager_ids_)    { (void) cudaFree(lend_eager_ids_); }
+        lend_eager_ids_ = nullptr;
+        lend_eager_ = false;
         for (void * p : { (void *) lend_space_.own, (void *) lend_space_.pin, (void *) lend_space_.stamp, (void *) lend_space_.cls,
                           (void *) lend_space_.last_miss, (void *) lend_space_.step, (void *) lend_space_.act, (void *) lend_space_.n_act }) {
             if (p != nullptr) { (void) cudaFree(p); }
@@ -2193,6 +2205,85 @@ public:
             lend_.victims.size(), lend_.restore.size(), lend_want_.empty() ? " (none: no decode plan)" : "", kept_pinned,
             lend_space_kept_.size() - kept_pinned, (size_t) held_slots - std::min((size_t) held_slots, kept_pinned));
         lend_space_kept_.clear();
+        if (lend_eager_) {
+            lend_eager_restore_locked("the prompt");
+        }
+    }
+
+    // RANMA_EXPERT_LEND_RESTORE=eager (diagnostic): when the prompt ends and after each plan install under a lease, every
+    // wanted expert is copied into the space and pinned, layer by layer, the way a decode launch restores one: the SSD
+    // tier serves the wanted list as a route (an expert only the file holds is read into the host ring; a staged service
+    // waits for all three kinds), then the decide and copy kernels copy and pin, then the layer's lease ends. It runs on
+    // its own stream and the host waits for it: nothing else computes meanwhile, so no ring slot or table is shared with a
+    // running graph.
+    void lend_eager_restore_locked(const char * when) {
+        if (lend_eager_ids_ == nullptr || lend_.restore.empty()) {
+            return;
+        }
+        const auto t0 = std::chrono::steady_clock::now();
+        const size_t L = (size_t) geo_.n_layers, M = (size_t) lend_space_max_ids;
+        const std::vector<std::vector<int32_t>> by = lend_eager_batches(lend_.restore, (int) L);
+        const volatile lend_live * live = lend_live_host_;
+        const unsigned long long n0 = live->restores, b0 = live->bytes;
+        l2_counters c0;
+        if (tier_) { c0 = tier_->counters_snapshot(); }
+        size_t wanted = 0;
+        for (size_t round = 0;; ++round) {
+            std::vector<int32_t> ids(L*M, 0);
+            std::vector<int> n(L, 0);
+            bool any = false;
+            for (size_t l = 0; l < L; ++l) {
+                for (size_t i = round*M; i < by[l].size() && i < (round + 1)*M; ++i) { ids[l*M + (size_t) n[l]++] = by[l][i]; }
+                any = any || n[l] > 0;
+                wanted += (size_t) n[l];
+            }
+            if (!any) {
+                break;
+            }
+            CUDA_CHECK(cudaMemcpyAsync(lend_eager_ids_, ids.data(), ids.size()*sizeof(int32_t), cudaMemcpyHostToDevice, lend_stream_));
+            for (size_t l = 0; l < L; ++l) {
+                if (n[l] == 0) {
+                    continue;
+                }
+                int32_t * lids = lend_eager_ids_ + l*M;
+                if (tier_) {
+                    // the route of one row: the tier makes the file-only experts readable, as for a decode launch
+                    ggml_tensor route;
+                    memset(&route, 0, sizeof(route));
+                    route.type  = GGML_TYPE_I32;
+                    route.ne[0] = n[l]; route.ne[1] = 1; route.ne[2] = 1; route.ne[3] = 1;
+                    route.nb[0] = sizeof(int32_t); route.nb[1] = (size_t) n[l]*sizeof(int32_t);
+                    route.nb[2] = route.nb[1]; route.nb[3] = route.nb[1];
+                    route.data  = lids;
+                    tier_->publish_and_wait((int) l, &route, lend_stream_);
+                    if (tier_->layer_staged((int) l)) {
+                        tier_->wait_kind((int) l, 1, lend_stream_);
+                        tier_->wait_kind((int) l, 2, lend_stream_);
+                    }
+                }
+                const ggml_cuda_kernel_launch_params dp(dim3(1), dim3(lend_space_threads), 0, lend_stream_);
+                ggml_cuda_kernel_launch(lend_space_decide_kernel, dp, (const lend_restore_desc *) lend_desc_dev_, lend_space_,
+                    (int) l, (const int32_t *) lids, 1, n[l], n[l], lend_live_dev_);
+                const ggml_cuda_kernel_launch_params cp(dim3(lend_restore_blocks), dim3(256), 0, lend_stream_);
+                ggml_cuda_kernel_launch(lend_space_copy_kernel, cp, (const lend_restore_desc *) lend_desc_dev_, lend_space_, (int) l,
+                    lend_tickets_dev_, lend_live_dev_);
+                if (tier_) {
+                    tier_->mark_done((int) l, lend_stream_);
+                }
+            }
+            CUDA_CHECK(cudaStreamSynchronize(lend_stream_));
+        }
+        const unsigned long long n = live->restores - n0, b = live->bytes - b0;
+        uint64_t ssd_reads = 0, ssd_bytes = 0;
+        if (tier_) {
+            const l2_counters c1 = tier_->counters_snapshot();
+            ssd_reads = c1.ssd_reads - c0.ssd_reads;
+            ssd_bytes = c1.ssd_bytes - c0.ssd_bytes;
+        }
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        GGML_LOG_INFO("expert cache: prefill lend: eager restore after %s (RANMA_EXPERT_LEND_RESTORE=eager): %llu of %zu wanted "
+                      "experts copied into the restore space (%.1f MiB; %.1f MiB of them first read from the SSD in %llu reads) "
+                      "in %.1f ms\n", when, n, wanted, b/1048576.0, ssd_bytes/1048576.0, (unsigned long long) ssd_reads, ms);
     }
 
     // A restore space taken back (the device is idle): the copies leave the tables.
@@ -2351,6 +2442,11 @@ public:
             abort_locked("prefill lend: the restore space after an install");
         }
         lend_upload_space_locked(kept, true);
+        // eager: the plan's wanted experts come in now, whatever the next request is (a next lend takes only the slots it
+        // needs, the lowest ranked copies last)
+        if (lend_eager_) {
+            lend_eager_restore_locked("a plan install");
+        }
         GGML_LOG_INFO("expert cache: prefill lend: plan %u installed in the %s kept slots per class; %zu experts of it come back "
                       "as the decode reads them, %zu copies of it stay pinned (of %zu copies in the space), LRU width %zu\n", id,
             split_text(lend_.limit).c_str(), lend_.restore.size(), kept.size(), restored.size(),
@@ -5872,6 +5968,8 @@ private:
     size_t lend_space_slots_ = 0;                  // lent slots of the space now
     size_t lend_space_pinned_ = 0;                 // pinned when it was last laid out
     std::vector<lend_restore> lend_space_kept_;    // the copies a lease over the space left in place (lend_take_space_locked)
+    bool lend_eager_ = false;                      // RANMA_EXPERT_LEND_RESTORE=eager (diagnostic)
+    int32_t * lend_eager_ids_ = nullptr;           // [layer][lend_space_max_ids] the wanted experts of an eager round
     ggml_expert_lend_counts lend_counts_{};
     bool lend_scratch_warned_ = false;
     // the expert prefetch (RANMA_EXPERT_PREFETCH)
