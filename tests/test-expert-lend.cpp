@@ -5,7 +5,10 @@
 //   P3: the release does not refill; the lent slots are a restore space: a decode launch copies a wanted evicted expert
 //       (the decode plan's) in when it reads it and pins it, other misses use the rest as an LRU cache (empty slots
 //       first, then the least recently used unpinned slot); a later lend takes the space back.
+//   P4: the LRU part of L1 (expert-l1-lru.h): the shares, the layout, a lend that keeps the most recently used copies
+//       below its top (and moves them there), the slots coming back, and a lend that takes the LRU part first.
 
+#include "expert-l1-lru.h"
 #include "expert-l2-class-ledger.h"
 #include "expert-lend.h"
 #include "expert-plan.h"
@@ -29,6 +32,7 @@ static bool g_quiet = false;
 static int n_l1_plans = 0, n_l1_regrow = 0, n_multi_pass = 0, n_restores = 0, n_sticky = 0, n_bounds = 0, n_wanted = 0;
 static int n_lru_evictions = 0, n_lru_full = 0, n_space_short = 0, n_space_pinned_kept = 0;
 static int n_untied = 0;   // plans that gave victims of their last tie back
+static int n_x_moves = 0, n_x_drops = 0, n_x_capped = 0, n_x_lend_inside = 0, n_x_lend_beyond = 0;
 #define CHECK(x) do { if (!(x)) { if (!g_quiet) { fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #x); } ++g_fail; return false; } } while (0)
 
 namespace {
@@ -1002,6 +1006,174 @@ bool test_pack_edges() {
 
 } // namespace
 
+// ---- P4: the LRU part of L1 ---------------------------------------------------------------------------------------
+
+static bool test_x_examples() {
+    // N % of each class, rounded down
+    CHECK((l1_lru_class_slots({ 100, 37, 0 }, 30) == std::vector<int>{ 30, 11, 0 }));
+    CHECK((l1_lru_class_slots({ 100 }, 0) == std::vector<int>{ 0 }));
+    // proportional to the mass, rounded down, the leftover to the largest remainders (ties: the lower layer)
+    CHECK((l1_lru_shares({ 1.0, 1.0, 2.0 }, 10, 100) == std::vector<int>{ 3, 2, 5 }));   // 2.5 2.5 5: the tie goes to layer 0
+    CHECK((l1_lru_shares({ 0.0, 0.0, 0.0 }, 7, 100) == std::vector<int>{ 3, 2, 2 }));    // no mass: equal shares
+    CHECK((l1_lru_shares({ 9.0, 1.0, -1.0 }, 10, 100) == std::vector<int>{ 9, 1, 0 }));  // -1: no positions
+    // the cap: the excess goes to the others (water filling)
+    CHECK((l1_lru_shares({ 100.0, 1.0, 1.0 }, 12, 6) == std::vector<int>{ 6, 3, 3 }));
+    CHECK((l1_lru_shares({ 1.0, 1.0 }, 20, 4) == std::vector<int>{ 4, 4 }));            // beyond n x cap: unused
+    // the layout by rounds: the top slots are the tails of the layers with the most
+    const auto lay = l1_lru_layout({ 1, 3, 2 }, 10);
+    CHECK((lay[0] == std::vector<int>{ 10 } && lay[1] == std::vector<int>{ 11, 13, 15 } && lay[2] == std::vector<int>{ 12, 14 }));
+    // a lend takes slots 13..15: the 3 most recent copies stay; 15 (layer 1, age 0) moves down into slot 12 (layer 2's
+    // copy of age 9 leaves), 14 (age 7) leaves, 10 (age 8) leaves as well
+    std::vector<l1_lru_pos> in = {
+        { 0, 10, 5, 8 }, { 1, 11, 6, 1 }, { 1, 13, 7, 2 }, { 1, 15, 8, 0 }, { 2, 12, 9, 9 }, { 2, 14, 4, 7 },
+    };
+    const l1_lru_shrink_plan sp = l1_lru_shrink(in, 13, 3);
+    // below the top: 3 slots (10, 11, 12); the most recent: 8 (age 0), 6 (1), 7 (2)
+    CHECK((sp.keep == std::vector<int>{ 1, 2, 3 }));
+    CHECK((sp.drop == std::vector<int>{ 0, 4, 5 }));
+    CHECK(sp.moves.size() == 2);   // 13 and 15 move into 10 and 12
+    CHECK(sp.slot_of[1] == 11 && sp.slot_of[2] == 10 && sp.slot_of[3] == 12);
+    CHECK((sp.layer_slots[0].empty() && sp.layer_slots[1] == std::vector<int>{ 11, 10, 12 } && sp.layer_slots[2].empty()));
+    // the slots come back: layer 0 and 2 get theirs, empty; layer 1 is at its share
+    std::vector<std::vector<int>> slots = sp.layer_slots;
+    l1_lru_revive(slots, { 1, 3, 2 }, { 15, 13, 14 });
+    CHECK((slots[0] == std::vector<int>{ 13 } && slots[1].size() == 3 && slots[2] == std::vector<int>{ 14, 15 }));
+    return true;
+}
+
+// Random: the shrink keeps the most recent copies, below the top, every slot below the top once; the revive restores
+// every share exactly.
+static bool test_x_random(uint32_t seed) {
+    std::mt19937 rng(seed*7919u + 3u);
+    const int n_layers = 1 + (int) (rng() % 9);
+    const int cap = 1 + (int) (rng() % 12);
+    const int total = (int) (rng() % (size_t) (n_layers*cap + 6));
+    std::vector<double> mass((size_t) n_layers);
+    for (double & m : mass) { m = rng() % 4 == 0 ? 0.0 : (double) (rng() % 1000); }
+    const std::vector<int> share = l1_lru_shares(mass, total, cap);
+    int sum = 0;
+    for (int v : share) { CHECK(v >= 0 && v <= cap); sum += v; }
+    CHECK(sum == std::min(total, n_layers*cap));
+    n_x_capped += total > n_layers*cap ? 1 : 0;
+    // proportionality: rounding down then at most one more, when no cap binds
+    double ms = 0.0;
+    for (double m : mass) { ms += m; }
+    if (total <= n_layers*cap && ms > 0.0) {
+        bool capped = false;
+        for (int v : share) { capped = capped || v == cap; }
+        for (size_t i = 0; i < mass.size() && !capped; ++i) {
+            const double want = (double) total*mass[i]/ms;
+            CHECK(share[i] >= (int) want && share[i] <= (int) want + 1);
+        }
+    }
+    const int base = 100;
+    const auto lay = l1_lru_layout(share, base);
+    std::vector<l1_lru_pos> in;
+    std::set<int> used_slots;
+    for (int l = 0; l < n_layers; ++l) {
+        CHECK((int) lay[(size_t) l].size() == share[(size_t) l]);
+        for (int sl : lay[(size_t) l]) {
+            CHECK(sl >= base && sl < base + sum && used_slots.insert(sl).second);
+            l1_lru_pos x;
+            x.layer = l;
+            x.slot  = sl;
+            x.owner = rng() % 3 == 0 ? -1 : (int) (rng() % 64);
+            x.age   = rng() % 50;
+            in.push_back(x);
+        }
+    }
+    const int top = base + (sum > 0 ? (int) (rng() % (size_t) (sum + 1)) : 0);
+    const l1_lru_shrink_plan sp = l1_lru_shrink(in, top, n_layers);
+    size_t owned = 0, below = 0;
+    for (const auto & x : in) { owned += x.owner >= 0 ? 1 : 0; below += x.slot < top ? 1 : 0; }
+    CHECK(sp.keep.size() == std::min(owned, below) && sp.keep.size() + sp.drop.size() == owned);
+    for (int k : sp.keep) {
+        for (int d : sp.drop) {
+            CHECK(in[(size_t) k].age <= in[(size_t) d].age);   // never an older copy kept over a newer one
+        }
+        CHECK(sp.slot_of[(size_t) k] >= base && sp.slot_of[(size_t) k] < top);
+    }
+    std::set<int> dst;
+    for (const auto & m : sp.moves) {
+        CHECK(m[0] >= top && m[1] < top && dst.insert(m[1]).second);
+    }
+    n_x_moves += sp.moves.empty() ? 0 : 1;
+    n_x_drops += sp.drop.empty() ? 0 : 1;
+    // the layers' slots below the top: each slot once, every slot below the top, no layer above its share
+    std::set<int> seen;
+    for (int l = 0; l < n_layers; ++l) {
+        CHECK((int) sp.layer_slots[(size_t) l].size() <= share[(size_t) l]);
+        for (int sl : sp.layer_slots[(size_t) l]) { CHECK(sl < top && seen.insert(sl).second); }
+    }
+    CHECK(seen.size() == below);
+    // a kept copy is in its layer's slots
+    for (int k : sp.keep) {
+        const auto & ls = sp.layer_slots[(size_t) in[(size_t) k].layer];
+        CHECK(std::find(ls.begin(), ls.end(), sp.slot_of[(size_t) k]) != ls.end());
+    }
+    std::vector<std::vector<int>> slots = sp.layer_slots;
+    std::vector<int> returned;
+    for (int sl = top; sl < base + sum; ++sl) { returned.push_back(sl); }
+    l1_lru_revive(slots, share, returned);
+    std::set<int> all;
+    for (int l = 0; l < n_layers; ++l) {
+        CHECK((int) slots[(size_t) l].size() == share[(size_t) l]);
+        for (int sl : slots[(size_t) l]) { CHECK(all.insert(sl).second); }
+    }
+    CHECK((int) all.size() == sum);
+    return true;
+}
+
+// A lend over the LRU part (the controller's lend_classes_locked): its slots are pseudo residents of tier 0 at the top of
+// the class, so a lend takes them before any resident, and evicts residents only beyond them.
+static bool test_x_lend(uint32_t seed) {
+    std::mt19937 rng(seed*31u + 17u);
+    const int stat = 4 + (int) (rng() % 20), x = 1 + (int) (rng() % 12);
+    lend_class c;
+    c.kind_bytes = { 1024, 1024, 2048 };
+    c.guard = { 0, 0, 0 };
+    c.slots = stat + x;
+    for (int s = 0; s < stat; ++s) {
+        lend_resident r;
+        r.layer = (int) (rng() % 4);
+        r.expert = s;
+        r.slot = s;
+        r.score = rng() % 100;
+        c.residents.push_back(r);
+    }
+    for (int s = stat; s < stat + x; ++s) {
+        lend_resident r;
+        r.layer = -1;
+        r.expert = s;
+        r.slot = s;
+        r.tier = 0;
+        c.residents.push_back(r);
+    }
+    const int want = 1 + (int) (rng() % (size_t) (stat + x));   // slots: the kind of 2048 bytes holds the piece
+    const lend_l1_plan p = plan_l1_lend({ c }, { (size_t) want*2048 }, 256);
+    CHECK(p.ok);
+    int pseudo = 0;
+    std::vector<uint64_t> evicted;
+    for (const auto & v : p.victims) {
+        if (v.layer < 0) { ++pseudo; } else { evicted.push_back(v.score); }
+    }
+    CHECK(p.limit[0] == stat + x - want);
+    if (want <= x) {
+        CHECK(evicted.empty() && pseudo == want && p.limit[0] >= stat);
+        ++n_x_lend_inside;
+    } else {
+        CHECK(pseudo == x && (int) evicted.size() == want - x);
+        // the residents that leave are the lowest ranked
+        std::vector<uint64_t> all;
+        for (const auto & r : c.residents) { if (r.layer >= 0) { all.push_back(r.score); } }
+        std::sort(all.begin(), all.end());
+        std::sort(evicted.begin(), evicted.end());
+        CHECK(evicted.back() <= all[evicted.size() - 1]);
+        ++n_x_lend_beyond;
+    }
+    return true;
+}
+
 int main(int argc, char ** argv) {
     const int seeds = argc > 1 ? atoi(argv[1]) : 2000;
     test_pack_edges();
@@ -1015,6 +1187,7 @@ int main(int argc, char ** argv) {
     test_space_staged();
     test_file_only_restore();
     test_eager_install();
+    if (!test_x_examples()) { fprintf(stderr, "the LRU part of L1: the examples fail\n"); }
     int n = 0;
     for (int i = 0; i < seeds; ++i) {
         const uint32_t seed = 1000u + (uint32_t) i;
@@ -1023,6 +1196,8 @@ int main(int argc, char ** argv) {
         n += test_restore(seed) ? 1 : 0;
         n += test_restore_want(seed) ? 1 : 0;
         n += test_space_lend(seed) ? 1 : 0;
+        n += test_x_random(seed) ? 1 : 0;
+        n += test_x_lend(seed) ? 1 : 0;
         if (g_fail > 0) {
             fprintf(stderr, "first failure at seed %u\n", seed);
             break;
@@ -1035,8 +1210,11 @@ int main(int argc, char ** argv) {
         n, seeds, g_fail, n_l1_plans, n_l1_regrow, n_multi_pass, n_restores, n_sticky, n_bounds, n_wanted, n_lru_evictions, n_lru_full,
         n_space_short, n_space_pinned_kept);
     printf("test-expert-lend: plans that gave victims of their last tie back (a class not needed) %d\n", n_untied);
+    printf("test-expert-lend: the LRU part of L1: shrinks with moves %d, with drops %d, capped shares %d, lends inside it %d, "
+        "lends beyond it %d\n", n_x_moves, n_x_drops, n_x_capped, n_x_lend_inside, n_x_lend_beyond);
     const bool covered = n_l1_plans > 0 && n_l1_regrow > 0 && n_multi_pass > 0 && n_restores > 0 && n_sticky > 0 && n_bounds > 0 &&
-        n_wanted > 0 && n_lru_evictions > 0 && n_space_short > 0 && n_space_pinned_kept > 0;
+        n_wanted > 0 && n_lru_evictions > 0 && n_space_short > 0 && n_space_pinned_kept > 0 && n_x_moves > 0 && n_x_drops > 0 &&
+        n_x_capped > 0 && n_x_lend_inside > 0 && n_x_lend_beyond > 0;
     if (!covered) {
         printf("a path was never taken\n");
     }
