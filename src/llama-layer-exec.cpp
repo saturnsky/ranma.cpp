@@ -14,6 +14,7 @@
 #include "ggml-cpp.h"
 
 // the scratch of the expert-major MoE op (plain C++, shared with the op and the layer mode)
+#include "../ggml/src/ggml-cuda/expert-lend.h"
 #include "../ggml/src/ggml-cuda/moe-ffn-had-layout.h"
 
 #include <algorithm>
@@ -914,13 +915,10 @@ static void lx_record_backends(ggml_backend_sched_t sched, ggml_cgraph * gf, con
     ggml_backend_sched_reset(sched);
 }
 
-// allocate the input tensors of a built graph in one host buffer: those in `only`, and those gf holds as leaves (an
-// input expanded on its own, read by no node, is still allocated and set like in a scheduled graph)
-static ggml_backend_buffer_t lx_alloc_inputs(ggml_context * ctx, ggml_backend_buffer_type_t buft, const std::set<const ggml_tensor *> * only,
-                                             ggml_cgraph * gf = nullptr) {
-    std::vector<ggml_tensor *> ts;
+// the bytes lx_place_inputs takes for the inputs of a graph (each padded to 256)
+static size_t lx_inputs_bytes(ggml_context * ctx, ggml_backend_buffer_type_t buft, const std::set<const ggml_tensor *> * only,
+                              ggml_cgraph * gf) {
     size_t size = 0;
-    const size_t align = ggml_backend_buft_get_alignment(buft);
     for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
         if (!(t->flags & GGML_TENSOR_FLAG_INPUT) || t->data != nullptr || t->view_src != nullptr) {
             continue;
@@ -928,22 +926,32 @@ static ggml_backend_buffer_t lx_alloc_inputs(ggml_context * ctx, ggml_backend_bu
         if (only != nullptr && only->count(t) == 0 && (gf == nullptr || ggml_graph_get_tensor(gf, t->name) != t)) {
             continue;
         }
-        ts.push_back(t);
-        size += lx_pad(ggml_backend_buft_get_alloc_size(buft, t), align);
+        size += (ggml_backend_buft_get_alloc_size(buft, t) + 255)/256*256 + 256;
     }
-    ggml_backend_buffer_t buf = ggml_backend_buft_alloc_buffer(buft, std::max<size_t>(size, align));
-    if (buf == nullptr) {
-        return nullptr;
-    }
-    char * p = (char *) ggml_backend_buffer_get_base(buf);
-    for (ggml_tensor * t : ts) {
-        if (ggml_backend_tensor_alloc(buf, t, p) != GGML_STATUS_SUCCESS) {
-            ggml_backend_buffer_free(buf);
-            return nullptr;
+    return size;
+}
+
+// the same inputs placed at the next free bytes of a lent host buffer (the prefill lend); false when they do not fit
+static bool lx_place_inputs(ggml_context * ctx, ggml_backend_buffer_t buf, size_t & used, const std::set<const ggml_tensor *> * only,
+                            ggml_cgraph * gf = nullptr) {
+    const size_t align = std::max<size_t>(256, ggml_backend_buffer_get_alignment(buf));
+    const size_t cap   = ggml_backend_buffer_get_size(buf);
+    char * base = (char *) ggml_backend_buffer_get_base(buf);
+    for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+        if (!(t->flags & GGML_TENSOR_FLAG_INPUT) || t->data != nullptr || t->view_src != nullptr) {
+            continue;
         }
-        p += lx_pad(ggml_backend_buft_get_alloc_size(buft, t), align);
+        if (only != nullptr && only->count(t) == 0 && (gf == nullptr || ggml_graph_get_tensor(gf, t->name) != t)) {
+            continue;
+        }
+        const size_t at   = (used + align - 1)/align*align;
+        const size_t size = ggml_backend_buffer_get_alloc_size(buf, t);
+        if (at + size > cap || ggml_backend_tensor_alloc(buf, t, base + at) != GGML_STATUS_SUCCESS) {
+            return false;
+        }
+        used = at + size;
     }
-    return buf;
+    return true;
 }
 
 namespace {
@@ -956,6 +964,7 @@ struct lx_donor {
     std::vector<ggml_tensor *> inputs;
     std::vector<std::pair<const ggml_tensor *, ggml_backend_t>> backends;
     ggml_backend_buffer_ptr inp_buf;
+    bool has_inputs = false;   // its inputs are in the lent host memory
 };
 
 // the planned buffer of a carried tensor: by its segment and its order among the carried tensors of that segment
@@ -1099,9 +1108,11 @@ int llama_context::layer_exec_decode(llama_memory_context_i * mctx, uint32_t n_t
         }
     };
 
-    const int64_t C = cparams.n_ubatch;
+    // the ubatch of the passes: the context's, or a narrower one when the width rule splits the batch again (below)
+    const int64_t C_ctx = cparams.n_ubatch;
+    int64_t C = C_ctx;
     const int64_t N = n_tokens_all;
-    const int64_t K = (N + C - 1)/C;
+    int64_t K = (N + C - 1)/C;
 
     const auto save_n_outputs = n_outputs;
     trace("start", N, C);
@@ -1177,18 +1188,33 @@ int llama_context::layer_exec_decode(llama_memory_context_i * mctx, uint32_t n_t
         return sizes[(size_t) backend_dev_id];
     };
 
-    // the cut of the chunk shapes: the edges per segment and their sizes
+    // the cut of the chunk shapes of ubatches of Cx tokens: the edges per segment and their sizes (the shapes of the
+    // context's ubatch first; again when the width rule splits the batch into narrower ubatches)
     std::vector<size_t> slot_pt;      // per edge slot: the largest bytes per token
+    std::vector<uint8_t> slot_x;      // per edge slot: 1 when it holds the router input of a layer (read over a whole pass)
     std::map<std::pair<int, int>, lx_carry_plan> carry_plan; // (segment, order) -> the buffer of a carried tensor
     size_t input_bytes_max = 0;
     size_t meta_bytes_max  = 0;
     size_t moe_need_c      = 0;       // the scheduler buffer of the MoE of one ubatch (C rows)
     size_t y_pt            = 0;       // MoE output bytes per row
     bool one_set = true;
-    {
-        std::vector<int64_t> shapes = { C };
-        if (N - (K - 1)*C != C) {
-            shapes.push_back(N - (K - 1)*C);
+    // the buffers of the carried tensors: one per tensor while it lives, a buffer freed when its last reader ran (a
+    // buffer written in segment s is free when the segment of its last read is before s)
+    std::vector<std::pair<size_t, int>> carry_slots; // per slot: bytes per token, the last segment that reads it
+    auto analyze = [&](int64_t Cx) -> const char * {
+        slot_pt.clear();
+        slot_x.clear();
+        carry_plan.clear();
+        carry_slots.clear();
+        input_bytes_max = 0;
+        meta_bytes_max  = 0;
+        moe_need_c      = 0;
+        y_pt            = 0;
+        one_set         = true;
+        const int64_t Kx = (N + Cx - 1)/Cx;
+        std::vector<int64_t> shapes = { Cx };
+        if (N - (Kx - 1)*Cx != Cx) {
+            shapes.push_back(N - (Kx - 1)*Cx);
         }
         for (int64_t n : shapes) {
             trace("reserve build", n);
@@ -1197,19 +1223,22 @@ int llama_context::layer_exec_decode(llama_memory_context_i * mctx, uint32_t n_t
             trace("reserve built", res ? ggml_graph_n_nodes(res->get_gf()) : -1);
             llama_lx_plan p;
             if (!res || !llama_lx_analyze(res->get_gf(), L, names, n, p)) {
-                n_outputs = save_n_outputs;
                 ggml_backend_sched_reset(sc);
                 if (log > 0 && res) {
                     LLAMA_LOG_INFO("%s: the graph of %" PRId64 " tokens does not cut: %s\n", __func__, n, p.err.c_str());
                 }
-                return skip("the graph does not cut");
+                return "the graph does not cut";
             }
             for (int s = 0; s <= L; ++s) {
                 for (size_t j = 0; j < p.out[s].size(); ++j) {
                     if (slot_pt.size() <= j) {
                         slot_pt.push_back(0);
+                        slot_x.push_back(0);
                     }
                     slot_pt[j] = std::max(slot_pt[j], p.out[s][j].pt);
+                    if (s < L && p.out[s][j].t == p.x[(size_t) s]) {
+                        slot_x[j] = 1;
+                    }
                 }
             }
             {
@@ -1221,19 +1250,27 @@ int llama_context::layer_exec_decode(llama_memory_context_i * mctx, uint32_t n_t
                 }
             }
             one_set = one_set && p.one_set;
-            input_bytes_max = std::max(input_bytes_max, p.input_bytes);
+            {
+                // what the host buffer of the inputs takes for the inputs of a ubatch graph of this shape
+                ggml_backend_buffer_type_t buft_in = ggml_backend_dev_host_buffer_type(model.dev_layer(0));
+                if (buft_in == nullptr) {
+                    buft_in = ggml_backend_cpu_buffer_type();
+                }
+                std::set<const ggml_tensor *> used(p.inputs.begin(), p.inputs.end());
+                input_bytes_max = std::max(input_bytes_max, std::max(p.input_bytes,
+                    lx_inputs_bytes(res->get_ctx(), buft_in, &used, res->get_gf())));
+            }
             meta_bytes_max  = std::max(meta_bytes_max, (size_t) ggml_graph_n_nodes(res->get_gf())*ggml_tensor_overhead()*2);
-            if (n == C) {
+            if (n == Cx) {
                 std::vector<llama_lx_region> regs;
                 std::vector<ggml_tensor *> inps;
                 std::string err;
                 if (!llama_lx_regions(res->get_gf(), L, names, regs, inps, err)) {
-                    n_outputs = save_n_outputs;
                     ggml_backend_sched_reset(sc);
                     if (log > 0) {
                         LLAMA_LOG_INFO("%s: the MoE of a ubatch does not cut: %s\n", __func__, err.c_str());
                     }
-                    return skip("the MoE regions do not cut");
+                    return "the MoE regions do not cut";
                 }
                 std::vector<std::pair<const ggml_tensor *, ggml_backend_t>> bk;
                 lx_record_backends(sc, res->get_gf(), &regs[0].nodes, bk, backend_dev);
@@ -1241,31 +1278,31 @@ int llama_context::layer_exec_decode(llama_memory_context_i * mctx, uint32_t n_t
                 y_pt = ggml_nbytes(regs[0].y)/(size_t) n;
             }
         }
-    }
-    ggml_backend_sched_reset(sc);
-    if (moe_need_c == SIZE_MAX || y_pt == 0) {
-        n_outputs = save_n_outputs;
-        return skip("the MoE of a ubatch cannot be measured");
-    }
-
-    // the buffers of the carried tensors: one per tensor while it lives, a buffer freed when its last reader ran (a
-    // buffer written in segment s is free when the segment of its last read is before s)
-    std::vector<std::pair<size_t, int>> carry_slots; // per slot: bytes per token, the last segment that reads it
-    for (auto & kv : carry_plan) {
-        const int s = kv.first.first;
-        int pick = -1;
-        for (size_t k = 0; k < carry_slots.size() && pick < 0; ++k) {
-            if (carry_slots[k].second < s) {
-                pick = (int) k;
+        ggml_backend_sched_reset(sc);
+        if (moe_need_c == SIZE_MAX || y_pt == 0) {
+            return "the MoE of a ubatch cannot be measured";
+        }
+        for (auto & kv : carry_plan) {
+            const int s = kv.first.first;
+            int pick = -1;
+            for (size_t k = 0; k < carry_slots.size() && pick < 0; ++k) {
+                if (carry_slots[k].second < s) {
+                    pick = (int) k;
+                }
             }
+            if (pick < 0) {
+                carry_slots.emplace_back(0, -1);
+                pick = (int) carry_slots.size() - 1;
+            }
+            carry_slots[(size_t) pick].first  = std::max(carry_slots[(size_t) pick].first, kv.second.pt);
+            carry_slots[(size_t) pick].second = kv.second.t_last;
+            kv.second.slot = pick;
         }
-        if (pick < 0) {
-            carry_slots.emplace_back(0, -1);
-            pick = (int) carry_slots.size() - 1;
-        }
-        carry_slots[(size_t) pick].first  = std::max(carry_slots[(size_t) pick].first, kv.second.pt);
-        carry_slots[(size_t) pick].second = kv.second.t_last;
-        kv.second.slot = pick;
+        return nullptr;
+    };
+    if (const char * why = analyze(C)) {
+        n_outputs = save_n_outputs;
+        return skip(why);
     }
 
     // ---- the plan: ubatches per group, MoE bundles --------------------------------------------------------------------
@@ -1277,20 +1314,24 @@ int llama_context::layer_exec_decode(llama_memory_context_i * mctx, uint32_t n_t
     //     router: there the value sets its pass rows (tokens * top-k) instead. Default: the largest multiple of the
     //     ubatch that keeps the MoE inside the scheduler buffer of a ubatch graph (at least one ubatch); the op keeps its
     //     own pass rows.
-    //   layer_exec_group_tokens (0 = automatic): the token rows of a group (rounded down to ubatches). Default: the most ubatches
-    //     whose edges and MoE fit the device budget, RANMA_LAYER_EXEC_DEV_MIB or half of the free device memory.
-    //     A batch of more ubatches runs group after group: the experts of a layer are read once per group.
-    const int     n_sets = one_set ? 1 : 2;
+    //   layer_exec_group_tokens (0 = automatic): the widest pass in tokens (in place of the widest the lend holds, below).
+    //     A batch wider than a pass runs pass after pass: the experts of a layer are read once per pass.
     const size_t  align  = std::max<size_t>(256, ggml_backend_buft_get_alignment(ggml_backend_dev_buffer_type(dev)));
-    size_t edge_pt = y_pt;
-    for (size_t pt : slot_pt) {
-        edge_pt += (size_t) n_sets*pt;
-    }
-    for (const auto & cs : carry_slots) {
-        edge_pt += cs.first;
-    }
-    const size_t n_slots    = (size_t) n_sets*slot_pt.size() + carry_slots.size() + 1;
-    const double moe_pt     = (double) moe_need_c/(double) C;
+    int    n_sets  = 1;
+    size_t edge_pt = 0;
+    double moe_pt  = 0.0;
+    auto derive = [&]() {
+        n_sets  = one_set ? 1 : 2;
+        edge_pt = y_pt;
+        for (size_t pt : slot_pt) {
+            edge_pt += (size_t) n_sets*pt;
+        }
+        for (const auto & cs : carry_slots) {
+            edge_pt += cs.first;
+        }
+        moe_pt = (double) moe_need_c/(double) C;
+    };
+    derive();
     const size_t sched_cur  = ggml_backend_sched_get_buffer_size(sc, backend_dev);
     const int64_t n_used    = (int64_t) model.hparams.n_expert_used();
     const int64_t moe_env   = lx_cfg_i64(&llama_layer_mode_config::layer_exec_moe_tokens);
@@ -1301,14 +1342,14 @@ int llama_context::layer_exec_decode(llama_memory_context_i * mctx, uint32_t n_t
     } else if (moe_env > 0) {
         B = moe_env;
     } else {
-        B = C; // grown below to what the budget leaves
+        B = C; // grown below to what the scheduler buffer holds
     }
     // PCIe once (the expert-major op of a group of ubatches, mul-mat-had.cu): the host experts of a layer cross the link
     // once per group (copied into two staging buffers of `once_slots` experts each) instead of once per tile of rows.
     //   RANMA_LAYER_EXEC_PCIE_ONCE: exact (T: the down rows of the group, n_used * n_embd F32 per token, and one sum per
     //     token in slot order: equal to the ubatch-major op), partial (no T: the sums of a token split at the chunks of the
     //     op, as the multi-chunk op without it; a rounding difference), 0 (off: the host experts are read in place per
-    //     tile). Default (auto): exact when a group of two ubatches fits with T, else partial, else off.
+    //     tile). Default (auto): exact when its passes are fewer than the ubatches, else partial, else off.
     //   RANMA_LAYER_EXEC_STAGE_SLOTS: experts per staging buffer. Default: an eighth of the device budget over the two
     //     buffers, 2 .. 64 (the op's tables), at most half the experts.
     int    once_mode  = 0; // 0 off, 1 exact, 2 partial
@@ -1332,102 +1373,218 @@ int llama_context::layer_exec_decode(llama_memory_context_i * mctx, uint32_t n_t
             once_env = "off";
         }
     }
+    // one of the two staging buffers (each its own piece of the lend; 256 bytes past the last expert for the reads past
+    // its last row)
     auto once_stage_bytes = [&]() -> size_t {
-        return once_mode != 0 ? (size_t) 2*once_slots*once_eb + 256 : 0;
+        return once_mode != 0 ? (size_t) once_slots*once_eb + 256 : 0;
     };
-    auto moe_extra = [&](int64_t w) -> size_t {
-        const int64_t rows = B > 0 ? std::min(B, w) : w;
-        const double need = moe_pt*(double) rows;
-        size_t extra = need > (double) sched_cur ? (size_t) (need - (double) sched_cur) : 0;
-        // the op's staging buffers and (exact) T, from the device pool
-        extra += once_stage_bytes() + (once_mode == 1 ? once_t_pt*(size_t) w : 0);
-        if (fused && op_rows > 0) {
-            // the op's scratch for passes wider than the block the expert cache keeps for it comes from the device pool
-            extra += ggml_moe_ffn_had_scratch_bytes(w, n_used, op_rows, (int64_t) model.hparams.n_expert, (int64_t) model.hparams.n_embd,
-                (int64_t) model.hparams.n_ff_exp(), 0, 0);
+    // The prefill lend (ggml_expert_lend_*): the edges, the MoE output, the carried tensors, the expert-major op's scratch,
+    // its staging and T come out of the lowest ranked L1 experts (nothing from host memory). The width rule below sizes
+    // the passes with them. The scheduler's own buffer grows by the MoE graph of the pass rows past what it holds: that
+    // part is not lent (reported in the layer_exec_passes line, not checked against the free memory).
+    const int64_t rows_env = lx_cfg_i64(&llama_layer_mode_config::expert_major_rows);
+    const int64_t op_R     = op_rows > 0 ? op_rows : rows_env > 0 ? rows_env : 4096;
+    // The segment edges are lent per ubatch. A lent region is one kind of the top slots of a class and the three kinds
+    // are lent together, so the largest indivisible piece sets how many slots a lend evicts. The segments read and write
+    // the rows of one ubatch at a time, so an edge slot is cut into pieces of `per` ubatches (as many pieces as a lend
+    // takes, GGML_EXPERT_LEND_MAX_PIECES); a slot that holds the router input of a layer stays one piece (the MoE of the
+    // layer reads it over every row of the pass), and so do the carried tensors and the MoE output.
+    struct lx_edges {
+        int64_t per = 1;              // ubatches per piece of a cut slot
+        std::vector<size_t> first;    // [set*n_slots + j] the first piece of the slot
+        size_t n_pieces = 0;          // the pieces of the edges (they come first in the request)
+    };
+    auto edges_of = [&](int64_t w) {
+        lx_edges el;
+        const int64_t g = std::max<int64_t>(1, (w + C - 1)/C);
+        size_t n_cut = 0;
+        for (uint8_t x : slot_x) {
+            n_cut += x ? 0 : (size_t) n_sets;
         }
-        return extra;
-    };
-    size_t dev_budget = 0;
-    {
-        const int64_t env = lx_env_i64("RANMA_LAYER_EXEC_DEV_MIB");
-        size_t free = 0;
-        size_t total = 0;
-        ggml_backend_dev_memory(dev, &free, &total);
-        dev_budget = env > 0 ? (size_t) env << 20 : free/2;
-    }
-    size_t host_budget = 0;
-    {
-        const int64_t env = lx_env_i64("RANMA_LAYER_EXEC_HOST_MIB");
-        if (env > 0) {
-            host_budget = (size_t) env << 20;
-        } else if (backend_cpu != nullptr) {
-            size_t free = 0;
-            size_t total = 0;
-            ggml_backend_dev_memory(ggml_backend_get_device(backend_cpu), &free, &total);
-            host_budget = free/2;
+        const size_t fixed = (size_t) n_sets*slot_pt.size() - n_cut + carry_slots.size() + 1 +
+            (fused ? 3 + (once_mode != 0 ? 2 : 0) + (once_mode == 1 ? 1 : 0) : 0);
+        el.per = g;
+        if (n_cut > 0 && fixed + n_cut <= GGML_EXPERT_LEND_MAX_PIECES) {
+            const int64_t room = (int64_t) ((GGML_EXPERT_LEND_MAX_PIECES - fixed)/n_cut);   // pieces per cut slot
+            el.per = (g + room - 1)/room;
         }
-    }
-    auto group_fits = [&](int64_t g) {
-        const int64_t w = g*C;
-        const size_t dev_need  = edge_pt*(size_t) w + align*(n_slots + 1) + moe_extra(w);
-        const size_t host_need = (input_bytes_max + meta_bytes_max)*(size_t) g;
-        return (dev_budget == 0 || dev_need <= dev_budget) && (host_budget == 0 || host_need <= host_budget);
+        for (int set = 0; set < n_sets; ++set) {
+            for (size_t j = 0; j < slot_pt.size(); ++j) {
+                el.first.push_back(el.n_pieces);
+                el.n_pieces += slot_x[j] ? 1 : (size_t) ((g + el.per - 1)/el.per);
+            }
+        }
+        return el;
     };
-    int64_t G = K;
-    auto pick_group = [&]() {
-        G = K;
-        const int64_t env = lx_cfg_i64(&llama_layer_mode_config::layer_exec_group_tokens);
-        if (env > 0) {
-            G = std::min<int64_t>(K, std::max<int64_t>(1, env/C));
-        } else {
-            while (G > 1 && !group_fits(G)) {
-                G--;
+    auto lend_request = [&](int64_t w, ggml_expert_lend_request & rq) {
+        rq = {};
+        auto add = [&](size_t bytes, int32_t role) {
+            GGML_ASSERT(rq.n_pieces < GGML_EXPERT_LEND_MAX_PIECES);
+            ggml_expert_lend_piece & pc = rq.pieces[rq.n_pieces++];
+            pc.bytes = bytes;
+            pc.role  = role;
+        };
+        // every piece is VRAM: the state (edges, carried tensors, y, T), the op's scratch and staging
+        const lx_edges el = edges_of(w);
+        const int64_t rows = el.per*C;   // of a piece of a cut slot
+        for (int set = 0; set < n_sets; ++set) {
+            for (size_t j = 0; j < slot_pt.size(); ++j) {
+                if (slot_x[j]) {
+                    add(lx_pad(slot_pt[j]*(size_t) w, align), GGML_EXPERT_LEND_BUFFER);
+                    continue;
+                }
+                for (int64_t r0 = 0; r0 < w; r0 += rows) {
+                    add(lx_pad(slot_pt[j]*(size_t) std::min(rows, w - r0), align), GGML_EXPERT_LEND_BUFFER);
+                }
+            }
+        }
+        for (const auto & cs : carry_slots) {
+            add(lx_pad(cs.first*(size_t) w, align), GGML_EXPERT_LEND_BUFFER);
+        }
+        add(lx_pad(y_pt*(size_t) w, align), GGML_EXPERT_LEND_BUFFER);
+        if (fused) {
+            size_t sb[3];
+            ggml_moe_ffn_had_scratch_split(w, n_used, op_R, (int64_t) model.hparams.n_expert, (int64_t) model.hparams.n_embd,
+                (int64_t) model.hparams.n_ff_exp(), once_mode != 0 ? once_slots : 0, 0, sb);
+            for (int i = 0; i < 3; ++i) {
+                add(sb[i], GGML_EXPERT_LEND_SCRATCH0 + i);
+            }
+            if (once_mode != 0) {
+                add(once_stage_bytes(), GGML_EXPERT_LEND_STAGE);
+                add(once_stage_bytes(), GGML_EXPERT_LEND_STAGE1);
+            }
+            if (once_mode == 1) {
+                add(once_t_pt*(size_t) w, GGML_EXPERT_LEND_T);
             }
         }
     };
+    // the host inputs of a group's ubatches and of the MoE graphs (their token rows): not lent, a host buffer of the
+    // context as the scheduler would allocate them (lx_host_inputs)
+    auto host_inputs_bytes = [&](int64_t w, int64_t g) -> size_t {
+        return (input_bytes_max + 4096)*(size_t) g + 8*(size_t) w*sizeof(llama_token) + 65536;
+    };
+    // A CPU layer device has no expert cache to lend from: its buffers are host memory of their own (the CPU tests)
+    const bool cpu_dev = ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU;
+    const bool lend_on = cpu_dev || (expert_iface != nullptr && expert_backend == backend_dev && expert_iface->lend_fits != nullptr &&
+        expert_iface->lend_acquire != nullptr);
+    auto sched_growth = [&](int64_t w) -> size_t {
+        const int64_t rows = B > 0 ? std::min(B, w) : w;
+        const double need = moe_pt*(double) rows;
+        return need > (double) sched_cur ? (size_t) (need - (double) sched_cur) : 0;
+    };
+    // whether the lend holds the pieces of a pass of w tokens now (the L1 residents as they are; nothing moves)
+    auto fits = [&](int64_t w) {
+        if (!lend_on) {
+            return false;
+        }
+        if (cpu_dev) {
+            return true;
+        }
+        ggml_expert_lend_request rq;
+        lend_request(w, rq);
+        return expert_iface->lend_fits(expert_backend, &rq);
+    };
+    // The width rule (ggml_cuda_expert::lend_width_rule, the budget is L1): P = ceil(N / W_max) passes of W = ceil(N / P)
+    // tokens, in ubatches of C' (the batch is split again when C' is narrower than the context's ubatch). W_max is the
+    // widest pass the lend holds now, or layer_exec_group_tokens. No free memory is asked: the passes depend on
+    // the prompt and the L1 residents only.
+    const int64_t unit = std::min<int64_t>(C_ctx, 256);
+    using lx_width = ggml_cuda_expert::lend_width;
+    auto width_rule = [&]() -> lx_width {
+        return ggml_cuda_expert::lend_width_rule(N, C_ctx, unit, lx_cfg_i64(&llama_layer_mode_config::layer_exec_group_tokens), fits);
+    };
+    if (!lend_on) {
+        n_outputs = save_n_outputs;
+        return skip("the prefill lend of the expert cache is off");
+    }
+    // the PCIe-once mode: exact when its passes are fewer than the ubatches, partial when exact is not (or, auto, when
+    // it needs fewer passes), else off (the op reads its host experts in place)
+    lx_width wr;
+    auto useful = [&](const lx_width & x) { return x.P > 0 && (x.P == 1 || x.P < K); };
     if (fused && once_env != "off") {
         const int64_t env_slots = lx_env_i64("RANMA_LAYER_EXEC_STAGE_SLOTS");
-        const int64_t rule      = (int64_t) (dev_budget/8/std::max<size_t>(1, 2*once_eb));
+        // the staged experts per buffer: an eighth of what the whole L1 could lend, over the two buffers
+        ggml_expert_lend_counts lc = {};
+        if (!cpu_dev && expert_iface->lend_counts != nullptr) {
+            expert_iface->lend_counts(&lc);
+        }
+        const int64_t rule = (int64_t) (lc.lendable_bytes/8/std::max<size_t>(1, 2*once_eb));
         once_slots = (int) std::max<int64_t>(2, std::min<int64_t>({ env_slots > 0 ? env_slots : rule, (int64_t) 64,
             std::max<int64_t>(2, ((int64_t) model.hparams.n_expert + 1)/2) }));
         const bool want_exact   = once_env == "auto" || once_env == "1" || once_env == "exact";
         const bool want_partial = once_env == "auto" || once_env == "1" || once_env == "partial";
-        once_mode = 0;
+        lx_width w_exact, w_partial;
         if (want_exact) {
             once_mode = 1;
-            pick_group();
+            w_exact = width_rule();
         }
-        if (want_partial && (once_mode == 0 || G < 2 || !group_fits(G))) {
+        if (want_partial) {
             once_mode = 2;
-            pick_group();
+            w_partial = width_rule();
         }
-        if (G < 2 || !group_fits(G)) {
-            once_mode = 0; // nothing staged fits: the op reads its host experts in place
+        if (useful(w_exact) && !(once_env == "auto" && useful(w_partial) && w_partial.P < w_exact.P)) {
+            once_mode = 1;
+            wr = w_exact;
+        } else if (useful(w_partial)) {
+            once_mode = 2;
+            wr = w_partial;
+        } else {
+            once_mode = 0;
         }
     }
-    pick_group();
-    if (G < 2 || !group_fits(G)) {
+    if (once_mode == 0) {
+        wr = width_rule();
+    }
+    if (!useful(wr)) {
         n_outputs = save_n_outputs;
         if (log > 0) {
-            LLAMA_LOG_INFO("%s: a group of %" PRId64 " ubatches of %" PRId64 " needs %zu MiB of device buffers (budget %zu MiB) "
-                "and %zu MiB of host inputs and graphs (budget %zu MiB)\n", __func__, std::max<int64_t>(G, 2), C,
-                (edge_pt*(size_t) (std::max<int64_t>(G, 2)*C) + moe_extra(std::max<int64_t>(G, 2)*C)) >> 20, dev_budget >> 20,
-                ((input_bytes_max + meta_bytes_max)*(size_t) std::max<int64_t>(G, 2)) >> 20, host_budget >> 20);
+            ggml_expert_lend_request rq;
+            lend_request(std::min<int64_t>(N, 2*C), rq);
+            size_t dev_b = 0;
+            for (int i = 0; i < rq.n_pieces; ++i) {
+                dev_b += rq.pieces[i].bytes;
+            }
+            LLAMA_LOG_INFO("%s: the widest pass the prefill lend holds is %" PRId64 " tokens (%" PRId64 " passes for %" PRId64
+                " tokens, not fewer than the %" PRId64 " ubatches of %" PRId64 "); a pass of %" PRId64 " tokens needs %zu MiB\n",
+                __func__, wr.W_max, wr.W_max > 0 ? (N + wr.W_max - 1)/wr.W_max : 0, N, K, C, std::min<int64_t>(N, 2*C), dev_b >> 20);
         }
-        return skip("not two ubatches fit the device and host budgets");
+        return skip("the passes the prefill lend holds are not fewer than the ubatches");
     }
+    // the batch in ubatches of C' (the context's ubatch when they are equal)
+    llama_memory_context_ptr mctx_split;
+    if (wr.C != C) {
+        const bool embd_all = n_outputs_all == n_tokens_all;
+        mctx_split = memory->init_batch(*balloc, (uint32_t) wr.C, embd_all);
+        const char * why = nullptr;
+        if (!mctx_split || mctx_split->get_status() != LLAMA_MEMORY_STATUS_SUCCESS) {
+            why = "the batch does not split into the ubatches of the passes";
+        } else {
+            C = wr.C;
+            K = (N + C - 1)/C;
+            why = analyze(C);
+            derive();
+            if (why == nullptr && wr.P > 1 && !fits(wr.W)) {
+                why = "a pass of the new ubatches does not fit the prefill lend";
+            }
+        }
+        if (why != nullptr) {
+            // the split of the batch allocator (its output order) as the ubatch loop will take it
+            mctx_split = memory->init_batch(*balloc, (uint32_t) C_ctx, embd_all);
+            n_outputs = save_n_outputs;
+            return skip(why);
+        }
+        mctx = mctx_split.get();
+    }
+    const int64_t G        = wr.P == 1 ? K : wr.g;     // ubatches per pass
     const int64_t n_groups = (K + G - 1)/G;
     const int64_t W_max    = std::min<int64_t>(N, G*C);
     if (!fused && moe_env <= 0) {
-        // the widest bundle (in ubatches) the budget leaves beside the edges of the group, the MoE at once when it fits
-        while (B < W_max && group_fits(G)) {
+        // the widest bundle (in ubatches) the scheduler buffer holds without growing, the MoE at once when it does
+        B = C;
+        while (B + C < W_max && moe_pt*(double) (B + C) <= (double) sched_cur) {
             B += C;
         }
-        if (!group_fits(G)) {
-            B -= C;
-        }
-        if (B >= W_max) {
+        if (B >= W_max || moe_pt*(double) W_max <= (double) sched_cur) {
             B = 0;
         }
     }
@@ -1486,59 +1643,107 @@ int llama_context::layer_exec_decode(llama_memory_context_i * mctx, uint32_t n_t
     ggml_backend_sched_reset(sc);
     mctx_full.reset();
 
-    // ---- the buffers -----------------------------------------------------------------------------------------------
-    ggml_backend_buffer_type_t buft_dev = ggml_backend_dev_buffer_type(dev);
-    std::vector<size_t> slot_off;
-    size_t edge_bytes = 0;
-    for (int set = 0; set < n_sets; ++set) {
-        for (size_t pt : slot_pt) {
-            slot_off.push_back(edge_bytes);
-            edge_bytes += lx_pad(pt*(size_t) W_max, align);
+    // ---- the buffers: the host inputs, the prefill lend ----------------------------------------------------------------
+    // the host inputs: a host buffer of the context, kept for the next prompt (grown when a pass needs more)
+    const size_t host_need = host_inputs_bytes(W_max, G);
+    const size_t sched_more = sched_growth(W_max);
+    if (!lx_host_inputs || ggml_backend_buffer_get_size(lx_host_inputs.get()) < host_need) {
+        lx_host_inputs.reset();
+        ggml_backend_buffer_type_t buft_in = cpu_dev ? nullptr : ggml_backend_dev_host_buffer_type(dev);
+        if (buft_in == nullptr) {
+            buft_in = ggml_backend_cpu_buffer_type();
+        }
+        lx_host_inputs.reset(ggml_backend_buft_alloc_buffer(buft_in, host_need));
+        if (!lx_host_inputs) {
+            n_outputs = save_n_outputs;
+            return skip("no host buffer for the inputs");
         }
     }
-    std::vector<size_t> carry_off;
-    for (const auto & cs : carry_slots) {
-        carry_off.push_back(edge_bytes);
-        edge_bytes += lx_pad(cs.first*(size_t) W_max, align);
-    }
-    const size_t y_off = edge_bytes;
-    edge_bytes += lx_pad(y_pt*(size_t) W_max, align);
-    edge_bytes += align;
-
-    ggml_backend_buffer_ptr edge_buf(ggml_backend_buft_alloc_buffer(buft_dev, edge_bytes));
-    if (!edge_buf) {
+    ggml_expert_lend_request lend_rq;
+    lend_request(W_max, lend_rq);
+    ggml_expert_lend_grant lend_grant = {};
+    std::vector<ggml_backend_buffer_ptr> cpu_bufs;
+    if (cpu_dev) {
+        for (int i = 0; i < lend_rq.n_pieces; ++i) {
+            cpu_bufs.emplace_back(ggml_backend_buft_alloc_buffer(ggml_backend_dev_buffer_type(dev),
+                std::max<size_t>(lend_rq.pieces[i].bytes, 256)));
+            lend_grant.buffers[i] = cpu_bufs.back().get();
+        }
+    } else if (!expert_iface->lend_acquire(expert_backend, &lend_rq, &lend_grant)) {
         n_outputs = save_n_outputs;
-        return skip("cannot allocate the segment buffers");
+        return skip("the prefill lend refused the buffers");
     }
-    char * edge_base = (char *) ggml_backend_buffer_get_base(edge_buf.get());
-    char * y_base    = edge_base + y_off;
-
-    ggml_backend_buffer_type_t buft_host = ggml_backend_dev_host_buffer_type(dev);
-    if (buft_host == nullptr) {
-        buft_host = ggml_backend_get_default_buffer_type(backend_cpu != nullptr ? backend_cpu : backend_dev);
+    // the lend ends with every path out of this call (the graphs that used it were synchronized: run() does)
+    struct lx_lend_guard {
+        const ggml_expert_iface * iface;
+        ggml_backend_t backend;
+        ~lx_lend_guard() {
+            if (iface != nullptr && iface->lend_release != nullptr) {
+                iface->lend_release(backend);
+            }
+        }
+    } lend_guard { cpu_dev ? nullptr : expert_iface, expert_backend };
+    size_t edge_bytes = 0;
+    size_t lend_dev_bytes = 0;
+    for (int i = 0; i < lend_rq.n_pieces; ++i) {
+        lend_dev_bytes += lend_rq.pieces[i].bytes;
+        if (lend_rq.pieces[i].bytes > 0 && lend_grant.buffers[i] == nullptr) {
+            n_outputs = save_n_outputs;
+            return skip("a piece of the prefill lend has no buffer");
+        }
     }
+    // piece order: the edge slots (a cut slot in pieces of lend_edges.per ubatches), the carried tensors, y, (fused) the
+    // op's pieces
+    const lx_edges lend_edges = edges_of(W_max);
+    const size_t n_edge_pieces = lend_edges.n_pieces;
+    auto piece_buf  = [&](size_t i) { return lend_grant.buffers[i]; };
+    auto piece_base = [&](size_t i) { return (char *) ggml_backend_buffer_get_base(lend_grant.buffers[i]); };
+    for (size_t i = 0; i < n_edge_pieces + carry_slots.size() + 1; ++i) {
+        edge_bytes += lend_rq.pieces[i].bytes;
+    }
+    const size_t y_piece = n_edge_pieces + carry_slots.size();
+    ggml_backend_buffer_t y_buf  = piece_buf(y_piece);
+    char *                y_base = piece_base(y_piece);
+    ggml_backend_buffer_t host_buf = lx_host_inputs.get();
+    size_t host_used = 0;
 
     // the token inputs of the donors
     for (auto & kv : donors) {
         lx_donor & d = kv.second;
         std::set<const ggml_tensor *> only(d.inputs.begin(), d.inputs.end());
         if (!only.empty()) {
-            d.inp_buf.reset(lx_alloc_inputs(d.res->get_ctx(), buft_host, &only));
-            if (!d.inp_buf) {
+            if (!lx_place_inputs(d.res->get_ctx(), host_buf, host_used, &only)) {
                 n_outputs = save_n_outputs;
-                return skip("cannot allocate the token input of a MoE");
+                return skip("the token input of a MoE does not fit the lent host memory");
             }
+            d.has_inputs = true;
         }
     }
+    const size_t host_donors = host_used;
 
     const int64_t t_plan = ggml_time_us();
+    // one line per call (a log check matches "layer_exec_passes:"): the passes and the lend that sized them
+    LLAMA_LOG_INFO("layer_exec_passes: %" PRId64 " tokens in %" PRId64 " pass%s of up to %" PRId64 " ubatches of %" PRId64 " (%" PRId64
+        " tokens): each expert of a layer is loaded at most %" PRId64 " time%s; the prefill lend holds %.1f MiB of VRAM (no prompt "
+        "state in host memory); host inputs %.1f MiB in a host buffer of the context; width rule: widest pass the lend holds %" PRId64
+        " tokens%s, ubatch %" PRId64 " of the context's %" PRId64 "; scheduler growth %.1f MiB (not lent)\n", N, n_groups,
+        n_groups > 1 ? "es" : "", G, C, W_max, n_groups, n_groups > 1 ? "s" : "", lend_dev_bytes/1048576.0, host_need/1048576.0,
+        wr.W_max, wr.P == 1 ? " (one pass)" : "", C, C_ctx, sched_more/1048576.0);
+    if (sched_more > 0 && !cpu_dev) {
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            LLAMA_LOG_WARN("%s: the MoE graph of a pass of %" PRId64 " tokens grows the scheduler's buffer by %.1f MiB, which the "
+                "prefill lend does not hold\n", __func__, W_max, sched_more/1048576.0);
+        }
+    }
     if (log > 0) {
         LLAMA_LOG_INFO("layer_exec_plan: %d of %d layers layer by layer, %" PRId64 " ubatches of %" PRId64 " in %" PRId64 " group%s of "
             "up to %" PRId64 ", MoE %s, %.1f KiB of edges per row (%zu slot%s x %d set%s, %zu carried), MoE %.1f KiB per row, "
-            "device budget %zu MiB, %zu MiB segment buffers\n",
+            "%zu MiB segment buffers (lent)\n",
             L, L_all, K, C, n_groups, n_groups > 1 ? "s" : "", G, fused ? (op_rows > 0 ? "expert-major op, passes of the rows set" :
             "expert-major op, its own passes") : B > 0 && B < W_max ? "in bundles" : "at once over a group", edge_pt/1024.0, slot_pt.size(),
-            slot_pt.size() == 1 ? "" : "s", n_sets, n_sets > 1 ? "s" : "", carry_slots.size(), moe_pt/1024.0, dev_budget >> 20,
+            slot_pt.size() == 1 ? "" : "s", n_sets, n_sets > 1 ? "s" : "", carry_slots.size(), moe_pt/1024.0,
             edge_bytes >> 20);
         if (!fused && B > 0 && B < W_max) {
             LLAMA_LOG_INFO("layer_exec_plan: MoE bundles of %" PRId64 " rows\n", B);
@@ -1547,11 +1752,21 @@ int llama_context::layer_exec_decode(llama_memory_context_i * mctx, uint32_t n_t
             LLAMA_LOG_INFO("layer_exec_plan: expert-major op passes of %" PRId64 " rows\n", op_rows);
         }
     }
+    if (log > 0) {
+        size_t n_cut = 0;
+        for (uint8_t x : slot_x) {
+            n_cut += x ? 0 : 1;
+        }
+        LLAMA_LOG_INFO("layer_exec_lend: %d pieces: %zu of the segment edges (%zu of %zu slot%s cut into pieces of %" PRId64
+            " ubatch%s, the router input whole), %zu carried, the MoE output%s\n", lend_rq.n_pieces, n_edge_pieces, n_cut,
+            slot_pt.size(), slot_pt.size() == 1 ? "" : "s", lend_edges.per, lend_edges.per == 1 ? "" : "es", carry_slots.size(),
+            fused ? ", the op's scratch, staging and T" : "");
+    }
     if (fused && (log > 0 || once_mode != 0)) {
         // one line per call: the PCIe-once mode the budget allowed (RANMA_LAYER_EXEC_PCIE_ONCE)
         LLAMA_LOG_INFO("layer_exec_pcie_once: %s (%s), %d experts per staging buffer (%.1f MiB for two), T %.1f KiB per row\n",
             once_mode == 1 ? "exact" : once_mode == 2 ? "partial" : "off", once_env.c_str(), once_slots,
-            once_stage_bytes()/1048576.0, once_mode == 1 ? once_t_pt/1024.0 : 0.0);
+            2*once_stage_bytes()/1048576.0, once_mode == 1 ? once_t_pt/1024.0 : 0.0);
     }
 
     // ---- every group: the memory, graph and inputs of its ubatches, then its layers -----------------------------------
@@ -1605,15 +1820,26 @@ int llama_context::layer_exec_decode(llama_memory_context_i * mctx, uint32_t n_t
     };
 
     // the rows of a slot are as wide as its widest tensor: the tensors of different segments in one slot keep the row
-    // ranges of their ubatches apart
-    auto slot_addr = [&](int s, size_t j, const llama_lx_edge & e, int64_t row0) {
-        GGML_UNUSED(e);
+    // ranges of their ubatches apart. Row row0 of the pass in slot j of segment s: its piece (a cut slot: the piece of
+    // its ubatch; a ubatch of the pass starts at a multiple of C) and its address there.
+    auto slot_piece = [&](int s, size_t j, int64_t row0) {
         const int set = one_set ? 0 : (s & 1);
-        return edge_base + slot_off[(size_t) set*slot_pt.size() + j] + (size_t) row0*slot_pt[j];
+        const size_t first = lend_edges.first[(size_t) set*slot_pt.size() + j];
+        return slot_x[j] ? first : first + (size_t) (row0/(lend_edges.per*C));
     };
+    auto slot_addr = [&](int s, size_t j, const llama_lx_edge & e, int64_t row0) -> char * {
+        GGML_UNUSED(e);
+        if (!slot_x[j] && row0 % C != 0) {
+            return nullptr;   // a cut slot holds whole ubatches only
+        }
+        const int64_t r = slot_x[j] ? row0 : row0 % (lend_edges.per*C);
+        return piece_base(slot_piece(s, j, row0)) + (size_t) r*slot_pt[j];
+    };
+    auto slot_buf = [&](int s, size_t j, int64_t row0) { return piece_buf(slot_piece(s, j, row0)); };
     auto carry_addr = [&](size_t k, int64_t row0) {
-        return edge_base + carry_off[k] + (size_t) row0*carry_slots[k].first;
+        return piece_base(n_edge_pieces + k) + (size_t) row0*carry_slots[k].first;
     };
+    auto carry_buf = [&](size_t k) { return piece_buf(n_edge_pieces + k); };
 
     const int64_t n_vocab = model.vocab.n_tokens();
     int64_t n_outputs_prev = 0;
@@ -1643,6 +1869,7 @@ int llama_context::layer_exec_decode(llama_memory_context_i * mctx, uint32_t n_t
         const int64_t g0 = i0_glob;   // the first token of the group in the batch
 
         std::vector<lx_chunk> chunks((size_t) kn);
+        host_used = host_donors;   // the inputs of the previous pass are no longer read
         std::vector<llama_token> tokens;
         tokens.reserve((size_t) W_max);
         int64_t i0 = 0;
@@ -1712,18 +1939,18 @@ int llama_context::layer_exec_decode(llama_memory_context_i * mctx, uint32_t n_t
                 }
             }
             // only the inputs the segments read: the others (e.g. the host masks a chunked graph makes on the device) stay
-            // unallocated, as in a graph the scheduler allocates
+            // unallocated, as in a graph the scheduler allocates; they are in the lent host memory
+            const size_t host_before = host_used;
             {
                 std::set<const ggml_tensor *> used(c.plan.inputs.begin(), c.plan.inputs.end());
-                c.inp_buf.reset(lx_alloc_inputs(c.res->get_ctx(), buft_host, &used, gf));
-            }
-            if (!c.inp_buf) {
-                return abort_batch("cannot allocate the inputs of a chunk");
+                if (!lx_place_inputs(c.res->get_ctx(), host_buf, host_used, &used, gf)) {
+                    return abort_batch("the inputs of a chunk do not fit the lent host memory");
+                }
             }
             const int64_t t_in = ggml_time_us();
             c.res->set_inputs(&ub);
             t_inputs_us += ggml_time_us() - t_in;
-            inputs_held += ggml_backend_buffer_get_size(c.inp_buf.get());
+            inputs_held += host_used - host_before;
             for (size_t b : c.plan.seg_input_bytes) {
                 inputs_copied += b;
             }
@@ -1808,7 +2035,8 @@ int llama_context::layer_exec_decode(llama_memory_context_i * mctx, uint32_t n_t
                 if (l > 0) {
                     for (size_t j = 0; j < p.out[l - 1].size(); ++j) {
                         const auto & e = p.out[l - 1][j];
-                        if (cp.leaf(e.t, edge_buf.get(), slot_addr(l - 1, j, e, c.i0), e.place_as) == nullptr) {
+                        char * at = slot_addr(l - 1, j, e, c.i0);
+                        if (at == nullptr || cp.leaf(e.t, slot_buf(l - 1, j, c.i0), at, e.place_as) == nullptr) {
                             return abort_batch("cannot place a segment input");
                         }
                     }
@@ -1816,13 +2044,13 @@ int llama_context::layer_exec_decode(llama_memory_context_i * mctx, uint32_t n_t
                     if (ggml_nbytes(y) != y_pt*(size_t) c.n) {
                         return abort_batch("the MoE output rows of a chunk differ from the MoE graph");
                     }
-                    if (cp.leaf(y, edge_buf.get(), y_base + (size_t) c.i0*y_pt) == nullptr) {
+                    if (cp.leaf(y, y_buf, y_base + (size_t) c.i0*y_pt) == nullptr) {
                         return abort_batch("cannot place a MoE output");
                     }
                 }
                 for (size_t k = 0; k < carried_in.size(); ++k) {
                     const auto & e = *carried_in[k];
-                    if (cp.leaf(e.t, edge_buf.get(), carry_addr(carried_in_slot[k], c.i0), e.place_as) == nullptr) {
+                    if (cp.leaf(e.t, carry_buf(carried_in_slot[k]), carry_addr(carried_in_slot[k], c.i0), e.place_as) == nullptr) {
                         return abort_batch("cannot place a carried tensor");
                     }
                 }
@@ -1831,13 +2059,17 @@ int llama_context::layer_exec_decode(llama_memory_context_i * mctx, uint32_t n_t
                 if (l < L) {
                     for (size_t j = 0; j < p.out[l].size(); ++j) {
                         const auto & e = p.out[l][j];
-                        place[e.place_as != nullptr ? e.place_as : e.t] = { edge_buf.get(), slot_addr(l, j, e, c.i0) };
+                        char * at = slot_addr(l, j, e, c.i0);
+                        if (at == nullptr) {
+                            return abort_batch("a segment output does not start a ubatch of its piece");
+                        }
+                        place[e.place_as != nullptr ? e.place_as : e.t] = { slot_buf(l, j, c.i0), at };
                     }
                 }
                 for (size_t k = 0; k < carried_out.size(); ++k) {
                     const auto & e = *carried_out[k];
                     place[e.place_as != nullptr ? e.place_as : e.t] =
-                        { edge_buf.get(), carry_addr(carried_out_slot[k], c.i0) };
+                        { carry_buf(carried_out_slot[k]), carry_addr(carried_out_slot[k], c.i0) };
                 }
                 std::string err;
                 if (!cp.copy(g, p.nodes[l], place, err)) {
@@ -1882,6 +2114,9 @@ int llama_context::layer_exec_decode(llama_memory_context_i * mctx, uint32_t n_t
                     return abort_batch("the router input is not in the same slot of every chunk");
                 }
             }
+            if (!slot_x[jx]) {
+                return abort_batch("the router input is in a slot lent per ubatch");
+            }
             int64_t r0 = 0;
             for (int64_t w : bw) {
                 lx_donor & d = donors.at(w);
@@ -1894,11 +2129,11 @@ int llama_context::layer_exec_decode(llama_memory_context_i * mctx, uint32_t n_t
                 if (!cp.init(r.nodes.size() + 1, r.nodes.size()*4 + 256)) {
                     return abort_batch("cannot make a MoE graph");
                 }
-                if (cp.leaf(r.x, edge_buf.get(), slot_addr(l, jx, out0[jx], r0)) == nullptr) {
+                if (cp.leaf(r.x, slot_buf(l, jx, r0), slot_addr(l, jx, out0[jx], r0)) == nullptr) {
                     return abort_batch("cannot place the router input");
                 }
                 std::map<const ggml_tensor *, std::pair<ggml_backend_buffer_t, char *>> place;
-                place[r.y] = { edge_buf.get(), y_base + (size_t) r0*y_pt };
+                place[r.y] = { y_buf, y_base + (size_t) r0*y_pt };
                 std::string err;
                 if (!cp.copy(gd, r.nodes, place, err)) {
                     LLAMA_LOG_ERROR("%s: %s\n", __func__, err.c_str());
@@ -1917,7 +2152,7 @@ int llama_context::layer_exec_decode(llama_memory_context_i * mctx, uint32_t n_t
                         }
                     }
                 }
-                if (d.inp_buf) {
+                if (d.has_inputs) {
                     ggml_tensor * t = d.res->get_inp_tokens();
                     if (t == nullptr || ggml_nelements(t) != w) {
                         return abort_batch("the token input of a MoE");

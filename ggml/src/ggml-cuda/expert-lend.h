@@ -278,6 +278,58 @@ inline void lend_l1_capacity(const std::vector<lend_class> & cls, const std::vec
     }
 }
 
+// ---- the width of a prompt's passes (the layer-major prefill) ---------------------------------------------------
+
+// The passes of a prompt of N tokens (more than one ubatch of C_ctx) on an L1 budget: P = ceil(N / W_max) passes, each of
+// W = ceil(N / P) tokens rounded up to `unit`, in g = ceil(W / C_ctx) ubatches of C = ceil(W / g) tokens rounded up to
+// `unit` and at most C_ctx (equal shares: the fewest passes, each as narrow as they allow). W_max is the widest multiple of
+// `unit` that `fits` (a pass of that many tokens can be lent now), or `forced` (> 0) in its place. One pass when all N
+// fit. When the rounding pushes the pass of P over what fits, P grows by one. P is 0 when no pass fits or the passes
+// would not be fewer than the ubatches of C_ctx (the ubatch loop loads every expert as often).
+struct lend_width {
+    int64_t P = 0;      // passes
+    int64_t W = 0;      // tokens of a pass (the last may be narrower)
+    int64_t C = 0;      // tokens of a ubatch of a pass
+    int64_t g = 0;      // ubatches of a pass
+    int64_t W_max = 0;  // the widest pass that fits
+};
+
+template <typename F>
+inline lend_width lend_width_rule(int64_t N, int64_t C_ctx, int64_t unit, int64_t forced, F && fits) {
+    lend_width r;
+    if (N <= 0 || C_ctx <= 0 || unit <= 0) { return r; }
+    const int64_t K = (N + C_ctx - 1)/C_ctx;
+    if (forced > 0 ? forced >= N : fits(N)) {
+        r.P = 1; r.W = N; r.C = C_ctx; r.g = K; r.W_max = N;
+        return r;
+    }
+    if (forced > 0) {
+        r.W_max = std::max(unit, forced/unit*unit);
+    } else {
+        int64_t lo = 0, hi = (N + unit - 1)/unit;   // in units: lo fits (0: none), hi does not
+        while (hi - lo > 1) {
+            const int64_t mid = lo + (hi - lo)/2;
+            (fits(mid*unit) ? lo : hi) = mid;
+        }
+        r.W_max = lo*unit;
+    }
+    if (r.W_max <= 0) { return r; }
+    for (int64_t P = (N + r.W_max - 1)/r.W_max; P < K; ++P) {
+        const int64_t w0 = (N + P - 1)/P;
+        const int64_t g  = (w0 + C_ctx - 1)/C_ctx;
+        const int64_t c  = std::min<int64_t>(C_ctx, ((w0 + g - 1)/g + unit - 1)/unit*unit);
+        const int64_t w  = g*c;
+        if (forced > 0 || fits(w)) {
+            r.P = ((N + c - 1)/c + g - 1)/g;
+            r.W = w;
+            r.C = c;
+            r.g = g;
+            return r;
+        }
+    }
+    return r;
+}
+
 // ---- the restore space ------------------------------------------------------------------------------------------
 
 // Whether the installed decode plan keeps (layer, expert) in L1: `want` [layer*n_experts + expert], empty = no plan.
