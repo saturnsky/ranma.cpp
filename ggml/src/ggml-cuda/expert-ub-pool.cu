@@ -210,8 +210,8 @@ static __device__ __forceinline__ bool ub_precedes(const ub_step_args & a, const
 // the copy kernel that follows it on the same stream.
 static __global__ void __launch_bounds__(ub_pool_threads) ub_step_kernel(const ub_step_args a) {
     __shared__ uint32_t s_t;
-    __shared__ int s_r, s_off, s_n_miss, s_n_victims;
-    __shared__ unsigned int s_hits, s_over, s_fills, s_evict, s_rejected;
+    __shared__ int s_r, s_off, s_fixed, s_n_miss, s_n_victims;
+    __shared__ unsigned int s_hits, s_fixed_hits, s_over, s_fills, s_evict, s_rejected;
     __shared__ int32_t s_key[ub_pool_max_experts];
     __shared__ int32_t s_miss[ub_pool_max_experts];
     __shared__ int32_t s_miss_key[ub_pool_max_experts];
@@ -249,6 +249,7 @@ static __global__ void __launch_bounds__(ub_pool_threads) ub_step_kernel(const u
         ub_pool_meta & m = a.meta[a.layer];
         s_r   = m.r;
         s_off = m.offset;
+        s_fixed = m.fixed;
         // the copy kernel of this launch reads only the list of this step
         *a.count = 0;
         if (s_r > 0) {
@@ -257,7 +258,7 @@ static __global__ void __launch_bounds__(ub_pool_threads) ub_step_kernel(const u
         s_t = m.step;
         s_n_miss = 0;
         s_n_victims = 0;
-        s_hits = s_over = s_fills = s_evict = s_rejected = 0;
+        s_hits = s_fixed_hits = s_over = s_fills = s_evict = s_rejected = 0;
         s_ring_fills = 0;
         s_ring_on = a.ringpos != nullptr && m.ring != 0 && s_r > 0;
         s_pf_arrived = s_pf_taken = 0;
@@ -322,7 +323,6 @@ static __global__ void __launch_bounds__(ub_pool_threads) ub_step_kernel(const u
     }
 
     const int n = a.n_rows*a.n_used;
-    unsigned int hits = 0;
     if (ghost) {
         // an expert two rows of this launch selected has its second access in this step: it passes the filter
         // (the router picks distinct experts within a row, so each selection is one row)
@@ -335,6 +335,7 @@ static __global__ void __launch_bounds__(ub_pool_threads) ub_step_kernel(const u
         }
         __syncthreads();
     }
+    unsigned int hits = 0, fixed_hits = 0;
     for (int i = tid; i < n; i += blockDim.x) {
         const int row = i/a.n_used;
         const int k   = i - row*a.n_used;
@@ -346,6 +347,7 @@ static __global__ void __launch_bounds__(ub_pool_threads) ub_step_kernel(const u
         if (p >= 0 && p < r) {
             a.stamp[off + p] = t;
             hits++;
+            fixed_hits += p < s_fixed;
             continue;
         }
         if (L.slots[id] >= 0) {
@@ -377,6 +379,9 @@ static __global__ void __launch_bounds__(ub_pool_threads) ub_step_kernel(const u
     }
     if (hits != 0) {
         atomicAdd(&s_hits, hits);
+    }
+    if (fixed_hits != 0) {
+        atomicAdd(&s_fixed_hits, fixed_hits);
     }
     __syncthreads();
 
@@ -520,6 +525,7 @@ static __global__ void __launch_bounds__(ub_pool_threads) ub_step_kernel(const u
     if (tid == 0) {
         atomicAdd(&a.counters[ub_pool_steps], 1ull);
         if (s_hits)  { atomicAdd(&a.counters[ub_pool_hits], (unsigned long long) s_hits); }
+        if (s_fixed_hits) { atomicAdd(&a.counters[ub_pool_fixed_hits], (unsigned long long) s_fixed_hits); }
         if (s_fills) {
             atomicAdd(&a.counters[ub_pool_fills], (unsigned long long) s_fills);
             atomicAdd(&a.counters[ub_pool_fill_bytes], (unsigned long long) s_fills*a.pos_bytes);
@@ -808,7 +814,7 @@ struct ub_lend_args {
     int32_t * ringpos;        // [P] or null
 };
 
-// lend: the r positions of every enabled layer, empty, their tails zeroed. The step count is kept.
+// lend: the r positions of every enabled layer after its fixed ones, empty, their tails zeroed. The step count is kept.
 static __global__ void __launch_bounds__(ub_pool_threads) ub_lend_kernel(const ub_lend_args a) {
     const int layer = blockIdx.x;
     const int tid = threadIdx.x;
@@ -822,7 +828,7 @@ static __global__ void __launch_bounds__(ub_pool_threads) ub_lend_kernel(const u
         return;
     }
     const int r = a.r;
-    const int off = m.offset;
+    const int off = m.offset + m.fixed;
     for (int p = 0; p < r; ++p) {
         const int q = off + p;
         if (tid == 0) {
@@ -842,22 +848,24 @@ static __global__ void __launch_bounds__(ub_pool_threads) ub_lend_kernel(const u
     }
     if (tid == 0) {
         a.count[layer] = 0;
-        m.r = r;
+        m.r = m.fixed + r;
         m.ring = a.ring;
     }
     // the tables may be mapped host memory, which the next kernels read
     __threadfence_system();
 }
 
-// reclaim: the entries of every owner back to their homes, then r = 0
+// reclaim: the entries of every owner of the lent region back to their homes, then r = the fixed positions (whose ring
+// owners stay marked in the rebuilt bitmap)
 static __global__ void ub_reclaim_kernel(const ub_pool_layer * layers, ub_pool_meta * meta, const uint64_t * home,
         int32_t * owner, int16_t * pos_of, int n_experts, uint32_t * pdown, int32_t * ringpos, uint32_t * ringbits,
         uint32_t * ringbits_host, int words) {
     const int layer = blockIdx.x;
     ub_pool_meta & m = meta[layer];
     const int r = m.r;
+    const int fixed = m.fixed;
     const ub_pool_layer & L = layers[layer];
-    for (int p = threadIdx.x; p < r; p += blockDim.x) {
+    for (int p = fixed + threadIdx.x; p < r; p += blockDim.x) {
         const int q = m.offset + p;
         const int e = owner[q];
         if (pdown != nullptr) {
@@ -881,21 +889,31 @@ static __global__ void ub_reclaim_kernel(const ub_pool_layer * layers, ub_pool_m
         owner[q] = -1;
     }
     if (ringbits != nullptr) {
+        if (fixed > 0) {
+            __syncthreads();   // the map of the region's owners is cleared
+        }
         for (int w = threadIdx.x; w < words; w += blockDim.x) {
-            ringbits[size_t(layer)*words + w] = 0;
-            ringbits_host[size_t(layer)*words + w] = 0;
+            uint32_t bits = 0;
+            for (int b = 0; fixed > 0 && b < 32; ++b) {
+                const int e = w*32 + b;
+                const int p = e < n_experts ? pos_of[size_t(layer)*n_experts + e] : -1;
+                bits |= (p >= 0 && p < fixed && ringpos[m.offset + p] != 0) ? 1u << b : 0u;
+            }
+            ringbits[size_t(layer)*words + w] = bits;
+            ringbits_host[size_t(layer)*words + w] = bits;
         }
     }
     __threadfence_system();
     __syncthreads();
     if (threadIdx.x == 0) {
-        m.r = 0;
+        m.r = fixed;
     }
 }
 
 // ---- host side --------------------------------------------------------------------------------------
 
-ub_pool::ub_pool(int n_layers, int n_experts, int r_cap) : n_layers_(n_layers), n_experts_(n_experts), r_cap_(r_cap) {}
+ub_pool::ub_pool(int n_layers, int n_experts, int r_cap, int r_base) : n_layers_(n_layers), n_experts_(n_experts), r_cap_(r_cap),
+    r_base_(r_base > 0 && r_base <= r_cap ? r_base : r_cap), fixed_((size_t) std::max(n_layers, 0), 0) {}
 
 ub_pool::~ub_pool() {
     if (blob_ != nullptr) {
@@ -992,7 +1010,7 @@ bool ub_pool::allocate(int device, const std::vector<ub_pool_layer> & layers,
     CUDA_CHECK(cudaMemcpy(d_sizes, sizes.data(), sizes.size()*sizeof(size_t), cudaMemcpyHostToDevice));
     std::vector<ub_pool_meta> meta(L);
     for (size_t l = 0; l < L; ++l) {
-        meta[l] = { int32_t(l*(size_t) r_cap_), 0, 0, 0, 0, 0 };
+        meta[l] = { int32_t(l*(size_t) r_cap_), 0, 0, 0, 0, 0, 0 };
     }
     CUDA_CHECK(cudaMemcpy(d_meta_, meta.data(), L*sizeof(ub_pool_meta), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMallocHost((void **) &h_addr_, P*3*sizeof(uint64_t)));
@@ -1028,8 +1046,10 @@ int ub_pool::lend(void * base, size_t bytes, cudaStream_t stream, void * base2, 
         const uintptr_t start = ((uintptr_t) b + 255) & ~uintptr_t(255);
         return n > size_t(start - (uintptr_t) b) ? (n - size_t(start - (uintptr_t) b))/per_round : 0;
     };
-    const int r1 = (int) std::min<size_t>(rounds(base, bytes), (size_t) r_cap_);
-    const int r2 = (int) std::min<size_t>(rounds(base2, bytes2), (size_t) (r_cap_ - r1));
+    // after the fixed positions of the layer with the most
+    const int room = std::max(r_cap_ - fixed_max_, 0);
+    const int r1 = (int) std::min<size_t>(rounds(base, bytes), (size_t) room);
+    const int r2 = (int) std::min<size_t>(rounds(base2, bytes2), (size_t) (room - r1));
     const int r  = r1 + r2;
     if (r <= 0) {
         return 0;
@@ -1042,7 +1062,7 @@ int ub_pool::lend(void * base, size_t bytes, cudaStream_t stream, void * base2, 
                 continue;
             }
             for (int p = p0; p < p1; ++p) {
-                const size_t q = size_t(l)*r_cap_ + p;
+                const size_t q = size_t(l)*r_cap_ + (size_t) fixed_[(size_t) l] + p;
                 for (int k = 0; k < 3; ++k) {
                     h_addr_[q*3 + k] = (uint64_t) at;
                     at += (kind_bytes_[l][k] + kind_tails_[l][k] + 255) & ~size_t(255);
@@ -1099,7 +1119,7 @@ long ub_pool::owned_in_second() const {
             continue;
         }
         for (int p = r_ - r2_; p < r_; ++p) {
-            n += owner[size_t(l)*r_cap_ + p] >= 0 ? 1 : 0;
+            n += owner[size_t(l)*r_cap_ + (size_t) fixed_[(size_t) l] + p] >= 0 ? 1 : 0;
         }
     }
     return n;
@@ -1189,8 +1209,14 @@ bool ub_pool::enable_ring() {
     return true;
 }
 
-void ub_pool::launch_copy(int layer, cudaStream_t stream) {
-    const ggml_cuda_kernel_launch_params launch(dim3(r_cap_, ub_pool_copy_blocks), dim3(ub_pool_threads), 0, stream);
+void ub_pool::launch_copy(int layer, cudaStream_t stream, int n_rows, int n_used) {
+    // a step fills at most one position per distinct expert of the launch: with fixed positions the grid follows the
+    // launch's rows instead of every allocated position
+    int gx = r_base_;
+    if (r_cap_ > r_base_) {
+        gx = std::min(r_cap_, std::max(r_base_, n_rows*n_used));
+    }
+    const ggml_cuda_kernel_launch_params launch(dim3(gx, ub_pool_copy_blocks), dim3(ub_pool_threads), 0, stream);
     ggml_cuda_kernel_launch(ub_copy_kernel, launch, (const ub_pool_layer *) d_layers_, layer,
         (const ub_pool_copy *) d_copy_ + size_t(layer)*r_cap_, (const int32_t *) d_count_ + layer,
         (const uint64_t *) d_addr_, (const uint64_t *) d_home_, (const char *) pf_.staging, pf_.slot_bytes,
@@ -1373,8 +1399,164 @@ bool ub_pool::read_live(uint64_t & hits, uint64_t & fills, uint64_t & fill_bytes
     return true;
 }
 
+// ---- fixed positions --------------------------------------------------------------------------------------------
+
+struct ub_table_write {
+    int32_t  layer, kind, expert;
+    uint64_t value;
+};
+
+// The listed table entries (each entry once), written by the device: the tables may be mapped host memory the worker reads.
+static __global__ void ub_table_write_kernel(const ub_pool_layer * layers, const ub_table_write * w, const int n) {
+    for (int i = blockIdx.x*blockDim.x + threadIdx.x; i < n; i += gridDim.x*blockDim.x) {
+        uint64_t * t = layers[w[i].layer].kind[w[i].kind].addresses;
+        if (t != nullptr) {
+            t[w[i].expert] = w[i].value;
+        }
+    }
+    __threadfence_system();
+}
+
+bool ub_pool::read_fixed(std::vector<std::vector<ub_fixed_pos>> & pos, std::vector<uint32_t> & steps) const {
+    pos.assign((size_t) n_layers_, {});
+    steps.assign((size_t) n_layers_, 0);
+    if (blob_ == nullptr || r_ != 0) {
+        return false;
+    }
+    const size_t L = (size_t) n_layers_, P = L*(size_t) r_cap_;
+    ggml_cuda_set_device(device_);
+    std::vector<ub_pool_meta> meta(L);
+    std::vector<int32_t> owner(P), ringpos(P, 0);
+    std::vector<uint32_t> stamp(P);
+    std::vector<uint64_t> home(P*3);
+    CUDA_CHECK(cudaMemcpy(meta.data(), d_meta_, L*sizeof(ub_pool_meta), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(owner.data(), d_owner_, P*sizeof(int32_t), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(stamp.data(), d_stamp_, P*sizeof(uint32_t), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(home.data(), d_home_, P*3*sizeof(uint64_t), cudaMemcpyDeviceToHost));
+    if (d_ringpos_ != nullptr) {
+        CUDA_CHECK(cudaMemcpy(ringpos.data(), d_ringpos_, P*sizeof(int32_t), cudaMemcpyDeviceToHost));
+    }
+    for (size_t l = 0; l < L; ++l) {
+        steps[l] = meta[l].step;
+        for (int p = 0; p < meta[l].fixed; ++p) {
+            const size_t q = l*(size_t) r_cap_ + (size_t) p;
+            ub_fixed_pos x;
+            x.owner = owner[q] >= 0 ? owner[q] : -1;   // a pending prefetch reservation counts as empty
+            x.stamp = stamp[q];
+            x.ring  = x.owner >= 0 ? ringpos[q] : 0;
+            for (int k = 0; k < 3; ++k) {
+                x.home[k] = home[q*3 + k];
+                x.addr[k] = h_addr_[q*3 + k];
+            }
+            pos[l].push_back(x);
+        }
+    }
+    return true;
+}
+
+bool ub_pool::set_fixed(const std::vector<std::vector<ub_fixed_pos>> & pos, const std::vector<std::pair<int, ub_fixed_pos>> & drop) {
+    if (blob_ == nullptr || r_ != 0 || (int) pos.size() != n_layers_) {
+        return false;
+    }
+    const size_t L = (size_t) n_layers_, E = (size_t) n_experts_, P = L*(size_t) r_cap_, W = ring_words();
+    for (size_t l = 0; l < L; ++l) {
+        if ((int) pos[l].size() > r_cap_ - r_base_ || (!layers_[l].enabled && !pos[l].empty())) {
+            return false;
+        }
+    }
+    ggml_cuda_set_device(device_);
+    std::vector<ub_pool_meta> meta(L);
+    CUDA_CHECK(cudaMemcpy(meta.data(), d_meta_, L*sizeof(ub_pool_meta), cudaMemcpyDeviceToHost));
+    std::vector<int32_t> owner(P, -1), ringpos(P, 0);
+    std::vector<uint32_t> stamp(P, 0);
+    std::vector<uint64_t> home(P*3, 0);
+    std::vector<int16_t> pos_of(L*E, -1);
+    std::vector<uint32_t> bits(L*W, 0);
+    // (layer, kind, expert) -> value; the drops first, so that an owner's own entries win
+    std::vector<ub_table_write> writes;
+    std::vector<int32_t> at(L*3*E, -1);
+    auto put = [&](int l, int k, int e, uint64_t v) {
+        const size_t i = ((size_t) l*3 + (size_t) k)*E + (size_t) e;
+        if (at[i] >= 0) {
+            writes[(size_t) at[i]].value = v;
+            return;
+        }
+        at[i] = (int32_t) writes.size();
+        writes.push_back({ l, k, e, v });
+    };
+    for (const auto & d : drop) {
+        if (d.first < 0 || (size_t) d.first >= L || d.second.owner < 0 || (size_t) d.second.owner >= E) {
+            return false;
+        }
+        for (int k = 0; k < 3; ++k) {
+            put(d.first, k, d.second.owner, d.second.ring ? 0 : d.second.home[k]);
+        }
+    }
+    for (size_t l = 0; l < L; ++l) {
+        for (size_t p = 0; p < pos[l].size(); ++p) {
+            const ub_fixed_pos & x = pos[l][p];
+            const size_t q = l*(size_t) r_cap_ + p;
+            for (int k = 0; k < 3; ++k) {
+                h_addr_[q*3 + k] = x.addr[k];
+                home[q*3 + k] = x.home[k];
+            }
+            if (x.owner < 0) {
+                continue;
+            }
+            if ((size_t) x.owner >= E || pos_of[l*E + (size_t) x.owner] >= 0 || (x.ring && !ring_)) {
+                return false;
+            }
+            owner[q]   = x.owner;
+            stamp[q]   = x.stamp;
+            ringpos[q] = x.ring ? 1 : 0;
+            pos_of[l*E + (size_t) x.owner] = (int16_t) p;
+            if (x.ring) {
+                bits[l*W + (size_t) x.owner/32] |= 1u << (x.owner%32);
+            }
+            for (int k = 0; k < 3; ++k) {
+                put((int) l, k, x.owner, x.addr[k]);
+            }
+        }
+        meta[l].fixed = (int32_t) pos[l].size();
+        meta[l].r     = meta[l].fixed;
+        meta[l].ring  = ring_ ? 1 : 0;
+    }
+    CUDA_CHECK(cudaMemcpy(d_owner_, owner.data(), P*sizeof(int32_t), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_stamp_, stamp.data(), P*sizeof(uint32_t), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_home_, home.data(), P*3*sizeof(uint64_t), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_addr_, h_addr_, P*3*sizeof(uint64_t), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_pos_of_, pos_of.data(), L*E*sizeof(int16_t), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(d_meta_, meta.data(), L*sizeof(ub_pool_meta), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemset(d_count_, 0, L*sizeof(int32_t)));
+    if (d_ringpos_ != nullptr) {
+        CUDA_CHECK(cudaMemcpy(d_ringpos_, ringpos.data(), P*sizeof(int32_t), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(d_ringbits_, bits.data(), L*W*sizeof(uint32_t), cudaMemcpyHostToDevice));
+        memcpy(h_ringbits_, bits.data(), L*W*sizeof(uint32_t));
+    }
+    if (pf_.inplace && pf_.pdown != nullptr) {
+        CUDA_CHECK(cudaMemset(pf_.pdown, 0, P*sizeof(uint32_t)));
+    }
+    if (!writes.empty()) {
+        ub_table_write * d_w = nullptr;
+        CUDA_CHECK(cudaMalloc((void **) &d_w, writes.size()*sizeof(ub_table_write)));
+        CUDA_CHECK(cudaMemcpy(d_w, writes.data(), writes.size()*sizeof(ub_table_write), cudaMemcpyHostToDevice));
+        const int n = (int) writes.size();
+        ub_table_write_kernel<<<std::min((n + 255)/256, 1024), 256>>>(d_layers_, d_w, n);
+        CUDA_CHECK(cudaGetLastError());
+        CUDA_CHECK(cudaDeviceSynchronize());
+        CUDA_CHECK(cudaFree(d_w));
+    }
+    CUDA_CHECK(cudaDeviceSynchronize());
+    fixed_max_ = 0;
+    for (size_t l = 0; l < L; ++l) {
+        fixed_[l] = (int) pos[l].size();
+        fixed_max_ = std::max(fixed_max_, fixed_[l]);
+    }
+    return true;
+}
+
 long ub_pool::verify(std::string & reason) const {
-    if (blob_ == nullptr || r_ == 0) {
+    if (blob_ == nullptr || (r_ == 0 && fixed_max_ == 0)) {
         return 0;
     }
     ggml_cuda_set_device(device_);
@@ -1396,7 +1578,7 @@ long ub_pool::verify(std::string & reason) const {
         if (!layers_[l].enabled) {
             continue;
         }
-        for (int p = 0; p < r_; ++p) {
+        for (int p = 0; p < fixed_[l] + r_; ++p) {
             const size_t q = l*r_cap_ + p;
             const int e = owner[q];
             if (e < 0) {

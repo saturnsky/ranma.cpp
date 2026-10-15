@@ -485,6 +485,165 @@ static int run_ring() {
     return 0;
 }
 
+// Fixed positions (the LRU part of L1, --expert-l1-lru-pct): positions in "L1 slots" before those of a lent region. Experts
+// 30..35 are ring occupants as in run_ring.
+static int run_fixed() {
+    fixture f;
+    std::vector<ub_pool_layer> layers;
+    std::vector<std::array<size_t, 3>> bytes, tails;
+    if (build(f, true, layers, bytes, tails)) { return 1; }
+    constexpr int R0 = 30, R1 = 36, SLOTS = 6;
+    std::vector<char *> ring(3), ring_dev(3), arena(3);
+    for (int k = 0; k < 3; ++k) {
+        CUDA_CHECK(hipHostMalloc((void **) &ring[k], (R1 - R0)*KIND_BYTES[k], hipHostMallocMapped));
+        CUDA_CHECK(hipHostGetDevicePointer((void **) &ring_dev[k], ring[k], 0));
+        for (int e = R0; e < R1; ++e) { memcpy(ring[k] + (e - R0)*KIND_BYTES[k], f.host[k] + e*KIND_BYTES[k], KIND_BYTES[k]); }
+        // the "L1 arena" of a kind: slot-major, no tail per slot
+        CUDA_CHECK(hipMalloc((void **) &arena[k], SLOTS*KIND_BYTES[k] + 512));
+        CUDA_CHECK(hipMemset(arena[k], 0xAB, SLOTS*KIND_BYTES[k] + 512));
+    }
+    auto ring_addr = [&](int k, int e) { return (uint64_t) (uintptr_t) (ring_dev[k] + (e - R0)*KIND_BYTES[k]); };
+    for (int l = 0; l < L; ++l) {
+        for (int e = R0; e < R1; ++e) {
+            f.serve_host[l][e/32] |= 1u << (e%32);
+            for (int k = 0; k < 3; ++k) { f.tables_host[l*3 + k][e] = ring_addr(k, e); }
+        }
+    }
+    auto slot_pos = [&](int slot) {
+        ub_fixed_pos x;
+        for (int k = 0; k < 3; ++k) { x.addr[k] = (uint64_t) (uintptr_t) (arena[k] + slot*KIND_BYTES[k]); }
+        return x;
+    };
+    auto in_arena = [&](int l, int e) {
+        std::vector<uint64_t> t;
+        table_read(f, l, 0, t);
+        const uintptr_t a = (uintptr_t) t[e];
+        return a >= (uintptr_t) arena[0] && a < (uintptr_t) arena[0] + SLOTS*KIND_BYTES[0];
+    };
+    auto bit = [&](ub_pool & pool, int l, int e) {
+        CUDA_CHECK(hipDeviceSynchronize());
+        uint32_t dev[2];
+        CUDA_CHECK(hipMemcpy(dev, pool.ring_bits_device() + l*2, sizeof(dev), hipMemcpyDeviceToHost));
+        const bool h = (pool.ring_bits_host()[l*2 + e/32] & (1u << (e%32))) != 0;
+        const bool d = (dev[e/32] & (1u << (e%32))) != 0;
+        return h == d ? (h ? 1 : 0) : -1;
+    };
+    // r_cap 8, of which 4 for a region: at most 4 fixed positions per layer
+    ub_pool pool(L, E, 8, 4);
+    CHECK(pool.allocate(0, layers, bytes, tails));
+    CHECK(pool.enable_ring());
+    {
+        std::vector<std::vector<ub_fixed_pos>> pos(L);
+        pos[0] = { slot_pos(0), slot_pos(1), slot_pos(2) };
+        pos[2] = { slot_pos(3), slot_pos(4) };
+        CHECK(pool.set_fixed(pos, {}));
+        std::vector<std::vector<ub_fixed_pos>> bad(L);
+        bad[1] = { slot_pos(5) };   // layer 1 takes no positions
+        CHECK(!pool.set_fixed(bad, {}));
+        bad[1].clear();
+        bad[0] = { slot_pos(0), slot_pos(1), slot_pos(2), slot_pos(3), slot_pos(4) };   // more than r_cap - r_base
+        CHECK(!pool.set_fixed(bad, {}));
+    }
+    CHECK(pool.fixed(0) == 3 && pool.fixed(2) == 2 && pool.fixed_max() == 3 && !pool.lent());
+    // not lent: the fixed positions take misses (a ring occupant and a host resident), the copies are read
+    if (launch(f, pool, 0, {{30, 10, 2, 1}})) { return 1; }
+    CHECK(counter(pool, ub_pool_fills) == 2 && counter(pool, ub_pool_ring_fills) == 1 && in_arena(0, 30) && in_arena(0, 10));
+    CHECK(bit(pool, 0, 30) == 1);
+    // the ring reuses the slot of 30 (the L2 evicted it): the copy stays and is read (launch checks the bytes)
+    for (int k = 0; k < 3; ++k) { memset(ring[k] + (30 - R0)*KIND_BYTES[k], 0x77, KIND_BYTES[k]); }
+    if (launch(f, pool, 0, {{30, 10, 1, 2}})) { return 1; }
+    CHECK(counter(pool, ub_pool_hits) == 2 && counter(pool, ub_pool_fixed_hits) == 2);
+    // a third miss fills the last fixed position; a fourth evicts the oldest (10 is used by every launch)
+    if (launch(f, pool, 0, {{11, 10, 1, 2}})) { return 1; }
+    if (launch(f, pool, 0, {{12, 10, 1, 2}})) { return 1; }
+    CHECK(in_arena(0, 12) && in_arena(0, 11) && in_arena(0, 10) && !in_arena(0, 30));
+    {
+        std::vector<uint64_t> t;
+        table_read(f, 0, 0, t);
+        CHECK(t[30] == 0 && bit(pool, 0, 30) == 0);   // a ring owner leaves as 0 (its old ring slot holds something else)
+    }
+    // a region after the fixed positions: an expert in a fixed position is a hit, never a second copy
+    if (alloc_region(f)) { return 1; }
+    CHECK(pool.lend(f.region, f.region_bytes, 0) == 2 && pool.r() == 2);
+    const uint64_t fills0 = counter(pool, ub_pool_fills);
+    if (launch(f, pool, 0, {{10, 11, 12, 31}})) { return 1; }
+    CHECK(counter(pool, ub_pool_fills) == fills0 + 1 && pooled(f, pool, 0, 31) && in_arena(0, 10));
+    if (launch(f, pool, 0, {{13, 14, 10, 31}})) { return 1; }   // 13, 14 evict 11, 12 (fixed) or the region's empty slot
+    std::string why;
+    long checked = pool.verify(why);
+    if (checked < 0) { fprintf(stderr, "verify: %s\n", why.c_str()); }
+    CHECK(checked == 5);
+    // layer 2 too: its region positions follow its 2 fixed ones
+    if (launch(f, pool, 2, {{5, 6, 7, 32}})) { return 1; }
+    CHECK(in_arena(2, 5) && in_arena(2, 6));
+    // reclaim: the region's owners go home, the fixed ones stay (and stay marked)
+    std::vector<int> fixed_owned;
+    for (int e = 4; e < 36; ++e) { if (in_arena(0, e)) { fixed_owned.push_back(e); } }
+    CHECK(fixed_owned.size() == 3);
+    pool.reclaim(0);
+    CUDA_CHECK(hipDeviceSynchronize());
+    CUDA_CHECK(hipMemset(f.region, 0xEE, f.region_bytes));
+    for (int e : fixed_owned) { CHECK(in_arena(0, e)); }
+    for (int e = 4; e < 36; ++e) {
+        if (std::find(fixed_owned.begin(), fixed_owned.end(), e) != fixed_owned.end() || in_arena(2, e)) { continue; }
+        std::vector<uint64_t> t;
+        table_read(f, 0, 0, t);
+        CHECK(t[e] == f.initial[0][e] || (e >= R0 && (t[e] == 0 || t[e] == ring_addr(0, e))));
+    }
+    for (int e : fixed_owned) { if (e >= R0) { CHECK(bit(pool, 0, e) == 1); } }
+    if (launch(f, pool, 0, {{fixed_owned[0], fixed_owned[1], 1, 2}})) { return 1; }
+    checked = pool.verify(why);
+    CHECK(checked == 5);   // 3 + 2 fixed copies
+    // a lend moves a fixed copy to another slot (read_fixed, D2D, set_fixed with the new address) and drops another
+    std::vector<std::vector<ub_fixed_pos>> pos;
+    std::vector<uint32_t> steps;
+    CHECK(pool.read_fixed(pos, steps) && pos[0].size() == 3 && steps[0] > 0);
+    std::vector<std::pair<int, ub_fixed_pos>> drop = { { 0, pos[0][2] } };
+    ub_fixed_pos moved = pos[0][0];
+    for (int k = 0; k < 3; ++k) {
+        CUDA_CHECK(hipMemcpy(arena[k] + 5*KIND_BYTES[k], arena[k] + 0*KIND_BYTES[k], KIND_BYTES[k], hipMemcpyDeviceToDevice));
+        moved.addr[k] = (uint64_t) (uintptr_t) (arena[k] + 5*KIND_BYTES[k]);
+    }
+    std::vector<std::vector<ub_fixed_pos>> next(L);
+    next[0] = { moved, pos[0][1] };
+    next[2] = pos[2];
+    CHECK(pool.set_fixed(next, drop));
+    CHECK(pool.fixed(0) == 2 && in_arena(0, moved.owner) && !in_arena(0, pos[0][2].owner));
+    {
+        std::vector<uint64_t> t;
+        table_read(f, 0, 0, t);
+        CHECK(t[moved.owner] == moved.addr[0]);
+        const int d = pos[0][2].owner;
+        CHECK(t[d] == (pos[0][2].ring ? 0 : f.initial[0][d]));
+    }
+    CUDA_CHECK(hipMemset(arena[0], 0x11, KIND_BYTES[0]));   // the old slot is the lend's now
+    if (launch(f, pool, 0, {{moved.owner, pos[0][1].owner, 1, 2}})) { return 1; }
+    CHECK(pool.verify(why) == 4);
+    // drop everything: every table at home (ring owners 0), the bitmap empty
+    CHECK(pool.read_fixed(pos, steps));
+    drop.clear();
+    for (int l = 0; l < L; ++l) {
+        for (ub_fixed_pos & x : pos[(size_t) l]) {
+            if (x.owner >= 0) { drop.push_back({ l, x }); x.owner = -1; x.ring = 0; }
+        }
+    }
+    CHECK(pool.set_fixed(pos, drop));
+    for (int l = 0; l < L; ++l) {
+        for (int e = 4; e < 36; ++e) {
+            std::vector<uint64_t> t;
+            table_read(f, l, 0, t);
+            CHECK(!in_arena(l, e) && (t[e] == f.initial[(size_t) l*3][(size_t) e] || (e >= R0 && (t[e] == 0 || t[e] == ring_addr(0, e)))));
+            if (e >= R0) { CHECK(bit(pool, l, e) == 0); }
+        }
+    }
+    CHECK(live_matches(pool));
+    for (int k = 0; k < 3; ++k) { CUDA_CHECK(hipHostFree(ring[k])); CUDA_CHECK(hipFree(arena[k])); }
+    printf("PASS: decode pool fixed positions: misses fill them while nothing is lent, a ring copy survives its ring slot's reuse, "
+           "LRU eviction, a region after them without duplicates, the reclaim keeps them, a move and a drop through "
+           "read_fixed/set_fixed, a full drop restores every table\n");
+    return 0;
+}
+
 int main() {
     CUDA_CHECK(hipSetDevice(0));
     if (run(false)) { return 1; }
@@ -492,6 +651,7 @@ int main() {
     if (run_ghost(false)) { return 1; }
     if (run_ghost(true)) { return 1; }
     if (run_ring()) { return 1; }
+    if (run_fixed()) { return 1; }
     printf("ALL PASS\n");
     return 0;
 }

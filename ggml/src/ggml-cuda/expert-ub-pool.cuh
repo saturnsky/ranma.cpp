@@ -48,6 +48,7 @@
 #include <array>
 #include <cstdint>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace ggml_cuda_expert {
@@ -83,6 +84,7 @@ enum ub_pool_counter : int {
     ub_pool_pf_fills,      // fills whose copy read a prefetch staging slot
     ub_pool_pf_arrived,    // staging slots whose generation matched at the step
     ub_pool_ring_fills,    // fills of ring occupants (ring admission), part of ub_pool_fills
+    ub_pool_fixed_hits,    // hits on positions in L1 slots (the LRU part of L1), part of ub_pool_hits
     ub_pool_n_counters,
 };
 
@@ -104,9 +106,10 @@ struct ub_pool_layer {
 
 struct ub_pool_meta {
     int32_t  offset; // first position of the layer
-    int32_t  r;      // active positions, 0 = the pool is not lent
+    int32_t  r;      // active positions: the fixed ones, then those of a lent region (0 = none)
     uint32_t step;   // launches that stepped a lent pool; kept across lends (stamps, ghost window)
     int32_t  ring;   // ring admission for this lend (set by the lend kernel); 0 = off
+    int32_t  fixed;  // the first positions, in L1 slots (set_fixed): kept through lends and reclaims
     unsigned long long n_hits, n_fills; // of the layer, cumulative: the values the step kernel writes to ub_pool_live
 };
 
@@ -218,10 +221,27 @@ struct ub_pf_dev {              // device state of the prefetch, passed to the s
 
 static constexpr int32_t ub_pending = -2;   // owner of a position reserved by the inplace prefetch
 
+// ---- fixed positions (the LRU part of L1, --expert-l1-lru-pct; expert-l1-lru.h) -----------------------------------
+//
+// A layer's first meta.fixed positions are L1 slots, set by the host while the device is idle and no region is lent
+// (set_fixed). The step and copy kernels treat them like any other position: one least recently used set per layer with
+// the positions of a lent region after them. A lend lays out its region after them and a reclaim gives back only the
+// region's positions; the ring bitmap is then rebuilt from the fixed ones. No tail is zeroed in an L1 slot (the bytes
+// past it are the next slot).
+struct ub_fixed_pos {
+    int32_t  owner   = -1;      // the expert, -1 empty
+    uint32_t stamp   = 0;
+    int32_t  ring    = 0;       // admitted from the ring (ringpos)
+    uint64_t home[3] = {0, 0, 0};
+    uint64_t addr[3] = {0, 0, 0};   // the L1 slot of each kind
+};
+
 
 class ub_pool {
 public:
-    ub_pool(int n_layers, int n_experts, int r_cap);
+    // `r_cap` positions per layer are allocated; `r_base` (<= r_cap) of them is what a region may use and bounds the copy
+    // grid when no position is fixed (0 = r_cap).
+    ub_pool(int n_layers, int n_experts, int r_cap, int r_base = 0);
     ~ub_pool();
 
     ub_pool(const ub_pool &) = delete;
@@ -260,7 +280,19 @@ public:
     void launch_step(int layer, const int32_t * ids, int n_rows, int row_stride, int n_used, bool admit, cudaStream_t stream,
         uint32_t * prof_counts = nullptr, size_t prof_bank_stride = 0, uint32_t prof_n_banks = 0,
         const profile_selection * prof_selection = nullptr);
-    void launch_copy(int layer, cudaStream_t stream);
+    // n_rows x n_used bounds the experts one step can fill (the copy grid) once the fixed positions widen the pool.
+    void launch_copy(int layer, cudaStream_t stream, int n_rows = 0, int n_used = 0);
+
+    // Fixed positions (above). Device idle and no region lent.
+    //   read_fixed: [layer] its fixed positions now, and [layer] its step count.
+    //   set_fixed: the fixed positions of every layer become `pos` (the size is the count); every owner's table entries
+    //     point at its slot; every expert of `drop` (layer, its old position) gets its entries back (its home, or 0 when
+    //     it came from the ring). The positions of a layer may not exceed r_cap - r_base.
+    bool read_fixed(std::vector<std::vector<ub_fixed_pos>> & pos, std::vector<uint32_t> & steps) const;
+    bool set_fixed(const std::vector<std::vector<ub_fixed_pos>> & pos, const std::vector<std::pair<int, ub_fixed_pos>> & drop);
+    int  fixed(int layer) const { return fixed_.empty() ? 0 : fixed_[(size_t) layer]; }
+    int  fixed_max() const { return fixed_max_; }
+    int  r_base() const { return r_base_; }
 
     // Prefetch staging (see above): once, after allocate and before any graph capture. `ring` sets of
     // `slots` staging slots of the largest position. False (and no prefetch) when it cannot allocate.
@@ -305,6 +337,9 @@ private:
     const int n_layers_;
     const int n_experts_;
     const int r_cap_;
+    const int r_base_;
+    std::vector<int> fixed_;     // [layer] fixed positions (host mirror of meta.fixed)
+    int    fixed_max_ = 0;
     int    device_ = -1;
     void * blob_   = nullptr;
     size_t bytes_  = 0;
