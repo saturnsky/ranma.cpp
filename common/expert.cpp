@@ -1,11 +1,13 @@
 #include "expert.h"
 
+#include "fit.h"
 #include "log.h"
 
 #include "../ggml/src/ggml-cuda/expert-os.h"
 
 #include <algorithm>
 #include <cstdlib>
+#include <stdexcept>
 #include <cerrno>
 #include <cstring>
 
@@ -33,7 +35,7 @@ expert_validation validate_expert_params(const common_params & params) {
     if (params.expert_l2_mib == 0) {
         return expert_reject("--expert-l2-mib 0 is not valid: the host tier cannot be empty; use -1 for an L2 that holds every expert");
     }
-    const bool active = params.expert_l1_mib > 0 || params.expert_l2_mib > 0;
+    const bool active = expert_cache_on(params);
     if (active && params.moe_cache_size > 0) {
         return expert_reject("--moe-cache-mib and the expert cache (--expert-l1-mib/--expert-l2-mib) cache the same experts; use one of them");
     }
@@ -134,7 +136,7 @@ expert_validation validate_expert_params(const common_params & params) {
 }
 
 bool expert_draft_joins(const common_params & params) {
-    return (params.expert_l1_mib > 0 || params.expert_l2_mib > 0) && params.expert_cache_draft &&
+    return expert_cache_on(params) && params.expert_cache_draft &&
         params.speculative.has_dft() && !params.speculative.draft.mparams.path.empty();
 }
 
@@ -258,4 +260,36 @@ ggml_expert_config expert_config_from_params(const common_params & params) {
     }
 
     return cfg;
+}
+
+bool expert_cache_on(const common_params & params) {
+    return params.expert_l1_mib > 0 || params.expert_l1_auto || params.expert_l2_mib > 0;
+}
+
+size_t expert_l1_auto_bytes(int64_t free, size_t model, size_t context, size_t compute, size_t margin) {
+    const int64_t mib  = 1024*1024;
+    const int64_t used = (int64_t) model + (int64_t) context + (int64_t) compute + (int64_t) margin;
+    return free > used ? (size_t) ((free - used)/mib*mib) : 0;
+}
+
+void common_expert_l1_auto(common_params & params, const llama_model_params & mparams, const llama_context_params & cparams) {
+    if (!params.expert_l1_auto || params.expert_l1_mib > 0) {
+        return;
+    }
+    std::vector<ggml_backend_dev_t> devs;
+    uint32_t hp_ngl = 0, hp_ctx = 0, hp_exp = 0;
+    const common_device_memory_data_vec dm = common_get_device_memory_data(params.model.path.c_str(), &mparams, &cparams, devs,
+        hp_ngl, hp_ctx, hp_exp, params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
+    if (dm.size() < 2) {
+        throw std::runtime_error("--expert-l1-mib auto: the measurement found no GPU");
+    }
+    const common_device_memory_data & d = dm[0];
+    const size_t margin = params.fit_params_target.empty() ? 0 : params.fit_params_target[0];
+    const size_t l1 = expert_l1_auto_bytes(d.free, d.model, d.context, d.compute, margin);
+    COM_INF("expert cache: L1 auto: %lld MiB free on the GPU - model %zu - KV %zu - compute %zu - fit target %zu = %zu MiB\n",
+        (long long) (d.free >> 20), d.model >> 20, d.context >> 20, d.compute >> 20, margin >> 20, l1 >> 20);
+    if (l1 == 0) {
+        throw std::runtime_error("--expert-l1-mib auto: the model, the KV cache and the compute buffers leave no VRAM for L1");
+    }
+    params.expert_l1_mib = (int32_t) (l1 >> 20);
 }

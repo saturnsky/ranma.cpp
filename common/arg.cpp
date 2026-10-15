@@ -972,7 +972,7 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
 
     // ranma expert cache: the byte budget decides the expert placement, so every routed expert goes to
     //                     host memory here, exactly like --cpu-moe (see docs/ranma/expert-cache.md)
-    if (params.expert_l1_mib > 0 || params.expert_l2_mib > 0) {
+    if (expert_cache_on(params)) {
         // exclusive mode spends the budget on VRAM slices that cannot move back, so the fitter would
         // measure free memory that is already gone; it is turned off here unless the user insisted,
         // and validate_expert_params rejects the combination when they did
@@ -988,7 +988,11 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
             LOG_WRN("warning: %s\n", w.c_str());
         }
         params.tensor_buft_overrides.push_back(llm_ffn_exps_cpu_override());
-        LOG_INF("expert cache: %d MiB budget, every routed expert placed in host memory\n", params.expert_l1_mib);
+        if (params.expert_l1_auto) {
+            LOG_INF("%s", "expert cache: L1 budget auto (sized before the load), every routed expert placed in host memory\n");
+        } else {
+            LOG_INF("expert cache: %d MiB budget, every routed expert placed in host memory\n", params.expert_l1_mib);
+        }
         if (expert_draft_joins(params)) {
             params.speculative.draft.tensor_buft_overrides.push_back(llm_ffn_exps_cpu_override());
             LOG_INF("%s", "expert cache: the draft model shares the cache, its routed experts are placed in host memory too\n");
@@ -3978,17 +3982,32 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_GPU_HEARTBEAT_SECONDS"));
     add_opt(common_arg(
-        {"--expert-l1-mib"}, "N",
+        {"--expert-l1-mib"}, "N|auto",
         string_format("VRAM budget in MiB for the cache of MoE routed-expert weights (default: %d; 0 = disabled)\n"
+                      "auto = the free VRAM the other weights, the KV cache and the compute buffers leave, less --fit-target\n"
+                      "(measured before the load, as -fit measures it)\n"
                       "this budget also decides the expert placement; a finite L2 leaves nonresidents in the GGUF file,\n"
                       "so it cannot be combined with --n-cpu-moe/--cpu-moe; it loads the model with --load-mode none\n"
                       "unless --load-mode is given and turns the host-direct path on unless GGML_CUDA_HOST_DIRECT is set",
                       params.expert_l1_mib),
-        [](common_params & params, int value) {
-            if (value < 0) {
-                throw std::invalid_argument("invalid value: must be 0 or more");
+        [](common_params & params, const std::string & value) {
+            if (value == "auto") {
+                params.expert_l1_auto = true;
+                params.expert_l1_mib  = 0;
+                return;
             }
-            params.expert_l1_mib = value;
+            int n = 0;
+            size_t used = 0;
+            try {
+                n = std::stoi(value, &used);
+            } catch (const std::exception &) {
+                used = 0;
+            }
+            if (used != value.size() || n < 0) {
+                throw std::invalid_argument("invalid value: must be 0 or more, or auto");
+            }
+            params.expert_l1_auto = false;
+            params.expert_l1_mib  = n;
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PERPLEXITY, LLAMA_EXAMPLE_COMPLETION}).set_env("LLAMA_ARG_EXPERT_L1_MIB"));
     add_opt(common_arg(
