@@ -30,7 +30,7 @@ Before the model loads, from the GGUF metadata and the free memory:
 | other slots' prompt batches | see below |
 
 The plan fits when, on the GPU, model + KV + compute buffer (measured with a no_alloc load of the model and the
-context, as `-fit` measures) + L1 budget + the op's buffers + a reserve of 4 GiB is at most the free memory, and on
+context, as `-fit` measures) + L1 budget + the op's buffers + `--fit-target` (per device, default 1024 MiB, the margin
 of `-fit` and of `--expert-l1-mib auto`) is at most the free memory. The host compute buffer is a compute buffer
 the scheduler holds for the life of the context, so it has no budget: the host compute buffer and the growth of the
 process peak during that load (graph metadata) are logged for information only. Each measurement logs one `layer mode: width ..., chunk ...` line; the decision logs `layer mode: on: ...`.
@@ -42,8 +42,6 @@ the layer-major prefill to the graphs through a process-wide setting (`llama_lay
 through environment variables; the layer-major prefill is switched on for DeepSeek-V4 and V4.1 (the models it cuts) and
 the setting is restored when the mode stays off. A prompt batch
 of another slot takes 3000 ms of compute (below).
-`GGML_CUDA_HOST_DIRECT_MAX_BATCH` keep their values when set. The reserves can be changed for development:
-`RANMA_LAYER_MODE_RESERVE_MIB` (4096), `RANMA_LAYER_MODE_HOST_MIB` (from the available memory),
 
 ## The logical batch
 

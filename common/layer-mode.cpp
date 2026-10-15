@@ -31,10 +31,9 @@
 #endif
 
 // Defaults of the automatic sizing; each can be changed through its environment variable (development use). The width
-// is not derived from rates of this machine: it is the widest that the measured memory allows.
-// - reserve: MiB of VRAM kept outside the plan (HIP pool, runtime, graph copies; 3.1 GiB measured on DS4F, plus room).
+// is not derived from rates of this machine: it is the widest that the measured memory allows. The VRAM kept outside
+// the plan is --fit-target of the device (upstream's margin of -fit, the same as --expert-l1-mib auto).
 // - preempt: ms a prompt batch of a slot other than 0 may take while slot 0 has priority (the wait of a new slot-0 request).
-#define LM_RESERVE_MIB  4096
 #define LM_PREEMPT_MS   3000
 #define LM_UB_MIN       1024
 // the widest ubatch of the layer-major prefill (default): the per-token time of the segment ops (dense products, sparse
@@ -47,11 +46,6 @@
 #define LM_MAX_ITEMS    65535 // MOE_FFN_HAD: GEMM items of one pass (grid y)
 
 static const size_t MiB = 1024*1024;
-
-static double lm_env_f(const char * name, double def) {
-    const char * v = getenv(name);
-    return v != nullptr && v[0] != '\0' ? atof(v) : def;
-}
 
 static bool lm_env_set(const char * name) {
     const char * v = getenv(name);
@@ -100,6 +94,7 @@ struct lm_model {
 
 struct lm_eval {
     bool    ok       = false;
+    int64_t l1       = 0; // the L1 budget of this width (--expert-l1-mib, or what auto leaves)
     int64_t dev_need = 0; // bytes the plan needs on the GPU, the measured part and the fixed parts
     int64_t dev_free = 0;
     int64_t host     = 0; // host compute buffer + graph metadata (information, not a limit)
@@ -312,7 +307,7 @@ void common_layer_mode_apply(common_params & params) {
     };
 
     // ---- support ---------------------------------------------------------------------------------------------------
-    const bool cache = params.expert_l1_mib > 0 || params.expert_l2_mib > 0;
+    const bool cache = expert_cache_on(params);
     if (!cache) {
         off("it needs the expert cache (--expert-l1-mib / --expert-l2-mib), whose experts are read from host memory");
         return;
@@ -379,9 +374,12 @@ void common_layer_mode_apply(common_params & params) {
     const bool    env_ring     = lm_env_set("RANMA_EXPERT_MAJOR_STREAM_MIB");
     const int64_t stage_min = lm_env_set("RANMA_EXPERT_MAJOR_STAGE_MIN") ? std::max(1, atoi(getenv("RANMA_EXPERT_MAJOR_STAGE_MIN"))) : 129;
 
-    const int64_t reserve = (int64_t) lm_env_f("RANMA_LAYER_MODE_RESERVE_MIB", LM_RESERVE_MIB)*(int64_t) MiB;
-    const int64_t l1 = (int64_t) params.expert_l1_mib*(int64_t) MiB;
-    // outside L1, or all of them in inclusive mode) and a reserve for the rest of the process and the other programs
+    // the VRAM kept outside the plan: --fit-target of the device. --expert-l1-mib auto: L1 is what the model, the KV
+    // cache and the compute buffers of a width leave less that reserve, so each width has its own L1; the width's lent
+    // buffers must fit that L1
+    const bool    l1_auto = params.expert_l1_auto && params.expert_l1_mib <= 0;
+    const int64_t reserve = params.fit_params_target.empty() ? 0 : (int64_t) params.fit_params_target[0];
+    int64_t l1 = l1_auto ? 0 : (int64_t) params.expert_l1_mib*(int64_t) MiB;
 
     // ---- width: the widest that fits, at most the context of one sequence -------------------------------------------
     // No rate of the link or of the GEMMs enters: the measurement below decides. The upper end is the context of one
@@ -447,14 +445,14 @@ void common_layer_mode_apply(common_params & params) {
     };
     // The prefill lend puts the blocks into the top slots of the L1 arena of each kind, after the lowest ranked experts
     // left. Estimated before the load with the largest layer's experts in one size class, the exclusive exchange spares kept.
-    auto lend_fits = [&](int64_t w) {
+    auto lend_fits = [&](int64_t w, int64_t l1w) {
         size_t b[3];
         scratch_split(w, b);
         const uint64_t per = m.kind_bytes[0] + m.kind_bytes[1] + m.kind_bytes[2];
         if (per == 0) {
             return false;
         }
-        const int64_t slots = std::max<int64_t>(0, l1/(int64_t) per - (params.expert_cache_mode == "exclusive" ? 8 : 0));
+        const int64_t slots = std::max<int64_t>(0, l1w/(int64_t) per - (params.expert_cache_mode == "exclusive" ? 8 : 0));
         std::vector<size_t> regions;
         for (int k = 0; k < 3; ++k) {
             const size_t span = (size_t) slots*m.kind_bytes[k];
@@ -542,14 +540,15 @@ void common_layer_mode_apply(common_params & params) {
         const common_device_memory_data & d = dm[0];
         // the op's buffers are lent from L1 (the prefill lend), not added to it
         const int64_t buffers = scratch_bytes(w);
-        const bool    lent    = lend_fits(w);
+        e.l1       = l1_auto ? (int64_t) expert_l1_auto_bytes(d.free, d.model, d.context, d.compute, (size_t) reserve) : l1;
+        const bool    lent    = e.l1 > 0 && lend_fits(w, e.l1);
         e.dev_free = d.free;
-        e.dev_need = (int64_t) (d.model + d.context + d.compute) + reserve + l1;
+        e.dev_need = (int64_t) (d.model + d.context + d.compute) + reserve + e.l1;
         e.host     = (int64_t) dm.back().compute + meta;
-        e.ok       = e.dev_need <= e.dev_free && lent;
-        LOG_INF("layer mode: width %lld, chunk %lld: GPU model %zu + KV %zu + compute %zu + L1 %lld + reserve %lld = %lld of %lld "
+        e.ok       = (l1_auto ? e.l1 > 0 : e.dev_need <= e.dev_free) && lent;
+        LOG_INF("layer mode: width %lld, chunk %lld: GPU model %zu + KV %zu + compute %zu + L1 %lld%s + reserve %lld = %lld of %lld "
             "MiB free; op buffers %lld MiB lent from L1: %s; host compute %zu + graph %lld MiB (not a limit) -> %s\n", (long long) w,
-            (long long) std::min(c, w), d.model/MiB, d.context/MiB, d.compute/MiB, (long long) (l1/MiB),
+            (long long) std::min(c, w), d.model/MiB, d.context/MiB, d.compute/MiB, (long long) (e.l1/MiB), l1_auto ? " (auto)" : "",
             (long long) (reserve/MiB), (long long) (e.dev_need/MiB), (long long) (e.dev_free/MiB), (long long) (buffers/MiB),
             lent ? "fits" : "does not fit", dm.back().compute/MiB, (long long) (meta/MiB),
             e.ok ? "fits" : "does not fit");
@@ -631,6 +630,17 @@ void common_layer_mode_apply(common_params & params) {
                 }
                 cc = std::max<int64_t>(c, (cc*3/4)/256*256);
             }
+        }
+    }
+
+    // --expert-l1-mib auto: the L1 the chosen width and chunk leave (one more measurement of exactly that setup)
+    if (l1_auto) {
+        const lm_eval fin = eval(ub, c);
+        if (fin.l1 > 0) {
+            l1 = fin.l1;
+            params.expert_l1_mib = (int32_t) (l1/(int64_t) MiB);
+            LOG_INF("layer mode: --expert-l1-mib auto is %d MiB at width %lld (the free VRAM less the model, the KV cache, "
+                "the compute buffers and --fit-target %lld MiB)\n", params.expert_l1_mib, (long long) ub, (long long) (reserve/MiB));
         }
     }
 

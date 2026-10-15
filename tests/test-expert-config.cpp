@@ -13,6 +13,27 @@ int main() {
     common_params p;
     CHECK(validate_expert_params(p).ok);
     p.expert_l1_mib = -1; CHECK(!validate_expert_params(p).ok); p.expert_l1_mib = 0;
+    {
+        // --expert-l1-mib auto: the cache is on before the size is known; the size is the free VRAM less the model, the KV
+        // cache, the compute buffers and --fit-target, in whole MiB, 0 when nothing is left
+        const size_t MiB = 1024*1024;
+        common_params a;
+        CHECK(!expert_cache_on(a));
+        a.expert_l1_auto = true;
+        CHECK(expert_cache_on(a));
+        CHECK(expert_l1_auto_bytes(32437*(int64_t) MiB, 4400*MiB, 1484*MiB, 5881*MiB, 1024*MiB) == 19648*MiB);
+        CHECK(expert_l1_auto_bytes(32437*(int64_t) MiB + 1000, 4400*MiB, 1484*MiB, 5881*MiB, 1024*MiB) == 19648*MiB);
+        CHECK(expert_l1_auto_bytes(32437*(int64_t) MiB - 1, 4400*MiB, 1484*MiB, 5881*MiB, 1024*MiB) == 19647*MiB);
+        CHECK(expert_l1_auto_bytes(8*(int64_t) MiB, 4*MiB, 2*MiB, 1*MiB, 1*MiB) == 0);
+        CHECK(expert_l1_auto_bytes(8*(int64_t) MiB, 4*MiB, 2*MiB, 2*MiB, 1*MiB) == 0);
+        CHECK(expert_l1_auto_bytes(-1, 0, 0, 0, 0) == 0);
+        // the margin is --fit-target of the first device, also with -fit off (exclusive mode turns it off)
+        a.fit_params = false;
+        CHECK(a.fit_params_target[0] == 1024*MiB);
+        // resolved (expert_l1_mib set) the config carries the size like a given one
+        a.expert_l1_mib = 19648;
+        CHECK(expert_config_from_params(a).l1_bytes == 19648*MiB);
+    }
     p.expert_cache_mode = "invalid"; CHECK(!validate_expert_params(p).ok); p.expert_cache_mode = "inclusive";
     p.expert_seed = -1; CHECK(!validate_expert_params(p).ok); p.expert_seed = 1;
     p.expert_l2_worker_cpu = -2; CHECK(!validate_expert_params(p).ok); p.expert_l2_worker_cpu = -1;
