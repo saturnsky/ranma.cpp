@@ -36,6 +36,10 @@
 #define LM_RESERVE_MIB  4096
 #define LM_PREEMPT_MS   3000
 #define LM_UB_MIN       1024
+// the widest ubatch of the layer-major prefill (default): the per-token time of the segment ops (dense products, sparse
+// attention, indexer) hardly changes above a few thousand tokens, the fixed cost of a segment graph is paid once per
+// ubatch and layer, and the compute buffers grow with the width (DS4F: 0.30 MiB per token, 2.5 GiB at 8192)
+#define LM_LX_UB        8192
 #define LM_CHUNK_MIN    512
 #define LM_ROWS         4096 // MOE_FFN_HAD rows per chunk (MMH_MOE_ROWS)
 #define LM_STAGE_SLOTS  64   // MMH_MOE_STAGE_MAX_SLOTS
@@ -358,6 +362,15 @@ void common_layer_mode_apply(common_params & params) {
     if (params.n_batch_explicit) {
         ub_top = std::min<int64_t>(ub_top, params.n_batch);
     }
+    // The layer-major prefill reads each expert once per pass, and a pass is as wide as L1 holds its
+    // buffers (the width rule, at prompt time). The ubatch is then only the width of its segment graphs: it sizes the
+    // compute buffers (fixed, outside L1), not the expert reads, so it is at most LM_LX_UB instead of the widest that
+    // fits. The ubatch loop without it keeps the widest (there a wider ubatch reads the experts fewer times).
+    // (it exists for DeepSeek-V4 and V4.1; the layer mode turns it on for them, see below)
+    const bool lx_on = m.arch == "deepseek4" || m.arch == "deepseek41";
+    if (lx_on) {
+        ub_top = std::min<int64_t>(ub_top, LM_LX_UB);
+    }
     int64_t ub = params.n_ubatch_explicit ? params.n_ubatch : ub_top;
     const double host_layer = (double) std::max<int64_t>(0, (int64_t) m.exps_bytes - l1)/m.n_moe_layers;
     LOG_INF("layer mode: %s, %d MoE layers, %.0f MiB of experts per layer outside L1; width %s %lld (context of a sequence "
@@ -443,6 +456,7 @@ void common_layer_mode_apply(common_params & params) {
     const llama_layer_mode_config lm_prev = llama_layer_mode_get_config();
     llama_layer_mode_config lm_cfg = lm_prev;
     lm_cfg.expert_major = true;
+    lm_cfg.layer_exec   = lx_on;
     llama_layer_mode_set_config(lm_cfg);
     const bool    chunked   = !(params.n_parallel > 1 && !params.kv_unified);
     const int32_t ub_prev   = params.n_ubatch;
