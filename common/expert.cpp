@@ -27,10 +27,10 @@ expert_validation validate_expert_params(const common_params & params) {
             params.expert_l2_prefill_ring_mib < -1) {
         return expert_reject("the --expert-l2-* sizes must be 0 or more");
     }
-    // Follows --cache-ram: -1 is no limit, but an empty host tier has no meaning here because the
+    // -1 holds every expert (and the prompt buffers of the lend); an empty host tier has no meaning here because the
     // experts that are not in VRAM have nowhere else to live except the file.
     if (params.expert_l2_mib == 0) {
-        return expert_reject("--expert-l2-mib 0 is not valid: the host tier cannot be empty; use -1 for unlimited");
+        return expert_reject("--expert-l2-mib 0 is not valid: the host tier cannot be empty; use -1 for an L2 that holds every expert");
     }
     const bool active = params.expert_l1_mib > 0 || params.expert_l2_mib > 0;
     if (active && params.moe_cache_size > 0) {
@@ -83,17 +83,20 @@ expert_validation validate_expert_params(const common_params & params) {
         std::all_of(params.speculative.types.begin(), params.speculative.types.end(),
             [](common_speculative_type t) { return t == COMMON_SPECULATIVE_TYPE_NONE || t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP; });
     const bool spec_unchecked = speculative && !joined_draft && !resident_mtp && !own_mtp;
+    // -1 is an L2 like any other, sized to hold every expert and the prompt buffers: the same gates apply
+    if (active) {
+        if (!ggml_cuda_expert::expert_os::supported()) { return expert_reject("the L2 of the expert cache needs Windows unbuffered reads"); }
+        if (params.n_parallel <= 0 || params.n_batch <= 0 || params.n_ubatch < 0) { return expert_reject("the L2 needs positive batch/parallel bounds and a nonnegative ubatch"); }
+        if (!params.mmproj.path.empty()) { return expert_reject("the L2 with mmproj has no gate yet"); }
+        if (spec_unchecked) { return expert_reject("the L2 with speculative decoding has no gate yet, except with a draft model in the joint cache"); }
+    }
     if (params.expert_l2_mib > 0) {
-        if (!ggml_cuda_expert::expert_os::supported()) { return expert_reject("finite L2 needs Windows unbuffered reads"); }
-        if (params.n_parallel <= 0 || params.n_batch <= 0 || params.n_ubatch < 0) { return expert_reject("finite L2 needs positive batch/parallel bounds and a nonnegative ubatch"); }
-        if (!params.mmproj.path.empty()) { return expert_reject("finite L2 with mmproj has no gate yet"); }
-        if (spec_unchecked) { return expert_reject("finite L2 with speculative decoding has no gate yet, except with a draft model in the joint cache"); }
         const int p = params.expert_l2_prefill_ring_mib >= 0 ? params.expert_l2_prefill_ring_mib : params.expert_l2_staging_mib;
         const int d = params.expert_l2_staging_mib;
         if (std::max(p, params.expert_prefill_swap ? d : p) > params.expert_l2_mib) { return expert_reject("configured L2 ring exceeds --expert-l2-mib; metadata and residents also need space"); }
         // The exact minimum, including the L1 payload upper bound for inclusive, needs model geometry.
     } else if (params.expert_l2_staging_mib != 0 || params.expert_l2_prefill_ring_mib >= 0) {
-        return expert_reject("the --expert-l2 ring sizes have no effect without --expert-l2-mib");
+        return expert_reject("the --expert-l2 ring sizes need --expert-l2-mib N; with -1 the rings are sized with the L2");
     }
     if (params.expert_prefill_swap) {
         if (!active) { return expert_reject("--expert-prefill-swap needs an expert cache budget"); }
@@ -178,8 +181,17 @@ ggml_expert_config expert_config_from_params(const common_params & params) {
     if (!params.expert_prefill_swap) {
         decode_mib = prefill_mib;
     }
-    // The backend spells an unlimited host arena 0; the option spells it -1.
+    // The option's -1 is 0 here: the backend sizes the L2 to hold every expert and the prompt buffers of the lend
     cfg.l2_bytes              = params.expert_l2_mib > 0 ? (size_t) params.expert_l2_mib*mib : 0;
+    cfg.l2_lend_bytes         = params.expert_l2_mib > 0 || !params.layer_mode_lend ? 0 : params.layer_mode_lend_bytes;
+    cfg.l2_lend_n_pieces      = 0;
+    if (cfg.l2_lend_bytes > 0) {
+        for (size_t p : params.layer_mode_lend_pieces) {
+            if (cfg.l2_lend_n_pieces < GGML_EXPERT_LEND_MAX_PIECES) {
+                cfg.l2_lend_pieces[cfg.l2_lend_n_pieces++] = p;
+            }
+        }
+    }
     cfg.l2_prefill_ring_bytes = (size_t) prefill_mib*mib;
     cfg.l2_decode_ring_bytes  = (size_t) decode_mib*mib;
     cfg.l2_worker_cpu         = params.expert_l2_worker_cpu;

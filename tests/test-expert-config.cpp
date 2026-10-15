@@ -18,11 +18,29 @@ int main() {
     p.expert_l2_worker_cpu = -2; CHECK(!validate_expert_params(p).ok); p.expert_l2_worker_cpu = -1;
     p.expert_profile_dir = "profile"; CHECK(!validate_expert_params(p).ok); p.expert_profile_dir.clear();
     p.expert_l2_staging_mib = 1; CHECK(!validate_expert_params(p).ok); p.expert_l2_staging_mib = 0;
-    // -1 is the unlimited host arena; 0 would be an empty one, which has no meaning.
+    // -1 is an L2 the backend sizes to hold every expert and the prompt buffers; 0 would be an empty one, which has no meaning.
     CHECK(p.expert_l2_mib == -1 && validate_expert_params(p).ok);
     p.expert_l2_mib = 0; CHECK(!validate_expert_params(p).ok);
     p.expert_l2_mib = -2; CHECK(!validate_expert_params(p).ok); p.expert_l2_mib = -1;
-    CHECK(expert_config_from_params(p).l2_bytes == 0);
+    CHECK(expert_config_from_params(p).l2_bytes == 0 && expert_config_from_params(p).l2_lend_bytes == 0);
+    {
+        // the same L2 path: the gates of the L2 apply to -1, the lend's bytes go with -1 only
+        const bool os_ok = ggml_cuda_expert::expert_os::supported();
+        common_params q; q.fit_params = false; q.expert_l1_mib = 3070;
+        CHECK(validate_expert_params(q).ok == os_ok);
+        q.mmproj.path = "fixture.gguf"; CHECK(!validate_expert_params(q).ok); q.mmproj.path.clear();
+        q.expert_l2_staging_mib = 512; CHECK(!validate_expert_params(q).ok); q.expert_l2_staging_mib = 0;
+        q.layer_mode_lend = true; q.layer_mode_lend_bytes = 123u << 20;
+        CHECK(expert_config_from_params(q).l2_bytes == 0 && expert_config_from_params(q).l2_lend_bytes == (123u << 20));
+        // the pieces of the widest pass go with it (the backend packs them as the lend does)
+        q.layer_mode_lend_pieces = { 100u << 20, 23u << 20 };
+        CHECK(expert_config_from_params(q).l2_lend_n_pieces == 2 && expert_config_from_params(q).l2_lend_pieces[1] == (23u << 20));
+        q.layer_mode_lend_pieces.assign(GGML_EXPERT_LEND_MAX_PIECES + 3, 1u << 20);
+        CHECK(expert_config_from_params(q).l2_lend_n_pieces == GGML_EXPERT_LEND_MAX_PIECES);
+        q.layer_mode_lend_pieces.clear();
+        q.expert_l2_mib = 8000; CHECK(expert_config_from_params(q).l2_lend_bytes == 0); q.expert_l2_mib = -1;
+        q.layer_mode_lend = false; CHECK(expert_config_from_params(q).l2_lend_bytes == 0);
+    }
     const bool os = ggml_cuda_expert::expert_os::supported();
     for (const char * mode : {"inclusive", "exclusive"}) for (int l1 : {0, 3070}) for (bool profile : {false, true}) {
         p = common_params(); p.fit_params = false;
@@ -100,7 +118,7 @@ int main() {
     }
     p = common_params(); p.fit_params = false;
     p.expert_l1_mib = 3070;
-    CHECK(validate_expert_params(p).ok); // Profile is optional even without finite L2.
+    CHECK(validate_expert_params(p).ok == os); // Profile is optional.
     p.expert_l2_mib = 1;
     CHECK(validate_expert_params(p).ok == os); // Exact ring floor belongs to geometry validation.
     p.expert_l2_staging_mib = 2; CHECK(!validate_expert_params(p).ok);
@@ -116,7 +134,7 @@ int main() {
     // ABI 7: the model loader's token-routed layers; none unless the loader declares them
     {
         const auto rc = expert_config_from_params(p);
-        CHECK(rc.abi_version == GGML_EXPERT_ABI_VERSION && rc.abi_version == 13 && rc.early_route_layers == nullptr &&
+        CHECK(rc.abi_version == GGML_EXPERT_ABI_VERSION && rc.abi_version == 16 && rc.early_route_layers == nullptr &&
               rc.n_early_route_layers == 0);
     }
     bench_expert_options o; o.supplied = true;

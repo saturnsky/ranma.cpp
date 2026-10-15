@@ -23,10 +23,11 @@
 extern "C" {
 #endif
 
-#define GGML_EXPERT_ABI_VERSION      13
+#define GGML_EXPERT_ABI_VERSION      16
 #define GGML_EXPERT_IFACE_PROC_NAME  "ggml_backend_expert_iface"
 
 #define GGML_EXPERT_BANK_NONE        0xFFFFFFFFu
+#define GGML_EXPERT_LEND_MAX_PIECES  48
 #define GGML_EXPERT_PLAN_NONE        0xFFFFFFFFu
 
 typedef uint32_t ggml_expert_bank_id;
@@ -59,7 +60,14 @@ struct ggml_expert_config {
     enum ggml_expert_policy policy;
     uint32_t random_seed;             // STATIC/OFF: deterministic per-layer expert order
 
-    size_t   l2_bytes;                // host tier budget (exclusive only); 0 = unlimited host arena
+    // Host tier budget. 0 (the option's -1): the budget that holds every expert outside L1 (exclusive) or every expert
+    // (inclusive), the rings, the tables and the spares, and (exclusive) ring slots for the L1 experts the prefill lend
+    // evicts (the slots a lend of l2_lend_pieces or of the op's lend_scratch blocks evicts, packed as a lend packs them;
+    // at most the L1 slots); the backend sizes it from the geometry.
+    size_t   l2_bytes;
+    size_t   l2_lend_bytes;           // l2_bytes 0: the most VRAM a prefill lend takes from L1 (at most L1), for the log
+    size_t   l2_lend_pieces[GGML_EXPERT_LEND_MAX_PIECES]; // l2_bytes 0: the pieces of the widest layer-major pass
+    int32_t  l2_lend_n_pieces;
     size_t   l2_prefill_ring_bytes;
     size_t   l2_decode_ring_bytes;
     uint64_t l2_prefill_rows, l2_decode_rows; // Worst-case rows, before any expert allocation.
@@ -114,15 +122,12 @@ struct ggml_expert_config {
 
 // ---- the prefill lend -------------------------------------------------------------------------------------------
 //
-// slots of a finite L2 (an unlimited L2 allocates host memory, which is its budget). A lend that does not fit is
-// refused; the caller then narrows its width. The release does not refill: a decode launch that reads an evicted
 // A prompt borrows its VRAM buffers from the L1 budget: the pieces evict the lowest ranked L1 experts (by the installed
 // plan's profile) and take the top slots of each size class. Nothing is lent from host memory: a lend that does not fit
 // L1 is refused and the caller narrows its width (more passes). The evicted experts go where an install sends them (the
 // L2, which holds only experts). The release does not refill: a decode launch that reads an evicted expert copies it
 // back into a lent slot first (lazy restore).
 
-#define GGML_EXPERT_LEND_MAX_PIECES 48
 
 // What a piece is for: a device piece of a role other than BUFFER is also handed to the expert-major op of the
 // holder's graphs (in place of its pool or block allocations).
@@ -159,7 +164,6 @@ struct ggml_expert_lend_counts {
     uint64_t releases;
     uint64_t evicted;       // L1 experts the lends evicted
     uint64_t evicted_bytes;
-    uint64_t l2_bytes;      // host bytes the lends gave (finite L2 slots or unlimited L2 memory)
     uint64_t restores;      // experts the decode copied back into their lent slot
     uint64_t restore_bytes;
     int32_t  held_slots;    // L1 slots of the current lease or restore space
@@ -210,14 +214,11 @@ struct ggml_expert_pool_counts {
 struct ggml_expert_iface {
     uint32_t abi_version;
 
-    // Lifecycle. configure -> (alloc_context | register_context) -> finalize -> ... -> release.
+    // Lifecycle. configure -> alloc_context -> finalize -> ... -> release.
     bool (*configure)(const struct ggml_expert_config * config);
-    // Exclusive mode owns the weight buffer of the routed-expert context. Returns NULL when the
-    // ordinary allocation must be used (inclusive mode, cache off, or the context holds no experts).
+    // The cache owns the weight buffer of the routed-expert context (VRAM, the L2 host arenas, the file). Returns NULL
+    // when the ordinary allocation must be used (cache off, or the context holds no experts).
     ggml_backend_buffer_t (*alloc_context)(struct ggml_context * ctx, ggml_backend_buffer_type_t buft, const char * identity);
-    // Inclusive mode: called after the ordinary allocation of every host weight context. Returns
-    // false when the context holds no routed experts; that is not an error.
-    bool (*register_context)(struct ggml_context * ctx, ggml_backend_buffer_t buffer, const char * identity);
     // Model load end: the weights are written and the host buffers are registered. Plans from the
     // stored profile, allocates the arenas exactly once and installs. Returns false when the cache
     // is off or was disabled (see status); the model still works without it.

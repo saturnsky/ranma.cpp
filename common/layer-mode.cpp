@@ -8,6 +8,7 @@
 #include "gguf.h"
 
 #include "../src/llama-ext.h"
+
 #include "../ggml/src/ggml-cuda/expert-lend.h"
 #include "../ggml/src/ggml-cuda/moe-ffn-had-layout.h"
 
@@ -246,6 +247,41 @@ static bool lm_lora_rank(const std::string & path, int64_t & rank, int & n_other
     return true;
 }
 
+// The prompt buffers of the layer-major prefill for one pass of n_tokens, from a no_alloc load of the
+// model and the context as they will run (llama_layer_exec_lend_bytes); false when it would not run.
+static bool lm_layer_major_lend(common_params & params, int64_t n_tokens, size_t l1, uint64_t out[2], std::vector<size_t> & pieces) {
+    struct quiet_t {
+        ggml_log_callback cb;
+        void * ud;
+    } q;
+    llama_log_get(&q.cb, &q.ud);
+    if (params.verbosity < LOG_LEVEL_DEBUG) {
+        llama_log_set([](ggml_log_level level, const char * text, void * ud) {
+            const quiet_t * q = (const quiet_t *) ud;
+            q->cb(level >= GGML_LOG_LEVEL_ERROR ? level : GGML_LOG_LEVEL_DEBUG, text, q->ud);
+        }, &q);
+    }
+    llama_model_params mp = common_model_params_to_llama(params);
+    mp.no_alloc  = true;
+    mp.load_mode = LLAMA_LOAD_MODE_NONE;
+    llama_context_params cp = common_context_params_to_llama(params);
+    bool ok = false;
+    llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mp);
+    if (model != nullptr) {
+        llama_context * ctx = llama_init_from_model(model, cp);
+        if (ctx != nullptr) {
+            size_t  pc[GGML_EXPERT_LEND_MAX_PIECES] = {};
+            int32_t n_pc = 0;
+            ok = llama_layer_exec_lend_bytes(ctx, n_tokens, l1, out, pc, &n_pc);
+            pieces.assign(pc, pc + n_pc);
+            llama_free(ctx);
+        }
+        llama_model_free(model);
+    }
+    llama_log_set(q.cb, q.ud);
+    return ok;
+}
+
 // DeepSeek-V4.1 with the layer mode off: its prompt processing is slow, and a small n_batch cuts the exact tail prefill short
 static void lm_warn_off(const common_params & params) {
     if (params.model.path.empty()) {
@@ -345,9 +381,7 @@ void common_layer_mode_apply(common_params & params) {
 
     const int64_t reserve = (int64_t) lm_env_f("RANMA_LAYER_MODE_RESERVE_MIB", LM_RESERVE_MIB)*(int64_t) MiB;
     const int64_t l1 = (int64_t) params.expert_l1_mib*(int64_t) MiB;
-    // host: what is available now, less what the expert cache will take in host memory (the finite L2, or every expert
-    // outside L1 when it is unlimited) and a reserve for the rest of the process and the other programs on the host
-            std::max<int64_t>(0, (int64_t) m.exps_all - l1);
+    // outside L1, or all of them in inclusive mode) and a reserve for the rest of the process and the other programs
 
     // ---- width: the widest that fits, at most the context of one sequence -------------------------------------------
     // No rate of the link or of the GEMMs enters: the measurement below decides. The upper end is the context of one
@@ -631,7 +665,24 @@ void common_layer_mode_apply(common_params & params) {
         params.layer_mode_preempt_ms = LM_PREEMPT_MS;
     }
     expert_host_direct_auto(params.n_ubatch);
-
+    // An L2 of -1 also holds the L1 experts the prefill lend evicts (ggml_expert_config::l2_lend_pieces): a lend takes the
+    // op's scratch of a ubatch-major prompt or the layer-major pieces of a pass (a new lend ends the one before it, so the
+    // two never hold at once). The width rule keeps a pass inside L1, so it is the pieces of one pass over the context of
+    // a sequence, at most all of L1. The backend packs both piece lists into the L1 slots as the lend does and keeps ring
+    // slots for the larger eviction; layer_mode_lend_bytes is the larger sum, for its log.
+    params.layer_mode_lend_bytes = params.layer_mode_lend_scratch[0] + params.layer_mode_lend_scratch[1] + params.layer_mode_lend_scratch[2];
+    params.layer_mode_lend_pieces.clear();
+    if (params.expert_l2_mib < 0 && lx_on && n_ctx_seq > ub) {
+        uint64_t b[2] = { 0, 0 };
+        if (lm_layer_major_lend(params, n_ctx_seq, (size_t) l1, b, params.layer_mode_lend_pieces)) {
+            LOG_INF("layer mode: the layer-major prefill of %lld tokens in one pass borrows %llu MiB of VRAM (host inputs %llu "
+                "MiB, not lent)\n", (long long) n_ctx_seq, (unsigned long long) (b[0] >> 20), (unsigned long long) (b[1] >> 20));
+            params.layer_mode_lend_bytes = std::max<size_t>(params.layer_mode_lend_bytes, b[0]);
+        } else {
+            LOG_INF("%s", "layer mode: the layer-major prefill could not size its prompt buffers; the L2 of -1 holds the op scratch\n");
+        }
+    }
+    params.layer_mode_lend_bytes = std::min<size_t>(params.layer_mode_lend_bytes, (size_t) std::max<int64_t>(0, l1));
     LOG_INF("layer mode: on: -ub %d -b %d, attention chunk %s, expert-major MoE %s (rows %lld), staging %lld MiB, scratch "
         "%lld MiB (stream ring %lld MiB) lent from L1 while a prompt runs (blocks %zu/%zu/%zu MiB), host-direct up to %d tokens, "
         "other slots' prompt batches about %d ms\n",

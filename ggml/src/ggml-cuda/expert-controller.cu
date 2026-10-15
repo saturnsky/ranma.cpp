@@ -387,19 +387,19 @@ public:
             GGML_LOG_INFO("expert cache: no profile directory; seeded fixed placement, no records or installs\n");
         }
         if (cfg_.mode == GGML_EXPERT_MODE_INCLUSIVE || cfg_.policy != GGML_EXPERT_POLICY_ADAPTIVE || !cfg_.l1_bytes) { cfg_.spare_slots = 0; }
-        if (cfg_.mode == GGML_EXPERT_MODE_EXCLUSIVE || cfg_.l2_bytes != 0 || cfg_.policy == GGML_EXPERT_POLICY_OFF) {
-            // validate_expert_params refuses this before the model loads; this is the backend-side
-            // guard for a caller that built the config by hand.
-            if (!expert_os::supported()) {
-                GGML_LOG_WARN("expert cache: owned host storage needs the OS address reservation, which this "
-                              "platform does not implement; cache off\n");
-                return false;
-            }
-            if (cfg_.spare_slots < 0 || (cfg_.spare_slots == 0 && cfg_.policy == GGML_EXPERT_POLICY_ADAPTIVE && cfg_.mode == GGML_EXPERT_MODE_EXCLUSIVE && cfg_.l1_bytes > 0)) {
-                GGML_LOG_WARN("expert cache: exclusive mode needs spare_slots > 0; cache off\n");
-                return false;
-            }
+        // Every mode owns the host storage of the experts (the L2 host arenas). validate_expert_params refuses this
+        // before the model loads; this is the backend-side guard for a caller that built the config by hand.
+        if (!expert_os::supported()) {
+            GGML_LOG_WARN("expert cache: owned host storage needs the OS address reservation, which this "
+                          "platform does not implement; cache off\n");
+            return false;
         }
+        if (cfg_.spare_slots < 0 || (cfg_.spare_slots == 0 && cfg_.policy == GGML_EXPERT_POLICY_ADAPTIVE && cfg_.mode == GGML_EXPERT_MODE_EXCLUSIVE && cfg_.l1_bytes > 0)) {
+            GGML_LOG_WARN("expert cache: exclusive mode needs spare_slots > 0; cache off\n");
+            return false;
+        }
+        // l2_bytes 0 (the option's -1): an L2 that holds everything, sized with the storage classes (size_class_tier_locked)
+        l2_auto_ = cfg_.l2_bytes == 0;
         // Debug override: read every resident slice back after each install and compare it with
         // the host tensor. Slow (the whole arena crosses PCIe twice): for a correctness check,
         // not for serving.
@@ -519,8 +519,7 @@ public:
         n_attached_.store(0, std::memory_order_release);
     }
 
-    // Owned host storage redirects loader writes for exclusive, finite inclusive and Off policies.
-    // Unlimited inclusive uses the ordinary host buffer and register_context.
+    // Owned host storage redirects loader writes in every mode: VRAM, the L2 host arenas or the file.
     ggml_backend_buffer_t alloc_context(ggml_context * ctx, ggml_backend_buffer_type_t buft, const char * identity) {
         std::lock_guard<std::mutex> lock(mutex_);
         if (accepting_ >= 0) {
@@ -545,8 +544,7 @@ public:
             members_[m].exclusive_buffer = buffer;
             return buffer;
         }
-        if (state_ != state_t::configured || (cfg_.mode != GGML_EXPERT_MODE_EXCLUSIVE && cfg_.l2_bytes == 0 && cfg_.policy != GGML_EXPERT_POLICY_OFF) ||
-                ctx == nullptr || buft == nullptr) {
+        if (state_ != state_t::configured || ctx == nullptr || buft == nullptr) {
             return nullptr;
         }
         if (!ggml_backend_buft_is_host(buft)) {
@@ -561,7 +559,7 @@ public:
         if (geo.n_layers == 0) {
             return nullptr; // no routed experts in this context
         }
-        if (!adopt_context_locked(ctx, buft, identity, geo, /*owns_host =*/ true)) {
+        if (!adopt_context_locked(ctx, buft, identity, geo)) {
             return nullptr;
         }
         if (!prepare_exclusive_locked()) {
@@ -599,38 +597,6 @@ public:
         return true;
     }
 
-    bool register_context(ggml_context * ctx, ggml_backend_buffer_t buffer, const char * identity) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        if (accepting_ >= 0) {
-            // inclusive: the arenas are built once every member is registered and loaded
-            if (state_ != state_t::registered || (l1_ && l1_->owns_host_storage()) || ctx == nullptr || buffer == nullptr ||
-                    !ggml_backend_buffer_is_host(buffer)) {
-                return false;
-            }
-            return join_context_locked(ctx, ggml_backend_buffer_get_type(buffer), identity) >= 0;
-        }
-        if (state_ != state_t::configured || ctx == nullptr || buffer == nullptr) {
-            return false;
-        }
-        geometry geo;
-        std::string reason;
-        if (!build_geometry(ctx, geo, reason)) {
-            disable_locked(("routed expert tensors rejected: " + reason).c_str());
-            return false;
-        }
-        if (geo.n_layers == 0) {
-            return false; // no routed experts in this context
-        }
-        // The model has one weight context per buffer type: the routed layers that fit in VRAM
-        // (-ncmoe leaves the last ones there) arrive in a device context and are not this cache's
-        // business; only the context in the HIP host buffer type is registered.
-        if (!ggml_backend_buffer_is_host(buffer)) {
-            GGML_LOG_DEBUG("expert cache: %d routed layers already live in device memory; not cached\n", geo.n_routed_layers());
-            return false;
-        }
-        return adopt_context_locked(ctx, ggml_backend_buffer_get_type(buffer), identity, geo, /*owns_host =*/ false);
-    }
-
     bool finalize() {
         std::lock_guard<std::mutex> lock(mutex_);
         return finalize_locked();
@@ -652,124 +618,40 @@ public:
         if (state_ != state_t::registered) {
             return false;
         }
-        const bool owns_host = l1_ && l1_->owns_host_storage();
-        if (!owns_host) {
-            // Inclusive: the arenas are planned over every member at once, so the cache waits for
-            // the models that were declared to join. Until then lookups miss and the host tensors
-            // are read, as without the cache.
-            size_t waiting = 0;
-            for (const member_state & m : members_) {
-                waiting += m.loaded ? 0 : 1;
-            }
-            if (waiting != 0) {
-                GGML_LOG_INFO("expert cache: waiting for %zu more model(s) to join before the arenas are built\n", waiting);
-                return true;
-            }
+        if (!l1_ || !l1_->owns_host_storage() || !tier_) {
+            disable_locked("the owned host storage and its L2 are not prepared");
+            return false;
         }
         ggml_cuda_set_device(device_);
 
-        if (owns_host) {
-            // The delegate buffer is not in the model's buffer list, so the backend's own
-            // post-load step for host buffers has not seen it. Do it here, while the loader's
-            // writes to it are final, exactly as llama does for the buffers it knows.
-            if (!finalize_delegate_buffer_locked(exclusive_buffer_)) {
-                abort_locked("delegate buffer finalization failed");
-            }
-            // the aux tensors (EXL3 rotations) are in the delegate buffer and final now: the VRAM slots get their rows
-            l1_->start_aux();
-            // The loader has written every slice to its home; register the host arenas as coarse
-            // mapped memory so the kernels can read them, and the cache is live.
-            if (!host_->map()) {
-                abort_locked("host arena registration failed");
-            }
-            if (tier_ && !start_tier_locked()) {
-                return false;
-            }
-            state_ = state_t::installed;
-            std::string reason;
-            if (!l1_->verify_current_assignment(reason)) {
-                abort_locked(("exclusive assignment is inconsistent: " + reason).c_str());
-            }
-            verify_all_locked();
-            GGML_LOG_INFO("expert cache: owned host install: %zu MiB in VRAM (%zu of %zu slices), "
-                          "%zu MiB in the host arena, %d spare slots per class\n",
-                l1_->device_bytes()/(1024*1024), resident_slices_locked(), total_slices_locked(),
-                host_->host_bytes()/(1024*1024), cfg_.spare_slots);
-            log_aux_locked("at model load");
-            if (tier_) {
-                report_tier_plan_locked("at model load");
-            }
-            log_members_locked("at model load");
-            allocate_ub_pool_locked();
-            lend_setup_locked();
-            return true;
+        // The delegate buffer is not in the model's buffer list, so the backend's own
+        // post-load step for host buffers has not seen it. Do it here, while the loader's
+        // writes to it are final, exactly as llama does for the buffers it knows.
+        if (!finalize_delegate_buffer_locked(exclusive_buffer_)) {
+            abort_locked("delegate buffer finalization failed");
         }
-
-        const size_t table_bytes = table_bytes_locked(false);
-        const size_t overhead = budget_overhead_locked(false);
-        if (cfg_.l1_bytes <= overhead) {
-            disable_locked("budget smaller than the cache tables");
-            return false;
-        }
-        const size_t remaining = cfg_.l1_bytes - overhead;
-
-        // The bank that seeds the load-time plan. Its stored profile decides the frozen capacities.
-        std::vector<uint64_t> scores;
-        const uint64_t * counts = seed_counts_locked(scores);
-        lend_scores_ = counts != nullptr ? scores : std::vector<uint64_t>();
-
-        placement_inputs in;
-        in.geo          = &geo_;
-        in.counts       = counts;
-        in.budget_bytes = remaining;
-        in.exclusive    = false;
-        placement initial = plan_placement(in);
-        if (!any_capacity(initial.capacities)) {
-            disable_locked("budget holds no expert slice");
-            return false;
-        }
-        capacities_ = initial.capacities;
-        if (carve_stage_locked()) {
-            // the static plan keeps the capacity the staging slots leave it
-            placement_inputs fixed = in;
-            fixed.fixed_capacities = &capacities_;
-            initial = plan_placement(fixed);
-        }
-
-        if (!allocate_profiler_locked()) { return false; }
-        l1_.reset(new l1_arena(geo_));
-        if (!l1_->allocate(capacities_, device_, 0, stage_class_slots_.empty() ? nullptr : &stage_class_slots_)) {
-            l1_.reset();
-            profiler_.reset();
-            disable_locked("arena allocation failed");
-            return false;
-        }
-        allocate_stage_locked();
-        // every member is loaded: the installs bring the aux rows (EXL3 rotations) of the slots they fill
+        // the aux tensors (EXL3 rotations) are in the delegate buffer and final now: the VRAM slots get their rows
         l1_->start_aux();
-        l1_install_stats stats;
-        if (!l1_->install(initial.selected, /*retain=*/false, stats)) {
-            disable_locked("initial install failed");
-            return false;
+        // The loader has written every slice to its home; register the host arenas as coarse
+        // mapped memory so the kernels can read them, and the cache is live.
+        if (!host_->map()) {
+            abort_locked("host arena registration failed");
         }
-        // One full slice read back and compared with its host source: a mismatch means the stride
-        // or source assumptions are wrong and the kernels would read wrong weights. That is fatal.
-        for (int l = geo_.n_layers - 1; l >= 0; --l) {
-            if (initial.selected[l].empty()) {
-                continue;
-            }
-            if (!l1_->verify_slice(l, 2, initial.selected[l][0])) {
-                GGML_ABORT("expert cache: H2D verification of layer %d expert %d failed", l, initial.selected[l][0]);
-            }
-            break;
+        if (!start_tier_locked()) {
+            return false;
         }
         state_ = state_t::installed;
+        std::string reason;
+        if (!l1_->verify_current_assignment(reason)) {
+            abort_locked(("exclusive assignment is inconsistent: " + reason).c_str());
+        }
         verify_all_locked();
-        if (counts != nullptr) { log_plan_locked(initial.stats); }
-        GGML_LOG_INFO("expert cache: installed %zu MiB in VRAM (%zu slices, %.1f ms); tables and profiler %zu KiB%s\n",
-            l1_->device_bytes()/(1024*1024), stats.copied, stats.ms,
-            (table_bytes + (profiler_ ? profiler_->device_bytes() : 0))/1024, models_text_locked().c_str());
+        GGML_LOG_INFO("expert cache: owned host install: %zu MiB in VRAM (%zu of %zu slices), "
+                      "%zu MiB in the host arena, %d spare slots per class\n",
+            l1_->device_bytes()/(1024*1024), resident_slices_locked(), total_slices_locked(),
+            host_->host_bytes()/(1024*1024), cfg_.spare_slots);
         log_aux_locked("at model load");
+        report_tier_plan_locked("at model load");
         log_members_locked("at model load");
         allocate_ub_pool_locked();
         lend_setup_locked();
@@ -1005,7 +887,7 @@ public:
         }
         // Installing what is already in the arena costs nothing: no drain, no copies, one line. The unified
         // host policy also skips it unless the rings are reseeded from the plan's profile at every install.
-        const bool tier_static = !tier_ || (tier_->unified() && tier_->unified_reseed() == 0);
+        const bool tier_static = tier_->unified() && tier_->unified_reseed() == 0;
         if (tier_static && plan.selected == l1_->selected()) {
             finish_plan_locked(id);
             if (cfg_.log_mask & GGML_EXPERT_LOG_INSTALL) {
@@ -1027,7 +909,7 @@ public:
     }
 
     bool install_once_locked(ggml_expert_plan_id id, const plan_state & plan) {
-        const bool ok = tier_ ? install_tier_locked(id, plan, /*seed =*/ false) : install_plain_locked(id, plan);
+        const bool ok = install_tier_locked(id, plan, /*seed =*/ false);
         if (ok && id != GGML_EXPERT_PLAN_NONE) {
             lend_scores_ = plan.scores;
             lend_set_want_locked(plan);
@@ -1058,39 +940,6 @@ public:
 
     const char * bank_label_locked(ggml_expert_bank_id bank) const {
         return bank < banks_.size() ? banks_[bank].label.c_str() : "prefill lend";
-    }
-
-    // An install without the SSD tier.
-    bool install_plain_locked(ggml_expert_plan_id id, const plan_state & plan) {
-        l1_install_stats stats;
-        if (!l1_->install(plan.selected, cfg_.delta_install, stats)) {
-            disable_locked("install failed");
-            return false;
-        }
-        if (l1_->owns_host_storage()) {
-            GGML_LOG_INFO("expert cache: installed plan %u of bank '%s': mode=%s retained=%zu exchanged=%zu "
-                          "h2d_bytes=%zu MiB d2h_bytes=%zu MiB in %.1f ms%s\n",
-                id, banks_[plan.bank].label.c_str(), mode_name(), stats.retained, stats.copied,
-                stats.bytes/(1024*1024), stats.d2h_bytes/(1024*1024), stats.ms, aux_text(stats).c_str());
-            std::string reason;
-            if (!l1_->verify_current_assignment(reason)) {
-                GGML_ABORT("expert cache: exclusive assignment is inconsistent after a swap: %s", reason.c_str());
-            }
-        } else {
-            GGML_LOG_INFO("expert cache: installed plan %u of bank '%s': retained=%zu copied=%zu bytes=%zu MiB in %.1f ms%s\n",
-                id, banks_[plan.bank].label.c_str(), stats.retained, stats.copied, stats.bytes/(1024*1024), stats.ms,
-                aux_text(stats).c_str());
-        }
-        if (cfg_.log_mask & GGML_EXPERT_LOG_L2) {
-            GGML_LOG_INFO("expert_metrics {\"kind\":\"install\",\"bank\":\"%s\",\"plan\":%u,\"install_ms\":%.6f,"
-                          "\"h2d_bytes\":%zu,\"d2h_bytes\":%zu,\"ssd_bytes\":0}\n",
-                banks_[plan.bank].label.c_str(), id, stats.ms, stats.bytes, stats.d2h_bytes);
-        }
-        // the plan that was installed until now is only reachable while it is a bank's newest one
-        finish_plan_locked(id);
-        verify_all_locked();
-        if (joint_) { log_members_locked("after install"); }
-        return true;
     }
 
     bool profile_select(ggml_backend_t backend, int32_t row_begin, int32_t row_end, ggml_expert_bank_id bank) {
@@ -1484,10 +1333,7 @@ public:
         const char * why = nullptr;
         if (joint_ || members_.size() > 1) {
             why = "a joint cache";
-        } else if (!l1_ || !l1_->allocated()) {
-            why = "no L1 arena";
-        } else if (l1_->owns_host_storage() && !tier_ && (!host_ || !host_->chunked())) {
-            why = "the exclusive host arena is not chunked";
+            why = "no L1 arena or L2";
         }
         if (why != nullptr) {
             GGML_LOG_WARN("expert cache: prefill lend off: %s; the prompt buffers use the pool\n", why);
@@ -1508,9 +1354,7 @@ public:
         CUDA_CHECK(cudaHostGetDevicePointer((void **) &lend_live_dev_, lend_live_host_, 0));
         CUDA_CHECK(cudaStreamCreateWithFlags(&lend_stream_, cudaStreamNonBlocking));
         CUDA_CHECK(cudaDeviceSynchronize());
-        if (tier_) {
-            tier_->set_restored_bits(lend_bits_dev_);
-        }
+        tier_->set_restored_bits(lend_bits_dev_);
         lend_rows_ = (int) std::max<uint64_t>(1, cfg_.l2_decode_rows);
         lend_ = lend_book();
         lend_.slots = l1_->slot_counts();
@@ -1651,10 +1495,6 @@ public:
         return out;
     }
 
-    bool lend_host_layout_locked() const {
-        return !tier_ || tier_->class_layout();
-    }
-
     // The L1 plan of `req`: the fewest lowest ranked residents whose slots hold every piece, over the slots held already.
     lend_l1_plan lend_plan_locked(const std::vector<ggml_expert_lend_piece> & req) {
         std::vector<size_t> bytes;
@@ -1672,7 +1512,7 @@ public:
 
     // An install of the kept L1 residents with the top `plan.evict` slots of each class retired (a shrink install,
     // expert-redraw.h's evacuation): the kept residents above the new slot counts move down first; the evicted
-    // experts go to their host home (exclusive without a finite tier: the host arena grows by them), the ring or the file.
+    // experts go to their host home, the ring or the file.
     bool lend_evict_locked(const lend_l1_plan & plan) {
         const size_t nc = capacities_.size();
         const std::vector<int> full = capacities_;
@@ -1686,10 +1526,8 @@ public:
         }
         const size_t L = (size_t) geo_.n_layers, E = (size_t) geo_.n_experts;
         std::vector<std::vector<uint8_t>> gone(L, std::vector<uint8_t>(E, 0));
-        std::vector<int> per_class(nc, 0);
         for (const lend_resident & v : plan.victims) {
             gone[(size_t) v.layer][(size_t) v.expert] = 1;
-            per_class[(size_t) geo_.layer_class[(size_t) v.layer]]++;
         }
         const auto & gpu = l1_->host_slots();
         expert_slot_table keep(L);
@@ -1720,17 +1558,6 @@ public:
         if (!l1_->evacuate(ev.ops, evac_ms)) {
             abort_locked("prefill lend: the evacuation copies failed");
         }
-        if (l1_->owns_host_storage() && !tier_) {
-            std::vector<int> host_up = host_->capacities();
-            for (size_t c = 0; c < nc; ++c) {
-                host_up[c] += per_class[c];
-            }
-            l1_arena::host_resize_stats hs;
-            std::string why;
-            if (!l1_->resize_host(host_up, hs, why)) {
-                abort_locked(("prefill lend: host arena growth: " + why).c_str());
-            }
-        }
         set_capacities_locked(caps);
         l1_->set_retire(plan.limit);
         unequal_ = cfg_.mode == GGML_EXPERT_MODE_EXCLUSIVE;
@@ -1738,20 +1565,7 @@ public:
         plan_state step;
         step.selected = keep;
         step.scores   = lend_scores_;
-        bool ok = false;
-        if (tier_) {
-            ok = install_tier_locked(GGML_EXPERT_PLAN_NONE, step, /*seed =*/ false);
-        } else {
-            l1_install_stats st;
-            ok = l1_->install(keep, /*retain =*/ true, st);
-            if (ok && l1_->owns_host_storage()) {
-                std::string reason;
-                if (!l1_->verify_current_assignment(reason)) {
-                    GGML_ABORT("expert cache: exclusive assignment is inconsistent after the prefill lend: %s", reason.c_str());
-                }
-            }
-            lend_last_d2h_ = st.d2h_bytes;
-        }
+        const bool ok = install_tier_locked(GGML_EXPERT_PLAN_NONE, step, /*seed =*/ false);
         l1_->set_retire({});
         unequal_ = false;
         l1_->set_unequal(false);
@@ -2483,9 +2297,7 @@ public:
         if (ub_cfg_.ring) {
             // ring admission (expert-ub-pool.cuh): only where the stream order alone protects the ring slot it copies
             const char * why = nullptr;
-            if (!tier_) {
-                why = "there is no SSD tier";
-            } else if (hash_mode_.ssd) {
+            if (hash_mode_.ssd) {
                 why = "RANMA_EXPERT_HASH_EARLY reads from the SSD while the graphs run";
             } else if (!ub_->enable_ring()) {
                 why = "its state could not be allocated";
@@ -3196,10 +3008,8 @@ public:
     }
 
 private:
-    // Shared tail of alloc_context and register_context: find the device of the buffer type and
-    // adopt the routed-expert context.
-    bool adopt_context_locked(ggml_context * ctx, ggml_backend_buffer_type_t buft, const char * identity,
-            geometry & geo, bool owns_host) {
+    // The tail of alloc_context: find the device of the buffer type and adopt the routed-expert context.
+    bool adopt_context_locked(ggml_context * ctx, ggml_backend_buffer_type_t buft, const char * identity, geometry & geo) {
         const int device = ggml_backend_cuda_dev_index(ggml_backend_buft_get_device(buft));
         if (device < 0) {
             GGML_LOG_INFO("expert cache: routed experts are in a CPU buffer, not the HIP host buffer type; not cached\n");
@@ -3237,8 +3047,8 @@ private:
         identity_  = first.identity;
         signature_ = identity_ + "\n" + geo_.signature();
         state_     = state_t::registered;
-        GGML_LOG_INFO("expert cache: registered %s%s: %d routed layers x %d experts, %zu size classes, device %d\n",
-            identity_.c_str(), owns_host ? " for owned host storage" : "", geo_.n_routed_layers(),
+        GGML_LOG_INFO("expert cache: registered %s for owned host storage: %d routed layers x %d experts, %zu size classes, device %d\n",
+            identity_.c_str(), geo_.n_routed_layers(),
             geo_.n_experts, geo_.class_bytes.size(), device_);
         if (joint_) {
             for (size_t m = 0; m < members_.size(); ++m) {
@@ -3711,6 +3521,11 @@ private:
         if (tier_->class_layout()) {
             return size_class_tier_locked(selected, host_capacities);
         }
+        if (l2_auto_) {
+            tier_.reset();
+            disable_locked("--expert-l2-mib -1 needs the class layout of the L2");
+            return false;
+        }
         const size_t fixed = tier_->fixed_bytes() + spare_bytes_locked() + arena_tail_total(geo_);
         const auto minimum = minimum_host_budget(geo_, capacities_, fixed, cfg_.mode == GGML_EXPERT_MODE_INCLUSIVE);
         if (!minimum.valid || cfg_.l2_bytes < minimum.bytes) {
@@ -3805,7 +3620,39 @@ private:
         };
         std::vector<int> ring(n, bound);
         tier_plan base;
-        if (!tier_scores_.empty()) {
+        std::vector<int> lend_slots(n, 0);
+        if (l2_auto_) {
+            // -1: every expert is an L2 resident, each storage class keeps the per ubatch bound as its ring, and (exclusive)
+            // the L1 experts the prefill lend can evict get ring slots of their own above it: the slots a lend of the
+            // widest layer-major pass (l2_lend_pieces) or of the op's scratch (lend_scratch) evicts, its pieces packed
+            // into the top slots of each class as the lend packs them (lend_evict_bound), at most the L1 slots.
+            // Inclusive: the L2 holds them already.
+            std::vector<int> l1_slots(n, 0);
+            std::vector<lend_class> lc(classes);
+            for (size_t c = 0; c < classes; ++c) {
+                const int cap = c < capacities_.size() ? std::max(0, capacities_[c]) : 0;
+                l1_slots[st.storage_of[c]] += cap;
+                for (int k = 0; k < geometry::n_kinds; ++k) {
+                    lc[c].kind_bytes.push_back(geo_.class_bytes[c][(size_t) k]);
+                    lc[c].guard.push_back(GGML_PAD(arena_tail_bytes(geo_, (int) c, k), 256));
+                }
+                lc[c].slots = cap + std::max(0, cfg_.spare_slots);
+                lc[c].residents.resize((size_t) cap);
+            }
+            if (!inclusive && cfg_.lend) {
+                const int n_pass = std::clamp(cfg_.l2_lend_n_pieces, 0, GGML_EXPERT_LEND_MAX_PIECES);
+                const std::vector<size_t> pass(cfg_.l2_lend_pieces, cfg_.l2_lend_pieces + n_pass);
+                const std::vector<size_t> scratch(cfg_.lend_scratch, cfg_.lend_scratch + 3);
+                const std::vector<int> ev_pass    = lend_evict_bound(lc, pass, 256);
+                const std::vector<int> ev_scratch = lend_evict_bound(lc, scratch, 256);
+                for (size_t c = 0; c < classes; ++c) {
+                    lend_slots[st.storage_of[c]] += std::max(ev_pass[c], ev_scratch[c]);
+                }
+                for (int s = 0; s < n; ++s) { lend_slots[s] = std::min(lend_slots[s], l1_slots[s]); }
+            }
+            for (int s = 0; s < n; ++s) { ring[s] += lend_slots[s]; }
+            cfg_.l2_bytes = full_host_budget(geo_, tier_vram_, host_pitch_, inclusive, base_fixed + ring_bytes(ring));
+        } else if (!tier_scores_.empty()) {
             std::fill(ring.begin(), ring.end(), 0);
             for (int round = 0; round < 1024; ++round) {
                 require(ring);
@@ -3819,18 +3666,19 @@ private:
                 if (!grew) { break; }
             }
         }
-        const std::vector<int> floors = ring;
+        // -1: the floors stay the per ubatch bound, so that the lend can take the slots above them
+        const std::vector<int> floors = l2_auto_ ? std::vector<int>(n, bound) : ring;
         // Without a stored profile the floors are the per ubatch bound, already the most one layer
         // can demand; the factor applies only to floors that come from a seed plan.
-        const bool seeded = !tier_scores_.empty();
+        const bool seeded = !tier_scores_.empty() && !l2_auto_;
         const double factor = seeded ? tier_->ring_factor() : 1.0;
         std::string note;
-        if (!seeded && tier_->ring_factor() > 1.0 && cfg_.l2_prefill_ring_bytes == 0) {
+        if (!seeded && !l2_auto_ && tier_->ring_factor() > 1.0 && cfg_.l2_prefill_ring_bytes == 0) {
             char text[64];
             snprintf(text, sizeof(text), "%g", tier_->ring_factor());
             note = std::string("no seed profile: the floors are the per ubatch bound, the ring factor ") + text + " is not applied";
         }
-        const size_t requested = cfg_.l2_prefill_ring_bytes;
+        const size_t requested = l2_auto_ ? 0 : cfg_.l2_prefill_ring_bytes;
         if (requested != 0) {
             require(ring);
             if (!base.valid) { base = cut(ring); }
@@ -3924,6 +3772,16 @@ private:
             spares/(1024*1024), base.resident_bytes/(1024*1024), base.ssd_slices, base.ssd_bytes/(1024*1024));
         if (!note.empty()) {
             GGML_LOG_INFO("expert cache: %s\n", note.c_str());
+        }
+        if (l2_auto_) {
+            size_t lend_bytes = 0;
+            for (int s = 0; s < n; ++s) { lend_bytes += size_t(lend_slots[s])*st.stride(s); }
+            GGML_LOG_INFO("expert cache: L2 -1 is %zu MiB: %s at the storage pitch %zu MiB, room for the L1 experts the prefill "
+                          "lend evicts %zu MiB (ring slots %s above the floors: the slots a lend of at most %zu MiB evicts, its "
+                          "pieces packed as the lend packs them, at most the L1 slots%s), tables, spares and tails %zu MiB\n",
+                cfg_.l2_bytes/(1024*1024), inclusive ? "every expert" : "every expert outside L1", base.resident_bytes/(1024*1024),
+                lend_bytes/(1024*1024), ring_text(lend_slots).c_str(), cfg_.l2_lend_bytes/(1024*1024),
+                inclusive ? "; none: inclusive holds them" : "", base_fixed/(1024*1024));
         }
         return true;
     }
@@ -4383,7 +4241,6 @@ private:
             (long long) cfg_.l2_bytes - (long long) accounted, storage_text.c_str());
     }
 
-    const char * mode_name() const { return cfg_.mode == GGML_EXPERT_MODE_INCLUSIVE ? "inclusive" : "exclusive"; }
 
     // Once the arenas own the expert bytes there is no uncached fallback: the routed tensors hold
     // logical addresses and no second copy exists. Every failure past that point ends the process.
@@ -4982,7 +4839,7 @@ private:
                 return false;
             }
         }
-        if (cfg_.l2_bytes != 0 && !size_tier_locked(initial.selected, host_capacities)) {
+        if (!size_tier_locked(initial.selected, host_capacities)) {
             return false;
         }
         // the seed plan is the installed plan until the first install (a cold cache has none)
@@ -4990,21 +4847,7 @@ private:
 
         // Plan time, before the first expert byte is copied: a host requirement larger than the
         // installed memory can never be met, so it is a configuration error, not a slow run.
-        size_t host_required = cfg_.l2_bytes;
-        // exclusive mode without a finite tier: the prefill lend grows the host arenas (expert-host-layout.h)
-        const bool host_chunks = !tier_ && cfg_.lend;
-        if (host_required == 0) {
-            for (size_t cls = 0; cls < host_capacities.size(); ++cls) {
-                for (int kind = 0; kind < geometry::n_kinds; ++kind) {
-                    const int slots = host_capacities[cls] + cfg_.spare_slots;
-                    host_required += host_chunks ?
-                        host_chunked_bytes(geo_.class_bytes[cls][kind], arena_tail_bytes(geo_, (int) cls, kind), slots,
-                            host_chunk_slots(geo_, (int) cls, host_chunk_mib << 20)) :
-                        size_t(slots)*geo_.class_bytes[cls][kind] + arena_tail_bytes(geo_, (int) cls, kind);
-                }
-            }
-        }
-        const auto memory = check_host_memory(host_required, expert_os::total_physical_bytes());
+        const auto memory = check_host_memory(cfg_.l2_bytes, expert_os::total_physical_bytes());
         if (!memory.ok) {
             GGML_ABORT("expert cache: the host tier needs %.1f GiB but the machine has %.1f GiB of physical memory; lower --expert-l2-mib or raise --expert-l1-mib",
                 double(memory.required_bytes)/(1024.0*1024.0*1024.0), double(memory.total_bytes)/(1024.0*1024.0*1024.0));
@@ -5020,37 +4863,15 @@ private:
         }
         allocate_stage_locked();
         host_.reset(new host_arena(geo_));
-        if (!tier_ && cfg_.lend) {
-            // the prefill lend grows the host capacity by the experts it evicts: an address table and chunked arenas
-            host_->enable_addresses();
-            host_->enable_chunks(host_chunk_mib << 20);
-        }
-        if (!host_->allocate(host_capacities, cfg_.spare_slots, device_,
-                tier_ && tier_->class_layout() ? &tier_->storage() : nullptr)) {
+        if (!host_->allocate(host_capacities, cfg_.spare_slots, device_, tier_->class_layout() ? &tier_->storage() : nullptr)) {
             host_.reset();
             l1_.reset();
             profiler_.reset();
             disable_locked("host arena allocation failed");
             return false;
         }
-        if (host_->addresses_enabled()) {
-            size_t table = size_t(geo_.n_routed_layers())*geometry::n_kinds*size_t(geo_.n_experts)*sizeof(uint64_t);
-            std::string per;
-            for (size_t c = 0; c < host_capacities.size(); ++c) { per += (c ? "," : "") + std::to_string(host_->chunk_slots((int) c)); }
-            GGML_LOG_INFO("expert cache: host address table on (%zu KiB of routed-layer entries); host arenas in %zu chunks "
-                          "of about %zu MiB (slots per chunk %s), %.1f MiB of chunk slack\n", table/1024, host_->chunk_count(),
-                host_chunk_mib, per.c_str(), double(host_->slack_bytes())/double(1 << 20));
-        }
         l1_->attach_host(host_.get(), cfg_.spare_slots, cfg_.mode == GGML_EXPERT_MODE_INCLUSIVE);
-        if (tier_) {
-            if (!allocate_tier_locked(initial.selected)) {
-                return false;
-            }
-        } else if (!l1_->assign_exclusive(initial.selected)) {
-            host_.reset();
-            l1_.reset();
-            profiler_.reset();
-            disable_locked("exclusive slot assignment failed");
+        if (!allocate_tier_locked(initial.selected)) {
             return false;
         }
         if (verify_all_) {
@@ -5474,6 +5295,7 @@ private:
     std::mutex mutex_;
     std::atomic<state_t> state_ { state_t::unconfigured };
     ggml_expert_config cfg_ = {};
+    bool          l2_auto_ = false;            // l2_bytes was 0 (-1): sized to hold every expert and the prefill lend
     std::string profile_dir_;
     std::string initial_bank_;
     std::string identity_;
@@ -5836,9 +5658,6 @@ static bool iface_configure(const ggml_expert_config * config) { return instance
 static ggml_backend_buffer_t iface_alloc_context(ggml_context * ctx, ggml_backend_buffer_type_t buft, const char * identity) {
     return instance().alloc_context(ctx, buft, identity);
 }
-static bool iface_register_context(ggml_context * ctx, ggml_backend_buffer_t buffer, const char * identity) {
-    return instance().register_context(ctx, buffer, identity);
-}
 static bool iface_finalize(void) { return instance().finalize(); }
 static void iface_release(ggml_context * ctx) { instance().release(ctx); }
 static bool iface_status(ggml_expert_status * out) { return instance().status(out); }
@@ -5903,7 +5722,6 @@ static const ggml_expert_iface g_expert_iface = {
     /* .abi_version      = */ GGML_EXPERT_ABI_VERSION,
     /* .configure        = */ iface_configure,
     /* .alloc_context    = */ iface_alloc_context,
-    /* .register_context = */ iface_register_context,
     /* .finalize         = */ iface_finalize,
     /* .release          = */ iface_release,
     /* .status           = */ iface_status,

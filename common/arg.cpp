@@ -4013,7 +4013,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PERPLEXITY, LLAMA_EXAMPLE_COMPLETION}).set_env("LLAMA_ARG_EXPERT_PREFILL_SWAP"));
     add_opt(common_arg(
         {"--expert-l2-mib"}, "N",
-        string_format("host memory budget in MiB for the expert cache (default: %d; -1 = unlimited)\n"
+        string_format("host memory budget in MiB for the expert cache (default: %d; -1 = a budget that holds every expert and the prompt buffers)\n"
                       "the routed experts that fit in neither VRAM nor this budget stay in the GGUF file and are\n"
                       "read from it on demand; supports both modes on Windows",
                       params.expert_l2_mib),

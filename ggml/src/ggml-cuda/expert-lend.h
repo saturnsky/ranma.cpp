@@ -3,9 +3,6 @@
 // ranma: the prefill lend of the expert cache. Pure C++ (the restore list below is also a device function), shared by
 // the controller (expert-controller.cu) and its CPU test (tests/test-expert-lend.cpp).
 //
-//   2. Host: a piece the GPU reads through a copy only (a graph input) comes from the L2: with a finite L2 the least
-//      recently used ring slots of a storage class (the ring is the L2's own order), taken as one range at the top of
-//      the arena; with an unlimited L2 the lend allocates host memory, which is what that budget is.
 // A prompt borrows its buffers (the layer-major edges, carried tensors and MoE output, the expert-major op's scratch,
 // its staging and its T) from the L1 budget instead of allocating them on its own:
 //   1. The lowest ranked L1 residents leave (exclusive: to the L2 or the file; inclusive: they are copies), the kept
@@ -264,6 +261,34 @@ inline lend_l1_plan plan_l1_lend(const std::vector<lend_class> & cls, const std:
     p.limit.assign(n_cls, 0);
     for (size_t c = 0; c < n_cls; ++c) { p.limit[c] = cls[c].slots - given[c]; }
     return p;
+}
+
+// The most slots of each class a lend of `pieces` evicts: the fewest top slots of that class alone whose regions hold
+// every piece (packed as plan_l1_lend packs them), or all its residents when even they do not. plan_l1_lend evicts the
+// lowest ranked residents over every class and stops as soon as the pieces fit, so it never takes more of a class than
+// that class alone needs: an upper bound per class whatever the ranks, the exact count with one class. Only
+// kind_bytes, guard, slots and the number of residents of `cls` are read (an L2 of -1 is sized before any resident).
+inline std::vector<int> lend_evict_bound(const std::vector<lend_class> & cls, const std::vector<size_t> & pieces, size_t align) {
+    std::vector<int> out(cls.size(), 0);
+    bool any = false;
+    for (size_t p : pieces) { any = any || p > 0; }
+    if (!any) { return out; }
+    for (size_t c = 0; c < cls.size(); ++c) {
+        const int n_res = (int) std::min<size_t>(cls[c].residents.size(), (size_t) std::max(0, cls[c].slots));
+        std::vector<int> given(cls.size(), 0);
+        auto fits = [&](int n) {
+            given[c] = n;
+            std::vector<size_t> bytes;
+            for (const auto & r : lend_regions_of(cls, given)) { bytes.push_back(r.bytes); }
+            std::vector<lend_fit> f;
+            return lend_pack(pieces, bytes, align, f);
+        };
+        // the first n that holds them, counted up one slot at a time as plan_l1_lend does, else every resident
+        int n = 0;
+        while (n < n_res && !fits(n)) { ++n; }
+        out[c] = n;
+    }
+    return out;
 }
 
 // The largest single piece and the total the whole L1 could lend (every resident evicted), for the width search.

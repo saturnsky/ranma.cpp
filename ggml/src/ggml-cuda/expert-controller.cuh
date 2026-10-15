@@ -2,7 +2,7 @@
 
 // Owner of the expert cache state machine for the one routed-expert model a process holds:
 //
-//   unconfigured --configure--> configured --register_context--> registered --finalize--> installed
+//   unconfigured --configure--> configured --alloc_context--> registered --finalize--> installed
 //   any state --disable(reason)--> disabled (lookups miss, the model keeps running uncached)
 //   installed --release--> unconfigured
 //

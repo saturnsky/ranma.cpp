@@ -12,16 +12,18 @@ classes" below).
 
 Both `--expert-cache-mode inclusive` and `exclusive` support a finite tier. Inclusive means the host
 set contains the VRAM set; exclusive means each resident expert has one home, in VRAM or in host
-memory. Neither mode changes or deletes the GGUF. L2 is a cache over that file, and the unlimited
-tier is the degenerate case in which the cache holds everything.
+memory. Neither mode changes or deletes the GGUF. L2 is a cache over that file.
 
-`--expert-l2-mib -1`, the default, is the unlimited tier; `0` is refused, because an empty host tier
-leaves the non-VRAM experts nowhere to live but the file. `--expert-l1-mib 0` is valid with a finite
-tier: no VRAM payload, every demand served from host memory or the file.
+`--expert-l2-mib -1`, the default, is an L2 on the same path, sized at load to hold everything: every
+expert outside L1 (exclusive) or every expert (inclusive), the rings, tables and spares, and in
+exclusive mode ring slots of their own for the L1 experts the prefill lend evicts (layer mode,
+`ggml_expert_config::l2_lend_pieces` and the op scratch: the slots a lend of those pieces evicts, packed into the
+top slots of each kind as the lend packs them, at most the L1 slots; inclusive already holds them). The prompt buffers themselves are never placed in L2. One log line gives the parts (`expert cache: L2 -1 is ... MiB`). `0` is
+refused, because an empty host tier leaves the non-VRAM experts nowhere to live but the file.
+`--expert-l1-mib 0` is valid: no VRAM payload, every demand served from host memory or the file.
 
-The finite tier needs Windows and HIP: its unbuffered read queue and its address reservation have no
-implementation elsewhere, and the validator refuses the option there with a message. The unlimited
-inclusive path stays OS independent.
+The L2 needs Windows and HIP: its unbuffered read queue and its address reservation have no
+implementation elsewhere, and the validator refuses the expert cache there with a message.
 
 ## Why it exists
 
@@ -243,8 +245,8 @@ the numbers.
 These are cache allocation budgets, not a cap on the process. Model metadata, non-expert weights,
 KV, backend workspaces, the driver, profiles and diagnostic buffers are additional.
 
-**Installed memory.** When the plan resolves its host requirement (the requested budget or, for the
-unlimited tier, the byte count of the host-resident set), it is compared with the physical memory
+**Installed memory.** When the plan resolves its host requirement (the requested budget or the
+budget -1 resolves to), it is compared with the physical memory
 installed in the machine. A requirement above that line can never be met, so the model load stops
 with one error line that names both numbers in GiB and the option to lower, before the first expert
 byte is copied. Available memory is not consulted: below the installed total, what else runs on the
@@ -258,7 +260,7 @@ the same greedy the VRAM tier uses, one level down: every expert the VRAM plan d
 candidate for host memory, ordered by score x bytes, until the host budget is full.
 
 `expert-plan.h::plan_install` produces one transaction over three locations: VRAM slot, host slot
-and file. The unlimited case is the same function without file locations. One
+and file. One
 mover, `l1_arena::execute`, moves every slice of a transaction whatever tier its two ends are in; for
 a source in the file a small reader gives it the batched read and the ring address. Before an install
 the device drains and the worker stops; ordered copies preserve every source until its last use;
@@ -380,7 +382,7 @@ or `--n-cpu-moe`.
 
 | Option | Default | Meaning |
 |---|---|---|
-| `--expert-l2-mib N` | -1 | Host memory budget in MiB; -1 is unlimited and 0 is refused. |
+| `--expert-l2-mib N` | -1 | Host memory budget in MiB; -1 is sized to hold every expert and the prompt buffers, 0 is refused. |
 | `--expert-l2-staging-mib N` | 0 | Total ring size over the storage classes in MiB; 0 is automatic (the floors times `RANMA_EXPERT_L2_RING_FACTOR`). |
 | `--expert-l2-prefill-ring-mib N` | the staging value | Overrides the staging value; 0 is automatic. |
 | `--expert-l2-worker-cpu N` | -1 | Logical CPU of the worker thread; -1 is the last active logical CPU. |
