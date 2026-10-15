@@ -55,7 +55,7 @@ target's arena or is read from host memory on every draft call.
   weights (`--spec-type draft-mtp` without `-md`) is accepted as well: it is not a second model, and
   its NextN block is one more routed layer of the target's cache (checked with the GLM5-Next MTP
   graph of upstream pull request #29928, a finite L2 and one slot; the prefill swap was not run with
-  it). Both stay refused for other speculative setups, which no run has checked. Inclusive with an
+  it). Other speculative setups, which no run has checked, are accepted with a startup warning (use at your own risk). Inclusive with an
   unlimited host tier keeps a host copy of every expert of both models; for a model the size of the
   machine's RAM use a finite L2, which stores both in the owned host arena.
 - **Finite L2.** One host budget and one greedy over every model: the host cut ranks the slices that

@@ -984,6 +984,9 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
         if (!valid.ok) {
             throw std::invalid_argument("error: " + valid.reason + "\n");
         }
+        for (const std::string & w : valid.warnings) {
+            LOG_WRN("warning: %s\n", w.c_str());
+        }
         params.tensor_buft_overrides.push_back(llm_ffn_exps_cpu_override());
         LOG_INF("expert cache: %d MiB budget, every routed expert placed in host memory\n", params.expert_l1_mib);
         if (expert_draft_joins(params)) {

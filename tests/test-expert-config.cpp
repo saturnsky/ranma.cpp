@@ -28,7 +28,7 @@ int main() {
         const bool os_ok = ggml_cuda_expert::expert_os::supported();
         common_params q; q.fit_params = false; q.expert_l1_mib = 3070;
         CHECK(validate_expert_params(q).ok == os_ok);
-        q.mmproj.path = "fixture.gguf"; CHECK(!validate_expert_params(q).ok); q.mmproj.path.clear();
+        q.mmproj.path = "fixture.gguf"; CHECK(validate_expert_params(q).ok == os_ok && (!os_ok || validate_expert_params(q).warnings.size() == 1)); q.mmproj.path.clear();
         q.expert_l2_staging_mib = 512; CHECK(!validate_expert_params(q).ok); q.expert_l2_staging_mib = 0;
         q.layer_mode_lend = true; q.layer_mode_lend_bytes = 123u << 20;
         CHECK(expert_config_from_params(q).l2_bytes == 0 && expert_config_from_params(q).l2_lend_bytes == (123u << 20));
@@ -58,17 +58,18 @@ int main() {
         p.n_parallel = 1; CHECK(validate_expert_params(p).ok == (os && profile));
         p.expert_prefill_swap = false;
         p.mmproj.path = "fixture.gguf";
-        CHECK(!validate_expert_params(p).ok);
-        if (os) { CHECK(validate_expert_params(p).reason.find("no gate yet") != std::string::npos); }
+        CHECK(validate_expert_params(p).ok == os);
+        if (os) { CHECK(validate_expert_params(p).warnings.size() == 1 && validate_expert_params(p).warnings[0].find("use at your own risk") != std::string::npos); }
         p.mmproj.path.clear(); p.speculative.types = {COMMON_SPECULATIVE_TYPE_DRAFT_SIMPLE};
-        CHECK(!validate_expert_params(p).ok);
+        CHECK(validate_expert_params(p).ok == os);
+        if (os) { CHECK(validate_expert_params(p).warnings.size() == 1); }
         p.speculative.draft.n_max = 7; p.n_parallel = 3;
         CHECK(expert_config_from_params(p).l2_decode_rows == 24);
     }
-    // A draft model in the joint cache lifts the finite-tier and prefill-swap refusal: a block drafter
+    // A draft model in the joint cache needs no warning for the finite tier and the prefill swap: a block drafter
     // and an MTP head loaded from its own file. An MTP context on the target's own weights (no draft
-    // file) is accepted too; a block drafter without a file, a draft kept out of the cache and a mixed
-    // speculative setup keep it.
+    // file) needs none too; a block drafter without a file, a draft kept out of the cache and a mixed
+    // speculative setup are accepted with a warning (not verified).
     for (common_speculative_type t : {COMMON_SPECULATIVE_TYPE_DRAFT_MTP, COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK}) {
         p = common_params(); p.fit_params = false;
         p.expert_cache_mode = "exclusive"; p.expert_l1_mib = 3070; p.expert_l2_mib = 32768; p.n_parallel = 1;
@@ -77,44 +78,53 @@ int main() {
         CHECK(!expert_draft_joins(p));
         if (t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP) {
             CHECK(validate_expert_params(p).ok == os);
-            p.speculative.types = {t, COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE}; CHECK(!validate_expert_params(p).ok);
+            if (os) { CHECK(validate_expert_params(p).warnings.empty()); }
+            p.speculative.types = {t, COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE}; CHECK(validate_expert_params(p).ok == os);
+            if (os) { CHECK(validate_expert_params(p).warnings.size() == 1); }
             p.speculative.types = {t};
         } else {
-            CHECK(!validate_expert_params(p).ok);
-            if (os) { CHECK(validate_expert_params(p).reason.find("no gate yet") != std::string::npos); }
+            CHECK(validate_expert_params(p).ok == os);
+            if (os) { CHECK(validate_expert_params(p).warnings.size() == 1); }
         }
         p.speculative.draft.mparams.path = "draft.gguf";
         CHECK(expert_draft_joins(p) && validate_expert_params(p).ok == os);
         CHECK(expert_config_from_params(p).l2_decode_rows == 2);
         p.expert_prefill_swap = true; CHECK(validate_expert_params(p).ok == os);
         p.expert_l2_mib = -1; CHECK(validate_expert_params(p).ok == os); p.expert_l2_mib = 32768;
-        p.expert_cache_draft = false; CHECK(!expert_draft_joins(p) && !validate_expert_params(p).ok);
-        if (os) { CHECK(validate_expert_params(p).reason.find("no gate yet") != std::string::npos); }
-        p.expert_prefill_swap = false; CHECK(!validate_expert_params(p).ok);
+        CHECK(validate_expert_params(p).warnings.empty());
+        p.expert_cache_draft = false; CHECK(!expert_draft_joins(p) && validate_expert_params(p).ok == os);
+        if (os) { CHECK(validate_expert_params(p).warnings.size() == 2); }
+        p.expert_prefill_swap = false; CHECK(validate_expert_params(p).ok == os);
+        if (os) { CHECK(validate_expert_params(p).warnings.size() == 1); }
         p.expert_cache_draft = true; p.speculative.types = {t, COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE};
-        CHECK(!validate_expert_params(p).ok);
+        CHECK(validate_expert_params(p).ok == os);
     }
-    // An MTP head kept out of the cache (--expert-cache-draft off) passes the gate only with every
-    // layer on the GPU and no draft tensor overrides; a block drafter kept out does not.
+    // An MTP head kept out of the cache (--expert-cache-draft off) needs no warning only with every
+    // layer on the GPU and no draft tensor overrides; a block drafter kept out warns.
     {
         p = common_params(); p.fit_params = false;
         p.expert_cache_mode = "exclusive"; p.expert_l1_mib = 3070; p.expert_l2_mib = 32768; p.n_parallel = 1;
         p.expert_profile_dir = "profile";
         p.speculative.types = {COMMON_SPECULATIVE_TYPE_DRAFT_MTP}; p.speculative.draft.n_max = 1;
         p.speculative.draft.mparams.path = "mtp.gguf"; p.expert_cache_draft = false;
-        CHECK(!expert_draft_joins(p) && !validate_expert_params(p).ok);   // layers left to the default
+        CHECK(!expert_draft_joins(p) && validate_expert_params(p).ok == os);   // layers left to the default: accepted with a warning
+        if (os) { CHECK(validate_expert_params(p).warnings.size() == 1); }
         p.speculative.draft.n_gpu_layers = 999; CHECK(validate_expert_params(p).ok == os);
+        if (os) { CHECK(validate_expert_params(p).warnings.empty()); }
         p.expert_prefill_swap = true; CHECK(validate_expert_params(p).ok == os); p.expert_prefill_swap = false;
         p.speculative.draft.n_gpu_layers = -2; CHECK(validate_expert_params(p).ok == os);
-        p.speculative.draft.n_gpu_layers = 40; CHECK(!validate_expert_params(p).ok);
+        p.speculative.draft.n_gpu_layers = 40; CHECK(validate_expert_params(p).ok == os);
+        if (os) { CHECK(validate_expert_params(p).warnings.size() == 1); }
         p.speculative.draft.n_gpu_layers = 999;
         p.speculative.draft.tensor_buft_overrides.push_back({"exps", nullptr});
-        CHECK(!validate_expert_params(p).ok);
+        CHECK(validate_expert_params(p).ok == os);
+        if (os) { CHECK(validate_expert_params(p).warnings.size() == 1); }
         p.speculative.draft.tensor_buft_overrides.clear();
         // a GPU-resident DSpark block drafter outside the joint cache is checked like a resident MTP head
         p.speculative.types = {COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK}; CHECK(validate_expert_params(p).ok == os);
         p.speculative.types = {COMMON_SPECULATIVE_TYPE_DRAFT_MTP, COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE};
-        CHECK(!validate_expert_params(p).ok);
+        CHECK(validate_expert_params(p).ok == os);
+        if (os) { CHECK(validate_expert_params(p).warnings.size() == 1); }
     }
     p = common_params(); p.fit_params = false;
     p.expert_l1_mib = 3070;

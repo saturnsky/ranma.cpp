@@ -7,10 +7,13 @@
 #include "ggml-expert.h"
 
 #include <string>
+#include <vector>
 
 struct expert_validation {
     bool        ok = true;
     std::string reason;
+    // combinations that are accepted but not verified; the caller prints each once
+    std::vector<std::string> warnings;
 };
 
 // One place for every rule about which option combinations are accepted. Called before the model loads.

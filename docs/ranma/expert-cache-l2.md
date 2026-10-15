@@ -391,10 +391,12 @@ or `--n-cpu-moe`.
 
 `llama-bench` accepts the same host tier options.
 
-The validator refuses a finite tier with a multimodal projector and with speculative decoding: those
-combinations have no correctness check yet, not a structural problem. A draft model in the joint
-cache (`expert-cache-joint.md`), a block drafter or an MTP head loaded with `-md`, is the exception, and
-so is an MTP context on the target's own weights (`--spec-type draft-mtp` without `-md`). More than one server slot is
+The validator accepts a finite tier with a multimodal projector and with speculative decoding but prints
+a warning once at startup ("not verified with the expert cache L2; use at your own risk"): those
+combinations have no correctness check yet, not a structural problem, and one developer cannot verify
+every combination. A draft model in the joint
+cache (`expert-cache-joint.md`), a block drafter or an MTP head loaded with `-md`, needs no warning, and
+neither does an MTP context on the target's own weights (`--spec-type draft-mtp` without `-md`). More than one server slot is
 accepted by the tier; the prompt swap keeps its single-slot rule. The slot count has to be given: without
 `-np` llama-server leaves it to be chosen later (four slots), and the validator refuses the tier with
 `finite L2 needs positive batch/parallel bounds`. Give `-np 1` for one user (`expert-cache.md`).
@@ -466,7 +468,8 @@ samples count the wait for the up slices only; `staged_wait_ms` adds up the gate
   (after the empty slots). Whether another order keeps more useful experts is not measured.
   With the unified host policy a demotion joins the ring at the probation point instead.
 - **No correctness check yet** for a finite tier with a multimodal projector or speculative decoding
-  other than a draft model in the joint cache; the validator refuses those.
+  other than a draft model in the joint cache; the validator accepts those with a startup warning
+  (use at your own risk).
 - **A lazily mapped model file slows the unbuffered reads.** A read-only mapping of a shard makes
   unbuffered reads of the same file markedly slower on this platform, which is why the loader maps
   only the shards that hold lazy tensors when ordinary mmap loading is off. A shard that holds both

@@ -17,6 +17,7 @@ static expert_validation expert_reject(const std::string & reason) {
 }
 
 expert_validation validate_expert_params(const common_params & params) {
+    std::vector<std::string> warnings;
     if (params.expert_l1_mib < 0) { return expert_reject("--expert-l1-mib must be 0 or more"); }
     if (params.expert_cache_mode != "inclusive" && params.expert_cache_mode != "exclusive") {
         return expert_reject("--expert-cache-mode must be 'inclusive' or 'exclusive', got '" + params.expert_cache_mode + "'");
@@ -87,8 +88,14 @@ expert_validation validate_expert_params(const common_params & params) {
     if (active) {
         if (!ggml_cuda_expert::expert_os::supported()) { return expert_reject("the L2 of the expert cache needs Windows unbuffered reads"); }
         if (params.n_parallel <= 0 || params.n_batch <= 0 || params.n_ubatch < 0) { return expert_reject("the L2 needs positive batch/parallel bounds and a nonnegative ubatch"); }
-        if (!params.mmproj.path.empty()) { return expert_reject("the L2 with mmproj has no gate yet"); }
-        if (spec_unchecked) { return expert_reject("the L2 with speculative decoding has no gate yet, except with a draft model in the joint cache"); }
+        // Not verified, but not a structural problem: warn and go on
+        if (!params.mmproj.path.empty()) {
+            warnings.push_back("mmproj (multimodal projector) is not verified with the expert cache L2; use at your own risk");
+        }
+        if (spec_unchecked) {
+            warnings.push_back("this speculative decoding setup is not verified with the expert cache L2 "
+                "(only a draft model in the joint cache, an MTP head and a DSpark drafter are); use at your own risk");
+        }
     }
     if (params.expert_l2_mib > 0) {
         const int p = params.expert_l2_prefill_ring_mib >= 0 ? params.expert_l2_prefill_ring_mib : params.expert_l2_staging_mib;
@@ -103,7 +110,7 @@ expert_validation validate_expert_params(const common_params & params) {
         if (params.expert_profile_dir.empty()) { return expert_reject("--expert-prefill-swap needs --expert-profile-dir"); }
         if (params.n_parallel != 1) { return expert_reject("--expert-prefill-swap needs -np 1"); }
         if (!params.mmproj.path.empty() || spec_unchecked) {
-            return expert_reject("--expert-prefill-swap with mmproj/speculative decoding has no gate yet, except with a draft model in the joint cache");
+            warnings.push_back("--expert-prefill-swap with mmproj or this speculative decoding setup is not verified with the expert cache L2; use at your own risk");
         }
     }
     if (!active && (!params.expert_profile_dir.empty() || params.expert_freeze || params.expert_profile_archive || params.expert_profile_reset)) {
@@ -121,7 +128,9 @@ expert_validation validate_expert_params(const common_params & params) {
             }
         }
     }
-    return {};
+    expert_validation res;
+    res.warnings = std::move(warnings);
+    return res;
 }
 
 bool expert_draft_joins(const common_params & params) {

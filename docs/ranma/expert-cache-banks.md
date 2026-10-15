@@ -119,8 +119,9 @@ The cache turns the host-direct path on and loads the model with `--load-mode no
 | `--expert-prefill-swap` (`LLAMA_ARG_EXPERT_PREFILL_SWAP`) | off | Install the `prefill` plan while a prompt is processed and the `decode` plan while tokens are generated, instead of keeping the `decode` plan throughout. |
 
 The validator refuses `--expert-prefill-swap` before the model loads when it cannot work: without an
-expert cache budget, without a profile directory, with `-np` greater than 1, with a multimodal
-projector, or with speculative decoding other than a draft model in the joint cache. The swap installs
+expert cache budget, without a profile directory, or with `-np` greater than 1. A multimodal
+projector, or speculative decoding other than a draft model in the joint cache, is accepted with a
+startup warning: it is not verified with the expert cache (use at your own risk). The swap installs
 a plan inside a request, so it needs a server with exactly one sequence; a draft context on the same
 device is drained by the install like the target's (`expert-cache-joint.md`: the draft keeps its VRAM
 slices across the swap).
