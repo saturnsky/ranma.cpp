@@ -700,6 +700,8 @@ struct common_params {
     bool    layer_mode_lend          = false; // set by the layer mode: the prompt buffers are lent from L1 and L2 (expert cache)
     size_t  layer_mode_lend_scratch[3] = {0, 0, 0}; // set by the layer mode: the op's three scratch blocks of a prompt ubatch
     std::function<void(int64_t, size_t[3])> layer_mode_lend_scratch_of; // set by the layer mode: the same blocks for n tokens
+    size_t  layer_mode_lend_bytes    = 0;     // set by the layer mode: the prompt buffers of the lend at their widest (an L2 of -1 holds them)
+    std::vector<size_t> layer_mode_lend_pieces; // set by the layer mode: the VRAM pieces of the widest layer-major pass
     int32_t n_ctx_checkpoints   = 32;    // max number of context checkpoints per slot
     int32_t kv_unified_per_slot = 0;     // max context per parallel slot; 0 = unset
     int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints
@@ -736,7 +738,7 @@ struct common_params {
     bool        expert_profile_archive    = false; // keep records that leave the score window under archive/
     bool        expert_profile_reset      = false; // discard the stored profiles at startup
     // the host tier and the SSD tier (docs/ranma/expert-cache-l2.md)
-    int32_t     expert_l2_mib             = -1;    // -1 = unlimited host arena, 0 is rejected
+    int32_t     expert_l2_mib             = -1;    // -1 = sized to hold every expert and the prompt buffers, 0 is rejected
     int32_t     expert_l2_staging_mib     = 0;     // 0 = automatic; sets both rings unless overridden
     int32_t     expert_l2_prefill_ring_mib = -1;   // -1 = inherit the staging value, 0 = automatic
     int32_t     expert_seed                = 1;

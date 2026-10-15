@@ -10,6 +10,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstdint>
 #include <functional>
 #include <numeric>
@@ -327,6 +328,22 @@ inline tier_minimum minimum_host_budget(const geometry & geo, const std::vector<
     }
     out.valid = true;
     return out;
+}
+
+// The L2 that holds everything (--expert-l2-mib -1): `fixed_bytes` (rings, tables, spares, tails) and every candidate
+// of the host cut at its class pitch, i.e. every expert outside VRAM (exclusive) or every expert (inclusive).
+inline size_t full_host_budget(const geometry & geo, const std::vector<std::vector<int32_t>> & vram,
+        const std::vector<size_t> & pitch, bool inclusive, size_t fixed_bytes) {
+    size_t bytes = fixed_bytes;
+    for (int l = 0; l < geo.n_layers; ++l) {
+        const int c = geo.layer_class[l];
+        if (c < 0 || (size_t) c >= pitch.size()) { continue; }
+        for (int e = 0; e < geo.experts(l); ++e) {
+            const bool in_vram = (size_t) l < vram.size() && (size_t) e < vram[l].size() && vram[l][e] >= 0;
+            bytes += inclusive || !in_vram ? pitch[(size_t) c] : 0;
+        }
+    }
+    return bytes;
 }
 
 // The machine must be able to hold the host side of the plan at all. Only the installed physical

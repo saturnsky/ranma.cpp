@@ -4,9 +4,9 @@
 //   P2: the width rule: the fewest passes whose pieces L1 holds (all of them in L1), in equal shares;
 //   P3: the release does not refill; a decode launch restores an evicted expert only when it reads it, into its own
 //       lent slot, and a later lend takes the restore space back.
-//       lent slot, and a later lend takes the restore space back.
 
 #include "expert-lend.h"
+#include "expert-plan.h"
 #include "expert-redraw.h"
 
 #include <algorithm>
@@ -23,7 +23,7 @@ using namespace ggml_cuda_expert;
 static int g_fail = 0;
 static bool g_quiet = false;
 // the paths a run took (each must be taken at least once)
-static int n_l1_plans = 0, n_l1_regrow = 0, n_multi_pass = 0, n_restores = 0, n_sticky = 0, n_wanted = 0;
+static int n_l1_plans = 0, n_l1_regrow = 0, n_multi_pass = 0, n_restores = 0, n_sticky = 0, n_bounds = 0, n_wanted = 0;
 static int n_untied = 0;   // plans that gave victims of their last tie back
 #define CHECK(x) do { if (!(x)) { if (!g_quiet) { fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #x); } ++g_fail; return false; } } while (0)
 
@@ -197,6 +197,20 @@ bool test_l1(uint32_t seed) {
     std::vector<int> limit = s.slots;
     const auto cls = s.classes(limit);
     const lend_l1_plan p = plan_l1_lend(cls, pieces, 256);
+    // the bound an L2 of -1 is sized with: never fewer slots of a class than the plan evicts, the same with one class,
+    // every resident when nothing fits
+    const std::vector<int> bound = lend_evict_bound(cls, pieces, 256);
+    CHECK(bound.size() == cls.size());
+    for (size_t c = 0; c < cls.size(); ++c) {
+        CHECK(bound[c] <= (int) cls[c].residents.size());
+        if (p.ok) {
+            CHECK(p.evict[c] <= bound[c]);
+            CHECK(cls.size() > 1 || p.evict[c] == bound[c]);
+        } else {
+            CHECK(bound[c] == (int) cls[c].residents.size());
+        }
+    }
+    n_bounds += p.ok && cls.size() > 1 ? 1 : 0;
     if (!p.ok) {
         // the pieces do not fit even with every resident gone: every piece-fit with all slots must fail too
         std::vector<int> all(cls.size());
@@ -256,6 +270,23 @@ bool test_checker_sees_wrong_rank() {
     CHECK(caught);
     const lend_l1_plan right = plan_l1_lend({ c }, { 4096 }, 256);
     CHECK(right.ok && right.victims.size() == 1 && right.victims[0].expert == 0);
+    return true;
+}
+
+// the eviction bound packs the pieces into the regions of each kind: more slots than the bytes over the slot stride
+bool test_evict_bound_packing() {
+    lend_class c;
+    c.kind_bytes = { 1024, 1024, 2048 };   // a slot of 4096 bytes
+    c.guard = { 0, 0, 0 };
+    c.slots = 10;
+    c.residents.resize(8);
+    // 2560 bytes are less than one slot of 4096, but one piece needs a region of 2560: two slots of the 2048 kind
+    CHECK(lend_evict_bound({ c }, { 2560 }, 256) == std::vector<int>({ 2 }));
+    // three pieces of 1024: one slot holds one in each kind
+    CHECK(lend_evict_bound({ c }, { 1024, 1024, 1024 }, 256) == std::vector<int>({ 1 }));
+    // nothing to lend, and more than every resident can hold
+    CHECK(lend_evict_bound({ c }, { 0 }, 256) == std::vector<int>({ 0 }));
+    CHECK(lend_evict_bound({ c }, { 9*2048 }, 256) == std::vector<int>({ 8 }));
     return true;
 }
 
@@ -596,6 +627,7 @@ int main(int argc, char ** argv) {
     const int seeds = argc > 1 ? atoi(argv[1]) : 2000;
     test_pack_edges();
     test_checker_sees_wrong_rank();
+    test_evict_bound_packing();
     test_untie_example();
     test_replay();
     test_width_examples();
@@ -612,10 +644,12 @@ int main(int argc, char ** argv) {
         }
     }
     printf("test-expert-lend: %d checks over %d seeds, %d failures; paths: L1 evictions %d, L1 growth over held slots %d, "
-        "widths of several passes %d, restore runs %d, sticky installs %d\n",
-        n, seeds, g_fail, n_l1_plans, n_l1_regrow, n_multi_pass, n_restores, n_sticky);
-    const bool covered = n_l1_plans > 0 && n_l1_regrow > 0 && n_multi_pass > 0 && n_restores > 0 && n_sticky > 0;
+        "widths of several passes %d, restore runs %d, sticky installs %d, eviction bounds over several classes %d, "
+        "restores limited to the decode plan %d\n",
+        n, seeds, g_fail, n_l1_plans, n_l1_regrow, n_multi_pass, n_restores, n_sticky, n_bounds, n_wanted);
     printf("test-expert-lend: plans that gave victims of their last tie back (a class not needed) %d\n", n_untied);
+    const bool covered = n_l1_plans > 0 && n_l1_regrow > 0 && n_multi_pass > 0 && n_restores > 0 && n_sticky > 0 && n_bounds > 0 &&
+        n_wanted > 0;
     if (!covered) {
         printf("a path was never taken\n");
     }

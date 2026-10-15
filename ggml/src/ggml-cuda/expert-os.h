@@ -13,7 +13,7 @@
 // bytes of an expert land straight in a ring slot and the operating system keeps no second copy of
 // a file that is larger than the machine's memory.
 //
-// Unlimited inclusive storage is OS independent. Finite host storage uses this interface in both modes.
+// The host storage of the expert cache (the L2, also at -1) uses this interface in both modes.
 
 #include <cstddef>
 #include <cstdint>

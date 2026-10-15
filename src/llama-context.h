@@ -300,7 +300,9 @@ public:
     // ranma: the graph counts of llama_get_graph_counts (llama-ext.h)
     void graph_counts(struct llama_graph_counts & out) const;
 
-    bool layer_exec_lend_bytes(int64_t n_tokens, size_t l1_bytes, uint64_t out[2]);
+    // ranma: llama_layer_exec_lend_bytes (llama-layer-exec.cpp)
+    bool layer_exec_lend_bytes(int64_t n_tokens, size_t l1_bytes, uint64_t out[2], size_t * pieces, int32_t * n_pieces);
+
 private:
     llm_graph_result * get_gf_res_prev();
 
@@ -507,7 +509,14 @@ private:
     // computed every ubatch of mctx and wrote their logits, 1 when it did not start (the ubatch loop runs), < 0 when it
     // failed after the memory changed (the batch is removed from the memory)
     int layer_exec_decode(llama_memory_context_i * mctx, uint32_t n_tokens_all, uint32_t n_outputs_all);
+    // set by layer_exec_lend_bytes: layer_exec_decode only sizes the lend of one pass of n_tokens and returns
+    struct lx_size_query {
+        size_t   l1_bytes = 0;
+        bool     ok       = false;
         uint64_t bytes[2] = { 0, 0 }; // VRAM lent, host inputs (not lent)
+        std::vector<size_t> pieces;   // the VRAM pieces of the lend (bytes[0] is their sum)
+    };
+    lx_size_query * lx_size = nullptr;
     // the host inputs of the layer-major prefill's graphs (not lent: a host compute buffer of the context, grown as needed)
     ggml_backend_buffer_ptr lx_host_inputs;
 

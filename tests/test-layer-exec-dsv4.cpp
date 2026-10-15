@@ -24,6 +24,7 @@
 #include "common.h"
 #include "llama.h"
 #include "llama-cpp.h"
+#include "ggml-expert.h"
 #include "../src/llama-ext.h"
 
 #include <algorithm>
@@ -460,6 +461,37 @@ int main(int argc, char ** argv) {
         const diff_t d = compare(r1, r2);
         printf("control (token 0 changed): max_rel=%.3e %s\n", d.max_rel, d.max_rel > 1e-4 ? "sensitive" : "BLIND");
         if (!(d.max_rel > 1e-4)) { n_fail++; }
+    }
+
+    // the size query an L2 of -1 is sized with (llama_layer_exec_lend_bytes): one pass of N tokens; the state pieces
+    // grow with N, a pass of one ubatch and a context without the layer-major prefill have none
+    {
+        cfg_t b; b.n_ubatch = 64; b.layer = true;
+        llama_context_ptr ctx = make_ctx(b);
+        uint64_t s1[2] = { 0, 0 }, s2[2] = { 0, 0 }, s0[2] = { 0, 0 }, s3[2] = { 0, 0 };
+        size_t p1[48] = {};
+        int32_t n1 = 0;
+        const bool ok1 = ctx && llama_layer_exec_lend_bytes(ctx.get(), 512, 0, s1, p1, &n1);
+        const bool ok2 = ctx && llama_layer_exec_lend_bytes(ctx.get(), 1024, 0, s2, nullptr, nullptr);
+        const bool one = ctx && llama_layer_exec_lend_bytes(ctx.get(), 64, 0, s0, nullptr, nullptr);
+        // out[0]: the VRAM the pass borrows (here the state: no expert-major op), out[1]: the host inputs (not lent)
+        const uint64_t dev1 = s1[0], dev2 = s2[0];
+        const bool lin = dev1 > 0 && dev2 + 256*48 >= 2*dev1 && dev2 <= 2*dev1 + 256*48 && s2[1] > 0;
+        // the pieces of the lend add up to it (an L2 of -1 packs them as the lend does)
+        uint64_t sum1 = 0;
+        for (int32_t i = 0; i < n1; ++i) {
+            sum1 += p1[i];
+        }
+        const bool pcs = n1 > 0 && sum1 == dev1;
+        set_layer_exec(false);
+        const bool off = ctx && llama_layer_exec_lend_bytes(ctx.get(), 512, 0, s3, nullptr, nullptr);
+        set_layer_exec(true);
+        logits_t r;
+        const bool runs = ctx && decode_range(ctx.get(), toks, 0, 517, { 516 }, &r);
+        printf("lend size query: 512 tokens %llu/%llu, 1024 tokens %llu/%llu bytes (lent VRAM/host inputs): %s\n",
+            (unsigned long long) s1[0], (unsigned long long) s1[1], (unsigned long long) s2[0], (unsigned long long) s2[1],
+            ok1 && ok2 && lin && pcs && !one && !off && runs ? "ok" : "FAILED");
+        if (!(ok1 && ok2 && lin && pcs && !one && !off && runs)) { n_fail++; }
     }
 
     // the layer mode reference: one ubatch of the whole width with attention chunks of the chunk size (not required

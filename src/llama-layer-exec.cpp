@@ -1004,8 +1004,9 @@ int llama_context::layer_exec_decode(llama_memory_context_i * mctx, uint32_t n_t
         return 1;
     };
 
-    const llama_ubatch & ub0 = mctx->get_ubatch();
-    if (ub0.n_tokens >= n_tokens_all) {
+    // a size query (layer_exec_lend_bytes) plans one pass of its tokens and stops before the memory and the lend
+    const bool dry = lx_size != nullptr;
+    if (!dry && mctx->get_ubatch().n_tokens >= n_tokens_all) {
         return 1;
     }
 
@@ -1038,14 +1039,17 @@ int llama_context::layer_exec_decode(llama_memory_context_i * mctx, uint32_t n_t
             return skip("layer input extraction");
         }
     }
-    const llama_batch & batch = balloc->get_batch();
-    if (batch.embd != nullptr || batch.token == nullptr || batch.n_seq_id == nullptr || batch.seq_id == nullptr) {
-        return skip("not a token batch");
-    }
-    const llama_seq_id seq = batch.seq_id[0][0];
-    for (int32_t i = 0; i < batch.n_tokens; ++i) {
-        if (batch.n_seq_id[i] != 1 || batch.seq_id[i][0] != seq) {
-            return skip("more than one sequence");
+    llama_seq_id seq = 0;
+    if (!dry) {
+        const llama_batch & batch = balloc->get_batch();
+        if (batch.embd != nullptr || batch.token == nullptr || batch.n_seq_id == nullptr || batch.seq_id == nullptr) {
+            return skip("not a token batch");
+        }
+        seq = batch.seq_id[0][0];
+        for (int32_t i = 0; i < batch.n_tokens; ++i) {
+            if (batch.n_seq_id[i] != 1 || batch.seq_id[i][0] != seq) {
+                return skip("more than one sequence");
+            }
         }
     }
 
@@ -1493,6 +1497,32 @@ int llama_context::layer_exec_decode(llama_memory_context_i * mctx, uint32_t n_t
     auto width_rule = [&]() -> lx_width {
         return ggml_cuda_expert::lend_width_rule(N, C_ctx, unit, lx_cfg_i64(&llama_layer_mode_config::layer_exec_group_tokens), fits);
     };
+    // the staged experts per buffer: an eighth of what the whole L1 could lend, over the two buffers
+    auto stage_slots = [&](size_t lendable) {
+        const int64_t env_slots = lx_env_i64("RANMA_LAYER_EXEC_STAGE_SLOTS");
+        const int64_t rule = (int64_t) (lendable/8/std::max<size_t>(1, 2*once_eb));
+        return (int) std::max<int64_t>(2, std::min<int64_t>({ env_slots > 0 ? env_slots : rule, (int64_t) 64,
+            std::max<int64_t>(2, ((int64_t) model.hparams.n_expert + 1)/2) }));
+    };
+    const bool want_exact   = once_env == "auto" || once_env == "1" || once_env == "exact";
+    const bool want_partial = once_env == "auto" || once_env == "1" || once_env == "partial";
+    if (dry) {
+        // the widest pass: every ubatch at once, with the largest PCIe-once pieces the op may take (T of the exact op)
+        if (fused && once_env != "off") {
+            once_slots = stage_slots(lx_size->l1_bytes);
+            once_mode  = want_exact ? 1 : want_partial ? 2 : 0;
+        }
+        ggml_expert_lend_request rq;
+        lend_request(N, rq);
+        for (int i = 0; i < rq.n_pieces; ++i) {
+            lx_size->bytes[0] += rq.pieces[i].bytes;
+            lx_size->pieces.push_back(rq.pieces[i].bytes);
+        }
+        lx_size->bytes[1] += host_inputs_bytes(N, K);
+        lx_size->ok = true;
+        n_outputs = save_n_outputs;
+        return 1;
+    }
     if (!lend_on) {
         n_outputs = save_n_outputs;
         return skip("the prefill lend of the expert cache is off");
@@ -1502,17 +1532,11 @@ int llama_context::layer_exec_decode(llama_memory_context_i * mctx, uint32_t n_t
     lx_width wr;
     auto useful = [&](const lx_width & x) { return x.P > 0 && (x.P == 1 || x.P < K); };
     if (fused && once_env != "off") {
-        const int64_t env_slots = lx_env_i64("RANMA_LAYER_EXEC_STAGE_SLOTS");
-        // the staged experts per buffer: an eighth of what the whole L1 could lend, over the two buffers
         ggml_expert_lend_counts lc = {};
         if (!cpu_dev && expert_iface->lend_counts != nullptr) {
             expert_iface->lend_counts(&lc);
         }
-        const int64_t rule = (int64_t) (lc.lendable_bytes/8/std::max<size_t>(1, 2*once_eb));
-        once_slots = (int) std::max<int64_t>(2, std::min<int64_t>({ env_slots > 0 ? env_slots : rule, (int64_t) 64,
-            std::max<int64_t>(2, ((int64_t) model.hparams.n_expert + 1)/2) }));
-        const bool want_exact   = once_env == "auto" || once_env == "1" || once_env == "exact";
-        const bool want_partial = once_env == "auto" || once_env == "1" || once_env == "partial";
+        once_slots = stage_slots(lc.lendable_bytes);
         lx_width w_exact, w_partial;
         if (want_exact) {
             once_mode = 1;
@@ -1771,7 +1795,7 @@ int llama_context::layer_exec_decode(llama_memory_context_i * mctx, uint32_t n_t
 
     // ---- every group: the memory, graph and inputs of its ubatches, then its layers -----------------------------------
     // (from here on a failure removes the batch from the memory)
-    const llama_pos pos0 = ub0.pos[0];
+    const llama_pos pos0 = mctx->get_ubatch().pos[0];
     auto abort_batch = [&](const char * what) {
         LLAMA_LOG_ERROR("%s: layer-major prefill failed: %s; removing the batch from the memory\n", __func__, what);
         ggml_backend_sched_synchronize(sc);
@@ -2227,4 +2251,34 @@ int llama_context::layer_exec_decode(llama_memory_context_i * mctx, uint32_t n_t
     }
 
     return 0;
+}
+
+bool llama_context::layer_exec_lend_bytes(int64_t n_tokens, size_t l1_bytes, uint64_t out[2], size_t * pieces, int32_t * n_pieces) {
+    if (memory == nullptr || n_tokens <= (int64_t) cparams.n_ubatch || n_tokens > UINT32_MAX) {
+        return false;
+    }
+    auto mctx = memory->init_full();
+    if (!mctx) {
+        return false;
+    }
+    lx_size_query q;
+    q.l1_bytes = l1_bytes;
+    lx_size = &q;
+    layer_exec_decode(mctx.get(), (uint32_t) n_tokens, 1);
+    lx_size = nullptr;
+    for (int i = 0; i < 2; ++i) {
+        out[i] = q.bytes[i];
+    }
+    if (n_pieces != nullptr) {
+        *n_pieces = (int32_t) std::min<size_t>(q.pieces.size(), GGML_EXPERT_LEND_MAX_PIECES);
+        for (int32_t i = 0; pieces != nullptr && i < *n_pieces; ++i) {
+            pieces[i] = q.pieces[(size_t) i];
+        }
+    }
+    return q.ok;
+}
+
+bool llama_layer_exec_lend_bytes(llama_context * ctx, int64_t n_tokens, size_t l1_bytes, uint64_t out[2], size_t * pieces,
+                                 int32_t * n_pieces) {
+    return ctx != nullptr && out != nullptr && ctx->layer_exec_lend_bytes(n_tokens, l1_bytes, out, pieces, n_pieces);
 }

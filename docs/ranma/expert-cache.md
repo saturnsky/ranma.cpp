@@ -114,7 +114,7 @@ No environment switch and no `--load-mode` is needed.
 | `--expert-l1-mib N` | 0 (off) | VRAM budget in MiB for expert payload and cache overhead. The budget also decides the expert placement (every routed expert goes to host memory), so `--n-cpu-moe`/`--cpu-moe` are refused together with it. Zero is valid together with a finite `--expert-l2-mib`. |
 | `--expert-profile-dir DIR` | none | Root of the profile banks, `DIR/<model key>/decode/` and `DIR/<model key>/prefill/`; the model key is the architecture name plus a hash of the routed-expert geometry, logged when a bank opens. Without it the placement is seeded and fixed: no records, no installs. |
 | `--expert-cache-mode MODE` | `inclusive` | `inclusive` keeps a host copy of each VRAM resident; `exclusive` keeps one home per expert (`expert-cache-exclusive.md`). |
-| `--expert-l2-mib N` | -1 (unlimited) | Host memory budget in MiB; what fits in neither tier stays in the file and is read on demand (`expert-cache-l2.md`). 0 is refused. |
+| `--expert-l2-mib N` | -1 (holds everything) | Host memory budget in MiB; -1 is sized to hold every expert and the prompt buffers; what fits in neither tier stays in the file and is read on demand (`expert-cache-l2.md`). 0 is refused. |
 | `--expert-prefill-swap` | off | Hold the prompt-processing plan while a prompt is processed (`expert-cache-banks.md`). |
 | `--expert-seed N` | 1 | Seed of the fixed random placement used when no profile is available. |
 | `--expert-freeze` | off | Profile and plan, never change the cache contents (for collecting a profile without disturbing a measurement). |
