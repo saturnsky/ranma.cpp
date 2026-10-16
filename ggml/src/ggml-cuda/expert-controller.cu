@@ -13,6 +13,8 @@
 #include "expert-redraw.h"
 #include "expert-profile-store.h"
 #include "expert-storage.h"
+#include "expert-ub-pool.cuh"
+#include "mapped-host.cuh"
 
 #include "ggml-alloc.h"
 #include "ggml-backend-impl.h"
@@ -590,6 +592,7 @@ public:
                 report_tier_plan_locked("at model load");
             }
             log_members_locked("at model load");
+            allocate_ub_pool_locked();
             return true;
         }
 
@@ -658,6 +661,7 @@ public:
             (table_bytes + (profiler_ ? profiler_->device_bytes() : 0))/1024, models_text_locked().c_str());
         log_aux_locked("at model load");
         log_members_locked("at model load");
+        allocate_ub_pool_locked();
         return true;
     }
 
@@ -691,6 +695,7 @@ public:
         installed_plan_ = GGML_EXPERT_PLAN_NONE;
         banks_.clear();
         n_banks_.store(0, std::memory_order_release);
+        free_ub_pool_locked();
         // the worker must stop before the arenas it reads into go away
         tier_.reset();
         free_stage_locked();
@@ -897,6 +902,8 @@ public:
         // The caller synchronized its context; the device-wide drain covers every stream that could
         // still read the arena or the tables.
         CUDA_CHECK(cudaDeviceSynchronize());
+        // the decode pool's entries go back to their homes before the install republishes the tables
+        ub_reclaim_sync_locked("install");
         // the install republishes the slot tables: the staging entries go, and the staging forgets its
         // experts (the next hint copies again; an install is rare next to the hints)
         for (std::vector<int32_t> & owners : stage_owner_) { stage_forget(owners); }
@@ -1019,6 +1026,9 @@ public:
                 if (attached_ctx_[i].load(std::memory_order_relaxed) == key) {
                     attached_ctx_[i].store(nullptr, std::memory_order_release);
                 }
+            }
+            if (ub_ && ub_->lent() && ub_owner_ == key) {
+                ub_reclaim_sync_locked("context freed");
             }
             return true;
         }
@@ -1161,14 +1171,296 @@ public:
                 (const int32_t *) l1_->lookup((int) joint, 0).slots, stage_first_[(size_t) joint],
                 stage_first_[(size_t) joint] + stage_slots_);
         }
-        if (profiler_) {
+        // The pool's step also counts the profile of a launch that gets one (one kernel less per layer)
+        const bool ub_step = ub_on_.load(std::memory_order_acquire) && member == ub_member_ && ub_layer_[(size_t) joint] &&
+                ids->ne[1] <= (int64_t) ub_rows_;
+        if (profiler_ && !ub_step) {
         launch_profile_ids((const int32_t *) ids->data, (int) ids->ne[1], (int) (ids->nb[1]/sizeof(int32_t)), (int) ids->ne[0],
             geo_.n_experts, profiler_->counts_base() + size_t(joint)*geo_.n_experts, profiler_->n_counts(), profiler_->n_banks(),
             profiler_->selection((uint32_t) member), ctx.stream());
         }
+        // The decode pool (expert-ub-pool.cuh): the step and the copies of a launch of few rows, before
+        // the tier and every matmul of the layer, on the same stream. The kernels run whether or not the
+        // pool is lent (r = 0 makes them return), so a captured graph stays valid either way.
+        if (ub_step) {
+            ub_->launch_step((int) joint, (const int32_t *) ids->data, (int) ids->ne[1], (int) (ids->nb[1]/sizeof(int32_t)),
+                (int) ids->ne[0], true, ctx.stream(),
+                profiler_ ? profiler_->counts_base() + size_t(joint)*geo_.n_experts : nullptr,
+                profiler_ ? profiler_->n_counts() : 0, profiler_ ? profiler_->n_banks() : 0,
+                profiler_ ? profiler_->selection((uint32_t) member) : nullptr);
+            ub_->launch_copy((int) joint, ctx.stream());
+        }
         // The SSD tier needs the same ids: this is the one site that sees both the fused and the
         // unfused router, and it is ordered before the layer's MUL_MAT_ID on the same stream.
         tier_route(ctx, (int) joint, ids);
+    }
+
+    // ---- the decode pool (expert-ub-pool.cuh) ----------------------------------------------------
+
+    // Called by the compute thread before every graph on `backend`: [base, base + size) is its
+    // compute buffer and the graph uses it up to `extent`; `n_tokens` is the batch (<= 0: not a
+    // batch, e.g. a K-shift). Lends the part above the decode graphs, and takes it back before a
+    // graph that reaches into it.
+    bool compute_spare(ggml_backend_t backend, void * base, size_t size, size_t extent, int32_t n_tokens) {
+        if (!ub_on_.load(std::memory_order_acquire) || backend == nullptr || !ggml_backend_is_cuda(backend)) {
+            return false;
+        }
+        ggml_backend_cuda_context * cctx = (ggml_backend_cuda_context *) backend->context;
+        if (cctx->device != device_) {
+            return false;
+        }
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!ub_ || state_ != state_t::installed) {
+            return false;
+        }
+        ggml_cuda_set_device(device_);
+        cudaStream_t stream = cctx->stream();
+        if (ub_->lent()) {
+            // an unknown buffer (null base) may be the lent one
+            const bool same = base == nullptr || base == ub_lent_base_;
+            if (same && extent <= ub_begin_) {
+                return true;
+            }
+            if (!same && (const void *) cctx != ub_owner_) {
+                return true;   // a buffer the pool does not use
+            }
+            if ((const void *) cctx != ub_owner_) {
+                // the graphs of the lending context read the pool on its own stream
+                CUDA_CHECK(cudaStreamSynchronize(ub_stream_));
+            }
+            ub_reclaim_locked(stream, same ? "a graph reaches into the pool" : "the compute buffer moved");
+        }
+        if (base == nullptr) {
+            return true;
+        }
+        // Only the largest compute buffer lends: the target's, not the smaller one of a draft context that computes on
+        // its own (contexts that share one buffer, LLAMA_MTP_SHARE_COMPUTE, see views of different sizes at one base).
+        // The decode high-water mark is kept per buffer.
+        ub_max_size_ = std::max(ub_max_size_, size);
+        ub_buf_base_ = base;
+        size_t & hwm = ub_hwm_of_[base];
+        if (ub_hwm_of_.size() > 16) {
+            ub_hwm_of_.clear();   // buffers come and go with the contexts; a forgotten mark is measured again
+        }
+        if (n_tokens <= 0 || n_tokens > ub_rows_ || member_of(cctx) != ub_member_) {
+            return true;
+        }
+        ub_hwm_ = hwm;
+        if (ub_cfg_.log && (ub_calls_ < 16 || extent > ub_hwm_)) {
+            GGML_LOG_INFO("expert cache: decode pool: a %d-row graph reaches %.1f MiB of the %.1f MiB compute buffer\n",
+                n_tokens, extent/1048576.0, size/1048576.0);
+        }
+        ++ub_calls_;
+        ub_hwm_ = std::max(ub_hwm_, extent);
+        ub_hwm_of_[base] = ub_hwm_;
+        const size_t align = size_t(2) << 20;
+        const size_t begin = (ub_hwm_ + std::max(ub_cfg_.margin, ub_hwm_/4) + align - 1)/align*align;
+        if (size < ub_max_size_ || begin >= size || size - begin < ub_cfg_.min_bytes) {
+            return true;
+        }
+        const int r = ub_->lend((char *) base + begin, size - begin, stream);
+        if (r > 0) {
+            ub_owner_     = cctx;
+            ub_stream_    = stream;
+            ub_begin_     = begin;
+            ub_lent_base_ = base;
+            ++ub_lends_;
+            if (ub_cfg_.log || ub_lends_ == 1) {
+                GGML_LOG_INFO("expert cache: decode pool lent %.1f MiB above %.1f MiB of a %.1f MiB compute buffer (decode "
+                              "graphs reach %.1f MiB): %d positions per layer, %d layers (lend %llu)\n",
+                    (size - begin)/1048576.0, begin/1048576.0, size/1048576.0, ub_hwm_/1048576.0, r, ub_n_layers_,
+                    (unsigned long long) ub_lends_);
+            }
+        }
+        return true;
+    }
+
+    int32_t compact_rows() const {
+        return ub_on_.load(std::memory_order_acquire) ? ub_rows_ : 0;
+    }
+
+    // The counts of the pool from host memory (ggml_expert_iface::pool_counts); never waits for the device.
+    bool pool_counts(ggml_expert_pool_counts * out) {
+        if (out == nullptr || !ub_on_.load(std::memory_order_acquire)) {
+            return false;
+        }
+        std::lock_guard<std::mutex> lock(mutex_);
+        if (!ub_) {
+            return false;
+        }
+        ggml_expert_pool_counts c{};
+        if (!ub_->read_live(c.hits, c.fills, c.fill_bytes)) {
+            return false;
+        }
+        c.lends    = ub_lends_;
+        c.reclaims = ub_reclaims_;
+        *out = c;
+        return true;
+    }
+
+    void ub_reclaim_locked(cudaStream_t stream, const char * why) {
+        ub_->reclaim(stream);
+        ++ub_reclaims_;
+        if (ub_cfg_.log) {
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            ub_log_counters_locked(why);
+        }
+        ub_owner_ = nullptr;
+    }
+
+    // While nothing computes (or before the device drain of the caller): back to the homes, synchronously.
+    void ub_reclaim_sync_locked(const char * why) {
+        if (!ub_ || !ub_->lent()) {
+            return;
+        }
+        ggml_cuda_set_device(device_);
+        CUDA_CHECK(cudaStreamSynchronize(ub_stream_));
+        if (verify_all_) {
+            std::string reason;
+            const long checked = ub_->verify(reason);
+            if (checked < 0) {
+                GGML_ABORT("expert cache: decode pool: %s", reason.c_str());
+            }
+            GGML_LOG_INFO("expert cache: decode pool: verified %ld slots against their homes\n", checked);
+        }
+        ub_->reclaim(ub_stream_);
+        CUDA_CHECK(cudaStreamSynchronize(ub_stream_));
+        ++ub_reclaims_;
+        if (ub_cfg_.log) {
+            ub_log_counters_locked(why);
+        }
+        ub_owner_ = nullptr;
+    }
+
+    void ub_log_counters_locked(const char * why) const {
+        std::array<uint64_t, ub_pool_n_counters> c{};
+        if (!ub_->read_counters(c)) {
+            return;
+        }
+        GGML_LOG_INFO("expert cache: decode pool counters (%s): lends=%llu reclaims=%llu steps=%llu hits=%llu fills=%llu "
+                      "(%.1f MiB) over=%llu evictions=%llu rejected=%llu\n", why,
+            (unsigned long long) ub_lends_,
+            (unsigned long long) ub_reclaims_, (unsigned long long) c[ub_pool_steps], (unsigned long long) c[ub_pool_hits],
+            (unsigned long long) c[ub_pool_fills], c[ub_pool_fill_bytes]/1048576.0, (unsigned long long) c[ub_pool_over],
+            (unsigned long long) c[ub_pool_evictions], (unsigned long long) c[ub_pool_rejected]);
+    }
+
+    void allocate_ub_pool_locked() {
+        if (ub_ || !l1_) {
+            return;
+        }
+        ub_cfg_ = ub_pool_config_from_env();
+        if (tier_ && !tier_->class_layout()) {
+            GGML_LOG_WARN("expert cache: decode pool needs the class layout of the SSD tier; off\n");
+            return;
+        }
+        if (geo_.n_experts > ub_pool_max_experts) {
+            GGML_LOG_WARN("expert cache: decode pool supports up to %d experts per layer; off\n", ub_pool_max_experts);
+            return;
+        }
+        const int L = geo_.n_layers;
+        const member_state & mb = members_[0];
+        const std::vector<uint8_t> early = early_joint_locked();
+        // without a table from the tier or the host arena the pool brings its own (0 = not pooled)
+        bool own_tables = false;
+        for (int l = mb.offset; l < mb.offset + mb.geo.n_layers && l < L; ++l) {
+            if (geo_.layer_class[l] >= 0 && l1_->lookup(l, 0).host_addresses == nullptr) {
+                own_tables = true;
+            }
+        }
+        if (own_tables) {
+            const size_t bytes = size_t(L)*geometry::n_kinds*size_t(geo_.n_experts)*sizeof(uint64_t);
+            if (cudaMalloc((void **) &ub_tables_, bytes) != cudaSuccess) {
+                (void) cudaGetLastError();
+                ub_tables_ = nullptr;
+                GGML_LOG_WARN("expert cache: decode pool: address tables not allocated; off\n");
+                return;
+            }
+            CUDA_CHECK(cudaMemset(ub_tables_, 0, bytes));
+            uint64_t * tables = ub_tables_;
+            const int E = geo_.n_experts;
+            l1_->attach_pool_addresses([tables, E](int layer, int kind) {
+                return (const uint64_t *) (tables + (size_t(layer)*geometry::n_kinds + size_t(kind))*size_t(E));
+            });
+        }
+        std::vector<ub_pool_layer> layers((size_t) L);
+        std::vector<std::array<size_t, 3>> bytes((size_t) L, {0, 0, 0}), tails((size_t) L, {0, 0, 0});
+        ub_layer_.assign((size_t) L, 0);
+        ub_n_layers_ = 0;
+        for (int l = mb.offset; l < mb.offset + mb.geo.n_layers && l < L; ++l) {
+            const int cls = geo_.layer_class[l];
+            if (cls < 0 || early[(size_t) l] || (!stage_index_.empty() && stage_index_[(size_t) l] >= 0)) {
+                continue;
+            }
+            ub_pool_layer & u = layers[(size_t) l];
+            bool ok = true;
+            for (int k = 0; k < geometry::n_kinds && ok; ++k) {
+                const ggml_cuda_expert_lookup lk = l1_->lookup(l, k);
+                const ggml_tensor * t = geo_.tensors[l][k];
+                ub_pool_kind & c = u.kind[k];
+                if (lk.host_data != nullptr) {
+                    c.tensor = (const char *) lk.host_data;
+                } else if (t != nullptr && t->buffer != nullptr && ggml_backend_buffer_is_host(t->buffer)) {
+                    c.tensor = (const char *) ggml_hip_mapped_host_device_alias(t);
+                }
+                c.host_slots = lk.host_slots;
+                c.addresses  = const_cast<uint64_t *>(lk.host_addresses);
+                c.stride     = geo_.class_bytes[cls][k];
+                ok = lk.slots != nullptr && c.addresses != nullptr && (c.tensor != nullptr || tier_);
+                u.slots = lk.slots;
+                bytes[(size_t) l][k] = geo_.class_bytes[cls][k];
+                tails[(size_t) l][k] = arena_tail_bytes(geo_, cls, k);
+            }
+            if (!ok) {
+                u = ub_pool_layer();
+                continue;
+            }
+            u.serve   = tier_ ? tier_->serve_bitmap(l) : nullptr;
+            u.enabled = 1;
+            ub_layer_[(size_t) l] = 1;
+            ++ub_n_layers_;
+        }
+        if (ub_n_layers_ == 0) {
+            GGML_LOG_WARN("expert cache: decode pool: no routed layer can take positions; off\n");
+            return;
+        }
+        ub_.reset(new ub_pool(L, geo_.n_experts, ub_cfg_.r_cap));
+        if (!ub_->allocate(device_, layers, bytes, tails, ub_cfg_.ghost)) {
+            ub_.reset();
+            GGML_LOG_WARN("expert cache: decode pool: state not allocated; off\n");
+            return;
+        }
+        if (tier_) {
+            tier_->set_served_only();
+        }
+        ub_member_ = 0;
+        ub_rows_   = ub_cfg_.rows > 0 ? ub_cfg_.rows : (int) std::max<uint64_t>(cfg_.l2_decode_rows, 1);
+        ub_on_.store(true, std::memory_order_release);
+        char filter_text[32];
+        if (ub_cfg_.ghost > 0) {
+            snprintf(filter_text, sizeof(filter_text), "ghost:%d", ub_cfg_.ghost);
+        } else {
+            snprintf(filter_text, sizeof(filter_text), "none");
+        }
+        GGML_LOG_INFO("expert cache: decode pool on: %d layers, up to %d positions each, launches of up to %d rows, "
+                      "%zu KiB of state, admission filter %s%s%s\n", ub_n_layers_, ub_cfg_.r_cap, ub_rows_,
+            ub_->device_bytes()/1024, filter_text, own_tables ? ", own address tables" : "", "");
+    }
+
+    void free_ub_pool_locked() {
+        ub_on_.store(false, std::memory_order_release);
+        ub_.reset();
+        if (ub_tables_ != nullptr) {
+            (void) cudaFree(ub_tables_);
+            ub_tables_ = nullptr;
+        }
+        ub_owner_ = nullptr;
+        ub_stream_ = nullptr;
+        ub_buf_base_ = nullptr;
+        ub_lent_base_ = nullptr;
+        ub_hwm_ = ub_begin_ = 0;
+        ub_max_size_ = 0;
+        ub_hwm_of_.clear();
     }
 
     void before_read(ggml_backend_cuda_context & ctx, const ggml_tensor * src0) {
@@ -1441,7 +1733,10 @@ private:
             }
             // the joined model's tensors have their sector shifts now, and with the class layout
             // its host residents are addressed at them
-            if (!tier_->worker_running()) { tier_->refresh_addresses(); }
+            if (!tier_->worker_running()) {
+                ub_reclaim_sync_locked("model join");
+                tier_->refresh_addresses();
+            }
             tier_->start_worker(); // no-op when it runs
             report_tier_plan_locked("after a model joined");
         }
@@ -3251,6 +3546,21 @@ private:
     std::map<ggml_expert_plan_id, plan_state> plans_;
     ggml_expert_plan_id next_plan_id_  = 0;
     ggml_expert_plan_id installed_plan_ = GGML_EXPERT_PLAN_NONE;
+    // decode pool (expert-ub-pool.cuh)
+    ub_pool_config ub_cfg_;
+    std::unique_ptr<ub_pool> ub_;
+    std::atomic<bool> ub_on_{ false };      // the step runs; read by profile_ids without the mutex
+    std::vector<uint8_t> ub_layer_;         // [joint layer] has positions; fixed while ub_on_
+    int ub_member_ = 0, ub_rows_ = 1, ub_n_layers_ = 0;
+    uint64_t * ub_tables_ = nullptr;        // the pool's own address tables [layer][kind][expert], or null
+    const void * ub_owner_ = nullptr;       // the compute context that lent its buffer
+    cudaStream_t ub_stream_ = nullptr;      // its stream
+    void * ub_buf_base_ = nullptr;          // the buffer of the last graph
+    void * ub_lent_base_ = nullptr;         // the buffer the pool is lent from
+    size_t ub_hwm_ = 0, ub_begin_ = 0;      // largest decode extent seen, start of the lent region (offsets)
+    uint64_t ub_lends_ = 0, ub_reclaims_ = 0, ub_calls_ = 0;
+    size_t   ub_max_size_ = 0;              // the largest compute buffer (view) seen
+    std::map<const void *, size_t> ub_hwm_of_;   // decode high-water mark per compute buffer base
 };
 
 static controller & instance() {
@@ -3523,6 +3833,11 @@ static bool iface_attach_backend(ggml_backend_t backend, ggml_context * weights)
 static bool iface_route_hint(ggml_backend_t backend, const ggml_expert_route_hint * hints, int32_t n_hints) {
     return instance().route_hint(backend, hints, n_hints);
 }
+static bool iface_compute_spare(ggml_backend_t backend, void * base, size_t size, size_t extent, int32_t n_tokens) {
+    return instance().compute_spare(backend, base, size, extent, n_tokens);
+}
+static int32_t iface_compact_rows(void) { return instance().compact_rows(); }
+static bool iface_pool_counts(ggml_expert_pool_counts * out) { return instance().pool_counts(out); }
 
 static const ggml_expert_iface g_expert_iface = {
     /* .abi_version      = */ GGML_EXPERT_ABI_VERSION,
@@ -3543,6 +3858,9 @@ static const ggml_expert_iface g_expert_iface = {
     /* .memory           = */ iface_memory,
     /* .attach_backend   = */ iface_attach_backend,
     /* .route_hint       = */ iface_route_hint,
+    /* .compute_spare    = */ iface_compute_spare,
+    /* .compact_rows     = */ iface_compact_rows,
+    /* .pool_counts      = */ iface_pool_counts,
 };
 
 const ggml_expert_iface * ggml_backend_cuda_expert_iface(void) {

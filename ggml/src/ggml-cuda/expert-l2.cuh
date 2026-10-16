@@ -207,6 +207,13 @@ public:
 
     // ---- the hot path ------------------------------------------------------------------------------
     const uint64_t * addresses(int layer, int kind) const;
+    // The serve bitmap of a layer on the device (file residents and ring occupants), null before allocate().
+    const uint32_t * serve_bitmap(int layer) const {
+        return serve_device_ != nullptr ? serve_device_ + (size_t) layer*bitmap_words() : nullptr;
+    }
+    // The decode pool (expert-ub-pool.cuh) owns the entries of the host residents it holds: from now on
+    // the worker rewrites only the entries of the experts it serves, and the verification skips the rest.
+    void set_served_only() { served_only_ = true; }
     void publish_and_wait(int layer, const ggml_tensor * ids, cudaStream_t stream);
     // Staged service only: orders the kernel that reads `kind` of `layer` after that kind's reads.
     // A no-op for the first kind, which the route waits for, and for a layer routed unstaged.
@@ -358,6 +365,7 @@ private:
     std::atomic<bool> running_{ false };
     bool verify_     = false;
     bool any_ssd_    = false;
+    bool served_only_ = false;
 
     l2_counters counters_;
     int clock_khz_ = 0, steady_khz_ = 0, first_layer_ = -1;

@@ -1070,7 +1070,11 @@ void l2_tier::serve_staged(int layer, uint32_t seq, const std::vector<l2_read> &
 }
 
 void l2_tier::publish_layer(int layer) {
+    const size_t words = bitmap_words();
     for (int expert = 0; expert < geo_.n_experts; ++expert) {
+        if (served_only_ && !(serve_host_[(size_t) layer*words + size_t(expert/32)] & (1u << (expert%32)))) {
+            continue;
+        }
         for (int kind = 0; kind < geometry::n_kinds; ++kind) {
             maps_host_[((size_t) layer*geometry::n_kinds + kind)*geo_.n_experts + expert] =
                 address_of(layer, kind, expert);
@@ -1080,7 +1084,11 @@ void l2_tier::publish_layer(int layer) {
 }
 
 void l2_tier::publish_layer_kind(int layer, int kind) {
+    const size_t words = bitmap_words();
     for (int expert = 0; expert < geo_.n_experts; ++expert) {
+        if (served_only_ && !(serve_host_[(size_t) layer*words + size_t(expert/32)] & (1u << (expert%32)))) {
+            continue;
+        }
         maps_host_[((size_t) layer*geometry::n_kinds + kind)*geo_.n_experts + expert] = address_of(layer, kind, expert);
     }
     std::atomic_thread_fence(std::memory_order_release);
@@ -1089,6 +1097,9 @@ void l2_tier::publish_layer_kind(int layer, int kind) {
 void l2_tier::verify_addresses(int demanded_layer, const std::vector<int> & ids) {
     for (int layer = 0; layer < geo_.n_layers; ++layer) {
         for (int expert = 0; expert < geo_.n_experts; ++expert) {
+            if (served_only_ && !(serve_host_[(size_t) layer*bitmap_words() + size_t(expert/32)] & (1u << (expert%32)))) {
+                continue;   // the decode pool may own this entry
+            }
             for (int kind = 0; kind < geometry::n_kinds; ++kind) {
                 const uint64_t actual = maps_host_[((size_t) layer*geometry::n_kinds + kind)*geo_.n_experts + expert];
                 const uint64_t expected = address_of(layer, kind, expert);
