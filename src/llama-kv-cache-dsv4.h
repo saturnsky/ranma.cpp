@@ -158,7 +158,10 @@ public:
     llama_dsv4_comp_state * get_lid_state() const;
 
     uint32_t get_n_rs_seq() const;
+    bool get_rs_prompt() const { return rs_prompt; }
+    void set_rs_prompt(bool prompt) override { rs_prompt = prompt; }
     const std::vector<uint32_t> & get_rs_idx() const;
+    // a call consumes the pending rollback of its sequences and sets the depth of their planes
     void reset_rs_idx_for_ubatches(const std::vector<llama_ubatch> & ubatches);
 
     // ranma: the smallest ubatch that reads the narrow raw window; a smaller one reads the whole raw cache
@@ -173,7 +176,8 @@ public:
     bool tail_can_continue(llama_seq_id seq_id, llama_pos p_end) const;
 
     // the compressed state of the sequence can go back to p0 > 0: nothing to undo past its end, else a rollback of at
-    // most n_rs_seq positions while none is pending. Independent of the raw cells (tail_can_continue).
+    // most the planes its last call wrote (at most n_rs_seq) while none is pending. Independent of the raw cells
+    // (tail_can_continue).
     bool comp_can_rollback(llama_seq_id seq_id, llama_pos p0) const;
 
     // ranma: the calls of the sequences of a batch begin with the first ubatch applied and end once the last one
@@ -263,6 +267,13 @@ private:
     const uint32_t n_rs_seq;
 
     std::vector<uint32_t> rs_idx;
+
+    // llama_set_rs_prompt: a call of one token that outputs keeps one rollback plane
+    bool rs_prompt = false;
+
+    // per sequence, the rollback planes its last call wrote (<= n_rs_seq); a call snapshots only as deep as it can be
+    // rolled back, the planes past that hold older states
+    std::vector<uint32_t> rs_depth;
 
     // positions per row of the compressed K caches, for the rows a sequence state saves: the CSA and HCA ratios on
     // DeepSeek-V4, the finest ratio of the shared caches on V4.1 (a coarser source uses fewer of its rows)

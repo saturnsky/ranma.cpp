@@ -244,13 +244,23 @@ dsv4_state_tensors dsv4_build_state_snapshot(
         ggml_context * ctx,
         const llm_graph_input_dsv4::comp_input & inp,
         const llama_dsv4_comp_state * state,
-        ggml_tensor * source_kv,
-        ggml_tensor * source_score,
+        const dsv4_state_tensors & restored,
+        ggml_tensor * state_kv,
+        ggml_tensor * state_score,
         int32_t il) {
+    // a call that cannot be rolled back writes no plane (llama_kv_cache_dsv4: dsv4_rs_call_depths)
     if (inp.state_snapshot_src_idxs == nullptr || inp.state_snapshot_dst_idxs == nullptr ||
-            source_kv == nullptr || source_score == nullptr) {
+            restored.kv == nullptr || restored.score == nullptr || state_kv == nullptr || state_score == nullptr) {
         return {};
     }
+
+    // the planes are taken from [base plane | ubatch rows]; the other planes are not read. The concat is a node of
+    // its own rather than the source of the compressor, which keeps its concat fused into the compress op.
+    ggml_tensor * base_kv    = dsv4_view_2d(ctx, restored.kv,    restored.kv->ne[0],    state->get_n_rows(), 0);
+    ggml_tensor * base_score = dsv4_view_2d(ctx, restored.score, restored.score->ne[0], state->get_n_rows(), 0);
+
+    ggml_tensor * source_kv    = ggml_concat(ctx, base_kv,    state_kv,    1);
+    ggml_tensor * source_score = ggml_concat(ctx, base_score, state_score, 1);
 
     ggml_tensor * kv_rows = ggml_get_rows(ctx, source_kv, inp.state_snapshot_src_idxs);
     ggml_tensor * kv = state->cpy_kv(ctx, kv_rows, inp.state_snapshot_dst_idxs, il);
@@ -1130,13 +1140,8 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention_impl(
         ggml_build_forward_expand(gf, inp_dsv4->mctx->get_csa()->cpy_k(ctx0,
                     kv_comp_csa_state, inp_dsv4->get_csa().state_write_idxs, il));
 
-        ggml_tensor * csa_snapshot_source_kv = ggml_concat(ctx0,
-                csa_restored.kv, csa_state_kv, 1);
-        ggml_tensor * csa_snapshot_source_score = ggml_concat(ctx0,
-                csa_restored.score, csa_state_score, 1);
-
         const dsv4_state_tensors csa_snapshot = dsv4_build_state_snapshot(
-                ctx0, inp_dsv4->get_csa(), csa_state, csa_snapshot_source_kv, csa_snapshot_source_score, il);
+                ctx0, inp_dsv4->get_csa(), csa_state, csa_restored, csa_state_kv, csa_state_score, il);
         if (csa_snapshot.kv != nullptr) {
             ggml_build_forward_expand(gf, csa_snapshot.kv);
         }
@@ -1202,13 +1207,8 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention_impl(
         ggml_build_forward_expand(gf, inp_dsv4->mctx->get_lid()->cpy_k(ctx0,
                     kv_comp_lid_state, inp_dsv4->get_lid().state_write_idxs, il));
 
-        ggml_tensor * lid_snapshot_source_kv = ggml_concat(ctx0,
-                lid_restored.kv, lid_state_kv, 1);
-        ggml_tensor * lid_snapshot_source_score = ggml_concat(ctx0,
-                lid_restored.score, lid_state_score, 1);
-
         const dsv4_state_tensors lid_snapshot = dsv4_build_state_snapshot(
-                ctx0, inp_dsv4->get_lid(), lid_state, lid_snapshot_source_kv, lid_snapshot_source_score, il);
+                ctx0, inp_dsv4->get_lid(), lid_state, lid_restored, lid_state_kv, lid_state_score, il);
         if (lid_snapshot.kv != nullptr) {
             ggml_build_forward_expand(gf, lid_snapshot.kv);
         }
@@ -1285,13 +1285,8 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention_impl(
             hca_source_score = ggml_concat(ctx0, hca_base_score, hca_state_score, 1);
         }
 
-        ggml_tensor * hca_snapshot_source_kv = ggml_concat(ctx0,
-                hca_restored.kv, hca_state_kv, 1);
-        ggml_tensor * hca_snapshot_source_score = ggml_concat(ctx0,
-                hca_restored.score, hca_state_score, 1);
-
         const dsv4_state_tensors hca_snapshot = dsv4_build_state_snapshot(
-                ctx0, inp_dsv4->get_hca(), hca_state, hca_snapshot_source_kv, hca_snapshot_source_score, il);
+                ctx0, inp_dsv4->get_hca(), hca_state, hca_restored, hca_state_kv, hca_state_score, il);
         if (hca_snapshot.kv != nullptr) {
             ggml_build_forward_expand(gf, hca_snapshot.kv);
         }

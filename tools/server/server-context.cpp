@@ -4900,9 +4900,14 @@ private:
         }
 
         bool has_output = false;
+        bool has_prompt = false;
         for (int i = off; i < off + batch.view.size(); ++i) {
             has_output |= batch.tokens[i].output;
+            has_prompt |= batch.tokens[i].is_prompt;
         }
+
+        // a prompt call of one token can be rolled back as well (a decode of one token cannot)
+        llama_set_rs_prompt(ctx_tgt, has_prompt);
 
         if (llama_sidecar_enabled()) {
             sidecar_tag(off);
@@ -4917,6 +4922,8 @@ private:
                 llama_synchronize(ctx_tgt);
             }
         });
+
+        llama_set_rs_prompt(ctx_tgt, false);
 
         if (ret != 0) {
             {

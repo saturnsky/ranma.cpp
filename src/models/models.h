@@ -34,12 +34,14 @@ dsv4_state_tensors dsv4_build_state_restore(
         const llama_dsv4_comp_state * state,
         int32_t il);
 
+// the rollback planes of the compressor state, from the restored base plane and the state rows of the ubatch
 dsv4_state_tensors dsv4_build_state_snapshot(
         ggml_context * ctx,
         const llm_graph_input_dsv4::comp_input & inp,
         const llama_dsv4_comp_state * state,
-        ggml_tensor * source_kv,
-        ggml_tensor * source_score,
+        const dsv4_state_tensors & restored,
+        ggml_tensor * state_kv,
+        ggml_tensor * state_score,
         int32_t il);
 
 // ref: https://github.com/ggml-org/llama.cpp/pull/28068

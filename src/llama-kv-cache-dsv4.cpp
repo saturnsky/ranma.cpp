@@ -471,6 +471,7 @@ static llama_kv_cache_dsv4_context::comp_plan dsv4_build_comp_plan(
         uint32_t kv_size,
         uint32_t n_stream,
         uint32_t n_rs_seq,
+        uint32_t n_rs_call,
         const std::vector<uint32_t> & rs_idx) {
     llama_kv_cache_dsv4_context::comp_plan plan;
     plan.n_visible.resize(ubatch.n_tokens);
@@ -700,6 +701,10 @@ static llama_kv_cache_dsv4_context::comp_plan dsv4_build_comp_plan(
         // Emit restore/snapshot entries for all layout streams so that the
         // graph tensor sizes do not depend on the ubatch's sequence count.
         // Streams not present in the ubatch get no-op entries.
+        // The restore runs whenever the cache keeps rollback planes; the
+        // snapshot writes only the n_rs_call planes this call can be rolled
+        // back by (none for a decode of one token without a draft).
+        GGML_ASSERT(n_rs_call <= n_rs_seq);
         for (uint32_t stream = 0; stream < n_stream; ++stream) {
             llama_seq_id seq_id = -1;
             if (n_stream == 1) {
@@ -734,8 +739,9 @@ static llama_kv_cache_dsv4_context::comp_plan dsv4_build_comp_plan(
             }
 
             const uint32_t n_seq_tokens = (uint32_t) token_idxs.size();
-            const int64_t scratch_off = (int64_t) state_rows*(1 + n_rs_seq);
-            for (uint32_t d = 1; d <= n_rs_seq; ++d) {
+            // the snapshot source is [base plane | current ubatch rows]: the other planes are never read
+            const int64_t scratch_off = state_rows;
+            for (uint32_t d = 1; d <= n_rs_call; ++d) {
                 const int64_t dst_plane = (int64_t) d*state_rows;
                 const uint32_t prefix = d <= n_seq_tokens ? n_seq_tokens - d : 0;
 
@@ -749,13 +755,16 @@ static llama_kv_cache_dsv4_context::comp_plan dsv4_build_comp_plan(
                         }
                     }
 
+                    int32_t dst = (int32_t) (dst_plane + stream_off + r);
                     if (n_seq_tokens == 0) {
-                        // no-op: copy the snapshot plane onto itself
-                        src = (int32_t) (dst_plane + stream_off + r);
+                        // no-op: the source holds no plane of this stream but its base, which this graph leaves as it
+                        // is, so the base row is written onto itself and the planes of the stream are not touched
+                        src = (int32_t) (stream_off + r);
+                        dst = (int32_t) (stream_off + r);
                     }
 
                     plan.state_snapshot_src_idxs.push_back(src);
-                    plan.state_snapshot_dst_idxs.push_back((int32_t) (dst_plane + stream_off + r));
+                    plan.state_snapshot_dst_idxs.push_back(dst);
                 }
             }
         }
@@ -774,12 +783,73 @@ static llama_kv_cache_dsv4_context::comp_plan dsv4_build_comp_plan(
         for (uint32_t s = 0; s < ubatch.n_seqs_unq; ++s) {
             const llama_seq_id seq_id = ubatch.seq_id_unq[s];
             const uint32_t rollback = seq_id >= 0 && (uint32_t) seq_id < rs_idx.size() ? rs_idx[seq_id] : 0;
-            LLAMA_LOG_DEBUG("%s:   seq %d pos [%d, %d] rollback=%u\n", __func__, seq_id,
-                    ubatch.pos[0], ubatch.pos[ubatch.n_tokens - 1], rollback);
+            LLAMA_LOG_DEBUG("%s:   seq %d pos [%d, %d] rollback=%u snapshot=%u\n", __func__, seq_id,
+                    ubatch.pos[0], ubatch.pos[ubatch.n_tokens - 1], rollback, n_rs_call);
         }
     }
 
     return plan;
+}
+
+// The rollback planes a call writes, per ubatch: only the last ubatch of a sequence in the call leaves planes behind,
+// and only as many as the call can be rolled back by afterwards. A verified draft of m tokens is m + 1 rows that all
+// output and is rolled back by at most m. A prompt outputs its last row only; that row can be removed again when a
+// later prompt reuses it, so a prompt keeps one plane. A call of one token (a decode without a draft) keeps none. A
+// plane d holds the state before the last d rows of that ubatch, so the depth is also capped by its row count.
+// depth_seq (optional, n_seq_max entries) receives the depth left behind for each sequence of the call.
+static std::vector<uint32_t> dsv4_rs_call_depths(
+        const std::vector<llama_ubatch> & ubatches,
+        uint32_t n_rs_seq,
+        uint32_t n_seq_max,
+        bool prompt,
+        std::vector<uint32_t> * depth_seq) {
+    std::vector<uint32_t> depths(ubatches.size(), 0);
+    if (n_rs_seq == 0) {
+        return depths;
+    }
+
+    std::vector<uint32_t> n_rows(n_seq_max, 0);
+    std::vector<uint32_t> n_outs(n_seq_max, 0);
+    std::vector<int32_t>  last  (n_seq_max, -1);
+    std::vector<uint32_t> n_last(n_seq_max, 0);
+
+    for (size_t u = 0; u < ubatches.size(); ++u) {
+        const llama_ubatch & ubatch = ubatches[u];
+        for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+            for (int32_t k = 0; k < ubatch.n_seq_id[i]; ++k) {
+                const llama_seq_id s = ubatch.seq_id[i][k];
+                if (s < 0 || (uint32_t) s >= n_seq_max) {
+                    continue;
+                }
+                n_rows[s]++;
+                n_outs[s] += ubatch.output != nullptr && ubatch.output[i] ? 1 : 0;
+                if (last[s] != (int32_t) u) {
+                    last  [s] = (int32_t) u;
+                    n_last[s] = 0;
+                }
+                n_last[s]++;
+            }
+        }
+    }
+
+    for (uint32_t s = 0; s < n_seq_max; ++s) {
+        // a call of one token has nothing to roll back, unless it is a prompt whose output row can be removed again
+        if (last[s] < 0 || (n_rows[s] < 2 && !(prompt && n_outs[s] > 0))) {
+            continue;
+        }
+        const uint32_t want = std::min({ n_rs_seq, std::max<uint32_t>(1, n_outs[s] > 0 ? n_outs[s] - 1 : 0), n_last[s] });
+        depths[last[s]] = std::max(depths[last[s]], want);
+    }
+
+    if (depth_seq != nullptr) {
+        for (uint32_t s = 0; s < n_seq_max; ++s) {
+            if (last[s] >= 0) {
+                (*depth_seq)[s] = std::min(depths[last[s]], n_last[s]);
+            }
+        }
+    }
+
+    return depths;
 }
 
 static std::vector<llama_kv_cache_dsv4_context::comp_plan> dsv4_build_comp_plans(
@@ -790,14 +860,18 @@ static std::vector<llama_kv_cache_dsv4_context::comp_plan> dsv4_build_comp_plans
         uint32_t kv_size,
         uint32_t n_stream,
         uint32_t n_rs_seq,
-        const std::vector<uint32_t> & rs_idx) {
+        const std::vector<uint32_t> & rs_idx,
+        bool prompt) {
     std::vector<llama_kv_cache_dsv4_context::comp_plan> plans;
     plans.reserve(ubatches.size());
 
+    const std::vector<uint32_t> depths = dsv4_rs_call_depths(ubatches, n_rs_seq, (uint32_t) rs_idx.size(), prompt, nullptr);
+
     // the first ubatch touching a seq consumes its rollback restore
     std::vector<uint32_t> rs(rs_idx);
-    for (const llama_ubatch & ubatch : ubatches) {
-        plans.push_back(dsv4_build_comp_plan(ubatch, ratio, overlap, state_size, kv_size, n_stream, n_rs_seq, rs));
+    for (size_t u = 0; u < ubatches.size(); ++u) {
+        const llama_ubatch & ubatch = ubatches[u];
+        plans.push_back(dsv4_build_comp_plan(ubatch, ratio, overlap, state_size, kv_size, n_stream, n_rs_seq, depths[u], rs));
 
         for (uint32_t s = 0; s < ubatch.n_seqs_unq; ++s) {
             const llama_seq_id seq_id = ubatch.seq_id_unq[s];
@@ -1606,7 +1680,8 @@ llama_kv_cache_dsv4::llama_kv_cache_dsv4(
     hparams_lid(model.hparams),
     n_seq_max(n_seq_max),
     n_rs_seq(n_rs_seq),
-    rs_idx(n_seq_max, 0) {
+    rs_idx(n_seq_max, 0),
+    rs_depth(n_seq_max, 0) {
 
     tail_v41     = model.arch == LLM_ARCH_DEEPSEEK41;
     tail_n_swa   = model.hparams.n_swa;
@@ -2107,7 +2182,8 @@ void llama_kv_cache_dsv4::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_ds
     lid_state->seq_cp(seq_id_src, seq_id_dst);
 
     if (seq_id_src != seq_id_dst) {
-        rs_idx[seq_id_dst] = 0;
+        rs_idx  [seq_id_dst] = 0;
+        rs_depth[seq_id_dst] = 0; // the copy has the base plane only
 
         // ranma: the copy has the same cells, written or not
         if (seq_id_src >= 0 && (uint32_t) seq_id_src < n_seq_max && seq_id_dst >= 0 && (uint32_t) seq_id_dst < n_seq_max) {
@@ -2325,11 +2401,14 @@ void llama_kv_cache_dsv4::state_read(llama_io_read_i & io, llama_seq_id seq_id, 
     hca_state->state_read(io, seq_id, flags);
     lid_state->state_read(io, seq_id, flags);
 
+    // a saved state holds one plane, so the restored sequence has nothing to roll back
     if (seq_id >= 0) {
         GGML_ASSERT((uint32_t) seq_id < n_seq_max);
-        rs_idx[seq_id] = 0;
+        rs_idx  [seq_id] = 0;
+        rs_depth[seq_id] = 0;
     } else {
-        std::fill(rs_idx.begin(), rs_idx.end(), 0);
+        std::fill(rs_idx  .begin(), rs_idx  .end(), 0);
+        std::fill(rs_depth.begin(), rs_depth.end(), 0);
     }
 
     tail_after_restore(seq_id, with_tail ? &recs : nullptr, partial_only, pos_max_before);
@@ -2438,8 +2517,10 @@ bool llama_kv_cache_dsv4::comp_can_rollback(llama_seq_id seq_id, llama_pos p0) c
         return false;
     }
 
+    // the planes the last call of the sequence wrote, not the capacity: a call snapshots only as deep as it can be
+    // rolled back (dsv4_rs_call_depths)
     const llama_pos rollback = pos_max - (p0 - 1);
-    if (rollback < 1 || rollback > (llama_pos) n_rs_seq) {
+    if (rollback < 1 || rollback > (llama_pos) rs_depth[seq_id]) {
         return false;
     }
 
@@ -2689,6 +2770,9 @@ void llama_kv_cache_dsv4::reset_rs_idx_for_ubatches(const std::vector<llama_ubat
         return;
     }
 
+    // the planes of the sequences of this call are the ones it writes
+    dsv4_rs_call_depths(ubatches, n_rs_seq, n_seq_max, rs_prompt, &rs_depth);
+
     for (const llama_ubatch & ubatch : ubatches) {
         for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
             for (int32_t s = 0; s < ubatch.n_seq_id[i]; ++s) {
@@ -2730,9 +2814,11 @@ void llama_kv_cache_dsv4::clear_compressed(llama_seq_id seq_id, bool data) {
     lid_state->clear(seq_id, data);
 
     if (seq_id >= 0) {
-        rs_idx[seq_id] = 0;
+        rs_idx  [seq_id] = 0;
+        rs_depth[seq_id] = 0;
     } else {
-        std::fill(rs_idx.begin(), rs_idx.end(), 0);
+        std::fill(rs_idx  .begin(), rs_idx  .end(), 0);
+        std::fill(rs_depth.begin(), rs_depth.end(), 0);
     }
 }
 
@@ -3207,13 +3293,13 @@ llama_kv_cache_dsv4_context::llama_kv_cache_dsv4_context(
     ubatches(std::move(ubatches)),
     plans_csa(dsv4_build_comp_plans(this->ubatches, kv->get_csa_state()->get_ratio(), kv->get_csa_state()->get_overlap(),
                 kv->get_csa_state()->get_state_size(), kv->get_csa()->get_size(), kv->get_csa_state()->get_n_stream(),
-                kv->get_n_rs_seq(), kv->get_rs_idx())),
+                kv->get_n_rs_seq(), kv->get_rs_idx(), kv->get_rs_prompt())),
     plans_hca(dsv4_build_comp_plans(this->ubatches, kv->get_hca_state()->get_ratio(), kv->get_hca_state()->get_overlap(),
                 kv->get_hca_state()->get_state_size(), kv->get_hca()->get_size(), kv->get_hca_state()->get_n_stream(),
-                kv->get_n_rs_seq(), kv->get_rs_idx())),
+                kv->get_n_rs_seq(), kv->get_rs_idx(), kv->get_rs_prompt())),
     plans_lid(dsv4_build_comp_plans(this->ubatches, kv->get_lid_state()->get_ratio(), kv->get_lid_state()->get_overlap(),
                 kv->get_lid_state()->get_state_size(), kv->get_lid()->get_size(), kv->get_lid_state()->get_n_stream(),
-                kv->get_n_rs_seq(), kv->get_rs_idx())),
+                kv->get_n_rs_seq(), kv->get_rs_idx(), kv->get_rs_prompt())),
     ctx_raw(std::make_unique<llama_kv_cache_dsv4_raw_context>(
                 kv->get_raw(),
                 std::move(sinfos_raw_base_write),
