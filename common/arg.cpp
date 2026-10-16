@@ -4712,6 +4712,49 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
 
+    // ranma: ngram-varlen
+    add_opt(common_arg(
+        {"--spec-ngram-varlen-n-max"}, "N",
+        string_format("ngram-varlen: draft tokens verified in one call, a longer draft is verified in parts (default: %d)", params.speculative.ngram_varlen.n_max),
+        [](common_params & params, int value) {
+            if (value < 1 || value > 1024) {
+                throw std::invalid_argument("ngram-varlen n-max must be between 1 and 1024 inclusive");
+            }
+            params.speculative.ngram_varlen.n_max = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--spec-ngram-varlen-rs"}, "N",
+        "ngram-varlen: rollback depth of the target context, cut to n_ubatch - 2; a call keeps only as many states as its draft (default: 7 for a model with recurrent layers, otherwise 127)",
+        [](common_params & params, int value) {
+            if (value < 1 || value > 4096) {
+                throw std::invalid_argument("ngram-varlen rs must be between 1 and 4096 inclusive");
+            }
+            params.speculative.ngram_varlen.n_rs = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--spec-ngram-varlen-ladder"}, "N",
+        string_format("ngram-varlen: a draft of k tokens needs k <= N*(samples - 1) (default: %d)", params.speculative.ngram_varlen.ladder),
+        [](common_params & params, int value) {
+            if (value < 1 || value > 1024) {
+                throw std::invalid_argument("ngram-varlen ladder must be between 1 and 1024 inclusive");
+            }
+            params.speculative.ngram_varlen.ladder = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--spec-ngram-varlen-p-min"}, "P",
+        string_format("ngram-varlen: weight share of the samples that agree on every drafted token, at least 0.8 (default: %.2f)", params.speculative.ngram_varlen.p_min),
+        [](common_params & params, const std::string & value) {
+            const double p = std::stod(value);
+            if (p < 0.8 || p > 1.0) {
+                throw std::invalid_argument("ngram-varlen p-min must be between 0.8 and 1.0 inclusive");
+            }
+            params.speculative.ngram_varlen.p_min = p;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+
     add_opt(common_arg(
         {"--spec-ngram-simple-size-n"}, "N",
         string_format("ngram size N for ngram-simple speculative decoding, length of lookup n-gram (default: %d)", params.speculative.ngram_simple.size_n),

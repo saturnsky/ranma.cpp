@@ -17,6 +17,10 @@ LLAMA_API struct ggml_cgraph * llama_graph_reserve(
         uint32_t n_seqs,
         uint32_t n_outputs);
 
+// ranma: true when a layer of the model keeps a recurrent (SSM / linear attention) state; the compressor state of
+// DeepSeek-V4 and V4.1 is not one. Reads the hparams only, so a no_alloc model works.
+LLAMA_API bool llama_model_has_recurrent_layers(const struct llama_model * model);
+
 // ranma: what the graphs of this context cost so far (diagnostics; the --spec-smart round log reads it). calls: ubatch
 // graphs computed; builds: of them, built and allocated anew (not reused or resumed), with the host time of the build
 // and allocation and the rows of the last one. With a GPU backend that counts its graph calls (ggml-cuda): the calls
