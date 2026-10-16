@@ -1140,12 +1140,23 @@ ggml_tensor * llama_model_deepseek41::graph::build_indexer_top_k(
             idx_w->ne[0], idx_w->ne[1]/n_stream, idx_w->ne[2], n_stream,
             idx_w->nb[1], idx_w->nb[2]/n_stream, idx_w->nb[3]/n_stream, 0);
 
+    // Level two: a source after the candidate source ranks only the positions inside its blocks.
+    // The candidate source itself ranks everything, so its mask never touches its own top-k.
+    const bool use_cand = hparams.candidate_source_layer >= 0 && il > hparams.candidate_source_layer && cand_keep;
+    bool cand_in_score  = false;
+
     // the attention mask is F16 when flash attention is on and F32 otherwise. it only ever holds
     // 0 or -inf, so converting it either way is exact.
     ggml_tensor * score = nullptr;
     if (cparams.fused_lid) {
         ggml_tensor * mask_f16 = mask->type == GGML_TYPE_F16 ? mask : ggml_cast(ctx0, mask, GGML_TYPE_F16);
-        score = ggml_lightning_indexer(ctx0, idx_q, idx_k, idx_w, mask_f16);
+        if (use_cand) {
+            // the op takes the keep of each block, a backend then skips the keys of a dropped block and scores it -inf
+            score = ggml_lightning_indexer_cand(ctx0, idx_q, idx_k, idx_w, mask_f16, cand_keep, (int32_t) hparams.candidate_block_size);
+            cand_in_score = true;
+        } else {
+            score = ggml_lightning_indexer(ctx0, idx_q, idx_k, idx_w, mask_f16);
+        }
         cb(score, "idx_score", il);
         res->add_fused_node({LLM_FUSED_OP_LIGHTNING_INDEXER, score, il});
     } else {
@@ -1164,10 +1175,8 @@ ggml_tensor * llama_model_deepseek41::graph::build_indexer_top_k(
         cb(score, "idx_score", il);
     }
 
-    // Level two: a source after the candidate source ranks only the positions inside its blocks.
-    // The candidate source itself ranks everything, so its mask never touches its own top-k.
     ggml_tensor * ranked = score;
-    if (hparams.candidate_source_layer >= 0 && il > hparams.candidate_source_layer && cand_keep) {
+    if (use_cand && !cand_in_score) {
         const int64_t bs = hparams.candidate_block_size;
         ggml_tensor * keep = cand_keep;
         GGML_ASSERT(keep->ne[0] == 1 && keep->ne[1]*bs == score->ne[0] && keep->ne[2] == score->ne[1] && keep->ne[3] == score->ne[3]);
