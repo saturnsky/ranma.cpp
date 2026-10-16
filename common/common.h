@@ -386,6 +386,10 @@ struct common_params_speculative_draft {
 
     int32_t n_gpu_layers = -1; // number of layers to store in VRAM for the draft model (-1 - use default)
 
+    // ranma: set by the layer mode for a DFlash/DSpark DSV4 draft that reads a window of target features: the ubatch
+    // and batch of the draft context (0: the target's). Its seeds, blocks and verifications are at most this wide.
+    int32_t n_ubatch_lm = 0;
+
     ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K
     ggml_type cache_type_v = GGML_TYPE_F16; // KV cache data type for the V
 

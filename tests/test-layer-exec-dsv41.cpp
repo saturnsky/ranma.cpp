@@ -21,6 +21,7 @@
 #include "ggml-backend.h"
 #include "gguf.h"
 #include "common.h"
+#include "speculative.h"
 #include "llama.h"
 #include "llama-cpp.h"
 #include "../src/llama-ext.h"
@@ -270,7 +271,16 @@ static int g_bundles = 0;     // layer-major prefills that ran the MoE in bundle
 static int g_split   = 0;     // layer-major prefills whose width rule split the batch into narrower ubatches
 static int g_edges_cut = 0;   // layer-major prefills whose edge slots were lent in pieces of ubatches (layer_exec_lend)
 
+static int g_tail_exact_n = 0;  // dsv41_tail_log lines of an exact tail
+static int g_tail_inp_n   = 0;  // ... of a tail turned off for the layer inputs of every row
+
 static void log_cb(ggml_log_level level, const char * text, void * /*user*/) {
+    if (strstr(text, "dsv41_tail_log: exact") != nullptr) {
+        g_tail_exact_n++;
+    }
+    if (strstr(text, "dsv41_tail_log: off") != nullptr && strstr(text, "layer inputs extracted") != nullptr) {
+        g_tail_inp_n++;
+    }
     if (strstr(text, "layer_exec_decode: ") != nullptr && strstr(text, " tokens in ") != nullptr) {
         g_layer_runs++;
         if (const char * g = strstr(text, " group")) {
@@ -711,6 +721,299 @@ static bool rs_same(const std::vector<rs_snap> & a, const std::vector<rs_snap> &
     return true;
 }
 
+// ---------------------------------------------------------------------------------------------------------------
+// DSpark feature window (ranma: llama_set_embeddings_layer_inp_last). A tiny DSV4 draft of the DFlash architecture (every
+// stage a sliding window of D_SWA over uncompressed KV, the V4.1 flavor without an output head) reads the inputs of the
+// target layers 6, 7 and the output of the last layer (8). Its drafter takes the features of the last D_SWA rows of a
+// call only; the target's exact tail and the layer-major prefill then stay on. Checked against the drafter that takes
+// every row: the target logits, the draft logits of every round (a block decoded after the prompt and after each
+// verification) and the draft's newest position.
+
+static const uint32_t D_LAYER = 2, D_SWA = 16, D_BLOCK = 4;
+static const int32_t  D_TAPS[3] = { 6, 7, 8 };
+
+static bool write_draft(const std::string & path, uint64_t seed) {
+    gen_t gen(seed ^ 0x5eed);
+    gguf_context * g = gguf_init_empty();
+    const std::string a = "dflash";
+    auto key = [&](const char * k) { return a + "." + k; };
+    auto u32 = [&](const std::string & k, uint32_t v) { gguf_set_val_u32(g, k.c_str(), v); };
+    auto f32 = [&](const std::string & k, float v) { gguf_set_val_f32(g, k.c_str(), v); };
+    gguf_set_val_str(g, "general.architecture", a.c_str());
+    u32(key("vocab_size"), N_VOCAB);
+    u32(key("context_length"), N_CTX);
+    u32(key("embedding_length"), N_EMBD);
+    u32(key("block_count"), D_LAYER);
+    u32(key("feed_forward_length"), 64);
+    u32(key("attention.head_count"), N_HEAD);
+    u32(key("attention.head_count_kv"), 1);
+    u32(key("attention.key_length"), N_HD);
+    u32(key("attention.value_length"), N_HD);
+    u32(key("rope.dimension_count"), N_HD / 2);
+    f32(key("rope.freq_base"), 10000.0f);
+    f32(key("attention.layer_norm_rms_epsilon"), 1e-6f);
+    u32(key("attention.sliding_window"), D_SWA);
+    u32(key("attention.q_lora_rank"), N_QLORA);
+    u32(key("expert_feed_forward_length"), N_FFEXP);
+    u32(key("expert_shared_count"), 1);
+    u32(key("expert_count"), N_EXP);
+    u32(key("expert_used_count"), 2);
+    u32(key("expert_gating_func"), 4);
+    f32(key("expert_weights_scale"), 1.5f);
+    gguf_set_val_bool(g, key("expert_weights_norm").c_str(), true);
+    f32(key("swiglu_clamp_exp"), 10.0f);
+    u32(key("attention.output_group_count"), N_OGRP);
+    u32(key("attention.output_lora_rank"), N_OLORA);
+    u32(key("hyper_connection.count"), N_HC);
+    u32(key("hyper_connection.sinkhorn_iterations"), 2);
+    f32(key("hyper_connection.epsilon"), 1e-6f);
+    {
+        std::vector<uint32_t> ratios(D_LAYER, 0);
+        gguf_set_arr_data(g, key("attention.compress_ratios").c_str(), GGUF_TYPE_UINT32, ratios.data(), ratios.size());
+    }
+    gguf_set_arr_data(g, key("target_layers").c_str(), GGUF_TYPE_INT32, D_TAPS, 3);
+    u32(key("block_size"), D_BLOCK);
+    gguf_set_val_str(g, key("sample_from_anchor").c_str(), "false");
+
+    gguf_set_val_str(g, "tokenizer.ggml.model", "test");
+    {
+        std::vector<std::string> toks(N_VOCAB);
+        std::vector<const char *> tp(N_VOCAB);
+        std::vector<float> scores(N_VOCAB, 0.0f);
+        for (uint32_t i = 0; i < N_VOCAB; i++) { toks[i] = "tok_" + std::to_string(i); tp[i] = toks[i].c_str(); }
+        gguf_set_arr_str(g, "tokenizer.ggml.tokens", tp.data(), N_VOCAB);
+        gguf_set_arr_data(g, "tokenizer.ggml.scores", GGUF_TYPE_FLOAT32, scores.data(), N_VOCAB);
+    }
+
+    ggml_init_params ip = { 16u * 1024 * 1024, nullptr, false };
+    ggml_context * ctx = ggml_init(ip);
+    const float W = 0.25f, NRM = 0.05f;
+    const int64_t hc_dim = N_HC * N_EMBD, hc_mix = (2 + N_HC) * N_HC;
+    add_tensor(g, ctx, gen, "fc.weight", { 3 * N_EMBD, N_EMBD }, 0.1f);
+    add_tensor(g, ctx, gen, "enc.output_norm.weight", { N_EMBD }, NRM, 1.0f);
+    add_tensor(g, ctx, gen, "output_norm.weight", { N_EMBD }, NRM, 1.0f);
+    for (uint32_t i = 0; i < D_LAYER; i++) {
+        auto nm = [&](const char * s) { return "blk." + std::to_string(i) + "." + s; };
+        add_tensor(g, ctx, gen, nm("attn_norm.weight"), { N_EMBD }, NRM, 1.0f);
+        add_tensor(g, ctx, gen, nm("attn_sinks.weight"), { N_HEAD }, 0.5f);
+        add_tensor(g, ctx, gen, nm("attn_q_a.weight"), { N_EMBD, N_QLORA }, W);
+        add_tensor(g, ctx, gen, nm("attn_q_a_norm.weight"), { N_QLORA }, NRM, 1.0f);
+        add_tensor(g, ctx, gen, nm("attn_q_b.weight"), { N_QLORA, N_HEAD * N_HD }, W);
+        add_tensor(g, ctx, gen, nm("attn_kv.weight"), { N_EMBD, N_HD }, W);
+        add_tensor(g, ctx, gen, nm("attn_kv_a_norm.weight"), { N_HD }, NRM, 1.0f);
+        add_tensor(g, ctx, gen, nm("attn_output_a.weight"), { N_HEAD * N_HD / N_OGRP, N_OLORA, N_OGRP }, W);
+        add_tensor(g, ctx, gen, nm("attn_output_b.weight"), { N_OGRP * N_OLORA, N_EMBD }, W);
+        add_tensor(g, ctx, gen, nm("hc_attn_fn.weight"), { hc_dim, hc_mix }, 0.1f);
+        add_tensor(g, ctx, gen, nm("hc_attn_base.weight"), { hc_mix }, 0.5f);
+        add_tensor(g, ctx, gen, nm("hc_attn_scale.weight"), { 3 }, 0.5f, 1.0f);
+        add_tensor(g, ctx, gen, nm("hc_ffn_fn.weight"), { hc_dim, hc_mix }, 0.1f);
+        add_tensor(g, ctx, gen, nm("hc_ffn_base.weight"), { hc_mix }, 0.5f);
+        add_tensor(g, ctx, gen, nm("hc_ffn_scale.weight"), { 3 }, 0.5f, 1.0f);
+        add_tensor(g, ctx, gen, nm("ffn_gate_inp.weight"), { N_EMBD, N_EXP }, W);
+        add_tensor(g, ctx, gen, nm("exp_probs_b.bias"), { N_EXP }, 0.1f);
+        add_tensor(g, ctx, gen, nm("ffn_norm.weight"), { N_EMBD }, NRM, 1.0f);
+        add_tensor(g, ctx, gen, nm("ffn_gate_exps.weight"), { N_EMBD, N_FFEXP, N_EXP }, W);
+        add_tensor(g, ctx, gen, nm("ffn_down_exps.weight"), { N_FFEXP, N_EMBD, N_EXP }, W);
+        add_tensor(g, ctx, gen, nm("ffn_up_exps.weight"), { N_EMBD, N_FFEXP, N_EXP }, W);
+        add_tensor(g, ctx, gen, nm("ffn_gate_shexp.weight"), { N_EMBD, N_FFEXP }, W);
+        add_tensor(g, ctx, gen, nm("ffn_down_shexp.weight"), { N_FFEXP, N_EMBD }, W);
+        add_tensor(g, ctx, gen, nm("ffn_up_shexp.weight"), { N_EMBD, N_FFEXP }, W);
+    }
+    const bool ok = gguf_write_to_file(g, path.c_str(), false);
+    ggml_free(ctx);
+    gguf_free(g);
+    return ok;
+}
+
+static llama_model * g_draft = nullptr;
+
+// how a DSpark case runs: the target's layer-major prefill and tail (the drafter reads the window of its features),
+// how the prompt is cut into calls, and the draft context's ubatch
+struct dcfg_t {
+    bool layer  = false;
+    int split = 0;               // 0 one call; 1 [0, N-4) without outputs, [N-4, N); 2 [0, N/2), [N/2, N);
+                                 // 3 (E) [0, N-W) without layer inputs, then [N-W, N) as a call of its own
+    uint32_t ub     = 128;
+    uint32_t ub_dft = 64;
+};
+
+struct drec_t {
+    logits_t tgt;   // the target's logits
+    logits_t dft;   // the draft's block logits, round*16 + row
+    logits_t feat;  // one-call prompts: the target features of the last D_SWA rows, tap*1000 + row
+    llama_pos pos_max = -2; // the draft's newest position at the end
+    int layer_runs = 0;
+    int tail_exact = 0;
+    int tail_layer_inp = 0;
+};
+
+// a call of the target over [p0, p1) with logits at the positions in out, then the drafter's process() of that batch
+static bool d_call(llama_context * ctx, common_speculative * spec, const std::vector<llama_token> & toks, int p0, int p1,
+                   const std::vector<int> & out, logits_t & res, int key_off, bool process = true) {
+    common_batch b(ctx);
+    std::vector<int> idx_of;
+    for (int p = p0; p < p1; p++) {
+        const bool o = std::find(out.begin(), out.end(), p) != out.end();
+        idx_of.push_back(o ? b.add(toks[p], p, 0, o) : (b.add(toks[p], p, 0, o), -1));
+    }
+    if (llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, b.get()) != 0) {
+        return false;
+    }
+    llama_synchronize(ctx);
+    for (int p = p0; p < p1; p++) {
+        if (idx_of[p - p0] >= 0) {
+            const float * l = llama_get_logits_ith(ctx, idx_of[p - p0]);
+            if (!l) { return false; }
+            res[key_off + p].assign(l, l + g_vocab);
+        }
+    }
+    return !process || common_speculative_process(spec, b);
+}
+
+// a block of the draft at pos (the anchor and D_BLOCK - 1 masks), its logits under key round*16, then taken back out of
+// the draft memory (the drafter decodes it again from the verification)
+static bool d_block(llama_context * ctx_dft, llama_token anchor, int pos, int round, logits_t & res) {
+    common_batch b(ctx_dft);
+    for (uint32_t i = 0; i < D_BLOCK; i++) {
+        b.add(i == 0 ? anchor : 1, pos + (int) i, 0, true);
+    }
+    if (llama_process(ctx_dft, LLAMA_PROCESS_TYPE_DECODE, b.get()) != 0) {
+        return false;
+    }
+    llama_synchronize(ctx_dft);
+    for (uint32_t i = 0; i < D_BLOCK; i++) {
+        const float * l = llama_get_logits_ith(ctx_dft, (int32_t) i);
+        if (!l) { return false; }
+        res[round*16 + (int) i].assign(l, l + g_vocab);
+    }
+    return llama_memory_seq_rm(llama_get_memory(ctx_dft), 0, pos, -1);
+}
+
+static llama_context_ptr make_draft_ctx(llama_context * ctx_tgt, uint32_t ub) {
+    llama_context_params cp = llama_context_default_params();
+    cp.n_ctx = N_CTX;
+    cp.n_batch = ub;
+    cp.n_ubatch = ub;
+    cp.n_seq_max = 1;
+    cp.n_threads = 4;
+    cp.n_threads_batch = 4;
+    cp.op_offload = false;
+    cp.ctx_other = ctx_tgt;
+    return llama_context_ptr(llama_init_from_model(g_draft, cp));
+}
+
+// a prompt of n tokens (cut as dc.split), then three rounds: a draft block, the verification of 3 drafts (4 rows with
+// logits) and the acceptance of 3, 1 and 0 of them (the target and the draft taken back past the accepted rows)
+static bool scenario_dspark(const dcfg_t & dc, const std::vector<llama_token> & toks, int n, drec_t & rec) {
+    cfg_t c; c.n_ubatch = dc.ub; c.n_batch = 4096; c.n_rs = 5; c.layer = dc.layer;
+    auto ctx = make_ctx(c);
+    if (!ctx) { return false; }
+    auto ctx_dft = make_draft_ctx(ctx.get(), dc.ub_dft);
+    if (!ctx_dft) { fprintf(stderr, "dspark: no draft context\n"); return false; }
+    common_params_speculative sp;
+    sp.types = { COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH };
+    sp.draft.n_max = 3;
+    sp.draft.backend_sampling = false;
+    sp.draft.ctx_tgt = ctx.get();
+    sp.draft.ctx_dft = ctx_dft.get();
+    common_speculative * spec = common_speculative_init(sp, 1);
+    if (spec == nullptr) { fprintf(stderr, "dspark: no drafter\n"); return false; }
+    struct spec_free { common_speculative * s; ~spec_free() { common_speculative_free(s); } } sf { spec };
+
+    const int runs0 = g_layer_runs;
+    const int te0 = g_tail_exact_n, tl0 = g_tail_inp_n;
+    bool ok = true;
+    const int W = (int) D_SWA;
+    switch (dc.split) {
+        case 0: ok = d_call(ctx.get(), spec, toks, 0, n, { n - 1 }, rec.tgt, 0); break;
+        case 1: ok = d_call(ctx.get(), spec, toks, 0, n - 4, {}, rec.tgt, 0) && d_call(ctx.get(), spec, toks, n - 4, n, { n - 1 }, rec.tgt, 0); break;
+        case 2: ok = d_call(ctx.get(), spec, toks, 0, n/2, {}, rec.tgt, 0) && d_call(ctx.get(), spec, toks, n/2, n, { n - 1 }, rec.tgt, 0); break;
+        case 3: {
+            for (int32_t t : D_TAPS) { llama_set_embeddings_layer_inp(ctx.get(), (uint32_t) t, false); }
+            ok = d_call(ctx.get(), spec, toks, 0, n - W, {}, rec.tgt, 0, /*process =*/ false);
+            for (int32_t t : D_TAPS) { llama_set_embeddings_layer_inp(ctx.get(), (uint32_t) t, true); }
+            ok = ok && d_call(ctx.get(), spec, toks, n - W, n, { n - 1 }, rec.tgt, 0);
+        } break;
+    }
+    if (!ok) { fprintf(stderr, "dspark: prompt failed\n"); return false; }
+    if (dc.split == 0) {
+        llama_synchronize(ctx.get());
+        for (int k = 0; k < 3; k++) {
+            for (int i = n - W; i < n; i++) {
+                const float * f = llama_get_embeddings_layer_inp_row(ctx.get(), (uint32_t) D_TAPS[k], i);
+                if (!f) { fprintf(stderr, "dspark: window row %d of layer %d not made\n", i, D_TAPS[k]); return false; }
+                rec.feat[k*1000 + i].assign(f, f + N_EMBD);
+            }
+        }
+    }
+    rec.layer_runs     = g_layer_runs - runs0;
+    rec.tail_exact     = g_tail_exact_n - te0;
+    rec.tail_layer_inp = g_tail_inp_n - tl0;
+    set_layer_exec(false);
+
+    llama_memory_t mem = llama_get_memory(ctx.get());
+    llama_memory_t mem_dft = llama_get_memory(ctx_dft.get());
+    int cur = n;
+    const int accept[3] = { 3, 1, 0 };
+    for (int r = 0; r < 3; r++) {
+        if (!d_block(ctx_dft.get(), toks[cur], cur, r, rec.dft)) { fprintf(stderr, "dspark: block %d failed\n", r); return false; }
+        std::vector<int> outs = { cur, cur + 1, cur + 2, cur + 3 };
+        if (!d_call(ctx.get(), spec, toks, cur, cur + 4, outs, rec.tgt, 100000*(r + 1))) {
+            fprintf(stderr, "dspark: verification %d failed\n", r);
+            return false;
+        }
+        const int keep = cur + accept[r] + 1;
+        if (keep < cur + 4) {
+            if (!llama_memory_seq_rm(mem, 0, keep, -1) || !llama_memory_seq_rm(mem_dft, 0, keep, -1)) {
+                fprintf(stderr, "dspark: rollback %d refused\n", r);
+                return false;
+            }
+        }
+        cur = keep;
+    }
+    if (!d_block(ctx_dft.get(), toks[cur], cur, 3, rec.dft)) { return false; }
+    rec.pos_max = llama_memory_seq_pos_max(mem_dft, 0);
+    return true;
+}
+
+// the falsifier of the window: the features of every row injected by hand, those outside the last W rows of the prompt
+// replaced by noise (garble) or not; the draft's first block must not see the difference
+static bool scenario_garble(const std::vector<llama_token> & toks, int n, int g_lo, int g_hi, logits_t & res) {
+    cfg_t c; c.n_ubatch = 128; c.n_batch = 4096;
+    auto ctx = make_ctx(c);
+    if (!ctx) { return false; }
+    for (int32_t t : D_TAPS) { llama_set_embeddings_layer_inp(ctx.get(), (uint32_t) t, true); }
+    auto ctx_dft = make_draft_ctx(ctx.get(), 64);
+    if (!ctx_dft) { return false; }
+    llama_set_embeddings_nextn(ctx_dft.get(), true, true);
+    llama_set_causal_attn(ctx_dft.get(), false);
+    logits_t tl;
+    if (!d_call(ctx.get(), nullptr, toks, 0, n, { n - 1 }, tl, 0, false)) { return false; }
+    const int n_enc = 3*(int) N_EMBD;
+    std::vector<float> feat((size_t) n*n_enc);
+    std::mt19937 rng(77);
+    std::normal_distribution<float> dis(0.0f, 3.0f);
+    for (int i = 0; i < n; i++) {
+        for (int k = 0; k < 3; k++) {
+            const float * src = llama_get_embeddings_layer_inp_row(ctx.get(), (uint32_t) D_TAPS[k], i);
+            if (!src) { fprintf(stderr, "garble: row %d not extracted\n", i); return false; }
+            for (int j = 0; j < (int) N_EMBD; j++) {
+                feat[(size_t) i*n_enc + k*N_EMBD + j] = i >= g_lo && i < g_hi ? dis(rng) : src[j];
+            }
+        }
+    }
+    common_batch bi(ctx_dft.get());
+    for (int i0 = 0; i0 < n; i0 += 64) {
+        bi.clear();
+        for (int i = i0; i < std::min(n, i0 + 64); i++) {
+            const llama_pos pa[4] = { i, i, i, 0 };
+            bi.add_embd({ feat.data() + (size_t) i*n_enc, 1, (size_t) n_enc }, pa, 0, false);
+        }
+        if (llama_process(ctx_dft.get(), LLAMA_PROCESS_TYPE_DECODE, bi.get()) != 0) { return false; }
+    }
+    return d_block(ctx_dft.get(), toks[n], n, 0, res);
+}
+
 int main(int argc, char ** argv) {
     uint64_t seed = 1234;
     std::string keep;
@@ -900,6 +1203,111 @@ int main(int argc, char ** argv) {
             printf("coverage missing\n");
             n_fail++;
         }
+    }
+
+    // DSpark: the feature window of the drafter
+    if (only[0] == 0) {
+        const std::string dpath = keep.empty() ? std::string("test-layer-exec-dsv41-draft.gguf") : keep + ".draft.gguf";
+        llama_model_ptr draft;
+        if (!write_draft(dpath, seed)) {
+            printf("dspark: draft write failed\n");
+            n_fail++;
+        } else {
+            llama_model_params dmp = llama_model_default_params();
+            dmp.devices = devs;
+            dmp.n_gpu_layers = 0;
+            draft.reset(llama_model_load_from_file(dpath.c_str(), dmp));
+            if (keep.empty()) { remove(dpath.c_str()); }
+            if (!draft || llama_model_dflash_feature_window(draft.get()) != (int32_t) D_SWA) {
+                printf("dspark: the draft did not load or has no feature window (%d)\n",
+                       draft ? llama_model_dflash_feature_window(draft.get()) : -1);
+                n_fail++;
+                draft.reset();
+            }
+        }
+        g_draft = draft.get();
+        auto drun = [&](const dcfg_t & dc, int n, drec_t & r, const char * name) {
+            if (!scenario_dspark(dc, toks, n, r)) {
+                printf("dspark %s n=%d: failed <<<<<< MISMATCH\n", name, n);
+                n_fail++;
+                return false;
+            }
+            return true;
+        };
+        // one comparison: target logits and draft logits; exact: bit for bit, else the top-1 of every row and a
+        // relative difference of rounding size
+        auto dcmp = [&](const std::string & what, const drec_t & a, const drec_t & b, bool exact) {
+            const diff_t dt = compare(a.tgt, b.tgt);
+            const diff_t dd = compare(a.dft, b.dft);
+            const bool ok_t = exact ? dt.max_abs == 0.0 && dt.top1_same : dt.top1_same && dt.max_rel < 1e-2;
+            const bool ok_d = exact ? dd.max_abs == 0.0 && dd.top1_same : dd.top1_same && dd.max_rel < 1e-2;
+            const bool ok_p = a.pos_max == b.pos_max;
+            printf("%-64s target n=%zu max_rel=%.3e top1=%s | draft n=%zu max_abs=%.3e max_rel=%.3e top1=%s | pos_max %d/%d %s\n",
+                   what.c_str(), dt.n, dt.max_rel, dt.top1_same ? "same" : "DIFF", dd.n, dd.max_abs, dd.max_rel,
+                   dd.top1_same ? "same" : "DIFF", (int) a.pos_max, (int) b.pos_max,
+                   ok_t && ok_d && ok_p ? (exact ? "(bit equal)" : "(rounding)") : "<<<<<< MISMATCH");
+            fflush(stdout);
+            n_fail += ok_t && ok_d && ok_p ? 0 : 1;
+        };
+        auto expect = [&](const std::string & what, bool cond) {
+            if (!cond) {
+                printf("dspark %s <<<<<< MISMATCH\n", what.c_str());
+                n_fail++;
+            }
+        };
+        for (int n : { 900, 1000 }) {
+            if (!g_draft) { break; }
+            const int n_split_max = quick ? 1 : 3;
+            dcfg_t w1;
+            dcfg_t w2;   w2.layer = true;
+            drec_t r1, r2;
+            if (!drun(w1, n, r1, "w1") || !drun(w2, n, r2, "w2")) {
+                continue;
+            }
+            const std::string tag = " n=" + std::to_string(n);
+            dcmp("window layer-major vs ubatches" + tag, r2, r1, true);
+            expect("the window keeps the exact tail on" + tag, r1.tail_exact > 0 && r1.tail_layer_inp == 0 && r2.tail_exact > 0);
+            expect("the window prompt ran layer-major" + tag, r2.layer_runs == 1);
+            printf("dspark%s: tail lines w1 %d w2 %d, layer-major runs w2 %d\n", tag.c_str(), r1.tail_exact,
+                   r2.tail_exact, r2.layer_runs);
+            // prompts of two calls (the checkpoint cut of the server, two long calls) and E: a prefix without layer inputs,
+            // then the window as a call of its own. The reference is the ubatch loop with the same cut: another cut moves
+            // the ubatch edges, and the random fixture amplifies the rounding of that (a weight change of 1e-7 moves the
+            // logits by 1e-3, one of 1e-6 by up to 0.1), so a cut against the one call proves nothing
+            for (int sp = 1; sp <= n_split_max; sp++) {
+                dcfg_t sw = w2;   sw.split = sp;
+                dcfg_t sb = w1;   sb.split = sp;
+                drec_t qw, qb;
+                if (!drun(sw, n, qw, "split window") || !drun(sb, n, qb, "split ubatches")) {
+                    continue;
+                }
+                const char * name = sp == 1 ? "checkpoint cut" : sp == 2 ? "two calls" : "E (prefix without features)";
+                dcmp(std::string("window layer-major, ") + name + " vs ubatches" + tag, qw, qb, true);
+                if (sp != 1) {
+                    expect(std::string(name) + " ran layer-major" + tag, qw.layer_runs >= 1);
+                }
+            }
+        }
+        // the falsifier: the features outside the window replaced by noise
+        if (g_draft) {
+            // (and the control: noise on the oldest row a query of the first block reaches, at n - W + 1, changes the draft)
+            const int nn = 900, w = (int) D_SWA;
+            logits_t ga, gb, gc;
+            const bool ok = scenario_garble(toks, nn, 0, 0, ga) && scenario_garble(toks, nn, 0, nn - w, gb) &&
+                            scenario_garble(toks, nn, nn - w + 1, nn - w + 2, gc);
+            if (!ok) {
+                printf("dspark garble: failed <<<<<< MISMATCH\n");
+                n_fail++;
+            } else {
+                const diff_t d = compare(ga, gb);
+                const diff_t dc = compare(ga, gc);
+                printf("dspark: features outside the window replaced by noise: max_abs=%.3e %s; the oldest row it reaches: "
+                       "max_abs=%.3e %s\n", d.max_abs, d.max_abs == 0.0 ? "(no effect)" : "<<<<<< MISMATCH", dc.max_abs,
+                       dc.max_abs > 0.0 ? "(changes the draft)" : "<<<<<< BLIND");
+                n_fail += d.max_abs == 0.0 && dc.max_abs > 0.0 ? 0 : 1;
+            }
+        }
+        g_draft = nullptr;
     }
 
     // sensitivity: a different first token must change the last logits

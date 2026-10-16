@@ -1106,6 +1106,11 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     int32_t n_embd_enc = 0;  // target_layer_ids_n * target_hidden_size
     int32_t n_embd_tgt = 0;  // target model hidden size
 
+    // ranma: the target feature rows the draft reads back from the newest position (llama_model_dflash_feature_window),
+    // 0 for every row. With a window the target makes the features of the last n_feat_window rows of every sequence in a
+    // call only (llama_set_embeddings_layer_inp_last), and process() injects those
+    int32_t n_feat_window = 0;
+
     int32_t     block_size    = 0;
     llama_token mask_token_id = 0;
 
@@ -1271,6 +1276,21 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             llama_set_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k], true);
         }
 
+        // ranma: a draft that reads a recent window of target features only (a DSpark DSV4 draft): the target makes the
+        // features of the window rows alone, which lets a prompt of many ubatches keep the layer-major prefill and the
+        // exact tail. The window holds a verification of a whole block; a draft without a window, or one narrower than a
+        // block, keeps the features of every row.
+        {
+            const int32_t w  = llama_model_dflash_feature_window(model_dft);
+            if (w > 0 && w >= block_size + 1 && w >= this->params.n_max + 1) {
+                n_feat_window = w;
+                llama_set_embeddings_layer_inp_last(ctx_tgt, (uint32_t) w);
+            }
+            LOG_INF("%s: target features of %s\n", __func__, n_feat_window > 0 ?
+                    ("the last " + std::to_string(n_feat_window) + " rows of a call (the draft's attention window)").c_str() :
+                    "every row");
+        }
+
         // DFlash2 reads its selector lattice from h_nextn and never consumes raw logits.
         llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ !is_dflash2);
         llama_set_causal_attn(ctx_dft, causal_attn); // DFlash needs non-causal attention unless the model says otherwise
@@ -1358,17 +1378,40 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
         const int32_t n_ubatch = (int32_t) llama_n_ubatch(ctx_dft);
 
+        // the feature copies of the target call are complete (the rows are read one by one below)
+        llama_synchronize(ctx_tgt);
+
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             if (i_batch_beg[seq_id] < 0) {
                 continue;
             }
-            const int32_t n_rows = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
+            int32_t n_rows = i_batch_end[seq_id] - i_batch_beg[seq_id] + 1;
 
             // an M-RoPE image pins all its rows to one position, so a windowed draft
             // cache cannot free cells for it - skip it, the draft can jump over the gap
             const bool pos_pinned = batch_in.tokens[i_batch_beg[seq_id]].pos[0] == batch_in.tokens[i_batch_end[seq_id]].pos[0];
             if (has_embeddings && n_rows > 1 && pos_pinned) {
                 continue;
+            }
+
+            // ranma: a feature window (n_feat_window): the target made the last rows of the call only, the rows a later
+            // query of the draft can reach; earlier rows are not injected. The draft memory keeps consecutive positions,
+            // so when the window starts past its newest cell, what it holds of the sequence lies before every window
+            // still to come and is removed
+            int32_t i_beg = i_batch_beg[seq_id];
+            if (n_feat_window > 0 && n_rows > n_feat_window) {
+                i_beg += n_rows - n_feat_window;
+                n_rows = n_feat_window;
+            }
+            if (n_feat_window > 0) {
+                llama_memory_t mem_dft = llama_get_memory(ctx_dft);
+                const llama_pos p_beg = batch_in.tokens[i_beg].pos[0];
+                const llama_pos p_max = llama_memory_seq_pos_max(mem_dft, seq_id);
+                if (p_max >= 0 && p_beg > p_max + 1 && !llama_memory_seq_rm(mem_dft, seq_id, -1, -1)) {
+                    LOG_ERR("%s: cannot clear the draft sequence %d before its feature window at %d\n", __func__,
+                            (int) seq_id, (int) p_beg);
+                    return false;
+                }
             }
 
             for (int32_t offset = 0; offset < n_rows; offset += n_ubatch) {
@@ -1378,20 +1421,23 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 // injects them into the K/V cache at the target positions
                 features_buf.resize((size_t) n_chunk * n_embd_enc);
                 for (uint32_t k = 0; k < target_layer_ids_n; ++k) {
-                    const float * layer = llama_get_embeddings_layer_inp(ctx_tgt, (uint32_t) target_layer_ids[k]);
-                    if (!layer) {
-                        GGML_ABORT("DFlash: target layer %d input not extracted.", target_layer_ids[k]);
-                    }
                     for (int32_t i = 0; i < n_chunk; ++i) {
-                        float       * dst = features_buf.data() + (size_t) i * n_embd_enc + k * (size_t) n_embd_tgt;
-                        const float * src = layer + (size_t) (i_batch_beg[seq_id] + offset + i) * n_embd_tgt;
+                        // ranma: by row, so that a row the call did not make is never read (a window row the target
+                        // left out would be a missing or stale feature)
+                        const float * src = llama_get_embeddings_layer_inp_row(ctx_tgt, (uint32_t) target_layer_ids[k],
+                                i_beg + offset + i);
+                        if (!src) {
+                            GGML_ABORT("DFlash: target layer %d input of batch row %d not extracted.", target_layer_ids[k],
+                                    i_beg + offset + i);
+                        }
+                        float * dst = features_buf.data() + (size_t) i * n_embd_enc + k * (size_t) n_embd_tgt;
                         std::memcpy(dst, src, (size_t) n_embd_tgt * sizeof(float));
                     }
                 }
 
                 batch_inject.clear();
                 for (int32_t i = 0; i < n_chunk; ++i) {
-                    const llama_pos p = batch_in.tokens[i_batch_beg[seq_id] + offset + i].pos[0];
+                    const llama_pos p = batch_in.tokens[i_beg + offset + i].pos[0];
                     const llama_pos pos_arr[4] = { p, p, p, 0 };
                     batch_inject.add_embd({ features_buf.data() + (size_t) i * n_embd_enc, 1, (size_t) n_embd_enc }, pos_arr, seq_id, false);
                 }
@@ -3639,6 +3685,13 @@ common_params common_base_params_to_speculative(const common_params & params) {
         if (params_spec.backend_sampling) {
             result.n_outputs_max_per_seq = per_seq;
         }
+    }
+
+    // ranma: the layer mode sized the draft context of a feature window (common_layer_mode_apply); without it the draft
+    // would reserve its compute for the wide ubatch of the target's layer-major prompt
+    if (has_block_draft && params_spec.n_ubatch_lm > 0) {
+        result.n_ubatch = params_spec.n_ubatch_lm;
+        result.n_batch  = params_spec.n_ubatch_lm;
     }
 
     return result;
