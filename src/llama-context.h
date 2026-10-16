@@ -130,6 +130,8 @@ struct llama_context {
     float * get_embeddings_nextn_ith(int32_t i);
 
     float * get_embeddings_layer_inp(uint32_t lid);
+    // ranma: the layer input of batch row i of the last call, nullptr when the call did not make it
+    float * get_embeddings_layer_inp_row(uint32_t lid, int32_t i);
 
     llama_token * get_sampled_tokens() const;
     llama_token   get_sampled_token_ith(int32_t idx);
@@ -158,6 +160,7 @@ struct llama_context {
     void set_embeddings (bool value);
     void set_embeddings_nextn(bool value, bool masked);
     void set_embeddings_layer_inp(uint32_t lid, bool enable);
+    void set_embeddings_layer_inp_last(uint32_t n_last);
     void set_nextn_layer_offset(int32_t offset);
     void set_causal_attn(bool value);
     void set_rs_prompt(bool value) { rs_prompt = value; }
@@ -282,6 +285,15 @@ private:
     // from backend into host-side embd_layer_inp buffers
     bool extract_layer_inputs(const llm_graph_result * res, size_t token_offset, size_t n_tokens);
 
+    // ranma: the layer inputs of the last rows (cparams.embeddings_layer_inp_last). lin_begin marks the rows of the call
+    // that the window holds; lin_extract copies the rows of t among them into embd_layer_inp. t holds the last rows of a
+    // ubatch of n_ub rows, whose batch indices are batch_idxs; backend == nullptr copies synchronously (t computed)
+    bool lin_active() const { return !lin_row.empty(); }
+    void lin_begin(const llama_batch & batch);
+    void lin_extract(uint32_t il, const ggml_tensor * t, ggml_backend_t backend, const std::vector<int32_t> & batch_idxs,
+                     int64_t n_ub);
+    void lin_extract_ubatch(const llm_graph_result * res, const llama_ubatch & ubatch);
+
     //
     // graph
     //
@@ -373,6 +385,14 @@ private:
     // populated when cparams.output_layer_inp[il] is true
     std::vector<buffer_view<float>> embd_layer_inp;
     std::vector<int32_t> embd_batch_idxs; // extracted index -> original batch index
+
+    // ranma: the layer inputs of the last rows of every sequence (cparams.embeddings_layer_inp_last): the rows of
+    // embd_layer_inp (lin_cap of them) hold the window rows of the call only. lin_row maps a batch index of the call to
+    // its row, -1 outside the window (empty: every row, in batch order); lin_ok[il][row] is set once the call wrote that
+    // row of layer il. Both are made again at the start of every call, so a row of an earlier call is never read
+    uint32_t lin_cap = 0;
+    std::vector<int32_t> lin_row;
+    std::vector<std::vector<uint8_t>> lin_ok;
 
     struct sampling_info {
         // !samplers.empty() to check if any samplers are active

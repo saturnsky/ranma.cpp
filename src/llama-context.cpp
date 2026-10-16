@@ -23,6 +23,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <limits>
+#include <map>
 #include <regex>
 #include <stdexcept>
 #include <string>
@@ -233,7 +234,9 @@ llama_context::llama_context(
 
     // +1: id n_layer() taps the output of the last layer ("input" of the head)
     cparams.embeddings_layer_inp.resize(hparams.n_layer() + 1, false);
+    cparams.embeddings_layer_inp_last = 0;
     embd_layer_inp.resize(hparams.n_layer() + 1);
+    lin_ok.resize(hparams.n_layer() + 1);
 
     cparams.ctx_type          = params.ctx_type;
     cparams.rope_scaling_type = params.rope_scaling_type;
@@ -1284,6 +1287,21 @@ float * llama_context::get_embeddings_nextn_ith(int32_t i) {
     }
 }
 
+float * llama_context::get_embeddings_layer_inp_row(uint32_t lid, int32_t i) {
+    if (lid >= embd_layer_inp.size() || !embd_layer_inp[lid].has_data() || i < 0) {
+        return nullptr;
+    }
+    const size_t n_embd = model.hparams.n_embd;
+    if (!lin_active()) {
+        output_reorder();
+        return (size_t) (i + 1)*n_embd <= embd_layer_inp[lid].size ? embd_layer_inp[lid].data + (size_t) i*n_embd : nullptr;
+    }
+    if ((size_t) i >= lin_row.size() || lin_row[i] < 0 || !lin_ok[lid][(size_t) lin_row[i]]) {
+        return nullptr;
+    }
+    return embd_layer_inp[lid].data + (size_t) lin_row[i]*n_embd;
+}
+
 float * llama_context::get_embeddings_layer_inp(uint32_t lid) {
     output_reorder();
 
@@ -1494,6 +1512,15 @@ void llama_context::set_embeddings_layer_inp(uint32_t lid, bool enable) {
     cparams.embeddings_layer_inp[lid] = enable;
 
     // note: without this reserve, the draft acceptance drops to zero. not sure why - this is unexpected
+    sched_need_reserve = true;
+}
+
+void llama_context::set_embeddings_layer_inp_last(uint32_t n_last) {
+    LLAMA_LOG_DEBUG("%s: n_last = %u\n", __func__, n_last);
+
+    cparams.embeddings_layer_inp_last = n_last;
+    lin_row.clear();
+
     sched_need_reserve = true;
 }
 
@@ -2411,6 +2438,10 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         return -2;
     };
 
+    // ranma: the window rows of the layer inputs of this call (llama_set_embeddings_layer_inp_last); after the reserve,
+    // which sizes them
+    lin_begin(balloc->get_batch());
+
     // start a new sampling transaction for this logical batch
     for (const auto & entry : sampling.samplers) {
         llama_sampler_backend_begin(entry.second);
@@ -2575,7 +2606,12 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         }
 
         // [TAG_EXTRACT_TARGET_EMBEDDINGS]
-        bool extract_all_idxs = extract_layer_inputs(res, n_tokens_prev, ubatch.n_tokens);
+        bool extract_all_idxs = false;
+        if (lin_active()) {
+            lin_extract_ubatch(res, ubatch);
+        } else {
+            extract_all_idxs = extract_layer_inputs(res, n_tokens_prev, ubatch.n_tokens);
+        }
 
         // extract nextn embeddings before
         // only meaningful in LLAMA_POOLING_TYPE_NONE (per-token); other pooling modes are ignored.
@@ -2713,9 +2749,13 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
         embd_nextn.size = (size_t) n_embd_out * n_batch;
     }
 
+    // ranma: the last rows of every sequence only (llama_set_embeddings_layer_inp_last)
+    lin_cap = cparams.embeddings_layer_inp_last > 0 ?
+        (uint32_t) std::min<uint64_t>(n_batch, (uint64_t) std::max<uint32_t>(1, cparams.n_seq_max)*cparams.embeddings_layer_inp_last) : 0;
+    const size_t n_rows_layer_inp = lin_cap > 0 ? lin_cap : n_batch;
     for (bool enabled : cparams.embeddings_layer_inp) {
         if (enabled) {
-            embd_layer_inp_float_count += (size_t) n_embd * n_batch;
+            embd_layer_inp_float_count += (size_t) n_embd * n_rows_layer_inp;
         }
     }
 
@@ -2787,7 +2827,7 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
 
     for (uint32_t il = 0; il < embd_layer_inp.size(); ++il) {
         if (cparams.embeddings_layer_inp[il]) {
-            embd_layer_inp[il] = buffer_view<float>{(float *) (base + offset), (size_t) n_embd * n_batch};
+            embd_layer_inp[il] = buffer_view<float>{(float *) (base + offset), (size_t) n_embd * n_rows_layer_inp};
             offset += embd_layer_inp[il].size * sizeof(float);
         } else {
             embd_layer_inp[il] = buffer_view<float>{nullptr, 0};
@@ -2873,6 +2913,95 @@ bool llama_context::extract_layer_inputs(const llm_graph_result * res, size_t to
     return extracted;
 }
 
+// ranma: the layer inputs of the last rows of every sequence (llama_set_embeddings_layer_inp_last). A drafter whose
+// attention reads only a recent window of target positions (a DSpark draft of sliding-window stages) needs the rows of
+// that window; the others are neither copied nor, where the model computes only what its outputs need (the exact tail
+// prefill of DeepSeek-V4.1), computed.
+void llama_context::lin_begin(const llama_batch & batch) {
+    lin_row.clear();
+    const uint32_t n_last = cparams.embeddings_layer_inp_last;
+    if (n_last == 0 || std::none_of(cparams.embeddings_layer_inp.begin(), cparams.embeddings_layer_inp.end(), [](bool b) { return b; })) {
+        return;
+    }
+    const int32_t n = batch.n_tokens;
+    lin_row.assign((size_t) std::max(n, 1), -1);
+    // the last n_last rows of every sequence (a row of several sequences counts for its first), then numbered in batch order
+    std::map<llama_seq_id, uint32_t> seen;
+    for (int32_t i = n - 1; i >= 0; --i) {
+        const llama_seq_id s = batch.n_seq_id != nullptr && batch.n_seq_id[i] > 0 ? batch.seq_id[i][0] : 0;
+        if (seen[s]++ < n_last) {
+            lin_row[(size_t) i] = 0;
+        }
+    }
+    int32_t k = 0;
+    for (int32_t i = 0; i < n; ++i) {
+        if (lin_row[(size_t) i] == 0) {
+            lin_row[(size_t) i] = k++;
+        } else {
+            lin_row[(size_t) i] = -1;
+        }
+    }
+    GGML_ASSERT((uint32_t) k <= lin_cap && "more window rows than the output buffer holds");
+    for (uint32_t il = 0; il < lin_ok.size(); ++il) {
+        lin_ok[il].assign(cparams.embeddings_layer_inp[il] ? (size_t) k : 0, 0);
+    }
+}
+
+void llama_context::lin_extract(uint32_t il, const ggml_tensor * t, ggml_backend_t backend,
+                                const std::vector<int32_t> & batch_idxs, int64_t n_ub) {
+    if (!lin_active() || t == nullptr || il >= lin_ok.size() || lin_ok[il].empty()) {
+        return;
+    }
+    const size_t n_embd = model.hparams.n_embd;
+    GGML_ASSERT(t->type == GGML_TYPE_F32 && ggml_is_contiguous(t) && ggml_nelements(t) % (int64_t) n_embd == 0);
+    const int64_t n_t = ggml_nelements(t)/(int64_t) n_embd; // the last n_t rows of the ubatch
+    GGML_ASSERT(n_t <= n_ub && (int64_t) batch_idxs.size() == n_ub);
+    const size_t row = n_embd*sizeof(float);
+    // runs of rows that are consecutive in the window: one copy each (the window rows of a ubatch are one run)
+    for (int64_t j = 0; j < n_t; ) {
+        const int32_t b = batch_idxs[(size_t) (n_ub - n_t + j)];
+        const int32_t c = b >= 0 && (size_t) b < lin_row.size() ? lin_row[(size_t) b] : -1;
+        if (c < 0) {
+            ++j;
+            continue;
+        }
+        int64_t m = 1;
+        while (j + m < n_t) {
+            const int32_t b2 = batch_idxs[(size_t) (n_ub - n_t + j + m)];
+            if (b2 < 0 || (size_t) b2 >= lin_row.size() || lin_row[(size_t) b2] != c + m) {
+                break;
+            }
+            ++m;
+        }
+        GGML_ASSERT((size_t) (c + m)*n_embd <= embd_layer_inp[il].size);
+        float * dst = embd_layer_inp[il].data + (size_t) c*n_embd;
+        if (backend != nullptr) {
+            ggml_backend_tensor_get_async(backend, t, dst, (size_t) j*row, (size_t) m*row);
+        } else {
+            ggml_backend_tensor_get(t, dst, (size_t) j*row, (size_t) m*row);
+        }
+        std::fill(lin_ok[il].begin() + c, lin_ok[il].begin() + c + m, 1);
+        j += m;
+    }
+}
+
+void llama_context::lin_extract_ubatch(const llm_graph_result * res, const llama_ubatch & ubatch) {
+    GGML_ASSERT(ubatch.data && ubatch.data->batch_idxs.size() == ubatch.n_tokens);
+    for (uint32_t il = 0; il < cparams.embeddings_layer_inp.size(); ++il) {
+        if (!cparams.embeddings_layer_inp[il]) {
+            continue;
+        }
+        // a ubatch without rows of the window may leave the layer out (the tail stops at a layer it has no rows of)
+        ggml_tensor * t = res->get_layer_inp((int) il);
+        if (t == nullptr) {
+            continue;
+        }
+        ggml_backend_t backend = ggml_backend_sched_get_tensor_backend(sched.get(), t);
+        GGML_ASSERT(backend != nullptr);
+        lin_extract(il, t, backend, ubatch.data->batch_idxs, ubatch.n_tokens);
+    }
+}
+
 void llama_context::output_reorder() {
     const uint64_t n_vocab     = model.vocab.n_tokens();
     const uint64_t n_embd      = model.hparams.n_embd;
@@ -2942,7 +3071,7 @@ void llama_context::output_reorder() {
                 }
             }
             for (auto & layer : embd_layer_inp) {
-                if (layer.has_data()) {
+                if (layer.has_data() && !lin_active()) {
                     for (size_t k = 0; k < n_embd; ++k) {
                         std::swap(layer.data[i*n_embd + k], layer.data[j*n_embd + k]);
                     }
@@ -5020,6 +5149,15 @@ float * llama_get_embeddings_layer_inp(llama_context * ctx, uint32_t lid) {
     ctx->synchronize();
 
     return ctx->get_embeddings_layer_inp(lid);
+}
+
+void llama_set_embeddings_layer_inp_last(llama_context * ctx, uint32_t n_last) {
+    ctx->set_embeddings_layer_inp_last(n_last);
+}
+
+float * llama_get_embeddings_layer_inp_row(llama_context * ctx, uint32_t lid, int32_t i) {
+    // no synchronize: read by row, after one llama_synchronize
+    return ctx->get_embeddings_layer_inp_row(lid, i);
 }
 
 bool llama_set_sampler(llama_context * ctx, llama_seq_id seq_id, llama_sampler * smpl) {

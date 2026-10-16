@@ -1576,7 +1576,9 @@ void llm_graph_result::set_outputs(const llm_graph_params & params) {
     {
         const auto & embeddings_layer_inp = params.cparams.embeddings_layer_inp;
         for (size_t il = 0; il < embeddings_layer_inp.size(); ++il) {
-            if (embeddings_layer_inp[il]) {
+            // ranma: with the layer inputs of the last rows only (llama_set_embeddings_layer_inp_last) a graph that
+            // computes only what its outputs need leaves out a layer it has no rows of (the DeepSeek-V4.1 tail)
+            if (embeddings_layer_inp[il] && (t_layer_inp[il] != nullptr || params.cparams.embeddings_layer_inp_last == 0)) {
                 GGML_ASSERT(t_layer_inp[il] != nullptr && "layer input tensor is null");
                 ggml_set_output(t_layer_inp[il]);
             }

@@ -209,9 +209,16 @@ static dsv41_tail_plan dsv41_tail_plan_make(
     if (cparams.embeddings || cparams.embeddings_nextn) {
         return off("embeddings");
     }
+    // ranma: layer inputs of the last W rows of the call (llama_set_embeddings_layer_inp_last, a DSpark drafter): the tail
+    // computes those rows at every layer, so its last layer hands on W rows instead of one; layer inputs of every row
+    // need the whole graph
+    int64_t n_out_rows = 1;
     for (bool b : cparams.embeddings_layer_inp) {
         if (b) {
-            return off("layer inputs extracted");
+            if (cparams.embeddings_layer_inp_last == 0) {
+                return off("layer inputs extracted");
+            }
+            n_out_rows = std::max<int64_t>(1, cparams.embeddings_layer_inp_last);
         }
     }
 
@@ -289,7 +296,7 @@ static dsv41_tail_plan dsv41_tail_plan_make(
     plan.rows.assign(n_layer, dsv41_tail_rows{});
     for (int32_t il = n_layer - 1; il >= il_first; --il) {
         auto & r = plan.rows[il];
-        r.n_o = il == n_layer - 1 ? 1 : plan.rows[il + 1].n_k;
+        r.n_o = il == n_layer - 1 ? n_out_rows : plan.rows[il + 1].n_k;
         r.n_k = r.n_o + n_swa - 1;
     }
 
@@ -2348,6 +2355,10 @@ llama_model_deepseek41::graph::graph(const llama_model & model, const llm_graph_
     // the positions picked by the most recent index source, reused by the layers that follow it
     dsv41_top_k_carry top_k_carry;
 
+    // the tail stopped at a layer without query rows in this ubatch: inpL is the input of that layer, not the output of
+    // the last one, and is no layer input of n_layer (ranma: llama_set_embeddings_layer_inp_last)
+    bool tail_cut = false;
+
     for (int il = 0; il < n_layer; ++il) {
         if ((size_t) il < cparams.embeddings_layer_inp.size() && cparams.embeddings_layer_inp[il]) {
             res->t_layer_inp[il] = dsv41_hc_mean(ctx0, inpL);
@@ -2377,6 +2388,7 @@ llama_model_deepseek41::graph::graph(const llama_model & model, const llm_graph_
             cb(cur, "attn_norm", il);
 
             tail_attn.write_only(model, inp_dsv4, cur, inp_pos, il);
+            tail_cut = true;
             break;
         }
 
@@ -2471,7 +2483,7 @@ llama_model_deepseek41::graph::graph(const llama_model & model, const llm_graph_
         cb(inpL, "l_last", il);
     }
 
-    if ((size_t) n_layer < cparams.embeddings_layer_inp.size() && cparams.embeddings_layer_inp[n_layer]) {
+    if ((size_t) n_layer < cparams.embeddings_layer_inp.size() && cparams.embeddings_layer_inp[n_layer] && !tail_cut) {
         res->t_layer_inp[n_layer] = dsv41_hc_mean(ctx0, inpL);
         cb(res->t_layer_inp[n_layer], "layer_inp", n_layer);
         ggml_build_forward_expand(gf, res->t_layer_inp[n_layer]);
@@ -2485,8 +2497,13 @@ llama_model_deepseek41::graph::graph(const llama_model & model, const llm_graph_
     }
 
     if (tail.active()) {
-        // the last tail layer computed the output row and nothing else
-        GGML_ASSERT(n_outputs == 1 && inpL->ne[2] == 1 && pre_mix->ne[1] == 1);
+        // the last tail layer computed the output row last, after the rows of a layer input window (ranma:
+        // llama_set_embeddings_layer_inp_last) when there is one: the head reads the last row
+        GGML_ASSERT(n_outputs == 1 && inpL->ne[2] >= 1 && pre_mix->ne[1] == inpL->ne[2]);
+        if (inpL->ne[2] > 1) {
+            inpL    = llm_graph_rows(ctx0, inpL,    2, inpL->ne[2] - 1, 1);
+            pre_mix = llm_graph_rows(ctx0, pre_mix, 1, pre_mix->ne[1] - 1, 1);
+        }
     } else if (inp_out_ids) {
         ggml_tensor * flat = ggml_reshape_2d(ctx0, inpL, n_embd*hc, n_tokens);
         inpL = ggml_reshape_3d(ctx0, ggml_get_rows(ctx0, flat, inp_out_ids), n_embd, hc, n_outputs);

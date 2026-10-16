@@ -947,6 +947,7 @@ struct lx_chunk {
     int64_t n         = 0;
     int32_t n_outputs = 0;
     llama_lx_plan plan;
+    std::vector<int32_t> batch_idxs; // the batch index of every row (the layer inputs of the window rows)
     std::vector<std::pair<const ggml_tensor *, ggml_backend_t>> backends;
 };
 
@@ -1101,9 +1102,11 @@ int llama_context::layer_exec_decode(llama_memory_context_i * mctx, uint32_t n_t
             cparams.pipeline_parallel || (loras && !loras->empty())) {
         return skip("embeddings, samplers, non-causal attention, pipeline parallelism or LoRA");
     }
+    // layer inputs of every row are not taken from the segments; those of the last rows of a call (ranma:
+    // llama_set_embeddings_layer_inp_last, a DSpark drafter) are read from the segment that computes them
     for (size_t il = 0; il < cparams.embeddings_layer_inp.size(); ++il) {
-        if (cparams.embeddings_layer_inp[il]) {
-            return skip("layer input extraction");
+        if (cparams.embeddings_layer_inp[il] && cparams.embeddings_layer_inp_last == 0) {
+            return skip("layer input extraction of every row");
         }
     }
     llama_seq_id seq = 0;
@@ -1941,6 +1944,7 @@ int llama_context::layer_exec_decode(llama_memory_context_i * mctx, uint32_t n_t
     int64_t t_build_us = 0;
     int64_t n_graphs = 0;
     int64_t n_moe = 0;
+    int64_t n_lin_copies = 0; // layer inputs read from the segments (ranma: llama_set_embeddings_layer_inp_last)
     size_t inputs_held_max = 0; // the input buffers of the ubatches of a group
     size_t inputs_copied = 0;   // the inputs the segments read, summed over segments (copied once per segment when on the host)
     // the attention masks per layer kind (SWA only; compressed; HCA, ratio 128 and up), counted per layer and ubatch: made
@@ -1977,6 +1981,12 @@ int llama_context::layer_exec_decode(llama_memory_context_i * mctx, uint32_t n_t
             auto & c = chunks[(size_t) k];
             c.i0 = i0;
             c.n  = ub.n_tokens;
+            if (lin_active()) {
+                if (ub.data == nullptr || ub.data->batch_idxs.size() != ub.n_tokens) {
+                    return abort_batch("a ubatch without its batch indices");
+                }
+                c.batch_idxs = ub.data->batch_idxs;
+            }
             i0  += ub.n_tokens;
             if (i0 > W_max || g0 + i0 > N || ub.token == nullptr) {
                 return abort_batch("unexpected ubatch");
@@ -2092,11 +2102,17 @@ int llama_context::layer_exec_decode(llama_memory_context_i * mctx, uint32_t n_t
                 const lx_graph g(c.res->get_gf());
                 if (l == L && c.n_outputs == 0) {
                     // the last segment ends the last layer run layer by layer, runs the layers after it and makes the
-                    // logits: nothing of a chunk without outputs survives it unless it writes a state
+                    // logits: nothing of a chunk without outputs survives it unless it writes a state or makes a layer
+                    // input the call reads (ranma: the window rows of llama_set_embeddings_layer_inp_last)
                     bool writes = false;
                     for (int i : p.nodes[l]) {
                         const ggml_tensor * t = g.node(i);
                         writes = writes || (!lx_is_view(t->op) && t->view_src != nullptr && g.kind(t->view_src) == LX_STATE);
+                    }
+                    for (uint32_t il = 0; lin_active() && !writes && il < cparams.embeddings_layer_inp.size(); ++il) {
+                        const ggml_tensor * t = cparams.embeddings_layer_inp[il] ? c.res->get_layer_inp((int) il) : nullptr;
+                        writes = t != nullptr && g.index(t) >= 0 &&
+                            std::find(p.nodes[l].begin(), p.nodes[l].end(), g.index(t)) != p.nodes[l].end();
                     }
                     if (!writes) {
                         continue;
@@ -2174,6 +2190,17 @@ int llama_context::layer_exec_decode(llama_memory_context_i * mctx, uint32_t n_t
                     return abort_batch("a segment failed");
                 }
                 n_graphs++;
+
+                // ranma: the layer inputs this segment made, their window rows (llama_set_embeddings_layer_inp_last); the
+                // segment graph is computed and its outputs are kept until the next one is allocated
+                for (uint32_t il = 0; lin_active() && il < cparams.embeddings_layer_inp.size(); ++il) {
+                    const ggml_tensor * t = cparams.embeddings_layer_inp[il] ? c.res->get_layer_inp((int) il) : nullptr;
+                    const auto it = t != nullptr ? cp.map.find(t) : cp.map.end();
+                    if (it != cp.map.end()) {
+                        lin_extract(il, it->second, nullptr, c.batch_idxs, c.n);
+                        n_lin_copies++;
+                    }
+                }
 
                 if (l == L && c.n_outputs > 0) {
                     ggml_tensor * t_logits = c.res->get_logits();
@@ -2283,10 +2310,11 @@ int llama_context::layer_exec_decode(llama_memory_context_i * mctx, uint32_t n_t
         const int64_t t_end = ggml_time_us();
         LLAMA_LOG_INFO("%s: %" PRId64 " tokens in %" PRId64 " chunks of %" PRId64 ", %d layers, %" PRId64 " graphs (%" PRId64 " MoE): plan %.1f ms, "
             "chunk graphs %.1f ms (inputs %.1f ms), segments %.1f ms, MoE %.1f ms, total %.1f ms; %zu MiB segment buffers (%d set%s, "
-            "%zu carried), %" PRId64 " group%s, %.1f MiB inputs held, %.1f MiB inputs read by the segments\n", __func__, N, K, C, L,
+            "%zu carried), %" PRId64 " group%s, %.1f MiB inputs held, %.1f MiB inputs read by the segments, %" PRId64 " layer "
+            "input copies\n", __func__, N, K, C, L,
             n_graphs, n_moe, (t_plan - t_start)/1000.0, t_build_us/1000.0, t_inputs_us/1000.0, t_seg_us/1000.0, t_moe_us/1000.0,
             (t_end - t_start)/1000.0, edge_bytes >> 20, n_sets, n_sets > 1 ? "s" : "", carry_slots.size(), n_groups,
-            n_groups > 1 ? "s" : "", inputs_held_max/1048576.0, inputs_copied/1048576.0);
+            n_groups > 1 ? "s" : "", inputs_held_max/1048576.0, inputs_copied/1048576.0, n_lin_copies);
         // one line a log check can match: "layer_exec_masks: device|host|mixed ..."
         const int n_dev  = mask_dev[0] + mask_dev[1] + mask_dev[2] + rest_dev;
         const int n_host = mask_host[0] + mask_host[1] + mask_host[2] + rest_host;
