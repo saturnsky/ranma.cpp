@@ -23,7 +23,7 @@
 extern "C" {
 #endif
 
-#define GGML_EXPERT_ABI_VERSION      16
+#define GGML_EXPERT_ABI_VERSION      18
 #define GGML_EXPERT_IFACE_PROC_NAME  "ggml_backend_expert_iface"
 
 #define GGML_EXPERT_BANK_NONE        0xFFFFFFFFu
@@ -114,7 +114,11 @@ struct ggml_expert_config {
     bool     lend;
     size_t   lend_scratch[3];
 
-    // ABI 13: the three blocks of lend_scratch for a prompt call of n_tokens (called without a lock; never larger than
+    // ABI 17: the share of the L1 budget (0..100 %) that is not planned: per routed layer, least recently used copies of
+    // the experts the layer missed (the decode pool's positions in L1 slots, docs/ranma/expert-cache-ub-pool.md); 0 = none.
+    uint32_t l1_lru_pct;
+
+    // ABI 18: the three blocks of lend_scratch for a prompt call of n_tokens (called without a lock; never larger than
     // lend_scratch is used). A graph borrows only these, not the blocks of the configured ubatch. NULL = lend_scratch always.
     void   (*lend_scratch_of)(void * user, int64_t n_tokens, size_t out[3]);
     void *   lend_scratch_user;

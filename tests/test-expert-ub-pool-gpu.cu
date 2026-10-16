@@ -3,6 +3,8 @@
 // ggml_cuda_expert_cache_select does and compares the bytes it reaches with the expert's home.
 #include "expert-ub-pool.cu"
 
+#include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <random>
 #include <vector>
@@ -644,14 +646,238 @@ static int run_fixed() {
     return 0;
 }
 
-int main() {
+// The copies of the fixed positions through an install (the controller's x_release_locked / x_restore_locked): set aside
+// (entries home), the tables published again (an expert becomes static, a host home moves, a ring slot is reused), then
+// check_fixed decides and set_fixed takes the copies back with their new homes.
+static int run_keep() {
+    fixture f;
+    std::vector<ub_pool_layer> layers;
+    std::vector<std::array<size_t, 3>> bytes, tails;
+    if (build(f, true, layers, bytes, tails)) { return 1; }
+    constexpr int R0 = 30, R1 = 36, SLOTS = 4;
+    std::vector<char *> ring(3), ring_dev(3), arena(3), moved(3), moved_dev(3);
+    for (int k = 0; k < 3; ++k) {
+        CUDA_CHECK(hipHostMalloc((void **) &ring[k], (R1 - R0)*KIND_BYTES[k], hipHostMallocMapped));
+        CUDA_CHECK(hipHostGetDevicePointer((void **) &ring_dev[k], ring[k], 0));
+        for (int e = R0; e < R1; ++e) { memcpy(ring[k] + (e - R0)*KIND_BYTES[k], f.host[k] + e*KIND_BYTES[k], KIND_BYTES[k]); }
+        CUDA_CHECK(hipMalloc((void **) &arena[k], SLOTS*KIND_BYTES[k] + 512));
+        CUDA_CHECK(hipMemset(arena[k], 0xAB, SLOTS*KIND_BYTES[k] + 512));
+        // the new host home of expert 11 after the install
+        CUDA_CHECK(hipHostMalloc((void **) &moved[k], KIND_BYTES[k], hipHostMallocMapped));
+        memcpy(moved[k], f.host[k] + 11*KIND_BYTES[k], KIND_BYTES[k]);
+        CUDA_CHECK(hipHostGetDevicePointer((void **) &moved_dev[k], moved[k], 0));
+    }
+    for (int l = 0; l < L; ++l) {
+        for (int e = R0; e < R1; ++e) {
+            f.serve_host[l][e/32] |= 1u << (e%32);
+            for (int k = 0; k < 3; ++k) { f.tables_host[l*3 + k][e] = (uint64_t) (uintptr_t) (ring_dev[k] + (e - R0)*KIND_BYTES[k]); }
+        }
+    }
+    auto slot_pos = [&](int slot) {
+        ub_fixed_pos x;
+        for (int k = 0; k < 3; ++k) { x.addr[k] = (uint64_t) (uintptr_t) (arena[k] + slot*KIND_BYTES[k]); }
+        return x;
+    };
+    ub_pool pool(L, E, 8, 4);
+    CHECK(pool.allocate(0, layers, bytes, tails));
+    CHECK(pool.enable_ring());
+    {
+        std::vector<std::vector<ub_fixed_pos>> pos(L);
+        pos[0] = { slot_pos(0), slot_pos(1), slot_pos(2), slot_pos(3) };
+        CHECK(pool.set_fixed(pos, {}));
+    }
+    // copies of 10, 11 (host homes), 30, 31 (ring occupants)
+    if (launch(f, pool, 0, {{10, 11, 30, 31}})) { return 1; }
+    CHECK(counter(pool, ub_pool_fills) == 4 && counter(pool, ub_pool_ring_fills) == 2);
+    // set aside: the entries go home, the positions stay empty
+    std::vector<std::vector<ub_fixed_pos>> saved, pos;
+    std::vector<uint32_t> steps;
+    CHECK(pool.read_fixed(saved, steps));
+    pos = saved;
+    std::vector<std::pair<int, ub_fixed_pos>> drop;
+    for (ub_fixed_pos & x : pos[0]) { if (x.owner >= 0) { drop.push_back({ 0, x }); x.owner = -1; x.ring = 0; } }
+    CHECK(drop.size() == 4 && pool.set_fixed(pos, drop));
+    // the install: 10 becomes an L1 resident, 11's host home moves, 31's ring slot is reused (entries 0)
+    {
+        const int32_t s10 = 5;
+        CUDA_CHECK(hipMemcpy(f.slots[0] + 10, &s10, sizeof(s10), hipMemcpyHostToDevice));
+        for (int k = 0; k < 3; ++k) {
+            f.tables_host[k][11] = (uint64_t) (uintptr_t) moved_dev[k];
+            f.tables_host[k][31] = 0;
+            memset(ring[k] + (31 - R0)*KIND_BYTES[k], 0x55, KIND_BYTES[k]);
+        }
+    }
+    std::vector<std::pair<int, int>> q;
+    for (const ub_fixed_pos & x : saved[0]) { q.push_back({ 0, x.owner }); }
+    std::vector<int> state;
+    std::vector<std::array<uint64_t, 3>> home;
+    CHECK(pool.check_fixed(q, state, home));
+    for (size_t i = 0; i < q.size(); ++i) {
+        const int e = q[i].second;
+        if (e == 10) { CHECK(state[i] == ub_fixed_static); }
+        if (e == 11) { CHECK(state[i] == ub_fixed_home && home[i][0] == (uint64_t) (uintptr_t) moved_dev[0] &&
+                             home[i][2] == (uint64_t) (uintptr_t) moved_dev[2]); }
+        if (e == 30 || e == 31) { CHECK(state[i] == ub_fixed_ring && home[i][0] == 0); }
+    }
+    // back: the stamps kept, 10 leaves (its slot stays, empty)
+    std::vector<std::vector<ub_fixed_pos>> next(L);
+    for (size_t i = 0; i < q.size(); ++i) {
+        ub_fixed_pos x = saved[0][i];
+        if (state[i] == ub_fixed_static || state[i] == ub_fixed_none) {
+            x.owner = -1;
+            x.ring  = 0;
+        } else {
+            x.ring = state[i] == ub_fixed_ring ? 1 : 0;
+            for (int k = 0; k < 3; ++k) { x.home[k] = home[i][(size_t) k]; }
+        }
+        next[0].push_back(x);
+    }
+    CHECK(pool.set_fixed(next, {}));
+    {
+        std::vector<uint64_t> t;
+        table_read(f, 0, 0, t);
+        const uintptr_t a0 = (uintptr_t) arena[0], a1 = a0 + SLOTS*KIND_BYTES[0];
+        for (int e : { 11, 30, 31 }) { CHECK((uintptr_t) t[e] >= a0 && (uintptr_t) t[e] < a1); }
+        CHECK((uintptr_t) t[10] < a0 || (uintptr_t) t[10] >= a1);
+    }
+    CHECK(pool.read_fixed(pos, steps));
+    for (size_t i = 0; i < pos[0].size(); ++i) { if (pos[0][i].owner >= 0) { CHECK(pos[0][i].stamp == saved[0][i].stamp); } }
+    // 31's ring slot holds something else now: the kept copy is read (launch checks the bytes); hits, no fills
+    const uint64_t fills0 = counter(pool, ub_pool_fills), hits0 = counter(pool, ub_pool_fixed_hits);
+    if (launch(f, pool, 0, {{11, 30, 31, 1}})) { return 1; }
+    CHECK(counter(pool, ub_pool_fills) == fills0 && counter(pool, ub_pool_fixed_hits) == hits0 + 3);
+    std::string why;
+    CHECK(pool.verify(why) == 3);
+    // dropped later: 11 goes to its new home, the ring copies to 0
+    CHECK(pool.read_fixed(pos, steps));
+    drop.clear();
+    for (ub_fixed_pos & x : pos[0]) { if (x.owner >= 0) { drop.push_back({ 0, x }); x.owner = -1; x.ring = 0; } }
+    CHECK(pool.set_fixed(pos, drop));
+    {
+        std::vector<uint64_t> t;
+        table_read(f, 0, 0, t);
+        CHECK(t[11] == (uint64_t) (uintptr_t) moved_dev[0] && t[30] == 0 && t[31] == 0);
+    }
+    // without the ring admission a served expert has no place in a fixed position
+    ub_pool plain(L, E, 8, 4);
+    CHECK(plain.allocate(0, layers, bytes, tails));
+    CHECK(plain.check_fixed({ { 0, 31 }, { 0, 12 }, { 0, 2 } }, state, home));
+    CHECK(state[0] == ub_fixed_none && state[1] == ub_fixed_home && state[2] == ub_fixed_static);
+    for (int k = 0; k < 3; ++k) { CUDA_CHECK(hipHostFree(ring[k])); CUDA_CHECK(hipFree(arena[k])); CUDA_CHECK(hipHostFree(moved[k])); }
+    printf("PASS: decode pool fixed positions through an install: set aside, a static expert leaves, a moved host home is "
+           "taken over, ring copies stay after their ring slot's reuse, stamps kept, hits after, drops to the new homes\n");
+    return 0;
+}
+
+// `bench`: the cost of a decode launch's step and copy kernels against the number of positions per layer (the LRU part
+// of L1 widens the pool from about 10 to tens of positions). The real kernels on a DS4.1F-like shape (40 layers, 384
+// experts, top-6, one row, ghost:8), with positions of 256-byte kinds so that the copies cost little; the ids follow a
+// Zipf law per layer. Each position count is measured against an idle pool (no position: the step returns at once) in
+// alternating chunks inside one process. Prints the median of the chunk pairs, in us per (step + copy) launch.
+static int bench() {
+    constexpr int BL = 40, BE = 384, BU = 6, TOKENS = 400, CHUNKS = 24;
+    const size_t KB = 256;
+    std::mt19937 rng(11);
+    std::vector<int32_t> ids((size_t) TOKENS*BL*BU);
+    std::vector<double> w(BE);
+    for (int e = 0; e < BE; ++e) { w[e] = 1.0/std::pow((double) (e + 1), 1.1); }
+    for (int t = 0; t < TOKENS; ++t) {
+        for (int l = 0; l < BL; ++l) {
+            std::vector<double> ww = w;
+            std::shuffle(ww.begin(), ww.end(), std::mt19937(1000 + l));   // a different hot set per layer
+            std::discrete_distribution<int> d(ww.begin(), ww.end());
+            std::vector<int> row;
+            while ((int) row.size() < BU) { const int e = d(rng); if (std::find(row.begin(), row.end(), e) == row.end()) { row.push_back(e); } }
+            for (int k = 0; k < BU; ++k) { ids[((size_t) t*BL + l)*BU + k] = row[k]; }
+        }
+    }
+    int32_t * d_ids = nullptr;
+    CUDA_CHECK(hipMalloc(&d_ids, ids.size()*sizeof(int32_t)));
+    CUDA_CHECK(hipMemcpy(d_ids, ids.data(), ids.size()*sizeof(int32_t), hipMemcpyHostToDevice));
+    char * host = nullptr, * host_dev = nullptr;
+    CUDA_CHECK(hipHostMalloc((void **) &host, BE*KB, hipHostMallocMapped));
+    CUDA_CHECK(hipHostGetDevicePointer((void **) &host_dev, host, 0));
+    int32_t * slots = nullptr;
+    CUDA_CHECK(hipMalloc(&slots, BE*sizeof(int32_t)));
+    CUDA_CHECK(hipMemset(slots, 0xFF, BE*sizeof(int32_t)));
+    std::vector<ub_pool_layer> layers(BL);
+    std::vector<std::array<size_t, 3>> bytes(BL, { KB, KB, KB }), tails(BL, { 0, 0, 0 });
+    for (int l = 0; l < BL; ++l) {
+        for (int k = 0; k < 3; ++k) {
+            uint64_t * t = nullptr;
+            CUDA_CHECK(hipMalloc(&t, BE*sizeof(uint64_t)));
+            CUDA_CHECK(hipMemset(t, 0, BE*sizeof(uint64_t)));
+            layers[l].kind[k].tensor = host_dev;
+            layers[l].kind[k].addresses = t;
+            layers[l].kind[k].stride = KB;
+        }
+        layers[l].slots = slots;
+        layers[l].enabled = 1;
+    }
+    const int counts[] = { 10, 40, 100, 190 };
+    char * arena = nullptr;
+    CUDA_CHECK(hipMalloc(&arena, (size_t) BL*190*3*KB));
+    hipStream_t st;
+    CUDA_CHECK(hipStreamCreate(&st));
+    printf("bench: step + copy per launch (40 layers x %d tokens per chunk, 1 row, top-%d, ghost:8), median of %d chunk pairs\n",
+        TOKENS, BU, CHUNKS);
+    for (int r : counts) {
+        ub_pool pool(BL, BE, 64 + 190, 64);
+        if (!pool.allocate(0, layers, bytes, tails, 8)) { return 1; }
+        std::vector<std::vector<ub_fixed_pos>> on(BL), off(BL);
+        for (int l = 0; l < BL; ++l) {
+            for (int p = 0; p < r; ++p) {
+                ub_fixed_pos x;
+                for (int k = 0; k < 3; ++k) { x.addr[k] = (uint64_t) (uintptr_t) (arena + (((size_t) l*190 + p)*3 + k)*KB); }
+                on[l].push_back(x);
+            }
+        }
+        auto run_chunk = [&]() {
+            const auto t0 = std::chrono::steady_clock::now();
+            for (int t = 0; t < TOKENS; ++t) {
+                for (int l = 0; l < BL; ++l) {
+                    pool.launch_step(l, d_ids + ((size_t) t*BL + l)*BU, 1, BU, BU, true, st);
+                    pool.launch_copy(l, st, 1, BU);
+                }
+            }
+            CUDA_CHECK(hipStreamSynchronize(st));
+            return std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - t0).count()/(TOKENS*BL);
+        };
+        std::vector<double> d_on, d_off, diff;
+        for (int c = 0; c < CHUNKS + 2; ++c) {
+            if (!pool.set_fixed(on, {})) { return 1; }   // the positions start empty each chunk: fills and hits
+            const double a = run_chunk();
+            std::vector<std::vector<ub_fixed_pos>> now;
+            std::vector<uint32_t> steps;
+            pool.read_fixed(now, steps);
+            std::vector<std::pair<int, ub_fixed_pos>> drop;
+            for (int l = 0; l < BL; ++l) { for (auto & x : now[l]) { if (x.owner >= 0) { drop.push_back({ l, x }); } } }
+            if (!pool.set_fixed(off, drop)) { return 1; }
+            const double b = run_chunk();
+            if (c >= 2) { d_on.push_back(a); d_off.push_back(b); diff.push_back(a - b); }
+        }
+        std::array<uint64_t, ub_pool_n_counters> cn{};
+        pool.read_counters(cn);
+        auto med = [](std::vector<double> v) { std::sort(v.begin(), v.end()); return v[v.size()/2]; };
+        printf("bench: %3d positions: %.2f us per launch, idle pool %.2f us, difference %.2f us [%.2f .. %.2f]; hits %.1f %%, "
+               "fills %llu, rejected %llu\n", r, med(d_on), med(d_off), med(diff), *std::min_element(diff.begin(), diff.end()),
+            *std::max_element(diff.begin(), diff.end()),
+            100.0*(double) cn[ub_pool_hits]/(double) ((size_t) (CHUNKS + 2)*TOKENS*BL*BU), (unsigned long long) cn[ub_pool_fills],
+            (unsigned long long) cn[ub_pool_rejected]);
+    }
+    return 0;
+}
+
+int main(int argc, char ** argv) {
     CUDA_CHECK(hipSetDevice(0));
+    if (argc > 1 && std::string(argv[1]) == "bench") { return bench(); }
     if (run(false)) { return 1; }
     if (run(true)) { return 1; }
     if (run_ghost(false)) { return 1; }
     if (run_ghost(true)) { return 1; }
     if (run_ring()) { return 1; }
     if (run_fixed()) { return 1; }
+    if (run_keep()) { return 1; }
     printf("ALL PASS\n");
     return 0;
 }

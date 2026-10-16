@@ -6,6 +6,7 @@
 #include "expert-hash-early.h"
 #include "expert-hash-stage.cuh"
 #include "expert-host.cuh"
+#include "expert-l1-lru.h"
 #include "expert-l2.cuh"
 #include "expert-lend.h"
 #include "expert-os.h"
@@ -786,6 +787,7 @@ public:
         report_tier_plan_locked("at model load");
         log_members_locked("at model load");
         allocate_ub_pool_locked();
+        x_layout_locked("at model load");
         lend_setup_locked();
         // the layer mode (it turns the lend on) moves the experts outside L1 once per layer; with none outside L1 its
         // lends only evict experts. Said once; nothing changes.
@@ -1040,10 +1042,13 @@ public:
         CUDA_CHECK(cudaDeviceSynchronize());
         // the decode pool's entries go back to their homes before the install republishes the tables
         ub_reclaim_sync_locked("install");
+        x_release_locked("install");
         // the install republishes the slot tables: the staging entries go, and the staging forgets its
         // experts (the next hint copies again; an install is rare next to the hints)
         for (std::vector<int32_t> & owners : stage_owner_) { stage_forget(owners); }
-        return install_once_locked(id, plan);
+        const bool ok = install_once_locked(id, plan);
+        x_restore_locked("install", ok && x_reshare_locked(id, plan));
+        return ok;
     }
 
     bool install_once_locked(ggml_expert_plan_id id, const plan_state & plan) {
@@ -1310,7 +1315,7 @@ public:
                 stage_first_[(size_t) joint] + stage_slots_);
         }
         // The pool's step also counts the profile of a launch that gets one (one kernel less per layer)
-        const bool ub_step = ub_on_.load(std::memory_order_acquire) && member == ub_member_ && ub_layer_[(size_t) joint] &&
+        const bool ub_step = ub_on_.load(std::memory_order_acquire) && ub_layer_[(size_t) joint] &&
                 ids->ne[1] <= (int64_t) ub_rows_;
         if (profiler_ && !ub_step) {
         launch_profile_ids((const int32_t *) ids->data, (int) ids->ne[1], (int) (ids->nb[1]/sizeof(int32_t)), (int) ids->ne[0],
@@ -1326,7 +1331,7 @@ public:
                 profiler_ ? profiler_->counts_base() + size_t(joint)*geo_.n_experts : nullptr,
                 profiler_ ? profiler_->n_counts() : 0, profiler_ ? profiler_->n_banks() : 0,
                 profiler_ ? profiler_->selection((uint32_t) member) : nullptr);
-            ub_->launch_copy((int) joint, ctx.stream());
+            ub_->launch_copy((int) joint, ctx.stream(), (int) ids->ne[1], (int) ids->ne[0]);
         }
         // The SSD tier needs the same ids: this is the one site that sees both the fused and the
         // unfused router, and it is ordered before the layer's MUL_MAT_ID on the same stream.
@@ -1431,8 +1436,8 @@ public:
         ++ub_calls_;
         ub_hwm_ = std::max(ub_hwm_, extent);
         ub_hwm_of_[base] = ub_hwm_;
-        if (!lends) {
-            return true;
+        if (!lends || x_lent_locked()) {
+            return true;   // a region lends only with the whole LRU part of L1 in place (lend_take_locked)
         }
         const size_t align = size_t(2) << 20;
         size_t begin = (ub_hwm_ + std::max(ub_cfg_.margin, ub_hwm_/4) + align - 1)/align*align;
@@ -1490,6 +1495,8 @@ public:
         }
         ggml_cuda_set_device(device_);
         lend_.slots = l1_->slot_counts();
+        // the LRU part of L1 sits on top of each class: a lend takes it first (lend_classes_locked)
+        for (size_t c = 0; c < lend_.slots.size() && x_on_; ++c) { lend_.slots[c] += x_class_[c]; }
         const size_t L = (size_t) geo_.n_layers, E = (size_t) geo_.n_experts, W = (E + 31)/32, nc = lend_.slots.size();
         size_t n_slots = 0;
         for (int n : lend_.slots) { n_slots += (size_t) std::max(n, 0); }
@@ -1518,8 +1525,9 @@ public:
         lend_space_.n_experts = geo_.n_experts;
         {
             // diagnostic: RANMA_EXPERT_LEND_LRU=0 turns the LRU part off (wanted experts only)
+            // with the LRU part of L1 the per-layer LRU takes that role: the space's LRU part defaults to off
             const char * v = getenv("RANMA_EXPERT_LEND_LRU");
-            lend_space_.lru = v != nullptr && strcmp(v, "0") == 0 ? 0 : 1;
+            lend_space_.lru = v != nullptr && *v != '\0' ? (strcmp(v, "0") == 0 ? 0 : 1) : (x_on_ ? 0 : 1);
             // diagnostic: RANMA_EXPERT_LEND_RESTORE=eager copies the wanted experts the L2 holds into the space when the
             // prompt ends, before the first decode launch (the restore kernels, fed with the wanted lists)
             const char * r = getenv("RANMA_EXPERT_LEND_RESTORE");
@@ -1555,7 +1563,8 @@ public:
                       "expert of its plan in %s, other misses use the rest as an LRU cache (%s; temporary "
                       "policy) (launches of up to %d rows)\n", split_text(lend_.slots).c_str(),
             lend_eager_ ? "when the prompt ends (RANMA_EXPERT_LEND_RESTORE=eager)" : "when it reads it",
-            lend_space_.lru ? (std::string("ghost:") + std::to_string(lend_space_.ghost)).c_str() : lend_eager_ ? "off: eager" : "off: RANMA_EXPERT_LEND_LRU=0",
+            lend_space_.lru ? (std::string("ghost:") + std::to_string(lend_space_.ghost)).c_str() : lend_eager_ ? "off: eager" :
+                getenv("RANMA_EXPERT_LEND_LRU") == nullptr && x_on_ ? "off: the L1 LRU part is on" : "off: RANMA_EXPERT_LEND_LRU=0",
             lend_rows_);
         lend_on_.store(true, std::memory_order_release);
     }
@@ -1760,7 +1769,26 @@ public:
                 out[(size_t) c].residents.push_back(r);
             }
         }
+        // nothing lent: the LRU part's slots are taken first, from the top (empty slots of tier 0; its copies are dropped
+        // or moved by x_shrink_locked, never written back)
+        if (x_on_ && lend_.state == lend_state::none) {
+            for (size_t c = 0; c < nc; ++c) {
+                for (int s = lend_static_slots_locked((int) c); s < lend_.slots[c]; ++s) {
+                    lend_resident r;
+                    r.layer  = -1 - (int) c;
+                    r.expert = s;
+                    r.slot   = s;
+                    r.tier   = 0;
+                    out[c].residents.push_back(r);
+                }
+            }
+        }
         return out;
+    }
+
+    // [class] the slots of a class below the LRU part (static capacity and spares)
+    int lend_static_slots_locked(int c) const {
+        return lend_.slots[(size_t) c] - (x_on_ && (size_t) c < x_class_.size() ? x_class_[(size_t) c] : 0);
     }
 
     // The L1 plan of `req`: the fewest lowest ranked residents whose slots hold every piece, over the slots held already.
@@ -1770,7 +1798,11 @@ public:
             bytes.push_back(pc.bytes);
         }
         const std::vector<int> held = lend_held_locked();
-        return plan_l1_lend(lend_classes_locked(), bytes, 256, &held);
+        lend_l1_plan plan = plan_l1_lend(lend_classes_locked(), bytes, 256, &held);
+        // the LRU part's slots are no residents: nothing is evicted for them
+        plan.victims.erase(std::remove_if(plan.victims.begin(), plan.victims.end(), [](const lend_resident & v) { return v.layer < 0; }),
+            plan.victims.end());
+        return plan;
     }
 
     // Whether `req` could be lent now (nothing moves).
@@ -1787,7 +1819,7 @@ public:
         std::vector<int> caps(nc);
         const std::vector<int> held = lend_held_locked();
         for (size_t c = 0; c < nc; ++c) {
-            caps[c] = full[c] - plan.evict[c];
+            caps[c] = full[c] - std::max(0, lend_static_slots_locked((int) c) - plan.limit[c]);
             if (caps[c] < 0) {
                 return false;
             }
@@ -1931,15 +1963,22 @@ public:
         if (!plan.ok) {
             return false;
         }
-        bool more = false;
-        for (size_t c = 0; c < held.size(); ++c) {
-            more = more || plan.evict[c] > held[c];
-        }
+        // one more slot than held per victim (plan_l1_lend), the LRU part's slots aside
+        const bool more = !plan.victims.empty();
+        GGML_UNUSED(held);
         lend_last_d2h_ = 0;
         lend_last_moves_ = 0;
         lend_last_dropped_ = 0;
-        if (more && !lend_evict_locked(plan)) {
-            return false;
+        x_shrink_locked(plan.limit);
+        if (more) {
+            // the install of the evictions republishes the tables: the copies that stayed are set aside meanwhile
+            x_release_locked("evictions of a lend");
+            const bool ok = lend_evict_locked(plan);
+            x_restore_locked("evictions of a lend", false);
+            if (!ok) {
+                x_revive_locked();
+                return false;
+            }
         }
         // the pieces
         lend_pieces_.clear();
@@ -2047,6 +2086,7 @@ public:
             return false;
         }
         lend_log_restores_locked("a new lend");
+        x_shrink_locked(sp.plan.limit);
         // the copies that stay above the top move down; the tables then name the kept copies at their slots
         std::vector<std::vector<std::pair<int, int>>> moves(nc);
         for (const auto & m : sp.moves) { moves[(size_t) m[0]].push_back({ m[1], m[2] }); }
@@ -2186,7 +2226,19 @@ public:
             size_t g[3];
             for (int k = 0; k < 3; ++k) { g[k] = lend_guard_[c*3 + (size_t) k]; }
             l1_->zero_heads((int) c, from, lend_.slots[c] - from, g);
-            held_slots += lend_.slots[c] - lend_.limit[c];
+            held_slots += std::max(0, lend_static_slots_locked((int) c) - lend_.limit[c]);
+        }
+        if (x_on_) {
+            // the restore space is the static part a lend took (its zero heads above cover the LRU part's slots too, which
+            // go back to the pool in x_revive_locked)
+            bool any = false;
+            for (size_t c = 0; c < lend_.slots.size(); ++c) {
+                lend_.top[c] = std::max(lend_.limit[c], std::min(lend_.top[c], lend_static_slots_locked((int) c)));
+                any = any || lend_.limit[c] < lend_static_slots_locked((int) c);
+            }
+            if (!any) {
+                lend_.clear();   // only the LRU part was lent: no restore space, no victims
+            }
         }
         lend_upload_space_locked(lend_space_kept_, true);
         if (tier_) {
@@ -2205,6 +2257,7 @@ public:
             lend_.victims.size(), lend_.restore.size(), lend_want_.empty() ? " (none: no decode plan)" : "", kept_pinned,
             lend_space_kept_.size() - kept_pinned, (size_t) held_slots - std::min((size_t) held_slots, kept_pinned));
         lend_space_kept_.clear();
+        x_revive_locked();
         if (lend_eager_) {
             lend_eager_restore_locked("the prompt");
         }
@@ -2350,6 +2403,7 @@ public:
         ggml_cuda_set_device(device_);
         CUDA_CHECK(cudaDeviceSynchronize());
         ub_reclaim_sync_locked("install");
+        x_release_locked("install");
         for (std::vector<int32_t> & owners : stage_owner_) { stage_forget(owners); }
         lend_log_restores_locked("a plan install");
         std::vector<std::vector<int32_t>> dev;
@@ -2374,7 +2428,7 @@ public:
         const std::vector<int> full = capacities_;
         std::vector<int> caps(nc);
         for (size_t c = 0; c < nc; ++c) {
-            caps[c] = full[c] - (lend_.slots[c] - lend_.limit[c]);
+            caps[c] = full[c] - std::max(0, lend_static_slots_locked((int) c) - lend_.limit[c]);
         }
         placement_inputs in;
         in.geo              = &geo_;
@@ -2394,10 +2448,12 @@ public:
         l1_->set_unequal(false);
         set_capacities_locked(full);
         if (!ok) {
+            x_restore_locked("install", false);
             return false;
         }
         lend_scores_ = plan.scores;
         lend_set_want_locked(plan);
+        x_restore_locked("install", x_reshare_locked(id, plan));
         // the restore set: what the plan holds beyond the kept slots
         const size_t E = (size_t) geo_.n_experts;
         std::vector<lend_resident> victims;
@@ -2622,6 +2678,12 @@ public:
                     ub_reclaim_locked(stream, "ring admission off");
                 }
                 ub_->set_ring(false);
+                if (x_on_) {
+                    CUDA_CHECK(cudaStreamSynchronize(stream));
+                    x_drop_locked("ring admission off");
+                    GGML_LOG_WARN("expert cache: L1 LRU part: without the ring admission the decode pool admits no expert of "
+                                  "the unified host policy; its slots stay empty\n");
+                }
                 ub_last_cctx_   = nullptr;
                 ub_last_stream_ = nullptr;
                 return;
@@ -2702,12 +2764,540 @@ public:
             snprintf(ring_text, sizeof(ring_text), " ring_fills=%llu", (unsigned long long) c[ub_pool_ring_fills]);
         }
         GGML_LOG_INFO("expert cache: decode pool counters (%s): lends=%llu reclaims=%llu "
-                      "steps=%llu hits=%llu fills=%llu "
+                      "steps=%llu hits=%llu (L1 LRU part %llu) fills=%llu "
                       "(%.1f MiB) over=%llu evictions=%llu rejected=%llu prefetch_fills=%llu prefetch_arrived=%llu%s\n", why,
             (unsigned long long) ub_lends_, (unsigned long long) ub_reclaims_, (unsigned long long) c[ub_pool_steps], (unsigned long long) c[ub_pool_hits],
-            (unsigned long long) c[ub_pool_fills], c[ub_pool_fill_bytes]/1048576.0, (unsigned long long) c[ub_pool_over],
+            (unsigned long long) c[ub_pool_fixed_hits], (unsigned long long) c[ub_pool_fills], c[ub_pool_fill_bytes]/1048576.0, (unsigned long long) c[ub_pool_over],
             (unsigned long long) c[ub_pool_evictions], (unsigned long long) c[ub_pool_rejected],
             (unsigned long long) c[ub_pool_pf_fills], (unsigned long long) c[ub_pool_pf_arrived], ring_text);
+    }
+
+    // ---- the LRU part of L1 (--expert-l1-lru-pct; expert-l1-lru.h) -------------------------------------------------
+    //
+    // N % of each class's L1 slots, carved from the static capacity at load (x_carve_locked), sit above the class's
+    // spares. Every routed layer of the decode pool owns some of them as its first positions (the pool's fixed positions):
+    // the shares follow the profile score of the experts outside the static plan (x_layout_locked at load). The copies are
+    // inclusive and stay through installs: before anything republishes the tables they are set aside (x_release_locked,
+    // their entries go back), afterwards they come back with their new homes unless they are static now or have none, and a
+    // decode plan's install gives new shares without moving a copy (x_restore_locked). A model join or the ring admission
+    // turning off drops them. A lend takes the slots from the top and keeps the most recently used copies in the slots
+    // below (x_shrink_locked), its end gives the slots back empty (x_revive_locked).
+
+    // Load time, after the staging carve. True when capacities_ changed.
+    bool x_carve_locked() {
+        x_on_ = false;
+        x_class_.clear();
+        const int pct = (int) std::min<uint32_t>(cfg_.l1_lru_pct, 100u);
+        if (pct <= 0) {
+            return false;
+        }
+        const char * why = nullptr;
+        const bool unified = cfg_.mode == GGML_EXPERT_MODE_EXCLUSIVE && !hash_mode_.any() && l2_unified_default;
+        if (geo_.n_experts > ub_pool_max_experts) {
+            why = "the decode pool supports at most 1024 experts per layer";
+        }
+        if (why != nullptr) {
+            GGML_LOG_WARN("expert cache: --expert-l1-lru-pct %d is off: %s\n", pct, why);
+            return false;
+        }
+        std::vector<int> x = l1_lru_class_slots(capacities_, pct);
+        const std::vector<int> x_pct = x;   // the static plans give up these; the proportional step only moves LRU slots
+        if (joint_ || members_.size() > 1) {
+            // a class without static slots (a joined model without a profile) takes its capacity's share of the LRU part
+            // from the other classes; only the ring-served experts of a joined model are pooled (see the pool setup)
+            if (!unified) {
+                GGML_LOG_WARN("expert cache: --expert-l1-lru-pct with a joint cache: the models that joined get no LRU slots "
+                              "without the unified host policy\n");
+            } else {
+                std::vector<int64_t> slices(x.size(), 0);
+                std::vector<size_t> vb(x.size(), 0);
+                for (size_t c = 0; c < x.size(); ++c) {
+                    slices[c] = geo_.class_slices((int) c);
+                    vb[c]     = geo_.class_vram_bytes((int) c);
+                }
+                l1_lru_proportional(x, capacities_, slices, vb);
+            }
+        }
+        size_t bytes = 0;
+        int total = 0;
+        std::string text;
+        for (size_t c = 0; c < x.size(); ++c) {
+            capacities_[c] -= x_pct[c];
+            total += x[c];
+            bytes += size_t(x[c])*geo_.class_vram_bytes((int) c);
+            text += (c ? ", " : "") + std::string("class ") + std::to_string(c) + " " + std::to_string(x[c]) + " of " +
+                std::to_string(capacities_[c] + x_pct[c]);
+        }
+        if (total == 0) {
+            GGML_LOG_WARN("expert cache: --expert-l1-lru-pct %d leaves no whole slot; off\n", pct);
+            for (size_t c = 0; c < x.size(); ++c) { capacities_[c] += x_pct[c]; }
+            return false;
+        }
+        x_class_ = x;
+        x_on_ = true;
+        GGML_LOG_INFO("expert cache: L1 LRU part %d%%: %d slots (%.1f MiB) are per-layer LRU copies, not planned (%s); the "
+                      "static plans keep %s slots per class\n", pct, total, bytes/1048576.0, text.c_str(), split_text(capacities_).c_str());
+        return true;
+    }
+
+    // After the carve: the LRU part cannot work; its slots stay empty (the static plans were sized without them).
+    void x_off_locked(const char * why) {
+        if (!x_on_) {
+            return;
+        }
+        x_on_ = false;
+        GGML_LOG_WARN("expert cache: L1 LRU part off: %s; its slots stay unused\n", why);
+    }
+
+    bool x_lent_locked() const {
+        for (size_t c = 0; x_on_ && c < x_top_.size(); ++c) {
+            if (x_top_[c] < l1_->lru_base((int) c) + x_class_[c]) { return true; }
+        }
+        return false;
+    }
+
+    // The device idle and no region lent: the experts of the fixed positions leave (their entries go back), the
+    // positions stay (empty). Before anything republishes the tables.
+    void x_drop_locked(const char * why) {
+        if (!x_on_ || !ub_) {
+            return;
+        }
+        ggml_cuda_set_device(device_);
+        xp_pause_locked(nullptr);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        std::vector<std::vector<ub_fixed_pos>> pos;
+        std::vector<uint32_t> steps;
+        if (!ub_->read_fixed(pos, steps)) {
+            abort_locked("L1 LRU part: the decode pool is lent while it drops");
+        }
+        std::vector<std::pair<int, ub_fixed_pos>> drop;
+        for (size_t l = 0; l < pos.size(); ++l) {
+            for (ub_fixed_pos & x : pos[l]) {
+                if (x.owner >= 0) {
+                    drop.push_back({ (int) l, x });
+                    x.owner = -1;
+                    x.ring  = 0;
+                }
+            }
+        }
+        if (drop.empty()) {
+            return;
+        }
+        if (!ub_->set_fixed(pos, drop)) {
+            abort_locked("L1 LRU part: the drop");
+        }
+        x_dropped_ += drop.size();
+        if (ub_cfg_.log) {
+            GGML_LOG_INFO("expert cache: L1 LRU part: %zu copies dropped (%s)\n", drop.size(), why);
+        }
+    }
+
+    // The fixed position of `layer` at L1 slot `slot` of its class, empty.
+    ub_fixed_pos x_position_locked(int layer, int slot) const {
+        ub_fixed_pos x;
+        const int c = geo_.layer_class[(size_t) layer];
+        for (int k = 0; k < geometry::n_kinds; ++k) {
+            x.addr[k] = (uint64_t) (uintptr_t) l1_->gpu_slice_address(c, k, slot);
+        }
+        return x;
+    }
+
+    // The shares of class c from the installed plan (its profile score of the experts outside the static plan, per layer
+    // of the pool; equal shares without a profile). `layers`: the layers of the class with positions, in the order of the
+    // result.
+    std::vector<int> x_class_shares_locked(size_t c, std::vector<int> & layers) const {
+        const size_t L = (size_t) geo_.n_layers, E = (size_t) geo_.n_experts;
+        const int cap = ub_->r_cap() - ub_->r_base();
+        const auto & sel = l1_->selected();
+        const bool scored = lend_scores_.size() == L*E;
+        layers.clear();
+        std::vector<double> mass;
+        std::vector<uint8_t> profiled;
+        for (size_t l = 0; l < L; ++l) {
+            if (geo_.layer_class[l] != (int) c || l >= ub_layer_.size() || !ub_layer_[l]) {
+                continue;
+            }
+            double m = 0.0, all = 0.0;
+            if (scored) {
+                std::vector<uint8_t> in(E, 0);
+                for (int32_t e : sel[l]) { if (e >= 0 && (size_t) e < E) { in[(size_t) e] = 1; } }
+                for (size_t e = 0; e < E; ++e) {
+                    all += (double) lend_scores_[l*E + e];
+                    m += in[e] ? 0.0 : (double) lend_scores_[l*E + e];
+                }
+            }
+            layers.push_back((int) l);
+            mass.push_back(m);
+            profiled.push_back(all > 0.0 ? 1 : 0);
+        }
+        // a layer without a profile (a draft model that joined without one) counts as an average layer of its class
+        l1_lru_fill_mass(mass, profiled);
+        return l1_lru_shares(mass, x_class_[c], cap);
+    }
+
+    // Whether an install gives the LRU part new shares: a decode plan with a profile. A prompt plan, a cold one or the
+    // install of a lend's evictions keeps the shares (each layer keeps its slots).
+    bool x_reshare_locked(ggml_expert_plan_id id, const plan_state & plan) const {
+        return id != GGML_EXPERT_PLAN_NONE && plan.bank < banks_.size() && !banks_[plan.bank].prompt && !plan.scores.empty();
+    }
+
+    // Before anything republishes the tables (a plan install, the install of a lend's evictions; the device idle, no
+    // region lent): the copies of the LRU part are set aside. Their table entries go back to their homes, as for a drop,
+    // and the positions stay, empty; x_restore_locked takes the copies back afterwards. Their bytes stay in their slots:
+    // only a lend writes the slots of the LRU part.
+    void x_release_locked(const char * why) {
+        x_saved_.clear();
+        x_saved_steps_.clear();
+        if (!x_on_ || !ub_) {
+            return;
+        }
+        ggml_cuda_set_device(device_);
+        xp_pause_locked(nullptr);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        std::vector<std::vector<ub_fixed_pos>> pos;
+        std::vector<uint32_t> steps;
+        if (!ub_->read_fixed(pos, steps)) {
+            abort_locked("L1 LRU part: the decode pool is lent while its copies are set aside");
+        }
+        x_saved_       = pos;
+        x_saved_steps_ = steps;
+        std::vector<std::pair<int, ub_fixed_pos>> drop;
+        for (size_t l = 0; l < pos.size(); ++l) {
+            for (ub_fixed_pos & x : pos[l]) {
+                if (x.owner >= 0) {
+                    drop.push_back({ (int) l, x });
+                    x.owner = -1;
+                    x.ring  = 0;
+                }
+            }
+        }
+        if (!drop.empty() && !ub_->set_fixed(pos, drop)) {
+            abort_locked("L1 LRU part: the copies set aside");
+        }
+        if (ub_cfg_.log) {
+            GGML_LOG_INFO("expert cache: L1 LRU part: %zu copies set aside (%s)\n", drop.size(), why);
+        }
+    }
+
+    // After the tables were published again (the device idle, no region lent): the copies set aside by x_release_locked
+    // come back where the step would still hold them (ub_pool::check_fixed): one now static leaves, one with a host home
+    // stays with that home, one the SSD worker serves stays as a ring copy while the ring admission is on, any other
+    // leaves. `reshare`: the shares follow the installed plan (l1_lru_reshare; nothing moves); otherwise every layer keeps
+    // its slots. Stamps, step counts and the ghost window are kept.
+    void x_restore_locked(const char * why, bool reshare) {
+        if (!x_on_ || !ub_) {
+            return;
+        }
+        const size_t L = (size_t) geo_.n_layers, nc = x_class_.size();
+        if (x_saved_.size() != L || x_slots_.size() != L) {
+            return;
+        }
+        if (reshare && x_lent_locked()) {
+            reshare = false;   // not expected: an install runs with the whole LRU part in place
+        }
+        const auto t0 = std::chrono::steady_clock::now();
+        ggml_cuda_set_device(device_);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        // the copies set aside: q[i] = (layer, expert), at[i] = (layer, position)
+        std::vector<std::pair<int, int>> q, at;
+        std::vector<std::vector<int>> qi(L);   // [layer][position] its index in q, -1 empty
+        for (size_t l = 0; l < L; ++l) {
+            qi[l].assign(x_saved_[l].size(), -1);
+            for (size_t p = 0; p < x_saved_[l].size(); ++p) {
+                if (x_saved_[l][p].owner >= 0) {
+                    qi[l][p] = (int) q.size();
+                    q.push_back({ (int) l, x_saved_[l][p].owner });
+                    at.push_back({ (int) l, (int) p });
+                }
+            }
+        }
+        std::vector<int> state;
+        std::vector<std::array<uint64_t, 3>> home;
+        if (!ub_->check_fixed(q, state, home)) {
+            abort_locked("L1 LRU part: the check of the copies set aside");
+        }
+        auto keepable = [&](int i) { return i >= 0 && (state[(size_t) i] == ub_fixed_home || state[(size_t) i] == ub_fixed_ring); };
+        size_t n_static = 0, n_none = 0, n_over = 0;
+        for (int st : state) {
+            n_static += st == ub_fixed_static ? 1 : 0;
+            n_none   += st == ub_fixed_none ? 1 : 0;
+        }
+        // [layer] its slots after the restore; [layer] slot -> the copy (its index in q) that stays in it
+        std::vector<std::vector<int>> slots(L);
+        std::vector<std::map<int, int>> copy_at(L);
+        if (reshare) {
+            std::vector<int> share(L, 0);
+            for (size_t c = 0; c < nc; ++c) {
+                std::vector<int> layers;
+                const std::vector<int> sh = x_class_shares_locked(c, layers);
+                // the shares of this class only: the free slots go to layers below their share, and a layer of another
+                // class (its share from the earlier round) must not take a slot of this one
+                std::vector<int> cshare(L, 0);
+                for (size_t i = 0; i < layers.size(); ++i) { share[(size_t) layers[i]] = sh[i]; cshare[(size_t) layers[i]] = sh[i]; }
+                std::vector<l1_lru_pos> in;
+                std::vector<uint8_t> ok;
+                std::vector<int> qof;
+                for (size_t l = 0; l < L; ++l) {
+                    if (geo_.layer_class[l] != (int) c) {
+                        continue;
+                    }
+                    for (size_t p = 0; p < x_saved_[l].size() && p < x_slots_[l].size(); ++p) {
+                        const int i = qi[l][p];
+                        l1_lru_pos x;
+                        x.layer = (int) l;
+                        x.slot  = x_slots_[l][p];
+                        x.owner = i >= 0 ? x_saved_[l][p].owner : -1;
+                        x.age   = i >= 0 ? x_saved_steps_[l] - x_saved_[l][p].stamp : 0;
+                        in.push_back(x);
+                        ok.push_back(keepable(i) ? 1 : 0);
+                        qof.push_back(i);
+                    }
+                }
+                const l1_lru_reshare_plan rp = l1_lru_reshare(in, ok, cshare, (int) L);
+                for (int k : rp.keep) { copy_at[(size_t) in[(size_t) k].layer][in[(size_t) k].slot] = qof[(size_t) k]; }
+                for (int d : rp.drop) { n_over += ok[(size_t) d] ? 1 : 0; }
+                for (size_t l = 0; l < L; ++l) {
+                    if (geo_.layer_class[l] == (int) c) { slots[l] = rp.layer_slots[l]; }
+                }
+            }
+            x_share_ = share;
+        } else {
+            for (size_t l = 0; l < L; ++l) {
+                slots[l] = x_slots_[l];
+                for (size_t p = 0; p < x_saved_[l].size() && p < x_slots_[l].size(); ++p) {
+                    if (keepable(qi[l][p])) { copy_at[l][x_slots_[l][p]] = qi[l][p]; }
+                }
+            }
+        }
+        std::vector<std::vector<ub_fixed_pos>> next(L);
+        size_t kept = 0, kept_ring = 0;
+        for (size_t l = 0; l < L; ++l) {
+            x_slots_[l] = slots[l];
+            for (int sl : slots[l]) {
+                ub_fixed_pos x = x_position_locked((int) l, sl);
+                const auto it = copy_at[l].find(sl);
+                if (it != copy_at[l].end()) {
+                    const size_t i = (size_t) it->second;
+                    const ub_fixed_pos & o = x_saved_[(size_t) at[i].first][(size_t) at[i].second];
+                    x.owner = o.owner;
+                    x.stamp = o.stamp;
+                    x.ring  = state[i] == ub_fixed_ring ? 1 : 0;
+                    for (int k = 0; k < 3; ++k) { x.home[k] = state[i] == ub_fixed_home ? home[i][(size_t) k] : 0; }
+                    ++kept;
+                    kept_ring += x.ring ? 1 : 0;
+                }
+                next[l].push_back(x);
+            }
+        }
+        if (!ub_->set_fixed(next, {})) {
+            abort_locked("L1 LRU part: the copies back");
+        }
+        const size_t before = q.size();
+        x_saved_.clear();
+        x_saved_steps_.clear();
+        x_kept_    += kept;
+        x_dropped_ += before - kept;
+        std::vector<int> sorted;
+        for (size_t l = 0; l < L; ++l) { if (!x_slots_[l].empty()) { sorted.push_back((int) x_slots_[l].size()); } }
+        std::sort(sorted.begin(), sorted.end());
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        GGML_LOG_INFO("expert cache: L1 LRU part kept through the %s: %zu of %zu copies stay (%zu ring copies); left: %zu "
+                      "static now, %zu without a home, %zu over the new shares; shares %s, %d/%d/%d slots per layer "
+                      "(min/median/max), nothing moved, in %.1f ms\n", why, kept, before, kept_ring, n_static, n_none, n_over,
+            reshare ? "of the installed plan" : "kept", sorted.empty() ? 0 : sorted.front(),
+            sorted.empty() ? 0 : sorted[sorted.size()/2], sorted.empty() ? 0 : sorted.back(), ms);
+    }
+
+    // The device idle, no region and nothing of the LRU part lent: the shares of the installed plan (its profile score of
+    // the experts outside the static plan, per layer of the pool), every position empty.
+    void x_layout_locked(const char * why) {
+        if (!x_on_ || !ub_) {
+            return;
+        }
+        x_drop_locked(why);
+        const size_t L = (size_t) geo_.n_layers, E = (size_t) geo_.n_experts, nc = x_class_.size();
+        const bool scored = lend_scores_.size() == L*E;
+        x_saved_.clear();
+        x_share_.assign(L, 0);
+        x_slots_.assign(L, {});
+        x_top_.assign(nc, 0);
+        std::vector<std::vector<ub_fixed_pos>> pos(L);
+        int lo = INT32_MAX, hi = 0, n_layers = 0, total = 0;
+        for (size_t c = 0; c < nc; ++c) {
+            const int base = l1_->lru_base((int) c);
+            x_top_[c] = base + x_class_[c];
+            std::vector<int> layers;
+            const std::vector<int> share = x_class_shares_locked(c, layers);
+            const std::vector<std::vector<int>> slots = l1_lru_layout(share, base);
+            for (size_t i = 0; i < layers.size(); ++i) {
+                const size_t l = (size_t) layers[i];
+                x_share_[l] = share[i];
+                x_slots_[l] = slots[i];
+                for (int sl : slots[i]) { pos[l].push_back(x_position_locked((int) l, sl)); }
+                lo = std::min(lo, share[i]);
+                hi = std::max(hi, share[i]);
+                total += share[i];
+                ++n_layers;
+            }
+        }
+        if (!ub_->set_fixed(pos, {})) {
+            abort_locked("L1 LRU part: the layout");
+        }
+        std::vector<int> sorted(x_share_);
+        sorted.erase(std::remove_if(sorted.begin(), sorted.end(), [](int v) { return v == 0; }), sorted.end());
+        std::sort(sorted.begin(), sorted.end());
+        GGML_LOG_INFO("expert cache: L1 LRU part laid out (%s): %d slots over %d layers, %d/%d/%d per layer (min/median/max), "
+                      "shares by %s\n", why, total, n_layers, n_layers ? lo : 0, sorted.empty() ? 0 : sorted[sorted.size()/2], hi,
+            scored ? "the plan's selections outside the static plan" : "equal shares (no profile)");
+    }
+
+    // A lend takes the slots at and above top[c] of every class (the device idle, no region lent): the most recently
+    // used copies of the LRU part stay, moved into the slots below the top whose copies leave or that are empty.
+    void x_shrink_locked(const std::vector<int> & top) {
+        if (!x_on_ || !ub_ || x_top_.empty()) {
+            return;
+        }
+        const auto t0 = std::chrono::steady_clock::now();
+        const size_t L = (size_t) geo_.n_layers, nc = x_class_.size();
+        bool any = false;
+        for (size_t c = 0; c < nc; ++c) { any = any || (c < top.size() && top[c] < x_top_[c]); }
+        if (!any) {
+            return;
+        }
+        ggml_cuda_set_device(device_);
+        xp_pause_locked(nullptr);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        std::vector<std::vector<ub_fixed_pos>> pos;
+        std::vector<uint32_t> steps;
+        if (!ub_->read_fixed(pos, steps)) {
+            abort_locked("L1 LRU part: the decode pool is lent while a lend takes its slots");
+        }
+        std::vector<std::vector<ub_fixed_pos>> next = pos;
+        std::vector<std::pair<int, ub_fixed_pos>> drop;
+        size_t taken = 0, kept = 0, moved = 0, moved_bytes = 0;
+        for (size_t c = 0; c < nc; ++c) {
+            if (c >= top.size() || top[c] >= x_top_[c]) {
+                continue;
+            }
+            const int base = l1_->lru_base((int) c);
+            const int t = std::max(top[c], base);
+            taken += (size_t) (x_top_[c] - t);
+            // every position of the class
+            std::vector<l1_lru_pos> in;
+            std::vector<std::pair<int, int>> where;   // (layer, position)
+            for (size_t l = 0; l < L; ++l) {
+                if (geo_.layer_class[l] != (int) c) {
+                    continue;
+                }
+                for (size_t p = 0; p < pos[l].size() && p < x_slots_[l].size(); ++p) {
+                    l1_lru_pos x;
+                    x.layer = (int) l;
+                    x.slot  = x_slots_[l][p];
+                    x.owner = pos[l][p].owner;
+                    x.age   = x.owner >= 0 ? steps[l] - pos[l][p].stamp : 0;
+                    in.push_back(x);
+                    where.push_back({ (int) l, (int) p });
+                }
+            }
+            const l1_lru_shrink_plan sp = l1_lru_shrink(in, t, (int) L);
+            std::vector<std::pair<int, int>> moves;
+            for (const auto & m : sp.moves) { moves.push_back({ m[0], m[1] }); }
+            if (!moves.empty() && !l1_->copy_slots((int) c, moves)) {
+                abort_locked("L1 LRU part: the moves of a lend");
+            }
+            moved += moves.size();
+            moved_bytes += moves.size()*geo_.class_vram_bytes((int) c);
+            kept += sp.keep.size();
+            for (int i : sp.drop) {
+                drop.push_back({ where[(size_t) i].first, pos[(size_t) where[(size_t) i].first][(size_t) where[(size_t) i].second] });
+            }
+            // the kept copies by their slot after the moves
+            std::vector<int> kept_at((size_t) (x_top_[c] - base), -1);
+            for (int i : sp.keep) { kept_at[(size_t) (sp.slot_of[(size_t) i] - base)] = i; }
+            for (size_t l = 0; l < L; ++l) {
+                if (geo_.layer_class[l] != (int) c) {
+                    continue;
+                }
+                next[l].clear();
+                x_slots_[l] = sp.layer_slots[l];
+                for (int sl : x_slots_[l]) {
+                    ub_fixed_pos x = x_position_locked((int) l, sl);
+                    const int i = kept_at[(size_t) (sl - base)];
+                    if (i >= 0) {
+                        const ub_fixed_pos & o = pos[(size_t) where[(size_t) i].first][(size_t) where[(size_t) i].second];
+                        x.owner = o.owner;
+                        x.stamp = o.stamp;
+                        x.ring  = o.ring;
+                        for (int k = 0; k < 3; ++k) { x.home[k] = o.home[k]; }
+                    }
+                    next[l].push_back(x);
+                }
+            }
+            x_top_[c] = t;
+        }
+        if (!ub_->set_fixed(next, drop)) {
+            abort_locked("L1 LRU part: the shrink of a lend");
+        }
+        ++x_lends_;
+        x_moved_ += moved;
+        x_dropped_ += drop.size();
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        GGML_LOG_INFO("expert cache: L1 LRU part: a lend takes %zu of its slots (%s per class left): %zu copies stay (the most "
+                      "recently used; %zu moved down, %.1f MiB), %zu dropped without a write back, in %.1f ms\n", taken,
+            split_text(x_top_).c_str(), kept, moved, moved_bytes/1048576.0, drop.size(), ms);
+    }
+
+    // The lend ended (the device idle, no region lent): the slots it took return empty to the layers below their share.
+    void x_revive_locked() {
+        if (!x_on_ || !ub_ || !x_lent_locked()) {
+            return;
+        }
+        ggml_cuda_set_device(device_);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        if (ub_->lent()) {
+            ub_reclaim_sync_locked("the L1 LRU part comes back");
+        }
+        std::vector<std::vector<ub_fixed_pos>> pos;
+        std::vector<uint32_t> steps;
+        if (!ub_->read_fixed(pos, steps)) {
+            abort_locked("L1 LRU part: the decode pool is lent while its slots come back");
+        }
+        const size_t L = (size_t) geo_.n_layers, nc = x_class_.size();
+        size_t back = 0;
+        for (size_t c = 0; c < nc; ++c) {
+            const int full = l1_->lru_base((int) c) + x_class_[c];
+            if (x_top_[c] >= full) {
+                continue;
+            }
+            std::vector<int> returned;
+            for (int sl = x_top_[c]; sl < full; ++sl) { returned.push_back(sl); }
+            back += returned.size();
+            std::vector<std::vector<int>> slots;
+            std::vector<int> share, layers;
+            for (size_t l = 0; l < L; ++l) {
+                if (geo_.layer_class[l] != (int) c || x_share_[l] == 0) {
+                    continue;
+                }
+                layers.push_back((int) l);
+                slots.push_back(x_slots_[l]);
+                share.push_back(x_share_[l]);
+            }
+            l1_lru_revive(slots, share, returned);
+            for (size_t i = 0; i < layers.size(); ++i) {
+                const size_t l = (size_t) layers[i];
+                for (size_t p = x_slots_[l].size(); p < slots[i].size(); ++p) {
+                    pos[l].push_back(x_position_locked((int) l, slots[i][p]));
+                }
+                x_slots_[l] = slots[i];
+            }
+            x_top_[c] = full;
+        }
+        if (!ub_->set_fixed(pos, {})) {
+            abort_locked("L1 LRU part: the slots coming back");
+        }
+        if (ub_cfg_.log) {
+            GGML_LOG_INFO("expert cache: L1 LRU part: %zu slots back from the lend, empty\n", back);
+        }
     }
 
     void allocate_ub_pool_locked() {
@@ -2724,10 +3314,12 @@ public:
         }
         if (tier_ && !tier_->class_layout()) {
             GGML_LOG_WARN("expert cache: decode pool needs the class layout of the SSD tier; off\n");
+            x_off_locked("no decode pool");
             return;
         }
         if (geo_.n_experts > ub_pool_max_experts) {
             GGML_LOG_WARN("expert cache: decode pool supports up to %d experts per layer; off\n", ub_pool_max_experts);
+            x_off_locked("no decode pool");
             return;
         }
         const int L = geo_.n_layers;
@@ -2759,12 +3351,21 @@ public:
         std::vector<std::array<size_t, 3>> bytes((size_t) L, {0, 0, 0}), tails((size_t) L, {0, 0, 0});
         ub_layer_.assign((size_t) L, 0);
         ub_n_layers_ = 0;
-        for (int l = mb.offset; l < mb.offset + mb.geo.n_layers && l < L; ++l) {
+        // The layers of a joined model (a draft model) get the fixed positions of the LRU part only, no lent region: its
+        // experts all come from the SSD tier's ring (unified host policy, ring admission), never from a host arena it has
+        // no tensors for yet. Only the classes that have LRU slots.
+        const bool joined_ok = x_on_ && tier_ && tier_->unified() && ub_cfg_.ring;
+        for (int l = 0; l < L; ++l) {
             const int cls = geo_.layer_class[l];
+            const bool first = l >= mb.offset && l < mb.offset + mb.geo.n_layers;
             if (cls < 0 || early[(size_t) l] || (!stage_index_.empty() && stage_index_[(size_t) l] >= 0)) {
                 continue;
             }
+            if (!first && (!joined_ok || (size_t) cls >= x_class_.size() || x_class_[(size_t) cls] <= 0)) {
+                continue;
+            }
             ub_pool_layer & u = layers[(size_t) l];
+            u.no_lend = first ? 0 : 1;
             bool ok = true;
             for (int k = 0; k < geometry::n_kinds && ok; ++k) {
                 const ggml_cuda_expert_lookup lk = l1_->lookup(l, k);
@@ -2794,12 +3395,21 @@ public:
         }
         if (ub_n_layers_ == 0) {
             GGML_LOG_WARN("expert cache: decode pool: no routed layer can take positions; off\n");
+            x_off_locked("no decode pool");
             return;
         }
-        ub_.reset(new ub_pool(L, geo_.n_experts, ub_cfg_.r_cap));
+        // the LRU part's positions come first in each layer: at most ub_pool_max_rcap in all
+        int r_alloc = ub_cfg_.r_cap;
+        if (x_on_) {
+            int most = 0;
+            for (int x : x_class_) { most = std::max(most, x); }
+            r_alloc = std::min(ub_pool_max_rcap, ub_cfg_.r_cap + most);
+        }
+        ub_.reset(new ub_pool(L, geo_.n_experts, r_alloc, ub_cfg_.r_cap));
         if (!ub_->allocate(device_, layers, bytes, tails, ub_cfg_.ghost)) {
             ub_.reset();
             GGML_LOG_WARN("expert cache: decode pool: state not allocated; off\n");
+            x_off_locked("no decode pool");
             return;
         }
         if (tier_) {
@@ -2820,6 +3430,9 @@ public:
                 GGML_LOG_WARN("expert cache: decode pool: ring admission is off: %s\n", why);
             }
         }
+        if (x_on_ && tier_ && tier_->unified() && !ub_->ring()) {
+            x_off_locked("the unified host policy serves every host expert from the rings and the ring admission is off");
+        }
         ub_member_ = 0;
         ub_rows_   = ub_cfg_.rows > 0 ? ub_cfg_.rows : (int) std::max<uint64_t>(cfg_.l2_decode_rows, 1);
         ub_on_.store(true, std::memory_order_release);
@@ -2829,9 +3442,10 @@ public:
         } else {
             snprintf(filter_text, sizeof(filter_text), "none");
         }
-        GGML_LOG_INFO("expert cache: decode pool on: %d layers, up to %d positions each, launches of up to %d rows, "
-                      "%zu KiB of state, admission filter %s%s%s\n", ub_n_layers_, ub_cfg_.r_cap, ub_rows_,
-            ub_->device_bytes()/1024, filter_text, own_tables ? ", own address tables" : "",
+        GGML_LOG_INFO("expert cache: decode pool on: %d layers, up to %d positions each%s, launches of up to %d rows, "
+                      "%zu KiB of state, admission filter %s%s%s\n", ub_n_layers_, ub_cfg_.r_cap,
+            x_on_ ? (" after those of the L1 LRU part (at most " + std::to_string(r_alloc - ub_cfg_.r_cap) + ")").c_str() : "",
+            ub_rows_, ub_->device_bytes()/1024, filter_text, own_tables ? ", own address tables" : "",
             ub_->ring() ? ", ring occupants admitted" : "");
         xp_start_locked();
     }
@@ -2934,7 +3548,7 @@ public:
         xp_reset_.assign((size_t) geo_.n_layers*3, 0);
         xp_layers_.clear();
         for (int l = 0; l < geo_.n_layers; ++l) {
-            if (ub_layer_[(size_t) l]) {
+            if (ub_layer_[(size_t) l] && member_of_layer(l) == ub_member_) {   // the layers of a joined model do not prefetch
                 xp_layers_.push_back(l);
             }
         }
@@ -3708,6 +4322,7 @@ private:
             // its host residents are addressed at them
             if (!tier_->worker_running()) {
                 ub_reclaim_sync_locked("model join");
+                x_drop_locked("model join");
                 tier_->refresh_addresses();
             }
         }
@@ -3969,6 +4584,7 @@ private:
         const auto t0 = std::chrono::steady_clock::now();
         tier_->stop_worker();
         ub_reclaim_sync_locked("model join");
+        x_drop_locked("model join");
         ggml_cuda_set_device(device_);
         CUDA_CHECK(cudaDeviceSynchronize());
         const expert_slot_table gpu_slots = l1_->host_slots();
@@ -5395,6 +6011,12 @@ private:
             fixed.fixed_capacities = &capacities_;
             initial = plan_placement(fixed);
         }
+        if (x_carve_locked()) {
+            // the same for the LRU part of L1: the static plans keep the rest
+            placement_inputs fixed = in;
+            fixed.fixed_capacities = &capacities_;
+            initial = plan_placement(fixed);
+        }
 
         std::vector<int> host_capacities(geo_.class_bytes.size(), 0);
         for (int cls = 0; cls < (int) geo_.class_bytes.size(); ++cls) {
@@ -5420,7 +6042,8 @@ private:
 
         if (!allocate_profiler_locked()) { return false; }
         l1_.reset(new l1_arena(geo_));
-        if (!l1_->allocate(capacities_, device_, cfg_.spare_slots, stage_class_slots_.empty() ? nullptr : &stage_class_slots_)) {
+        if (!l1_->allocate(capacities_, device_, cfg_.spare_slots, stage_class_slots_.empty() ? nullptr : &stage_class_slots_,
+                x_class_.empty() ? nullptr : &x_class_)) {
             l1_.reset();
             profiler_.reset();
             disable_locked("arena allocation failed");
@@ -5916,6 +6539,15 @@ private:
     std::map<ggml_expert_plan_id, plan_state> plans_;
     ggml_expert_plan_id next_plan_id_  = 0;
     ggml_expert_plan_id installed_plan_ = GGML_EXPERT_PLAN_NONE;
+    // the LRU part of L1 (--expert-l1-lru-pct, expert-l1-lru.h): decode pool positions in L1 slots
+    bool x_on_ = false;
+    std::vector<int> x_class_;               // [class] its slots (above the static capacity and the spares)
+    std::vector<int> x_share_;               // [layer] the share of the last layout
+    std::vector<std::vector<int>> x_slots_;  // [layer] its slots now, in the order of its positions
+    std::vector<int> x_top_;                 // [class] the slots at and above it are lent (base + x_class_ when none)
+    uint64_t x_lends_ = 0, x_moved_ = 0, x_dropped_ = 0, x_kept_ = 0;
+    std::vector<std::vector<ub_fixed_pos>> x_saved_;   // [layer] the positions set aside by x_release_locked
+    std::vector<uint32_t> x_saved_steps_;              // [layer] the step count then
     // decode pool (expert-ub-pool.cuh)
     ub_pool_config ub_cfg_;
     std::unique_ptr<ub_pool> ub_;

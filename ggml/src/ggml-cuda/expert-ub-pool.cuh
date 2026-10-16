@@ -102,6 +102,7 @@ struct ub_pool_layer {
     const int32_t *  slots = nullptr;     // VRAM slot table of the layer (L1 residents)
     const uint32_t * serve = nullptr;     // SSD tier: experts only the worker places; null = none
     int32_t          enabled = 0;
+    int32_t          no_lend = 0;         // positions of the fixed part only: a lent region gives this layer none (a joined model)
 };
 
 struct ub_pool_meta {
@@ -228,6 +229,13 @@ static constexpr int32_t ub_pending = -2;   // owner of a position reserved by t
 // the positions of a lent region after them. A lend lays out its region after them and a reclaim gives back only the
 // region's positions; the ring bitmap is then rebuilt from the fixed ones. No tail is zeroed in an L1 slot (the bytes
 // past it are the next slot).
+enum ub_fixed_state : int32_t {
+    ub_fixed_none = 0,
+    ub_fixed_static,
+    ub_fixed_home,
+    ub_fixed_ring,
+};
+
 struct ub_fixed_pos {
     int32_t  owner   = -1;      // the expert, -1 empty
     uint32_t stamp   = 0;
@@ -290,6 +298,12 @@ public:
     //     it came from the ring). The positions of a layer may not exceed r_cap - r_base.
     bool read_fixed(std::vector<std::vector<ub_fixed_pos>> & pos, std::vector<uint32_t> & steps) const;
     bool set_fixed(const std::vector<std::vector<ub_fixed_pos>> & pos, const std::vector<std::pair<int, ub_fixed_pos>> & drop);
+    //   check_fixed: for each (layer, expert) of `q`, whether a copy of it may stay in a fixed position after the tables were
+    //     published again (an install): ub_fixed_static (an L1 resident now: the copy leaves), ub_fixed_home (a host home
+    //     the step admits: the copy stays, `home` its entries now), ub_fixed_ring (the SSD worker serves it and the ring
+    //     admission is on: the copy stays as a ring copy, home 0), ub_fixed_none (the copy leaves). Device idle, nothing of
+    //     the pool's own in the tables (no fixed owner, no region lent).
+    bool check_fixed(const std::vector<std::pair<int, int>> & q, std::vector<int> & state, std::vector<std::array<uint64_t, 3>> & home) const;
     int  fixed(int layer) const { return fixed_.empty() ? 0 : fixed_[(size_t) layer]; }
     int  fixed_max() const { return fixed_max_; }
     int  r_base() const { return r_base_; }
