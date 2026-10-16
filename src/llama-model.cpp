@@ -3487,6 +3487,22 @@ int32_t llama_model_dflash_selector_top_k(const llama_model * model) {
     return model->hparams.dflash_selector_top_k;
 }
 
+// ranma: the DSpark DSV4 draft (load_arch_hparams of llama_model_dflash) attends a standard sliding window on every stage,
+// over the uncompressed KV that the injection of each target row writes for that row alone: a query at position p reads
+// the rows after p - n_swa, so the newest n_swa rows of the target features are all a later query can reach
+int32_t llama_model_dflash_feature_window(const llama_model * model) {
+    const auto & hp = model->hparams;
+    if (model->arch != LLM_ARCH_DFLASH || hp.dsv4_hc_mult == 0 || hp.swa_type != LLAMA_SWA_TYPE_STANDARD || hp.n_swa == 0) {
+        return 0;
+    }
+    for (uint32_t il = 0; il < hp.n_layer(); ++il) {
+        if (!hp.is_swa(il) || hp.dsv4_compress_ratios[il] != 0) {
+            return 0;
+        }
+    }
+    return (int32_t) hp.n_swa;
+}
+
 int32_t llama_model_n_head(const llama_model * model) {
     return model->hparams.n_head();
 }

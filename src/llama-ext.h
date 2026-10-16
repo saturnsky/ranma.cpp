@@ -193,6 +193,22 @@ LLAMA_API void llama_set_embeddings_layer_inp(struct llama_context * ctx, uint32
 // LLAMA_API float * llama_get_embeddings(struct llama_context * ctx);
 LLAMA_API float * llama_get_embeddings_layer_inp(struct llama_context * ctx, uint32_t lid);
 
+// ranma: the layer inputs only of the last n_last rows of every sequence in a call (0: every row, the default). A drafter
+// that reads target features of a recent window only (a DSpark draft of sliding-window stages) sets it; a model that
+// computes only what its outputs need (the exact tail prefill of DeepSeek-V4.1) then computes those rows as well. The
+// rows are then read with llama_get_embeddings_layer_inp_row, not llama_get_embeddings_layer_inp.
+LLAMA_API void llama_set_embeddings_layer_inp_last(struct llama_context * ctx, uint32_t n_last);
+
+// ranma: the input embedding of layer lid for batch row i of the last call, nullptr when the call did not make it (a row
+// outside the window of llama_set_embeddings_layer_inp_last, a layer not extracted). Call llama_synchronize first: it
+// does not wait for the copies itself.
+LLAMA_API float * llama_get_embeddings_layer_inp_row(struct llama_context * ctx, uint32_t lid, int32_t i);
+
+// ranma: the rows of target features a draft model reads back from the newest position: its attention window when every
+// stage of the draft attends a sliding window over uncompressed KV of the injected features alone (the DSpark DSV4 draft),
+// else 0 (it reads every row)
+LLAMA_API int32_t llama_model_dflash_feature_window(const struct llama_model * model);
+
 LLAMA_API llama_context * llama_get_ctx_other(struct llama_context * ctx);
 
 //

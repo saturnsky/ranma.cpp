@@ -61,6 +61,9 @@ struct llama_cparams {
     size_t moe_cache_size;
 
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
+    // ranma: 0, or the layer inputs only of the last this many rows of every sequence in a call
+    // (llama_set_embeddings_layer_inp_last)
+    uint32_t embeddings_layer_inp_last;
 
     enum llama_ple_prefetch ple_prefetch;
     enum llama_context_type ctx_type;
