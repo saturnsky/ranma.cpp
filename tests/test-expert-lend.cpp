@@ -2,9 +2,11 @@
 //   P1: the pieces evict the lowest ranked L1 residents first and take contiguous ranges at the top of each class;
 //       nothing is lent from host memory;
 //   P2: the width rule: the fewest passes whose pieces L1 holds (all of them in L1), in equal shares;
-//   P3: the release does not refill; a decode launch restores an evicted expert only when it reads it, into its own
-//       lent slot, and a later lend takes the restore space back.
+//   P3: the release does not refill; the lent slots are a restore space: a decode launch copies a wanted evicted expert
+//       (the decode plan's) in when it reads it and pins it, other misses use the rest as an LRU cache (empty slots
+//       first, then the least recently used unpinned slot); a later lend takes the space back.
 
+#include "expert-l2-class-ledger.h"
 #include "expert-lend.h"
 #include "expert-plan.h"
 #include "expert-redraw.h"
@@ -13,6 +15,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <functional>
 #include <random>
 #include <set>
 #include <string>
@@ -24,6 +27,7 @@ static int g_fail = 0;
 static bool g_quiet = false;
 // the paths a run took (each must be taken at least once)
 static int n_l1_plans = 0, n_l1_regrow = 0, n_multi_pass = 0, n_restores = 0, n_sticky = 0, n_bounds = 0, n_wanted = 0;
+static int n_lru_evictions = 0, n_lru_full = 0, n_space_short = 0, n_space_pinned_kept = 0;
 static int n_untied = 0;   // plans that gave victims of their last tie back
 #define CHECK(x) do { if (!(x)) { if (!g_quiet) { fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #x); } ++g_fail; return false; } } while (0)
 
@@ -93,10 +97,10 @@ sim_l1 make_l1(std::mt19937 & rng, int n_cls, int layers, int experts, bool ties
     return s;
 }
 
-// P1: the victims are the lowest ranked residents, over every class, and nothing ranked lower stays (by score: in
+// P1: the victims are the lowest ranked residents, over every class, and nothing ranked lower stays (by tier and score: in
 // the last tie the plan keeps the residents of a class the pieces do not need, whatever their layer and id)
 static bool rank_below(const lend_resident & a, const lend_resident & b) {
-    return a.score < b.score;
+    return a.tier != b.tier ? a.tier < b.tier : a.score < b.score;
 }
 
 bool check_rank(const std::vector<lend_class> & cls, const lend_l1_plan & p) {
@@ -470,107 +474,232 @@ bool test_width_examples() {
 }
 
 // ---- P3: the restore space ----
+
+// The space of one class as the kernels hold it, and the oracle checks of one launch.
+struct sim_space {
+    int first = 0, n = 0;
+    std::vector<int32_t> own, pin;
+    std::vector<uint32_t> stamp;
+    uint32_t clock = 0;
+    void open(int f, int count) { first = f; n = count; own.assign((size_t) n, -1); pin.assign((size_t) n, 0); stamp.assign((size_t) n, 0); clock = 0; }
+    int pinned() const { int k = 0; for (int j = 0; j < n; ++j) { k += own[(size_t) j] >= 0 && pin[(size_t) j] ? 1 : 0; } return k; }
+};
+
+// One launch through lend_space_step, checked against what the policy promises: wanted experts first; an empty slot
+// before any occupant is replaced; a replaced occupant is the least recently used unpinned slot this launch does not
+// read; a pinned slot is never replaced; an LRU copy only after a miss within the ghost window. Applies the publish.
+bool space_launch(sim_space & sp, int layer, int E, const std::vector<int32_t> & ids, int rows, int used,
+                  std::vector<std::vector<int32_t>> & dev, std::vector<std::vector<int32_t>> & want,
+                  std::vector<std::vector<uint32_t>> & last_miss, std::vector<uint32_t> & step, uint32_t ghost,
+                  const std::function<bool(int)> & readable, int & n_copies, int & n_evict, int & n_wanted_copies) {
+    std::vector<int32_t> own0 = sp.own, pin0 = sp.pin;
+    std::vector<uint32_t> stamp0 = sp.stamp;
+    std::vector<uint32_t> lm0 = last_miss[(size_t) layer];
+    const uint32_t st = step[(size_t) layer] + 1, t = sp.clock + 1;
+    // the slots this launch reads (hits) are not victims
+    std::set<int> hit_j;
+    for (int32_t e : ids) {
+        const int32_t g = dev[(size_t) layer][(size_t) e];
+        if (g >= sp.first && g < sp.first + sp.n && own0[(size_t) (g - sp.first)] == layer*E + e) { hit_j.insert(g - sp.first); }
+    }
+    lend_space_copy out[lend_space_max_ids];
+    const int n = lend_space_step(ids.data(), rows, used, used, E, layer, dev[(size_t) layer].data(), want[(size_t) layer].data(),
+        last_miss[(size_t) layer].data(), &step[(size_t) layer], ghost, sp.first, sp.n, sp.own.data(), sp.pin.data(),
+        sp.stamp.data(), &sp.clock, [&](int e) { return readable(e); }, out, lend_space_max_ids);
+    CHECK(sp.clock == t && step[(size_t) layer] == st);
+    int empties = 0;
+    for (int j = 0; j < sp.n; ++j) { empties += own0[(size_t) j] < 0 ? 1 : 0; }
+    bool lru_seen = false;
+    std::set<int> taken;
+    for (int i = 0; i < n; ++i) {
+        const lend_space_copy & c = out[i];
+        CHECK(std::find(ids.begin(), ids.end(), c.expert) != ids.end());
+        CHECK(dev[(size_t) layer][(size_t) c.expert] < 0 && readable(c.expert));
+        CHECK(taken.insert(c.j).second);
+        if (!c.wanted) {
+            lru_seen = true;
+            CHECK(lend_space_admit(false, lm0[(size_t) c.expert], st, ghost, true, lend_rows_with(ids.data(), rows, used, used, c.expert)));
+        } else {
+            CHECK(!lru_seen);   // the wanted first
+        }
+        // an empty slot first, in index order
+        if (i < empties) {
+            CHECK(c.evicted < 0 && own0[(size_t) c.j] < 0);
+        } else {
+            CHECK(c.evicted >= 0 && !pin0[(size_t) c.j] && hit_j.count(c.j) == 0);
+            // the least recently used of the unpinned slots not read now and not taken before it
+            for (int j = 0; j < sp.n; ++j) {
+                if (own0[(size_t) j] >= 0 && !pin0[(size_t) j] && hit_j.count(j) == 0 && taken.count(j) == 0) {
+                    CHECK(stamp0[(size_t) c.j] <= stamp0[(size_t) j]);
+                }
+            }
+            ++n_evict;
+            const int ol = c.evicted/E, oe = c.evicted%E;
+            CHECK(dev[(size_t) ol][(size_t) oe] == sp.first + c.j);
+            dev[(size_t) ol][(size_t) oe] = -1;
+        }
+        n_wanted_copies += c.wanted;
+        ++n_copies;
+    }
+    // a wanted readable miss that got no slot: every slot was pinned or read now
+    for (int32_t e : ids) {
+        if (dev[(size_t) layer][(size_t) e] < 0 && want[(size_t) layer][(size_t) e] >= 0 && readable(e)) {
+            bool placed = false;
+            for (int i = 0; i < n; ++i) { placed = placed || out[i].expert == e; }
+            if (!placed) {
+                for (int j = 0; j < sp.n; ++j) { CHECK(sp.own[(size_t) j] >= 0 && (sp.pin[(size_t) j] || sp.stamp[(size_t) j] == t)); }
+            }
+        }
+    }
+    // the publish of the copy kernel's last block
+    for (int i = 0; i < n; ++i) { dev[(size_t) layer][(size_t) out[i].expert] = sp.first + out[i].j; }
+    // the tables and the space agree; a slot holds one expert
+    for (int j = 0; j < sp.n; ++j) {
+        const int32_t o = sp.own[(size_t) j];
+        if (o >= 0) { CHECK(dev[(size_t) (o/E)][(size_t) (o%E)] == sp.first + j); }
+    }
+    return true;
+}
+
 bool test_restore(uint32_t seed) {
     std::mt19937 rng(seed);
-    sim_l1 s = make_l1(rng, 1 + (int) (rng() % 2), 6, 40, seed % 2 == 0);
+    sim_l1 s = make_l1(rng, 1, 6, 40, seed % 2 == 0);
     lend_book book;
     book.slots = s.slots;
     book.limit = s.slots;
     std::vector<size_t> pieces = { (size_t) (1 + rng() % 200000), (size_t) (1 + rng() % 200000), (size_t) (rng() % 100000) };
     const lend_l1_plan p = plan_l1_lend(s.classes(book.limit), pieces, 256);
-    if (!p.ok) {
+    if (!p.ok || p.victims.empty()) {
         return true;
     }
-    const auto residents_before = s.table;
     if (!apply_evacuation(s, p)) { return false; }
-    const void * ctx_a = &book, * ctx_b = &s;
-    CHECK(book.hold(p.limit, p.victims, ctx_a, true));
-    CHECK(!book.hold(p.limit, {}, ctx_b, false));                  // one lease at a time
-    CHECK(book.state == lend_state::held && book.explicit_);
+    CHECK(book.hold(p.limit, p.victims, &book, true));
+    CHECK(!book.hold(p.limit, {}, &s, false));                     // one lease at a time
     const uint64_t epoch = book.epoch;
-    // the release: the regions become the restore space, nothing is copied yet
-    CHECK(book.open_restore(s.layer_class));
+    const int E = s.experts;
+    std::vector<uint8_t> want_plan((size_t) s.layers*E, 0);
+    for (const auto & v : p.victims) {
+        if (rng() % 3) { want_plan[(size_t) v.layer*E + v.expert] = 1; }
+    }
+    CHECK(book.open_restore(s.layer_class, &want_plan, E));
     CHECK(book.state == lend_state::restore && book.owner == nullptr);
-    CHECK(book.restore.size() == p.victims.size());                // one victim per lent slot
-    std::set<std::pair<int, int>> slot_used;
-    for (const auto & r : book.restore) {
-        CHECK(r.slot >= book.limit[(size_t) r.cls] && r.slot < book.slots[(size_t) r.cls]);
-        CHECK(slot_used.insert({r.cls, r.slot}).second);
-        CHECK(residents_before[(size_t) r.layer][(size_t) r.expert] >= 0);   // it was an L1 resident before the lend
-    }
-    // highest rank gets the lowest slot of its class
-    for (size_t i = 1; i < book.restore.size(); ++i) {
-        const auto & a = book.restore[i - 1], & b = book.restore[i];
-        if (a.cls == b.cls) {
-            CHECK(a.slot < b.slot);
-        }
-    }
-    // the device tables of the decode: the mirror plus the restored copies
-    const size_t E = (size_t) s.experts;
+    sim_space sp;
+    sp.open(book.limit[0], book.slots[0] - book.limit[0]);
     std::vector<std::vector<int32_t>> dev = s.table;
-    std::vector<std::vector<int32_t>> rest((size_t) s.layers, std::vector<int32_t>(E, -1));
-    for (const auto & r : book.restore) { rest[(size_t) r.layer][(size_t) r.expert] = r.slot; }
+    std::vector<std::vector<int32_t>> want((size_t) s.layers, std::vector<int32_t>((size_t) E, -1));
+    for (const auto & r : book.restore) { want[(size_t) r.layer][(size_t) r.expert] = 1; }
+    std::vector<std::vector<uint32_t>> last_miss((size_t) s.layers, std::vector<uint32_t>((size_t) E, lend_never));
+    std::vector<uint32_t> step((size_t) s.layers, 0);
+    const uint32_t ghost = seed % 4 == 0 ? 0 : 8;
+    // an expert without a source (no address, no host slot) is never copied
+    const int unreadable = (int) (rng() % E);
+    auto readable = [&](int e) { return e != unreadable; };
     // no refill: no victim is in a table before a decode launch reads it
     for (const auto & v : p.victims) { CHECK(dev[(size_t) v.layer][(size_t) v.expert] < 0); }
-    std::set<std::pair<int, int>> read, restored;
-    for (int t = 0; t < 200; ++t) {
+    int n_copies = 0, n_evict = 0, n_wanted = 0;
+    for (int tok = 0; tok < 300; ++tok) {
         const int used = 4, rows = 1 + (int) (rng() % 2);
         for (int l = 0; l < s.layers; ++l) {
             std::vector<int32_t> ids((size_t) rows*used);
-            for (auto & id : ids) { id = (int32_t) (rng() % E); }
-            // a duplicate in a launch is restored once
-            if (rows*used >= 2) { ids[1] = ids[0]; }
-            int32_t list[64];
-            const int n = lend_restore_list(ids.data(), rows, used, used, (int) E, rest[(size_t) l].data(), dev[(size_t) l].data(), list, 64);
-            std::set<int32_t> seen;
-            for (int i = 0; i < n; ++i) {
-                CHECK(seen.insert(list[i]).second);
-                CHECK(std::find(ids.begin(), ids.end(), list[i]) != ids.end());   // only what the launch reads
-                CHECK(rest[(size_t) l][(size_t) list[i]] >= 0 && dev[(size_t) l][(size_t) list[i]] < 0);
+            for (auto & id : ids) { id = (int32_t) (rng() % (uint32_t) E); }
+            if (rows*used >= 2) { ids[1] = ids[0]; }   // a duplicate in a launch is copied once
+            if (!space_launch(sp, l, E, ids, rows, used, dev, want, last_miss, step, ghost, readable, n_copies, n_evict, n_wanted)) {
+                return false;
             }
-            // the last block's publish
-            for (int i = 0; i < n; ++i) {
-                dev[(size_t) l][(size_t) list[i]] = rest[(size_t) l][(size_t) list[i]];
-                rest[(size_t) l][(size_t) list[i]] = -1;
-                restored.insert({l, list[i]});
-            }
-            for (int32_t id : ids) { read.insert({l, id}); }
         }
     }
-    // exactly the victims that were read came back, each into its own slot
-    std::set<std::pair<int, int>> want;
+    // the LRU part shrinks by one slot per pinned expert; pinned ones are exactly the wanted copies still there
+    int wanted_back = 0;
     for (const auto & r : book.restore) {
-        if (read.count({r.layer, r.expert})) { want.insert({r.layer, r.expert}); }
+        const int32_t g = dev[(size_t) r.layer][(size_t) r.expert];
+        if (g >= sp.first) { ++wanted_back; CHECK(sp.pin[(size_t) (g - sp.first)] == 1); }
     }
-    CHECK(restored == want);
-    n_restores += restored.empty() ? 0 : 1;
-    for (const auto & r : book.restore) {
-        if (restored.count({r.layer, r.expert})) { CHECK(dev[(size_t) r.layer][(size_t) r.expert] == r.slot); }
-    }
+    CHECK(sp.pinned() == wanted_back && sp.pinned() == n_wanted);
+    n_restores += n_wanted > 0 ? 1 : 0;
+    n_lru_evictions += n_evict > 0 ? 1 : 0;
+    n_lru_full += sp.pinned() == sp.n ? 1 : 0;
     // a later lend takes the space back: the copies leave the tables (the mirror), the lease is new
     std::vector<int> held(book.slots.size());
     for (size_t c = 0; c < held.size(); ++c) { held[c] = book.slots[c] - book.limit[c]; }
     const lend_l1_plan again = plan_l1_lend(s.classes(book.limit), pieces, 256, &held);
     CHECK(again.ok && again.victims.empty());                     // the same pieces need no new eviction
-    CHECK(book.hold(again.limit, again.victims, ctx_b, false));
+    CHECK(book.hold(again.limit, again.victims, &s, false));
     CHECK(book.epoch == epoch + 1 && book.restore.empty() && !book.explicit_);
-    // sticky: an install under the lease keeps the restored copies the new restore set still has
-    CHECK(book.open_restore(s.layer_class));
+    // an install under the lease keeps the wanted copies at their slots; the rest of the wanted set waits
+    CHECK(book.open_restore(s.layer_class, &want_plan, E));
     std::vector<lend_restore> kept;
     for (const auto & r : book.restore) {
-        if (rng() % 2) { kept.push_back(r); }
+        if (rng() % 2) { lend_restore k = r; k.slot = sp.first + (int) kept.size(); kept.push_back(k); }
     }
-    const auto again_restore = plan_restore(book.victims, s.layer_class, book.limit, book.slots, &kept);
-    std::set<std::pair<int, int>> slots2;
-    for (const auto & k : kept) { slots2.insert({k.cls, k.slot}); }
+    const auto again_restore = plan_restore(book.victims, s.layer_class, &kept, &want_plan, E);
     for (const auto & r : again_restore) {
         for (const auto & k : kept) { CHECK(!(k.layer == r.layer && k.expert == r.expert)); }
-        CHECK(slots2.insert({r.cls, r.slot}).second);
+        CHECK(want_plan[(size_t) r.layer*E + r.expert] == 1);
     }
     CHECK(again_restore.size() + kept.size() == book.restore.size());
     n_sticky += kept.empty() ? 0 : 1;
     book.clear();
     CHECK(book.state == lend_state::none && book.limit == book.slots);
+    return true;
+}
+
+// The LRU part grows and shrinks: four lent slots, wanted A and B. Misses C, D, F fill the empty slots as LRU copies
+// (ghost 0); A takes the last empty slot; B finds none and replaces the least recently used copy; the LRU width is
+// 4 - pinned; with every slot pinned a miss gets no slot.
+bool test_space_example() {
+    const int E = 8, L = 1;
+    sim_space sp;
+    sp.open(10, 4);
+    std::vector<std::vector<int32_t>> dev((size_t) L, std::vector<int32_t>((size_t) E, -1));
+    std::vector<std::vector<int32_t>> want((size_t) L, std::vector<int32_t>((size_t) E, -1));
+    const int A = 0, B = 1, C = 2, D = 3, F = 4, G = 5, H = 6;
+    want[0][A] = want[0][B] = 1;
+    std::vector<std::vector<uint32_t>> lm((size_t) L, std::vector<uint32_t>((size_t) E, lend_never));
+    std::vector<uint32_t> step((size_t) L, 0);
+    auto all = [](int) { return true; };
+    int nc = 0, ne = 0, nw = 0;
+    auto run = [&](std::vector<int32_t> ids) { return space_launch(sp, 0, E, ids, 1, (int) ids.size(), dev, want, lm, step, 0, all, nc, ne, nw); };
+    CHECK(run({ C }) && run({ D }) && run({ F }));
+    CHECK(nc == 3 && ne == 0 && sp.pinned() == 0);              // LRU width 4
+    CHECK(run({ A }));                                          // the empty slot, nothing replaced
+    CHECK(ne == 0 && sp.pinned() == 1 && dev[0][A] == 13);
+    CHECK(run({ D }));                                          // a hit: D is the most recent copy now
+    CHECK(run({ B }));                                          // no empty slot: C, the least recently used, goes
+    CHECK(ne == 1 && dev[0][C] < 0 && dev[0][B] == 10 && sp.pinned() == 2);   // LRU width 2
+    CHECK(run({ G, D }));                                       // D is read now: F goes, not D
+    CHECK(dev[0][F] < 0 && dev[0][D] >= 0 && dev[0][G] >= 0);
+    // the ghost filter: with ghost 2, H is admitted on its second miss only
+    nc = 0;
+    CHECK(space_launch(sp, 0, E, { H }, 1, 1, dev, want, lm, step, 2, all, nc, ne, nw) && nc == 0 && dev[0][H] < 0);
+    CHECK(space_launch(sp, 0, E, { H }, 1, 1, dev, want, lm, step, 2, all, nc, ne, nw) && nc == 1 && dev[0][H] >= 0);
+    // two rows of one launch selecting an expert are its second access in that step: admitted at the first miss
+    nc = 0;
+    CHECK(dev[0][7] < 0 && lm[0][7] == lend_never);
+    CHECK(space_launch(sp, 0, E, { 7, 7 }, 2, 1, dev, want, lm, step, 2, all, nc, ne, nw) && nc == 1 && dev[0][7] >= 0);
+    CHECK(lend_space_admit(false, lend_never, 5, 8, true, 2) && !lend_space_admit(false, lend_never, 5, 8, true, 1));
+    CHECK(!lend_space_admit(false, lend_never, 5, 8, false, 2));   // LRU off: still only a wanted expert
+    // every slot pinned: nothing more is copied, the LRU width is 0
+    want[0][C] = want[0][F] = 1;
+    CHECK(run({ C }) && run({ F }));
+    CHECK(sp.pinned() == 4);
+    const int before = nc;
+    CHECK(run({ D, G, H }) && nc == before);
+    return true;
+}
+
+// A cold cache (no decode plan) wants nothing: the evicted experts come back only as LRU copies, never pinned.
+bool test_space_cold() {
+    lend_book book;
+    book.slots = { 6 };
+    book.limit = { 6 };
+    std::vector<lend_resident> v(3);
+    for (int i = 0; i < 3; ++i) { v[(size_t) i].layer = 0; v[(size_t) i].expert = i; }
+    CHECK(book.hold({ 3 }, v, &book, true));
+    const std::vector<uint8_t> none;
+    CHECK(book.open_restore({ 0 }, &none, 8) && book.restore.empty());
+    // the LRU part off (RANMA_EXPERT_LEND_LRU=0): only a wanted expert is admitted
+    CHECK(lend_space_admit(true, lend_never, 5, 8, false) && !lend_space_admit(false, 4, 5, 8, false) && lend_space_admit(false, 4, 5, 8, true));
+    CHECK(!lend_space_admit(false, lend_never, 5, 0, false) && lend_space_admit(false, lend_never, 5, 0, true));
     return true;
 }
 
@@ -610,6 +739,208 @@ bool test_restore_want(uint32_t seed) {
     return true;
 }
 
+// A long lend, the decode fills its restore space, then a short lend: it takes only the top slots it needs (empty slots,
+// then LRU copies, then the lowest ranked pinned copies), the copies that stay move below that top, the space goes on
+// under it and after the lend; a lend that needs more than the space is refused (the caller drops the space).
+bool test_space_lend(uint32_t seed) {
+    std::mt19937 rng(seed);
+    sim_l1 s = make_l1(rng, 1, 6, 40, seed % 2 == 0);
+    lend_book book;
+    book.slots = s.slots;
+    book.limit = s.slots;
+    book.top = s.slots;
+    const std::vector<size_t> big = { (size_t) (100000 + rng() % 200000), (size_t) (100000 + rng() % 200000) };
+    const lend_l1_plan p = plan_l1_lend(s.classes(book.limit), big, 256);
+    if (!p.ok || p.victims.size() < 4) {
+        return true;
+    }
+    if (!apply_evacuation(s, p)) { return false; }
+    CHECK(book.hold(p.limit, p.victims, &book, true));
+    const int E = s.experts;
+    std::vector<uint8_t> want_plan((size_t) s.layers*E, 0);
+    for (const auto & v : p.victims) { want_plan[(size_t) v.layer*E + v.expert] = 1; }
+    CHECK(book.open_restore(s.layer_class, &want_plan, E));
+    sim_space sp;
+    sp.open(book.limit[0], book.slots[0] - book.limit[0]);
+    std::vector<std::vector<int32_t>> dev = s.table;
+    std::vector<std::vector<int32_t>> want((size_t) s.layers, std::vector<int32_t>((size_t) E, -1));
+    for (const auto & r : book.restore) { want[(size_t) r.layer][(size_t) r.expert] = 1; }
+    std::vector<std::vector<uint32_t>> last_miss((size_t) s.layers, std::vector<uint32_t>((size_t) E, lend_never));
+    std::vector<uint32_t> step((size_t) s.layers, 0);
+    auto all = [](int) { return true; };
+    int nc = 0, ne = 0, nw = 0;
+    auto decode = [&](int tokens) {
+        for (int tok = 0; tok < tokens; ++tok) {
+            for (int l = 0; l < s.layers; ++l) {
+                std::vector<int32_t> ids(4);
+                for (auto & id : ids) { id = (int32_t) (rng() % (uint32_t) E); }
+                if (!space_launch(sp, l, E, ids, 1, 4, dev, want, last_miss, step, 2, all, nc, ne, nw)) { return false; }
+            }
+        }
+        return true;
+    };
+    if (!decode(1 + (int) (rng() % 40))) { return false; }
+    // the copies of the space now
+    std::vector<lend_restore> copies;
+    for (int j = 0; j < sp.n; ++j) {
+        if (sp.own[(size_t) j] < 0) { continue; }
+        lend_restore r;
+        r.layer = sp.own[(size_t) j]/E; r.expert = sp.own[(size_t) j]%E; r.cls = 0; r.slot = sp.first + j; r.pin = sp.pin[(size_t) j];
+        copies.push_back(r);
+    }
+    const int pinned_before = sp.pinned();
+    // a short lend: a piece of one to a few slots
+    lend_class kinds = s.classes(book.limit)[0];
+    kinds.slots = book.slots[0];
+    const size_t slot_bytes = kinds.kind_bytes[0];
+    const std::vector<size_t> small = { slot_bytes*(1 + rng() % 3) };
+    const lend_space_take t = plan_space_lend({ kinds }, book.limit, copies, s.score, E, small, 256);
+    if (!t.ok) {
+        return true;   // the space is too small for even the short piece
+    }
+    const int top = t.plan.limit[0];
+    CHECK(top >= book.limit[0] && top < book.slots[0]);
+    // the fewest slots: one slot fewer does not hold the pieces
+    {
+        std::vector<int> fewer = { book.slots[0] - top - 1 };
+        std::vector<size_t> bytes;
+        for (const auto & r : lend_regions_of({ kinds }, fewer)) { bytes.push_back(r.bytes); }
+        std::vector<lend_fit> f;
+        CHECK(!lend_pack(small, bytes, 256, f));
+    }
+    // the slots it takes: the empty ones and the dropped copies, nothing more
+    const int empties = sp.n - (int) copies.size();
+    CHECK((book.slots[0] - top) == std::min(empties, book.slots[0] - top) + (int) t.dropped.size());
+    CHECK(t.dropped.empty() || t.empty_taken[0] == empties);
+    // drop order: every dropped copy ranks below every kept one (LRU before pinned, then the score)
+    auto rank_of = [&](const lend_restore & r) {
+        lend_resident x; x.layer = r.layer; x.expert = r.expert; x.score = s.score[(size_t) r.layer*E + r.expert]; x.tier = r.pin ? 1 : 0;
+        return x;
+    };
+    for (const auto & d : t.dropped) {
+        for (const auto & k : t.kept) { CHECK(!lend_rank_less(rank_of(k), rank_of(d))); }
+    }
+    CHECK(t.kept.size() + t.dropped.size() == copies.size());
+    // the moves: from the taken top down into free slots of the space; every kept copy below the top, one per slot
+    std::set<int> at;
+    for (const auto & k : t.kept) {
+        CHECK(k.slot >= book.limit[0] && k.slot < top);
+        CHECK(at.insert(k.slot).second);
+    }
+    for (const auto & m : t.moves) { CHECK(m[1] >= top && m[2] < top); }
+    // the pieces lie above the top
+    for (const auto & r : t.plan.regions) { CHECK(r.begin >= (size_t) top*kinds.kind_bytes[(size_t) r.kind]); }
+    int kept_pinned = 0;
+    for (const auto & k : t.kept) { kept_pinned += k.pin; }
+    int dropped_pinned = 0;
+    for (const auto & d : t.dropped) { dropped_pinned += d.pin; }
+    CHECK(kept_pinned + dropped_pinned == pinned_before);
+    n_space_short += 1;
+    n_space_pinned_kept += kept_pinned > 0 && dropped_pinned < pinned_before ? 1 : 0;
+    // the lend over the space: the tables follow the moves and the drops
+    CHECK(book.hold_space(t.plan.limit, &s, false));
+    CHECK(book.state == lend_state::held && book.top[0] == top && book.limit[0] == sp.first);
+    for (const auto & d : t.dropped) {
+        dev[(size_t) d.layer][(size_t) d.expert] = -1;
+        if (d.pin) { want[(size_t) d.layer][(size_t) d.expert] = 1; }
+    }
+    sim_space sp2;
+    sp2.open(sp.first, sp.n);
+    for (const auto & k : t.kept) {
+        dev[(size_t) k.layer][(size_t) k.expert] = k.slot;
+        sp2.own[(size_t) (k.slot - sp.first)] = k.layer*E + k.expert;
+        sp2.pin[(size_t) (k.slot - sp.first)] = k.pin;
+    }
+    // the lend ends: the whole space again, the kept copies in place, the decode goes on
+    book.state = lend_state::held;
+    CHECK(book.open_restore(s.layer_class, &want_plan, E) && book.top[0] == book.slots[0]);
+    sp = sp2;
+    if (!decode(20)) { return false; }
+    // a lend wider than the space is refused (the caller drops the space and evicts residents)
+    const size_t widest = *std::max_element(kinds.kind_bytes.begin(), kinds.kind_bytes.end());
+    std::vector<size_t> huge = { (size_t) (sp.n + 2)*widest };
+    copies.clear();
+    for (int j = 0; j < sp.n; ++j) {
+        if (sp.own[(size_t) j] < 0) { continue; }
+        lend_restore r;
+        r.layer = sp.own[(size_t) j]/E; r.expert = sp.own[(size_t) j]%E; r.cls = 0; r.slot = sp.first + j; r.pin = sp.pin[(size_t) j];
+        copies.push_back(r);
+    }
+    CHECK(!plan_space_lend({ kinds }, book.limit, copies, s.score, E, huge, 256).ok);
+    return true;
+}
+
+// The staged service: with only kind 0 of the generation in place the restore space does not copy; with every kind (or
+// the whole generation) it does.
+bool test_space_staged() {
+    const uint32_t seq = 7;
+    const uint32_t only0[3] = { seq, seq - 1, seq - 1 }, two[3] = { seq, seq, seq - 1 }, all[3] = { seq, seq, seq };
+    CHECK(!lend_space_sources_ready(seq - 1, only0, seq));
+    CHECK(!lend_space_sources_ready(seq - 1, two, seq));
+    CHECK(lend_space_sources_ready(seq - 1, all, seq));
+    CHECK(lend_space_sources_ready(seq, only0, seq));
+    return true;
+}
+
+// Two file-only evicted experts (no host slot, no address): A is wanted (the decode plan's), B is not. The SSD tier
+// serves a launch of A, A, B from the file into its ring (each expert's three kinds read once), then the restore space
+// copies A from the ring slot the tier just published and pins it, while B is read where the ring has it (host-direct).
+// The next generation leaves A out of the demand (the restored bitmap); A's ring copy stays until its lease is done,
+// and only then can a new read reuse that slot.
+bool test_file_only_restore() {
+    const int E = 4, A = 1, B = 2, C = 3;
+    l2_class_ledger ring;
+    ring.reset(1, E, { 0 }, { 2 });
+    CHECK(ring.make_ring(0, 0) && ring.make_ring(0, 1));
+    std::vector<std::vector<int32_t>> dev(1, std::vector<int32_t>((size_t) E, -1));
+    std::vector<uint8_t> restored((size_t) E, 0);
+    auto homed = [&](int, int e) { return dev[0][(size_t) e] >= 0; };
+    // the publish kernel: the demand without the restored experts
+    auto demand = [&](std::vector<int> ids) {
+        std::vector<int> out;
+        for (int e : ids) { if (!restored[(size_t) e]) { out.push_back(e); } }
+        return out;
+    };
+    // generation 1: A, A, B
+    const l2_service g1 = ring.service(0, demand({ A, A, B }), 1, homed);
+    CHECK(g1.ok && g1.misses == 2 && g1.reads.size() == 6);
+    int reads_a[3] = {0, 0, 0}, reads_b[3] = {0, 0, 0};
+    for (const l2_read & r : g1.reads) { (r.expert == A ? reads_a : reads_b)[r.kind]++; }
+    for (int k = 0; k < 3; ++k) { CHECK(reads_a[k] == 1 && reads_b[k] == 1); }
+    const int slot_a = ring.slot_of(0, A), slot_b = ring.slot_of(0, B);
+    CHECK(slot_a >= 0 && slot_b >= 0 && slot_a != slot_b);
+    // the restore space: A from its ring slot (readable: the tier published its address), B not admitted
+    sim_space sp;
+    sp.open(8, 2);
+    std::vector<int32_t> want((size_t) E, -1);
+    want[(size_t) A] = 1;
+    std::vector<uint32_t> last_miss((size_t) E, lend_never);
+    uint32_t step = 0;
+    auto readable = [&](int e) { return ring.slot_of(0, e) >= 0; };
+    lend_space_copy out[lend_space_max_ids];
+    const int32_t ids[3] = { A, A, B };
+    const int n = lend_space_step(ids, 1, 3, 3, E, 0, dev[0].data(), want.data(), last_miss.data(), &step, 8, sp.first, sp.n,
+        sp.own.data(), sp.pin.data(), sp.stamp.data(), &sp.clock, readable, out, lend_space_max_ids);
+    CHECK(n == 1 && out[0].expert == A && out[0].wanted == 1);
+    const int source = ring.slot_of(0, A);           // what the copy kernel reads: the current ring bytes of A
+    CHECK(source == slot_a);
+    dev[0][(size_t) A] = sp.first + out[0].j;
+    restored[(size_t) A] = 1;
+    CHECK(dev[0][(size_t) B] < 0 && ring.slot_of(0, B) == slot_b);   // B is read in the ring (host-direct)
+    // generation 2: A is no longer demanded; B is a hit
+    const l2_service g2 = ring.service(0, demand({ A, B }), 2, homed);
+    CHECK(g2.ok && g2.misses == 0 && g2.hits == 1 && g2.reads.empty());
+    CHECK(ring.slot_of(0, A) == slot_a);             // A's ring copy stays
+    // C needs a slot: A's copy holds lease 1, B's lease 2; nothing is reusable before the GPU finished generation 1
+    const l2_service g3 = ring.service(0, { C }, 3, homed);
+    CHECK(!g3.ok);
+    ring.set_done(0, 1);
+    const l2_service g4 = ring.service(0, { C }, 3, homed);
+    CHECK(g4.ok && g4.misses == 1 && ring.slot_of(0, C) == slot_a && ring.slot_of(0, A) < 0);
+    CHECK(dev[0][(size_t) A] >= sp.first);            // A stays in L1
+    return true;
+}
+
 bool test_pack_edges() {
     std::vector<lend_fit> f;
     CHECK(lend_pack({}, {}, 256, f));
@@ -631,6 +962,10 @@ int main(int argc, char ** argv) {
     test_untie_example();
     test_replay();
     test_width_examples();
+    test_space_example();
+    test_space_cold();
+    test_space_staged();
+    test_file_only_restore();
     int n = 0;
     for (int i = 0; i < seeds; ++i) {
         const uint32_t seed = 1000u + (uint32_t) i;
@@ -638,6 +973,7 @@ int main(int argc, char ** argv) {
         n += test_width(seed) ? 1 : 0;
         n += test_restore(seed) ? 1 : 0;
         n += test_restore_want(seed) ? 1 : 0;
+        n += test_space_lend(seed) ? 1 : 0;
         if (g_fail > 0) {
             fprintf(stderr, "first failure at seed %u\n", seed);
             break;
@@ -645,11 +981,13 @@ int main(int argc, char ** argv) {
     }
     printf("test-expert-lend: %d checks over %d seeds, %d failures; paths: L1 evictions %d, L1 growth over held slots %d, "
         "widths of several passes %d, restore runs %d, sticky installs %d, eviction bounds over several classes %d, "
-        "restores limited to the decode plan %d\n",
-        n, seeds, g_fail, n_l1_plans, n_l1_regrow, n_multi_pass, n_restores, n_sticky, n_bounds, n_wanted);
+        "restores limited to the decode plan %d, LRU replacements %d, spaces filled by pinned experts %d, short lends over a space %d "
+        "(keeping pinned copies %d)\n",
+        n, seeds, g_fail, n_l1_plans, n_l1_regrow, n_multi_pass, n_restores, n_sticky, n_bounds, n_wanted, n_lru_evictions, n_lru_full,
+        n_space_short, n_space_pinned_kept);
     printf("test-expert-lend: plans that gave victims of their last tie back (a class not needed) %d\n", n_untied);
     const bool covered = n_l1_plans > 0 && n_l1_regrow > 0 && n_multi_pass > 0 && n_restores > 0 && n_sticky > 0 && n_bounds > 0 &&
-        n_wanted > 0;
+        n_wanted > 0 && n_lru_evictions > 0 && n_space_short > 0 && n_space_pinned_kept > 0;
     if (!covered) {
         printf("a path was never taken\n");
     }

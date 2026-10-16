@@ -239,6 +239,12 @@ public:
     bool publish_overlay(const std::vector<slot_entry> & extra);
     bool stage_aux(const std::vector<slot_entry> & entries);
     bool zero_heads(int cls, int first, int count, const size_t bytes[3]);
+    // The rows record of slots [first, first + count) of a class is dropped: the restore kernel writes aux rows there
+    // itself, so a later publish copies the rows of whatever expert it names there again.
+    void forget_aux(int cls, int first, int count);
+    // While nothing computes: the weights of slot `from` of a class are copied to slot `to`, all kinds, VRAM to VRAM, for
+    // each (from, to); no table changes (the caller publishes them, and the publish copies the aux rows).
+    bool copy_slots(int cls, const std::vector<std::pair<int, int>> & moves);
 
 private:
     // Arena parts of a class: the weight kinds, then the aux rows (kind-major, rot_in then rot_out).
