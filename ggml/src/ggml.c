@@ -6850,6 +6850,17 @@ struct ggml_tensor * ggml_lightning_indexer(
         struct ggml_tensor  * k,
         struct ggml_tensor  * weights,
         struct ggml_tensor  * mask) {
+    return ggml_lightning_indexer_cand(ctx, q, k, weights, mask, NULL, 0);
+}
+
+struct ggml_tensor * ggml_lightning_indexer_cand(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * weights,
+        struct ggml_tensor  * mask,
+        struct ggml_tensor  * cand,
+        int32_t               cand_block) {
 
     GGML_ASSERT(       q->type == GGML_TYPE_F32);
     GGML_ASSERT( weights->type == GGML_TYPE_F32);
@@ -6866,6 +6877,17 @@ struct ggml_tensor * ggml_lightning_indexer(
     GGML_ASSERT(      k->ne[3] == weights->ne[3]);
     GGML_ASSERT(weights->ne[3] % mask->ne[3] == 0);
 
+    if (cand) {
+        GGML_ASSERT(cand_block > 0);
+        GGML_ASSERT(cand->type   == GGML_TYPE_F32);
+        GGML_ASSERT(cand->ne[0]  == 1);
+        GGML_ASSERT(cand->ne[1]*cand_block == k->ne[2]);
+        GGML_ASSERT(cand->ne[2]  == q->ne[2]);
+        GGML_ASSERT(cand->ne[3]  == q->ne[3]);
+    } else {
+        GGML_ASSERT(cand_block == 0);
+    }
+
     int64_t ne[4] = { k->ne[2], q->ne[2], 1, q->ne[3] };
     struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
 
@@ -6874,6 +6896,9 @@ struct ggml_tensor * ggml_lightning_indexer(
     result->src[1] = k;
     result->src[2] = weights;
     result->src[3] = mask;
+    result->src[4] = cand;
+
+    ggml_set_op_params_i32(result, 0, cand_block);
 
     return result;
 }

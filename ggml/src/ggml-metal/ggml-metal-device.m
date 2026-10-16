@@ -1776,6 +1776,10 @@ bool ggml_metal_device_supports_op(ggml_metal_device_t dev, const struct ggml_te
             if (op->src[0]->ne[0] != OP_LIGHTNING_INDEXER_DK) {
                 return false;
             }
+            if (op->src[4] != nullptr) {
+                // candidate blocks are not implemented here
+                return false;
+            }
             if (!has_simdgroup_mm ||
                 op->src[0]->type != GGML_TYPE_F32 ||
                 op->src[2]->type != GGML_TYPE_F32 ||

@@ -12714,11 +12714,13 @@ void ggml_compute_forward_lightning_indexer(
     const ggml_tensor * k = dst->src[1];
     const ggml_tensor * w = dst->src[2]; // weights
     const ggml_tensor * m = dst->src[3]; // mask
+    const ggml_tensor * c = dst->src[4]; // optional candidate blocks, 0 or -inf per block
 
     GGML_ASSERT(dst->type  == GGML_TYPE_F32);
     GGML_ASSERT(   q->type == GGML_TYPE_F32);
     GGML_ASSERT(   w->type == GGML_TYPE_F32);
     GGML_ASSERT(   m->type == GGML_TYPE_F16);
+    GGML_ASSERT(c == nullptr || c->type == GGML_TYPE_F32);
 
     GGML_TENSOR_LOCALS(int64_t, neq,  q, ne)
     GGML_TENSOR_LOCALS(size_t,  nbq,  q, nb)
@@ -12743,6 +12745,10 @@ void ggml_compute_forward_lightning_indexer(
     const int n_stream  = q->ne[3];
     const int n_kv      = k->ne[2];
 
+    // positions of a block share one candidate entry
+    const int cand_block = c ? ggml_get_op_params_i32(dst, 0) : 0;
+    GGML_ASSERT(c == nullptr || (cand_block > 0 && c->ne[0] == 1 && c->ne[1]*cand_block == n_kv));
+
     ggml_to_float_t const k_to_float = ggml_get_type_traits(k->type)->to_float;
     GGML_ASSERT((k->type == GGML_TYPE_F32 || k_to_float) && "lightning indexer: unsupported K-type");
 
@@ -12765,7 +12771,17 @@ void ggml_compute_forward_lightning_indexer(
             const float       *   w_row =       (float *) ((char *)   w->data + t*nbw1 +        s*nbw3);
             const ggml_fp16_t *   m_row = (ggml_fp16_t *) ((char *)   m->data + t*nbm1 + (s%nem3)*nbm3);
             float             * dst_row =       (float *) ((char *) dst->data + t*nb1  +        s*nb3 );
+            const char        *   c_row = c ? (const char *) c->data + t*c->nb[2] + s*c->nb[3] : nullptr;
             for (int ik = ir0; ik < ir1; ++ik) {
+                float cand = 0.0f;
+                if (c_row) {
+                    cand = *(const float *) (c_row + (ik/cand_block)*c->nb[1]);
+                    if (cand == -INFINITY) {
+                        // dropped by the candidate input, no need to look at the key
+                        dst_row[ik] = -INFINITY;
+                        continue;
+                    }
+                }
                 char * k_row = (char *) k->data + ik*nbk2 + s*nbk3;
                 if (k_to_float) {
                     k_to_float(k_row, k_row_f32, n_embd);
@@ -12782,7 +12798,7 @@ void ggml_compute_forward_lightning_indexer(
                     score += MAX(qk, 0.0f) * w_row[h];
                 }
                 // apply mask
-                dst_row[ik] = score + GGML_CPU_FP16_TO_FP32(m_row[ik]);
+                dst_row[ik] = score + GGML_CPU_FP16_TO_FP32(m_row[ik]) + cand;
             }
         }
     }

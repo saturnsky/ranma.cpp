@@ -2792,6 +2792,21 @@ extern "C" {
         struct ggml_tensor  * weights,
         struct ggml_tensor  * mask);
 
+    // same, with a candidate block input: the keys of one block of cand_block consecutive positions share one
+    // entry of cand, which is 0 (keep) or -inf (drop). A dropped position scores -inf, as if cand had been
+    // broadcast over its block and added to the result, so a backend need not read the keys of a dropped block.
+    //
+    // cand:    [1, n_kv/cand_block, n_batch, ne3] !! f32, 0 or -inf !!
+    //
+    GGML_API struct ggml_tensor * ggml_lightning_indexer_cand(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * weights,
+        struct ggml_tensor  * mask,
+        struct ggml_tensor  * cand,
+        int32_t               cand_block);
+
     // DeepSeek V4 hyper-connections (ref. https://arxiv.org/pdf/2512.24880)
     // In short these operations are replacements for the original residual connection (x = transformer(x) + x)
     // using a richer representation through streams.
