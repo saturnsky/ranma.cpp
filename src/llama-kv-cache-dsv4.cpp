@@ -2,6 +2,7 @@
 
 #include "ggml-backend.h"
 #include "llama-impl.h"
+#include "llama-ext.h"
 #include "llama-batch.h"
 #include "llama-graph-chunk.h"
 #include "llama-io.h"
@@ -1289,6 +1290,16 @@ void llama_dsv4_comp_state::state_read(llama_io_read_i & io, llama_seq_id seq_id
 
         dsv4_state_read_tensor_streams(io, layer.kv,    state_size, state_size, s0, ns);
         dsv4_state_read_tensor_streams(io, layer.score, state_size, state_size, s0, ns);
+    }
+}
+
+void llama_dsv4_comp_state::dump(std::vector<uint8_t> & out) const {
+    for (const auto & l : layers) {
+        for (const ggml_tensor * t : { l.kv, l.score }) {
+            const size_t n0 = out.size();
+            out.resize(n0 + ggml_nbytes(t));
+            ggml_backend_tensor_get(t, out.data() + n0, 0, ggml_nbytes(t));
+        }
     }
 }
 
@@ -3327,8 +3338,9 @@ llama_kv_cache_dsv4_context::llama_kv_cache_dsv4_context(
     hca_state(kv->get_hca_state()),
     lid_state(kv->get_lid_state()),
     status(ctx_raw->get_status()) {
+    // the pending rollbacks are consumed when the call starts (apply), not here: the layer-major prefill may make the
+    // context again in narrower ubatches, whose plans must restore the same planes
     this->kv = kv;
-    kv->reset_rs_idx_for_ubatches(this->ubatches);
 }
 
 llama_kv_cache_dsv4_context::~llama_kv_cache_dsv4_context() = default;
@@ -3372,6 +3384,13 @@ bool llama_kv_cache_dsv4_context::apply() {
     } else if (i_next == 0 && kv != nullptr) {
         // ranma: the call begins with its first ubatch
         kv->tail_call_begin(ubatches);
+    }
+
+    // the call takes the pending rollbacks of its sequences, once: its plans restore them, and the planes it leaves are
+    // those of its own depths (a context that is never applied leaves both as they are)
+    if (res && !rs_taken && kv != nullptr && !ubatches.empty()) {
+        kv->reset_rs_idx_for_ubatches(ubatches);
+        rs_taken = true;
     }
 
     return res;
@@ -3520,4 +3539,25 @@ const llama_kv_cache_dsv4_context::comp_plan & llama_kv_cache_dsv4_context::get_
             lid_state->get_state_size(), get_lid()->get_n_kv(), lid_state->get_n_stream(), lid_state->get_n_rs_seq());
 
     return reserve_plan_lid;
+}
+
+bool llama_dsv4_rs_dump(struct llama_context * ctx, llama_seq_id seq_id, std::vector<uint8_t> * states, uint32_t * rs_idx,
+                        uint32_t * rs_depth) {
+    const auto * kv = ctx != nullptr ? dynamic_cast<const llama_kv_cache_dsv4 *>(llama_get_memory(ctx)) : nullptr;
+    if (kv == nullptr || seq_id < 0 || (size_t) seq_id >= kv->get_rs_idx().size()) {
+        return false;
+    }
+    if (states != nullptr) {
+        states->clear();
+        kv->get_csa_state()->dump(*states);
+        kv->get_hca_state()->dump(*states);
+        kv->get_lid_state()->dump(*states);
+    }
+    if (rs_idx != nullptr) {
+        *rs_idx = kv->get_rs_idx()[seq_id];
+    }
+    if (rs_depth != nullptr) {
+        *rs_depth = kv->get_rs_depth()[seq_id];
+    }
+    return true;
 }

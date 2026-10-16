@@ -330,9 +330,11 @@ void common_layer_mode_apply(common_params & params) {
         return;
     }
     // contexts the no_alloc measurement does not build (a draft or MTP context, a multimodal projector) are not planned
-    // for yet: the mode stays off with them rather than guessing their memory
+    // for yet: the mode stays off with them rather than guessing their memory. ngram-varlen has no context of its own and
+    // reads no layer inputs; the rollback planes it asks of the target (n_rs_seq) are part of the KV cache that the
+    // measurement builds from the same context parameters
     if (params.speculative.has_dft() || std::any_of(params.speculative.types.begin(), params.speculative.types.end(),
-            [](common_speculative_type t) { return t != COMMON_SPECULATIVE_TYPE_NONE; })) {
+            [](common_speculative_type t) { return t != COMMON_SPECULATIVE_TYPE_NONE && t != COMMON_SPECULATIVE_TYPE_NGRAM_VARLEN; })) {
         off("a draft model or MTP context is not covered by the memory check yet");
         return;
     }

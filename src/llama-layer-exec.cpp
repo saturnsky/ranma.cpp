@@ -333,9 +333,17 @@ bool llama_lx_analyze(ggml_cgraph * gf, int n_layer, const llama_lx_names & name
         });
     }
 
-    // the writes into a state, by their earliest segment; the reads of that state run in the same segment
+    // the segment of the writes into a state; the reads of that state run in the same segment. An appendable state is
+    // written in the earliest segment of its writes, which must agree. Any other state is written, and read, in the
+    // latest earliest segment of its writes: a write that needs no layer output (DeepSeek-V4's rollback restore of a
+    // compressor state, which only copies a plane) runs with the writes that do (the snapshot and the persist of the
+    // same layer), in graph order. Where a write or read cannot run that late (a reader of an earlier segment), the
+    // placement below fails.
     std::map<const ggml_tensor *, int> wseg;
     std::vector<char> writer(n, 0);
+    auto is_appendable = [&](const ggml_tensor * b) {
+        return names.appendable != nullptr && names.appendable->count(b) > 0;
+    };
     for (int i = 0; i < n; ++i) {
         const ggml_tensor * t = g.node(i);
         if (region[i] >= 0 || pure[i] || lx_is_view(t->op) || t->view_src == nullptr || g.kind(t->view_src) != LX_STATE) {
@@ -343,10 +351,13 @@ bool llama_lx_analyze(ggml_cgraph * gf, int n_layer, const llama_lx_names & name
         }
         writer[i] = 1;
         const auto it = wseg.find(t->view_src);
-        if (it != wseg.end() && it->second != lo[i]) {
+        if (it == wseg.end()) {
+            wseg[t->view_src] = lo[i];
+        } else if (!is_appendable(t->view_src)) {
+            it->second = std::max(it->second, lo[i]);
+        } else if (it->second != lo[i]) {
             return fail(std::string("the state ") + t->view_src->name + " is written in two segments");
         }
-        wseg[t->view_src] = lo[i];
     }
 
     // the segment: as late as the consumers allow (a view, or a node of no state), where the state it reads is
@@ -380,7 +391,7 @@ bool llama_lx_analyze(ggml_cgraph * gf, int n_layer, const llama_lx_names & name
                 if (it == wseg.end()) {
                     return;
                 }
-                if (names.appendable != nullptr && names.appendable->count(b) > 0) {
+                if (is_appendable(b)) {
                     s_min = std::max(s_min, it->second);
                     return;
                 }
@@ -566,6 +577,40 @@ bool llama_lx_analyze(ggml_cgraph * gf, int n_layer, const llama_lx_names & name
             }
         }
     }
+    // every access to a state that is not appendable runs in the segment of its writes, and every write into a state runs
+    // once (the placement above should already ensure both; a write copied twice or a read in another segment would
+    // change the state that the ubatch loop leaves behind)
+    {
+        std::vector<int> n_in(n, 0);
+        for (int s = 0; s <= L; ++s) {
+            for (int i : plan.nodes[s]) {
+                n_in[i]++;
+            }
+        }
+        for (int i = 0; i < n; ++i) {
+            if (region[i] >= 0 || pure[i] || lx_is_view(g.node(i)->op)) {
+                continue;
+            }
+            if (writer[i] && n_in[i] != 1) {
+                return fail(std::string("the state write ") + g.node(i)->name + " runs in " + std::to_string(n_in[i]) + " segments");
+            }
+            std::string err;
+            g.deps(i, [&](const ggml_tensor * d) {
+                const ggml_tensor * b = cut.state_base(d);
+                if (b == nullptr || !err.empty() || is_appendable(b)) {
+                    return;
+                }
+                const auto it = wseg.find(b);
+                if (it != wseg.end() && seg[i] != it->second) {
+                    err = std::string(g.node(i)->name) + " (segment " + std::to_string(seg[i]) + ") accesses the state " +
+                        b->name + " of segment " + std::to_string(it->second);
+                }
+            });
+            if (!err.empty()) {
+                return fail(err);
+            }
+        }
+    }
     // an in-place result and the node it writes into are one tensor: the result carries it for both
     for (int j = 0; j < n; ++j) {
         if (last_read[j] < 0) {
@@ -702,6 +747,28 @@ bool llama_lx_analyze(ggml_cgraph * gf, int n_layer, const llama_lx_names & name
     }
 
     return true;
+}
+
+bool llama_layer_exec_analyze_segments(ggml_cgraph * gf, int32_t n_layer, const char * moe_in, const char * moe_out,
+                                       int64_t n_tokens, int32_t * seg, char * err, size_t err_size) {
+    llama_lx_names names;
+    names.moe_in  = moe_in;
+    names.moe_out = moe_out;
+    llama_lx_plan plan;
+    const bool ok = llama_lx_analyze(gf, n_layer, names, n_tokens, plan);
+    if (err != nullptr && err_size > 0) {
+        snprintf(err, err_size, "%s", plan.err.c_str());
+    }
+    if (ok && seg != nullptr) {
+        const int n = ggml_graph_n_nodes(gf);
+        std::fill(seg, seg + n, -1);
+        for (int s = 0; s <= n_layer; ++s) {
+            for (int i : plan.nodes[s]) {
+                seg[i] = seg[i] == -1 ? s : -2;
+            }
+        }
+    }
+    return ok;
 }
 
 bool llama_lx_regions(ggml_cgraph * gf, int n_layer, const llama_lx_names & names, std::vector<llama_lx_region> & out,

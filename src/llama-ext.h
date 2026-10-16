@@ -68,6 +68,19 @@ struct llama_layer_mode_config {
 LLAMA_API llama_layer_mode_config llama_layer_mode_get_config();
 LLAMA_API void                    llama_layer_mode_set_config(const llama_layer_mode_config & cfg);
 
+// ranma (tests): the cut of a graph by the layer-major prefill (llama_lx_analyze), the MoE of layer il between the nodes
+// named "<moe_in>-<il>" and "<moe_out>-<il>". seg (room for the nodes of gf) gets, per node, the segment that computes
+// it, -1 for none and -2 for several (a view or a pure node each segment makes again). false, with err, when it does
+// not cut.
+LLAMA_API bool llama_layer_exec_analyze_segments(struct ggml_cgraph * gf, int32_t n_layer, const char * moe_in,
+                                                 const char * moe_out, int64_t n_tokens, int32_t * seg, char * err,
+                                                 size_t err_size);
+
+// ranma (tests): the compressor states of a DeepSeek-V4 cache (every layer's base and rollback planes, CSA, HCA and
+// index states in this order) and the pending rollback and plane depth of seq_id. false for another memory.
+LLAMA_API bool llama_dsv4_rs_dump(struct llama_context * ctx, llama_seq_id seq_id, std::vector<uint8_t> * states,
+                                  uint32_t * rs_idx, uint32_t * rs_depth);
+
 // Get the default ggml_type for a given ftype.
 LLAMA_API ggml_type llama_ftype_get_default_type(llama_ftype ftype);
 

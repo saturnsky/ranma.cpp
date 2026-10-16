@@ -52,6 +52,9 @@ public:
     ggml_tensor * cpy_kv   (ggml_context * ctx, ggml_tensor * cur, ggml_tensor * idxs, int32_t il) const;
     ggml_tensor * cpy_score(ggml_context * ctx, ggml_tensor * cur, ggml_tensor * idxs, int32_t il) const;
 
+    // ranma (tests): the bytes of every layer's state, the base plane and the rollback planes, appended to out
+    void dump(std::vector<uint8_t> & out) const;
+
 private:
     struct layer {
         uint32_t il;
@@ -161,6 +164,7 @@ public:
     bool get_rs_prompt() const { return rs_prompt; }
     void set_rs_prompt(bool prompt) override { rs_prompt = prompt; }
     const std::vector<uint32_t> & get_rs_idx() const;
+    const std::vector<uint32_t> & get_rs_depth() const { return rs_depth; }
     // a call consumes the pending rollback of its sequences and sets the depth of their planes
     void reset_rs_idx_for_ubatches(const std::vector<llama_ubatch> & ubatches);
 
@@ -543,6 +547,7 @@ private:
     size_t i_next = 0;
 
     llama_kv_cache_dsv4 * kv = nullptr;
+    bool rs_taken = false; // the pending rollbacks of the call were taken (the first apply)
 
     llama_seq_id out_seq = -1;
     llama_pos    out_pos = -1;
