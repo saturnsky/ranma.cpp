@@ -36,6 +36,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <numeric>
 #include <random>
 #include <regex>
 #include <set>
@@ -11854,6 +11855,99 @@ struct test_lightning_indexer : public test_case {
     }
 };
 
+// GGML_OP_LIGHTNING_INDEXER with the candidate block input
+struct test_lightning_indexer_cand : public test_case {
+    const int64_t nh;        // num indexer heads
+    const int64_t kv;        // kv size, a multiple of block
+    const int64_t nb;        // batch size
+    const int64_t ns;        // num streams
+    const ggml_type type_K;
+    const int64_t block;     // positions per candidate entry
+    const int pattern;       // 0: kept blocks at random, 1: kept blocks consecutive
+
+    std::string vars() override {
+        return VARS_TO_STR7(nh, kv, nb, ns, type_K, block, pattern);
+    }
+
+    double max_nmse_err() override {
+        return 1e-6;
+    }
+
+    uint64_t op_flops(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return ((2 * 128 + 2) * nh + 1) * kv * nb * ns;
+    }
+
+    test_lightning_indexer_cand(int64_t nh = 32, int64_t kv = 32768, int64_t nb = 1, int64_t ns = 1, ggml_type type_K = GGML_TYPE_F16,
+            int64_t block = 8, int pattern = 0)
+        : nh(nh), kv(kv), nb(nb), ns(ns), type_K(type_K), block(block), pattern(pattern) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t hsk = 128;
+
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, hsk, nh, nb, ns);
+        ggml_set_param(q);
+        ggml_set_name(q, "q");
+
+        ggml_tensor * k = ggml_new_tensor_4d(ctx, type_K, hsk, 1, kv, ns);
+        ggml_set_param(k);
+        ggml_set_name(k, "k");
+
+        ggml_tensor * w = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, nh, nb, 1, ns);
+        ggml_set_param(w);
+        ggml_set_name(w, "w");
+
+        ggml_tensor * m = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, kv, nb, 1, 1);
+        ggml_set_param(m);
+        ggml_set_name(m, "m");
+
+        // one entry per block of positions, 0 keeps it and -inf drops it
+        ggml_tensor * c = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, 1, kv/block, nb, ns);
+        ggml_set_name(c, "c");
+
+        ggml_tensor * out = ggml_lightning_indexer_cand(ctx, q, k, w, m, c, (int32_t) block);
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "m") == 0) {
+                init_tensor_kq_mask(t);
+            } else if (strcmp(t->name, "c") == 0) {
+                // half of the blocks stay, at most 2048 as in the model
+                const int64_t n_blocks = t->ne[1];
+                const int64_t n_keep   = std::min<int64_t>(2048, std::max<int64_t>(1, n_blocks/2));
+
+                std::mt19937 rng(1234);
+                std::vector<float> data(ggml_nelements(t), -INFINITY);
+                std::vector<int64_t> ids(n_blocks);
+                for (int64_t i3 = 0; i3 < t->ne[3]; ++i3) {
+                    for (int64_t i2 = 0; i2 < t->ne[2]; ++i2) {
+                        float * row = data.data() + (i3*t->ne[2] + i2)*n_blocks;
+                        if (pattern == 0) {
+                            std::iota(ids.begin(), ids.end(), 0);
+                            std::shuffle(ids.begin(), ids.end(), rng);
+                            for (int64_t j = 0; j < n_keep; ++j) {
+                                row[ids[j]] = 0.0f;
+                            }
+                        } else {
+                            const int64_t start = (int64_t) (rng() % (uint64_t) (n_blocks - n_keep + 1));
+                            for (int64_t j = 0; j < n_keep; ++j) {
+                                row[start + j] = 0.0f;
+                            }
+                        }
+                    }
+                }
+                ggml_backend_tensor_set(t, data.data(), 0, ggml_nbytes(t));
+            } else {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // Deserializable generic test case
 struct input_tensor {
     ggml_type type;
@@ -15432,6 +15526,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             test_cases.emplace_back(new test_lightning_indexer(128, nh, kv, nb, 1, 1, GGML_TYPE_F16, 4, 2*kv));
             test_cases.emplace_back(new test_lightning_indexer(128, nh, kv, nb, 2, 1, GGML_TYPE_F16, 2, 0));
         }
+    }
+
+    // lightning_indexer with the candidate block input: the HIP decode shape (32 heads, F16 K, one token, one stream,
+    // block 8) at the model's boundary 16384 and above, then the shapes that take the dense launch and the add
+    for (int pattern : { 0, 1 }) {
+        for (int kv : { 256, 16384, 32768, 65536 }) {
+            test_cases.emplace_back(new test_lightning_indexer_cand(32, kv, 1, 1, GGML_TYPE_F16, 8, pattern));
+        }
+        test_cases.emplace_back(new test_lightning_indexer_cand(32, 4096, 1, 1, GGML_TYPE_Q8_0, 8, pattern));
+        test_cases.emplace_back(new test_lightning_indexer_cand(32, 4096, 1, 1, GGML_TYPE_F32, 8, pattern));
+        test_cases.emplace_back(new test_lightning_indexer_cand(64, 4096, 1, 1, GGML_TYPE_F16, 8, pattern));
+        test_cases.emplace_back(new test_lightning_indexer_cand(32, 4096, 1, 2, GGML_TYPE_F16, 8, pattern));
+        test_cases.emplace_back(new test_lightning_indexer_cand(32, 4096, 9, 2, GGML_TYPE_F16, 8, pattern));
+        test_cases.emplace_back(new test_lightning_indexer_cand(32, 4096, 1, 1, GGML_TYPE_F16, 16, pattern));
+        test_cases.emplace_back(new test_lightning_indexer_cand(4, 4096, 8, 1, GGML_TYPE_F16, 8, pattern));
     }
 
     return test_cases;
