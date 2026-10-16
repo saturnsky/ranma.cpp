@@ -10,14 +10,22 @@
 //   - Shares (l1_lru_shares): at each plan install, the slots of a class are split over its layers in proportion to the
 //     installed plan's profile score of the experts outside the static plan (the selections the static part misses),
 //     rounded down, the leftover slots one each to the largest remainders (ties: the lower layer); equal shares without a
-//     score. At most `cap` per layer, the excess goes to the others.
+//     score. At most `cap` per layer, the excess goes to the others. A layer without any profile (a joined draft model)
+//     counts as an average layer of its class (l1_lru_fill_mass).
+//   - Classes (l1_lru_proportional): a class without static slots (no profile for its experts) takes the share of the
+//     LRU part's bytes that its experts' bytes make of all classes', from the classes with the largest LRU parts. The
+//     layers of a joined model hold only these fixed positions; the decode pool lends them no region.
 //   - A prefill lend takes the top slots of a class, the LRU part first (it sits at the top). The copies that stay are
 //     the most recently used ones whatever their slot (l1_lru_shrink): the ones above the lent top move down into the
 //     slots below it whose copies are dropped (or that are empty). When the lend ends, the returned slots go, empty, to the
 //     layers that have fewer than their share (l1_lru_revive).
+//   - The copies stay through a plan install. A decode plan's install gives new shares (l1_lru_reshare): each layer keeps
+//     its most recently used copies up to its new share in their slots, the others leave, and the free slots go, empty, to
+//     the layers below their share. Nothing moves: a copy holds an expert of its own layer.
 
 #include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstdint>
 #include <vector>
 
@@ -34,6 +42,79 @@ inline std::vector<int> l1_lru_class_slots(const std::vector<int> & capacities, 
         out[c] = (int) ((int64_t) std::max(capacities[c], 0)*pct/100);
     }
     return out;
+}
+
+// A class without static slots (its experts have no profile, e.g. a draft model that joined without one) would get no slots
+// of the LRU part. Such a class takes a share of the LRU part's bytes in proportion to its capacity, the bytes of all
+// its experts against those of all classes (`class_slices` experts of `slot_bytes` each), from the classes that have
+// slots, the largest LRU part first. `x` holds the slots from l1_lru_class_slots; on return the needy classes have slots
+// and the donors fewer, and the total bytes of the LRU part are unchanged (or less, when the donors cannot pay).
+inline void l1_lru_proportional(std::vector<int> & x, const std::vector<int> & capacities, const std::vector<int64_t> & class_slices,
+        const std::vector<size_t> & slot_bytes) {
+    const size_t nc = x.size();
+    if (capacities.size() != nc || class_slices.size() != nc || slot_bytes.size() != nc) {
+        return;
+    }
+    double lru = 0.0, all = 0.0;
+    std::vector<uint8_t> needy(nc, 0);
+    bool any = false;
+    for (size_t c = 0; c < nc; ++c) {
+        lru += (double) x[c]*(double) slot_bytes[c];
+        all += (double) class_slices[c]*(double) slot_bytes[c];
+        needy[c] = capacities[c] <= 0 && x[c] == 0 && class_slices[c] > 0 && slot_bytes[c] > 0 ? 1 : 0;
+        any = any || needy[c];
+    }
+    if (!any || lru <= 0.0 || all <= 0.0) {
+        return;
+    }
+    double owed = 0.0;
+    std::vector<int> want(nc, 0);
+    for (size_t c = 0; c < nc; ++c) {
+        if (needy[c]) {
+            want[c] = (int) std::min<double>((double) class_slices[c], lru*(double) class_slices[c]/all);
+            owed += (double) want[c]*(double) slot_bytes[c];
+        }
+    }
+    std::vector<size_t> donors;
+    for (size_t c = 0; c < nc; ++c) { if (!needy[c] && x[c] > 0) { donors.push_back(c); } }
+    std::stable_sort(donors.begin(), donors.end(), [&](size_t a, size_t b) {
+        return (double) x[a]*(double) slot_bytes[a] > (double) x[b]*(double) slot_bytes[b];
+    });
+    for (size_t c : donors) {
+        if (owed <= 0.0) { break; }
+        const int d = (int) std::min<double>((double) x[c], std::ceil(owed/(double) slot_bytes[c]));
+        x[c] -= d;
+        owed -= (double) d*(double) slot_bytes[c];
+    }
+    // the donors could not pay in full: the needy classes give back what is still owed
+    for (size_t c = 0; c < nc && owed > 0.0; ++c) {
+        if (needy[c] && want[c] > 0) {
+            const int d = (int) std::min<double>((double) want[c], std::ceil(owed/(double) slot_bytes[c]));
+            want[c] -= d;
+            owed -= (double) d*(double) slot_bytes[c];
+        }
+    }
+    for (size_t c = 0; c < nc; ++c) { x[c] += needy[c] ? want[c] : 0; }
+}
+
+// A layer without a profile has no mass, which would leave it no slots next to profiled layers of its class. Its mass
+// becomes the mean of the profiled layers' (a capacity-proportional share: an average layer). `profiled[i]` 0 marks it;
+// layers with mass < 0 (no positions) stay out. Without any profiled layer nothing changes (equal shares follow).
+inline void l1_lru_fill_mass(std::vector<double> & mass, const std::vector<uint8_t> & profiled) {
+    if (profiled.size() != mass.size()) {
+        return;
+    }
+    double s = 0.0;
+    size_t k = 0;
+    for (size_t i = 0; i < mass.size(); ++i) {
+        if (mass[i] >= 0.0 && profiled[i]) { s += mass[i]; ++k; }
+    }
+    if (k == 0 || !(s > 0.0)) {
+        return;
+    }
+    for (size_t i = 0; i < mass.size(); ++i) {
+        if (mass[i] >= 0.0 && !profiled[i]) { mass[i] = s/(double) k; }
+    }
 }
 
 // `total` slots over the layers of `mass` (one entry per layer of the class; a layer with mass < 0 gets none), in
@@ -212,6 +293,55 @@ inline void l1_lru_revive(std::vector<std::vector<int>> & slots, const std::vect
             slots[l].push_back(returned[next++]);
         }
     }
+}
+
+struct l1_lru_reshare_plan {
+    std::vector<int> keep;                      // [i] of the input: the copy stays in its slot
+    std::vector<int> drop;                      // [i] of the input: the copy leaves (owned, not kept)
+    std::vector<std::vector<int>> layer_slots;  // [layer] its slots (its kept copies first, then empty ones)
+};
+
+// An install: the copies of the LRU part of a class (`pos`, every position of the class; `keepable[i]` = 0 when the copy
+// must leave: its expert is static now, or it has no admissible home) over the new shares `share` [layer]. Each layer
+// keeps its most recently used keepable copies (lowest age, then lower slot), up to its share, in their slots; the other
+// copies leave. The free slots (empty, or their copy left) go, empty, to the layers below their share, lower layers
+// first, the lowest slots first. Nothing moves. Slots no layer takes stay with no layer.
+inline l1_lru_reshare_plan l1_lru_reshare(const std::vector<l1_lru_pos> & pos, const std::vector<uint8_t> & keepable,
+        const std::vector<int> & share, int n_layers) {
+    l1_lru_reshare_plan p;
+    p.layer_slots.assign((size_t) std::max(n_layers, 0), {});
+    const size_t n = pos.size();
+    std::vector<std::vector<size_t>> by_layer((size_t) std::max(n_layers, 0));
+    for (size_t i = 0; i < n; ++i) {
+        const int l = pos[i].layer;
+        if (pos[i].owner >= 0 && i < keepable.size() && keepable[i] && l >= 0 && l < n_layers) {
+            by_layer[(size_t) l].push_back(i);
+        }
+    }
+    std::vector<uint8_t> kept(n, 0);
+    for (size_t l = 0; l < by_layer.size(); ++l) {
+        auto & v = by_layer[l];
+        std::stable_sort(v.begin(), v.end(), [&](size_t a, size_t b) {
+            if (pos[a].age != pos[b].age) { return pos[a].age < pos[b].age; }
+            return pos[a].slot < pos[b].slot;
+        });
+        const size_t s = l < share.size() ? (size_t) std::max(share[l], 0) : 0;
+        for (size_t j = 0; j < v.size() && j < s; ++j) {
+            kept[v[j]] = 1;
+            p.layer_slots[l].push_back(pos[v[j]].slot);
+        }
+    }
+    std::vector<int> free;
+    for (size_t i = 0; i < n; ++i) {
+        if (kept[i]) {
+            p.keep.push_back((int) i);
+        } else {
+            if (pos[i].owner >= 0) { p.drop.push_back((int) i); }
+            free.push_back(pos[i].slot);
+        }
+    }
+    l1_lru_revive(p.layer_slots, share, free);
+    return p;
 }
 
 } // namespace ggml_cuda_expert

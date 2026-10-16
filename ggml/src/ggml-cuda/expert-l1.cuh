@@ -87,12 +87,16 @@ public:
 
     // Exactly once. capacities[class] slots per class, plus `spare_slots` free slots per class that
     // the exclusive exchange rotates through (0 for inclusive mode); the tables start empty (-1).
-    // `stage_slots[class]` more slots follow the spares: the VRAM staging of early-route layers
-    // (expert-hash-stage.cuh). No plan, install or slot count below ever includes them.
+    // `lru_slots[class]` more slots follow the spares: the LRU part of L1 (expert-l1-lru.h), positions of the decode pool;
+    // then `stage_slots[class]`: the VRAM staging of early-route layers (expert-hash-stage.cuh). No plan, install or slot
+    // count below ever includes either.
     bool allocate(const std::vector<int> & capacities, int device, int spare_slots = 0,
-                  const std::vector<int> * stage_slots = nullptr);
+                  const std::vector<int> * stage_slots = nullptr, const std::vector<int> * lru_slots = nullptr);
+    // The first slot of the LRU part of a class (after the static capacity and the spares), and its slot count.
+    int lru_base(int cls) const { return capacities_at_alloc_.empty() ? 0 : capacities_at_alloc_[(size_t) cls] + spare_slots_; }
+    int lru_slots(int cls) const { return lru_slots_.empty() ? 0 : lru_slots_[(size_t) cls]; }
     // The first staging slot of a class (after the static capacity and the spares).
-    int stage_base(int cls) const { return capacities_[(size_t) cls] + spare_slots_; }
+    int stage_base(int cls) const { return capacities_[(size_t) cls] + spare_slots_ + lru_slots(cls); }
 
     // A shrink install (the prefill lend, expert-redraw.h), while nothing computes:
     //   - set_static_capacities: the static capacity the next plans and installs are bound to;
@@ -264,6 +268,8 @@ private:
     int device_ = -1;
     cudaStream_t copy_stream_ = nullptr;
     std::vector<int> capacities_;
+    std::vector<int> lru_slots_;                       // [class] the LRU part's slots, after the spares
+    std::vector<int> capacities_at_alloc_;             // [class] the static capacity allocate() was given
     std::vector<int> slots_;                           // [class] slot counts once set_static_capacities ran
     std::vector<int> retire_;                          // [class] slot count the next install leaves
     bool unequal_ = false;

@@ -136,6 +136,41 @@ ring nor host memory) are still not admitted.
 With the switch at 0 nothing is allocated, the step kernel's ring branch is never taken, the publish kernel
 gets a null bitmap, and the worker's checks see no bitmap.
 
+## The LRU part of L1 (`--expert-l1-lru-pct N`)
+
+`--expert-l1-lru-pct N` (0..100, default 0, `LLAMA_ARG_EXPERT_L1_LRU_PCT`) keeps N % of the L1 budget out of the static
+plans: at load, N % of each size class's slots (rounded down) are carved from its static capacity and sit above its
+spares. Each routed layer of the pool owns some of them as its first positions ("fixed" positions), before the positions
+of a lent compute buffer region: one least recently used set per layer, with the same admission filter (ghost:K) and the
+same ring admission. The step and copy kernels are the same; nothing is launched in addition.
+
+- **Shares.** At load and at every install of a decode plan with a profile, the slots of a class are split over its
+  layers in proportion to the installed plan's profile score of the experts outside its static plan, rounded down, the
+  leftover slots one each to the largest remainders; equal shares without a profile. A prompt plan, a cold plan or the
+  install of a lend's evictions keeps the shares. A layer takes at most 256 - 64 (the positions per layer of the pool) positions, the
+  excess goes to the others (`expert-l1-lru.h`). One log line per layout gives the min/median/max per layer.
+- **Copies only.** A position holds a copy (the original is in the L2 or the file), so it leaves without a write back.
+  Under the ring admission a copy stays valid when the L2 reuses its ring slot (the bitmap keeps the worker away).
+- **Through installs.** The copies stay across plan installs (prompt and generation, request end) and the install of a
+  lend's evictions. Nothing but a lend writes these slots, so only the tables matter: before the install republishes
+  them the copies are set aside (their entries go back to their homes), afterwards one kernel checks each copy against
+  the new tables. A copy whose expert is static now leaves (it would only take a slot and count false hits); one with a
+  host home stays with that home; one the SSD worker serves stays as a ring copy while the ring admission is on (its
+  entries are written 0 when it leaves, as above); any other leaves. New shares move no copy: each layer keeps its most
+  recently used copies up to its new share in their slots, the others leave, and the free slots go empty to the layers
+  below their share. Stamps, step counts and the ghost window carry on. One log line per install gives the kept copies
+  and why the others left. A model join and the ring admission turning off still drop every copy (the join publishes
+  every home again; ring copies need the ring admission).
+- **Prefill lend.** A lend takes the top slots of a class, so the LRU part first: it is no resident, nothing is evicted
+  or written back for it. The copies that stay (those of the previous requests) are the most recently used ones of the
+  class: those above the lent top move (VRAM to VRAM) into the slots below it whose copies leave. One log line per lend
+  gives the kept, moved and dropped copies and the time. A lend beyond the LRU part evicts residents as before, and only that static part becomes the
+  restore space; with the LRU part on, the restore space's own LRU part defaults to off (`RANMA_EXPERT_LEND_LRU` set
+  explicitly wins). When the lend ends the slots return empty, to the layers below their share. While part of it is lent,
+  no compute buffer region is lent.
+- With a joint cache only the first model's layers get positions (one warning line, not checked).
+- The counter line (`RANMA_EXPERT_UB_POOL_LOG=1`) counts the hits on these positions apart (`L1 LRU part`).
+
 ## Settings
 
 The pool has no switches for its size or admission: a region is lent from 256 MiB up with 64 MiB of headroom
@@ -145,7 +180,6 @@ ring admission follows the unified host policy.
 
 | Environment switch | Default | Effect |
 |---|---|---|
-| `RANMA_EXPERT_UB_POOL` | 1 | 0 turns the decode pool off. |
 | `RANMA_EXPERT_UB_POOL_LOG` | 0 | 1: lends, reclaims and counters. |
 
 It is read once at startup. `RANMA_EXPERT_VERIFY` compares every position with its home before every

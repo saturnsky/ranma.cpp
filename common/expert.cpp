@@ -25,6 +25,7 @@ expert_validation validate_expert_params(const common_params & params) {
         return expert_reject("--expert-cache-mode must be 'inclusive' or 'exclusive', got '" + params.expert_cache_mode + "'");
     }
     if (params.expert_seed < 0) { return expert_reject("--expert-seed must be 0 or more"); }
+    if (params.expert_l1_lru_pct < 0 || params.expert_l1_lru_pct > 100) { return expert_reject("--expert-l1-lru-pct must be 0..100"); }
     if (params.expert_l2_worker_cpu < -1) { return expert_reject("--expert-l2-worker-cpu must be -1 or a logical CPU index"); }
     if (params.expert_l2_mib < -1 || params.expert_l2_staging_mib < 0 ||
             params.expert_l2_prefill_ring_mib < -1) {
@@ -182,6 +183,7 @@ ggml_expert_config expert_config_from_params(const common_params & params) {
             (*static_cast<std::function<void(int64_t, size_t[3])> *>(user))(n, out);
         };
     }
+    cfg.l1_lru_pct = (uint32_t) params.expert_l1_lru_pct;
 
     const size_t mib = 1024*1024;
     const int32_t prefill_mib = params.expert_l2_prefill_ring_mib >= 0 ?

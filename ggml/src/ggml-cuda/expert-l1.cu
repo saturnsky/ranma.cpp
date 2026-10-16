@@ -79,11 +79,15 @@ l1_arena::~l1_arena() {
 }
 
 bool l1_arena::allocate(const std::vector<int> & capacities, int device, int spare_slots,
-        const std::vector<int> * stage_slots) {
+        const std::vector<int> * stage_slots, const std::vector<int> * lru_slots) {
     if (allocated() || capacities.size() != geo_.class_bytes.size() || geo_.n_layers <= 0 || spare_slots < 0 ||
-            (stage_slots != nullptr && stage_slots->size() != capacities.size())) {
+            (stage_slots != nullptr && stage_slots->size() != capacities.size()) ||
+            (lru_slots != nullptr && lru_slots->size() != capacities.size())) {
         return false;
     }
+    lru_slots_.assign(capacities.size(), 0);
+    for (size_t c = 0; lru_slots != nullptr && c < capacities.size(); ++c) { lru_slots_[c] = std::max((*lru_slots)[c], 0); }
+    capacities_at_alloc_ = capacities;
     device_      = device;
     spare_slots_ = spare_slots;
     ggml_cuda_set_device(device_);
@@ -93,13 +97,14 @@ bool l1_arena::allocate(const std::vector<int> & capacities, int device, int spa
     aux_owner_.assign(capacities.size(), {});
     for (size_t c = 0; c < capacities.size(); ++c) {
         const int stage = stage_slots != nullptr ? std::max((*stage_slots)[c], 0) : 0;
-        aux_owner_[c].assign(size_t(capacities[c] + spare_slots), -1);
-        if (capacities[c] == 0 && spare_slots == 0 && stage == 0) { continue; }
+        const int lru = lru_slots_[c];
+        aux_owner_[c].assign(size_t(capacities[c] + spare_slots + lru), -1);
+        if (capacities[c] == 0 && spare_slots == 0 && stage == 0 && lru == 0) { continue; }
         for (int k = 0; k < n_parts; ++k) {
             if (k >= geometry::n_kinds && part_bytes((int) c, k) == 0) {
                 continue;
             }
-            const size_t bytes = size_t(capacities[c] + spare_slots + stage)*part_bytes((int) c, k) + part_tail((int) c, k);
+            const size_t bytes = size_t(capacities[c] + spare_slots + lru + stage)*part_bytes((int) c, k) + part_tail((int) c, k);
             if (cudaMalloc(&class_data_[c][k], bytes) != cudaSuccess) {
                 (void) cudaGetLastError();
                 class_data_[c][k] = nullptr;

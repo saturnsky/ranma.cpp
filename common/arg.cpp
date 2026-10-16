@@ -4011,6 +4011,18 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PERPLEXITY, LLAMA_EXAMPLE_COMPLETION}).set_env("LLAMA_ARG_EXPERT_L1_MIB"));
     add_opt(common_arg(
+        {"--expert-l1-lru-pct"}, "N",
+        string_format("share of the L1 expert budget (0..100 %%) kept as least recently used copies per routed layer instead of\n"
+                      "planned experts; each layer gets slots in proportion to the profile's selections outside the static\n"
+                      "plan (default: %d)", params.expert_l1_lru_pct),
+        [](common_params & params, int value) {
+            if (value < 0 || value > 100) {
+                throw std::invalid_argument("invalid value: must be 0..100");
+            }
+            params.expert_l1_lru_pct = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_PERPLEXITY, LLAMA_EXAMPLE_COMPLETION}).set_env("LLAMA_ARG_EXPERT_L1_LRU_PCT"));
+    add_opt(common_arg(
         {"--expert-cache-mode"}, "MODE",
         string_format("how the expert cache holds the weights: inclusive or exclusive (default: %s)", params.expert_cache_mode.c_str()),
         [](common_params & params, const std::string & value) {

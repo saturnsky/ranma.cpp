@@ -189,23 +189,6 @@ static __global__ void ub_settle_down_kernel(const ub_pool_layer * layers, const
     __threadfence_system();
 }
 
-// empty positions first, then the oldest stamp, then the lower position
-static __device__ __forceinline__ bool ub_precedes(const ub_step_args & a, const int off, const uint32_t t, const int x, const int y) {
-    const bool ex = a.owner[off + x] < 0;
-    const bool ey = a.owner[off + y] < 0;
-    if (ex != ey) {
-        return ex;
-    }
-    if (!ex) {
-        const uint32_t ax = t - a.stamp[off + x];
-        const uint32_t ay = t - a.stamp[off + y];
-        if (ax != ay) {
-            return ax > ay;
-        }
-    }
-    return x < y;
-}
-
 // One block per launch of a routed layer. Everything of the layer is written by this block, or by
 // the copy kernel that follows it on the same stream.
 static __global__ void __launch_bounds__(ub_pool_threads) ub_step_kernel(const ub_step_args a) {
@@ -216,6 +199,7 @@ static __global__ void __launch_bounds__(ub_pool_threads) ub_step_kernel(const u
     __shared__ int32_t s_miss[ub_pool_max_experts];
     __shared__ int32_t s_miss_key[ub_pool_max_experts];
     __shared__ int32_t s_victim[ub_pool_max_rcap];
+    __shared__ uint64_t s_rank_key[ub_pool_max_rcap];
     __shared__ unsigned int s_rows_w[ub_pool_max_experts];   // ghost filter: the selections (= rows) of the expert in this launch
     __shared__ uint8_t s_missed[ub_pool_max_experts];   // ghost filter: 1 a miss, 2 an admissible miss it rejected
     __shared__ int8_t  s_pfidx[ub_pool_max_experts];    // prefetch: the arrived staging slot holding the expert, -1
@@ -401,14 +385,26 @@ static __global__ void __launch_bounds__(ub_pool_threads) ub_step_kernel(const u
     const int n_miss = s_n_miss;
 
     if (n_miss > 0) {
-        // ranked by counting, so the order is deterministic
+        // ranked by counting, so the order is deterministic: each position's key once into shared memory (empty first,
+        // then the oldest stamp, then the lower position; not eligible: none), then every rank from there
         for (int p = tid; p < r; p += blockDim.x) {
-            if (!ub_eligible(a, off, t, p)) {
+            uint64_t k = ~uint64_t(0);
+            if (ub_eligible(a, off, t, p)) {
+                const bool empty = a.owner[off + p] < 0;
+                const uint32_t young = empty ? 0u : 0xFFFFFFFFu - (t - a.stamp[off + p]);
+                k = (uint64_t(empty ? 0 : 1) << 41) | (uint64_t(young) << 9) | uint64_t(p);
+            }
+            s_rank_key[p] = k;
+        }
+        __syncthreads();
+        for (int p = tid; p < r; p += blockDim.x) {
+            const uint64_t k = s_rank_key[p];
+            if (k == ~uint64_t(0)) {
                 continue;
             }
             int rank = 0;
             for (int q = 0; q < r; ++q) {
-                rank += q != p && ub_eligible(a, off, t, q) && ub_precedes(a, off, t, q, p);
+                rank += s_rank_key[q] < k;
             }
             s_victim[rank] = p;
             atomicAdd(&s_n_victims, 1);
@@ -820,9 +816,9 @@ static __global__ void __launch_bounds__(ub_pool_threads) ub_lend_kernel(const u
     const int tid = threadIdx.x;
     const ub_pool_layer & L = a.layers[layer];
     ub_pool_meta & m = a.meta[layer];
-    if (!L.enabled) {
+    if (!L.enabled || L.no_lend) {
         if (tid == 0) {
-            m.r = 0;
+            m.r = L.enabled ? m.fixed : 0;
             a.count[layer] = 0;
         }
         return;
@@ -1036,7 +1032,7 @@ int ub_pool::lend(void * base, size_t bytes, cudaStream_t stream, void * base2, 
     GGML_ASSERT(r_ == 0);
     size_t per_round = 0;
     for (int l = 0; l < n_layers_; ++l) {
-        per_round += pos_bytes_[l];
+        per_round += layers_[l].no_lend ? 0 : pos_bytes_[l];
     }
     // each region starts 256-aligned and holds whole rounds (one position of every layer)
     auto rounds = [per_round](void * b, size_t n) -> size_t {
@@ -1058,7 +1054,7 @@ int ub_pool::lend(void * base, size_t bytes, cudaStream_t stream, void * base2, 
     auto lay = [&](void * b, size_t n, int p0, int p1) {
         uintptr_t at = ((uintptr_t) b + 255) & ~uintptr_t(255);
         for (int l = 0; l < n_layers_; ++l) {
-            if (!layers_[l].enabled) {
+            if (!layers_[l].enabled || layers_[l].no_lend) {
                 continue;
             }
             for (int p = p0; p < p1; ++p) {
@@ -1115,7 +1111,7 @@ long ub_pool::owned_in_second() const {
     CUDA_CHECK(cudaMemcpy(owner.data(), d_owner_, P*sizeof(int32_t), cudaMemcpyDeviceToHost));
     long n = 0;
     for (int l = 0; l < n_layers_; ++l) {
-        if (!layers_[l].enabled) {
+        if (!layers_[l].enabled || layers_[l].no_lend) {
             continue;
         }
         for (int p = r_ - r2_; p < r_; ++p) {
@@ -1551,6 +1547,70 @@ bool ub_pool::set_fixed(const std::vector<std::vector<ub_fixed_pos>> & pos, cons
     for (size_t l = 0; l < L; ++l) {
         fixed_[l] = (int) pos[l].size();
         fixed_max_ = std::max(fixed_max_, fixed_[l]);
+    }
+    return true;
+}
+
+struct ub_fixed_query {
+    int32_t  layer, expert;
+    int32_t  state;
+    int32_t  pad;
+    uint64_t home[3];
+};
+
+// check_fixed: the step's admission rules against the tables as they are now (ub_admissible, ub_ring_admissible without
+// the nonzero entries: the copy exists already).
+static __global__ void ub_fixed_check_kernel(const ub_pool_layer * layers, ub_fixed_query * q, const int n, const int ring) {
+    for (int i = blockIdx.x*blockDim.x + threadIdx.x; i < n; i += gridDim.x*blockDim.x) {
+        const ub_pool_layer & L = layers[q[i].layer];
+        const int e = q[i].expert;
+        int32_t st = ub_fixed_none;
+        for (int k = 0; k < 3; ++k) { q[i].home[k] = 0; }
+        if (!L.enabled || L.slots == nullptr) {
+            st = ub_fixed_none;
+        } else if (L.slots[e] >= 0) {
+            st = ub_fixed_static;
+        } else if (ub_admissible(L, e)) {
+            st = ub_fixed_home;
+            for (int k = 0; k < 3; ++k) { q[i].home[k] = L.kind[k].addresses != nullptr ? L.kind[k].addresses[e] : 0; }
+        } else if (ring && L.serve != nullptr && (L.serve[e/32] & (1u << (e%32))) != 0) {
+            st = ub_fixed_ring;
+        }
+        q[i].state = st;
+    }
+}
+
+bool ub_pool::check_fixed(const std::vector<std::pair<int, int>> & q, std::vector<int> & state,
+        std::vector<std::array<uint64_t, 3>> & home) const {
+    state.assign(q.size(), ub_fixed_none);
+    home.assign(q.size(), { 0, 0, 0 });
+    if (blob_ == nullptr || r_ != 0) {
+        return false;
+    }
+    if (q.empty()) {
+        return true;
+    }
+    std::vector<ub_fixed_query> h(q.size());
+    for (size_t i = 0; i < q.size(); ++i) {
+        if (q[i].first < 0 || q[i].first >= n_layers_ || q[i].second < 0 || q[i].second >= n_experts_) {
+            return false;
+        }
+        h[i] = {};
+        h[i].layer  = q[i].first;
+        h[i].expert = q[i].second;
+    }
+    ggml_cuda_set_device(device_);
+    ub_fixed_query * d = nullptr;
+    CUDA_CHECK(cudaMalloc((void **) &d, h.size()*sizeof(ub_fixed_query)));
+    CUDA_CHECK(cudaMemcpy(d, h.data(), h.size()*sizeof(ub_fixed_query), cudaMemcpyHostToDevice));
+    const int n = (int) h.size();
+    ub_fixed_check_kernel<<<std::min((n + 255)/256, 1024), 256>>>(d_layers_, d, n, ring_ ? 1 : 0);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaMemcpy(h.data(), d, h.size()*sizeof(ub_fixed_query), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaFree(d));
+    for (size_t i = 0; i < h.size(); ++i) {
+        state[i] = h[i].state;
+        for (int k = 0; k < 3; ++k) { home[i][(size_t) k] = h[i].home[k]; }
     }
     return true;
 }
