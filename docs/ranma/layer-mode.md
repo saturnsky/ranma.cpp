@@ -123,7 +123,8 @@ The expert cache must be on (`--expert-l1-mib` or `--expert-l2-mib`), the model 
 (`deepseek4`) with
 EXL3 routed experts (separate gate and up). Anything else logs `layer mode: ...; prompt processing runs as with
 --layer-mode off` and runs as `off`. So does a setup with a context the memory check does not build yet: a draft
-model or an MTP context (`-md`, `--spec-type`), or a multimodal projector (`--mmproj`).
+model or an MTP context (`-md`, `--spec-type` other than `ngram-varlen`), or a multimodal projector (`--mmproj`).
+`ngram-varlen` alone has no context of its own, so the mode stays on with it.
 
 - MTP blocks of their own (blocks with `nextn` tensors) are not counted as routed layers of a prompt step; the
   staging slot is sized for the largest routed layer.

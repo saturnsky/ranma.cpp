@@ -17,6 +17,7 @@
 // usage: test-layer-exec-dsv41 [-s SEED] [--keep model.gguf] [--quick] [--long] [--only N1 N2 UB]
 
 #include "ggml.h"
+#include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "gguf.h"
 #include "common.h"
@@ -252,6 +253,7 @@ static bool write_model(const std::string & path, uint64_t seed) {
 struct cfg_t {
     uint32_t n_ubatch = 64;
     uint32_t n_batch  = 4096;
+    uint32_t n_rs     = 0;            // n_rs_seq of the context (rollback planes, ngram-varlen)
     bool layer = false;               // layer_exec
     const char * group      = nullptr; // layer_exec_group_tokens
     const char * moe        = nullptr; // layer_exec_moe_tokens
@@ -302,7 +304,7 @@ static void log_cb(ggml_log_level level, const char * text, void * /*user*/) {
             g_bundles++;
         }
     }
-    if (level >= GGML_LOG_LEVEL_WARN || strstr(text, "layer_exec") != nullptr || strstr(text, "layer-major") != nullptr) {
+    if (level >= GGML_LOG_LEVEL_WARN || strstr(text, "layer_exec") != nullptr || strstr(text, "layer-major") != nullptr || strstr(text, "does not cut") != nullptr) {
         fputs(text, stderr);
     }
 }
@@ -322,6 +324,7 @@ static llama_context_ptr make_ctx(const cfg_t & c) {
     cp.n_batch = c.n_batch;
     cp.n_ubatch = c.n_ubatch;
     cp.n_seq_max = 1;
+    cp.n_rs_seq = c.n_rs;
     cp.n_threads = 4;
     cp.n_threads_batch = 4;
     cp.op_offload = false;
@@ -464,6 +467,250 @@ static bool scenario_ckpt(const cfg_t & c, const std::vector<llama_token> & toks
     return true;
 }
 
+// the cut of a model-free graph of two layers, each with a compressor-like state of a base plane and two rollback
+// planes, written as DeepSeek-V4 does: a restore (a plane copied onto the base, no layer output read, earliest segment
+// 0), then a read of [base | rows of the ubatch], a snapshot into a plane and a persist into the base (earliest segment
+// l). variant 0: every access to the state of layer l runs in segment l, in graph order. variant 1: the router input of
+// layer 0 also reads the state of layer 1, which would then be read in segment 0 and written in segment 1 (across the
+// MoE of layer 0): the cut must refuse it.
+static int fixture_cut(ggml_backend_dev_t cpu) {
+    int n_fail = 0;
+    const int64_t D = 8, T = 4, RW = 4;
+    ggml_backend_buffer_type_t buft = ggml_backend_dev_buffer_type(cpu);
+    for (int variant = 0; variant < 2; variant++) {
+        ggml_init_params ip = { 64*ggml_tensor_overhead(), nullptr, true };
+        ggml_context * cw = ggml_init(ip);
+        ggml_context * cs = ggml_init(ip);
+        ggml_context * ci = ggml_init(ip);
+        ggml_init_params gp = { 1024*ggml_tensor_overhead() + ggml_graph_overhead_custom(1024, false), nullptr, true };
+        ggml_context * cg = ggml_init(gp);
+        ggml_tensor * W[2];
+        ggml_tensor * S[2];
+        for (int l = 0; l < 2; l++) {
+            W[l] = ggml_new_tensor_2d(cw, GGML_TYPE_F32, D, D);
+            S[l] = ggml_new_tensor_2d(cs, GGML_TYPE_F32, D, 3*RW);
+            ggml_format_name(S[l], "fx_state-%d", l);
+        }
+        auto in_i32 = [&](int64_t n, const char * name) {
+            ggml_tensor * t = ggml_new_tensor_1d(ci, GGML_TYPE_I32, n);
+            ggml_set_name(t, name);
+            ggml_set_input(t);
+            return t;
+        };
+        ggml_tensor * inp = ggml_new_tensor_2d(ci, GGML_TYPE_F32, D, T);
+        ggml_set_name(inp, "fx_inp");
+        ggml_set_input(inp);
+        ggml_tensor * ridx  = in_i32(RW, "fx_restore_src");
+        ggml_tensor * didx  = in_i32(RW, "fx_restore_dst");
+        ggml_tensor * sidx  = in_i32(T,  "fx_read");
+        ggml_tensor * snsrc = in_i32(RW, "fx_snapshot_src");
+        ggml_tensor * sndst = in_i32(RW, "fx_snapshot_dst");
+        ggml_tensor * psrc  = in_i32(T,  "fx_persist_src");
+        ggml_tensor * pdst  = in_i32(T,  "fx_persist_dst");
+        ggml_backend_buffer_t bw = ggml_backend_alloc_ctx_tensors_from_buft(cw, buft);
+        ggml_backend_buffer_t bs = ggml_backend_alloc_ctx_tensors_from_buft(cs, buft);
+        ggml_backend_buffer_t bi = ggml_backend_alloc_ctx_tensors_from_buft(ci, buft);
+        ggml_backend_buffer_set_usage(bw, GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+        ggml_cgraph * gf = ggml_new_graph_custom(cg, 1024, false);
+        ggml_tensor * h = ggml_scale(cg, inp, 1.0f);
+        ggml_tensor * wr[2][3] = {}; // per layer: restore, snapshot, persist
+        ggml_tensor * rd_plane[2] = {};
+        for (int l = 0; l < 2; l++) {
+            auto all = [&]() { return ggml_view_2d(cg, S[l], D, 3*RW, S[l]->nb[1], 0); };
+            ggml_tensor * g = ggml_get_rows(cg, all(), ridx);
+            rd_plane[l] = g;
+            ggml_tensor * r = ggml_set_rows(cg, all(), g, didx);
+            ggml_build_forward_expand(gf, r);
+            ggml_tensor * base = ggml_view_2d(cg, r, D, RW, r->nb[1], 0);
+            ggml_tensor * src = ggml_concat(cg, base, h, 1);
+            ggml_tensor * rd = ggml_get_rows(cg, src, sidx);
+            ggml_tensor * sn = ggml_set_rows(cg, all(), ggml_get_rows(cg, src, snsrc), sndst);
+            ggml_build_forward_expand(gf, sn);
+            ggml_tensor * ps = ggml_set_rows(cg, all(), ggml_get_rows(cg, h, psrc), pdst);
+            ggml_build_forward_expand(gf, ps);
+            wr[l][0] = r; wr[l][1] = sn; wr[l][2] = ps;
+            ggml_tensor * x = ggml_add(cg, h, rd);
+            if (variant == 1 && l == 0) {
+                ggml_tensor * s1 = ggml_view_2d(cg, S[1], D, RW, S[1]->nb[1], 0);
+                x = ggml_add(cg, x, ggml_get_rows(cg, s1, sidx));
+            }
+            ggml_format_name(x, "fx_moe_in-%d", l);
+            ggml_tensor * y = ggml_mul_mat(cg, W[l], x);
+            ggml_format_name(y, "fx_moe_out-%d", l);
+            h = ggml_scale(cg, y, 0.5f);
+        }
+        ggml_build_forward_expand(gf, ggml_scale(cg, h, 1.0f));
+
+        const int n = ggml_graph_n_nodes(gf);
+        std::vector<int32_t> seg((size_t) n, -1);
+        char err[512] = {};
+        const bool ok = llama_layer_exec_analyze_segments(gf, 2, "fx_moe_in", "fx_moe_out", T, seg.data(), err, sizeof err);
+        auto idx_of = [&](const ggml_tensor * t) {
+            for (int i = 0; i < n; i++) {
+                if (ggml_graph_node(gf, i) == t) { return i; }
+            }
+            return -1;
+        };
+        auto seg_of = [&](const ggml_tensor * t) {
+            const int i = idx_of(t);
+            return i < 0 ? -3 : seg[(size_t) i];
+        };
+        bool pass = false;
+        std::string what;
+        if (variant == 0) {
+            pass = ok;
+            what = ok ? "" : err;
+            for (int l = 0; l < 2 && ok; l++) {
+                for (int w = 0; w < 3; w++) {
+                    if (seg_of(wr[l][w]) != l) {
+                        pass = false;
+                        what += " write " + std::to_string(w) + " of layer " + std::to_string(l) + " in segment " +
+                            std::to_string(seg_of(wr[l][w])) + ";";
+                    }
+                }
+                if (seg_of(rd_plane[l]) != l) {
+                    pass = false;
+                    what += " the plane read of layer " + std::to_string(l) + " in segment " +
+                        std::to_string(seg_of(rd_plane[l])) + ";";
+                }
+                // the graph order: restore, snapshot, persist
+                if (!(idx_of(wr[l][0]) < idx_of(wr[l][1]) && idx_of(wr[l][1]) < idx_of(wr[l][2]))) {
+                    pass = false;
+                    what += " order;";
+                }
+            }
+            if (pass) {
+                what = "restore, snapshot and persist of layer 1 in segment 1";
+            }
+        } else {
+            pass = !ok;
+            what = ok ? "cut, expected a refusal" : err;
+        }
+        printf("fixture cut %s: %s (%s)\n", variant == 0 ? "co-placed restore/snapshot/persist" : "state read across a MoE",
+               pass ? "ok" : "FAIL <<<<<<", what.c_str());
+        fflush(stdout);
+        n_fail += pass ? 0 : 1;
+        ggml_backend_buffer_free(bw);
+        ggml_backend_buffer_free(bs);
+        ggml_backend_buffer_free(bi);
+        ggml_free(cg);
+        ggml_free(ci);
+        ggml_free(cs);
+        ggml_free(cw);
+    }
+    return n_fail;
+}
+
+// the compressor states (base and rollback planes of every layer) and the pending rollback and depth of sequence 0
+struct rs_snap {
+    std::vector<uint8_t> st;
+    uint32_t idx = 0;
+    uint32_t depth = 0;
+};
+
+static bool rs_take(llama_context * ctx, std::vector<rs_snap> & v) {
+    rs_snap s;
+    if (!llama_dsv4_rs_dump(ctx, 0, &s.st, &s.idx, &s.depth)) {
+        fprintf(stderr, "rs: no DeepSeek-V4 cache to dump\n");
+        return false;
+    }
+    v.push_back(std::move(s));
+    return true;
+}
+
+// ngram-varlen on the target: R = n_rs_seq rollback planes. A prompt (llama_set_rs_prompt) of several ubatches, then
+//  - a removal of its last two rows, refused (a prompt keeps one plane),
+//  - the last prompt row taken back and decoded again as a call of one token (the prompt reuse of the server),
+//  - a verification call of m + 1 rows (m drafts, all with logits: the planes of depth m),
+//  - a partial removal after k accepted drafts (k = 0: the first position rejected), refused or not,
+//  - n3 > 0: a prompt of n3 tokens (layer-major when the case is) that starts with that rollback pending,
+//  - and 3 tokens on.
+// The result of every seq_rm is recorded in ev, the states after every call and removal in snaps; the layer-major run has
+// to give the ubatch loop's logits, results and states. pend: the rollback pending before the n3 prompt.
+static bool scenario_rs(const cfg_t & c, const std::vector<llama_token> & toks, int n1, int m, int k, int n3, logits_t & res,
+                        std::vector<int> & ev, std::vector<rs_snap> & snaps, uint32_t & pend) {
+    auto ctx = make_ctx(c);
+    if (!ctx) { return false; }
+    const int runs0 = g_layer_runs;
+    const size_t masks0 = g_mask_modes.size();
+    llama_memory_t mem = llama_get_memory(ctx.get());
+    llama_set_rs_prompt(ctx.get(), true);
+    const bool ok0 = decode_range(ctx.get(), toks, 0, n1, { n1 - 1 }, &res);
+    llama_set_rs_prompt(ctx.get(), false);
+    if (!ok0) { fprintf(stderr, "rs: prompt failed\n"); return false; }
+    if (!check_runs(c, runs0, masks0, n1 > (int) c.n_ubatch ? 1 : 0, { n1 })) { return false; }
+    set_layer_exec(false);
+    if (!rs_take(ctx.get(), snaps)) { return false; }
+    // depth 2 after a prompt: refused
+    ev.push_back(llama_memory_seq_rm(mem, 0, n1 - 2, -1) ? 1 : 0);
+    // the prompt's last row reused
+    ev.push_back(llama_memory_seq_rm(mem, 0, n1 - 1, -1) ? 1 : 0);
+    if (ev.back()) {
+        llama_set_rs_prompt(ctx.get(), true);
+        const bool ok = decode_range(ctx.get(), toks, n1 - 1, n1, { n1 - 1 }, &res, 200000);
+        llama_set_rs_prompt(ctx.get(), false);
+        if (!ok) { fprintf(stderr, "rs: reuse decode failed\n"); return false; }
+    }
+    if (!rs_take(ctx.get(), snaps)) { return false; }
+    // the verification call, m + 1 rows with logits (m = 0: a plain decode of one token, q = 0)
+    std::vector<int> outs;
+    for (int p = n1; p <= n1 + m; p++) { outs.push_back(p); }
+    if (!decode_range(ctx.get(), toks, n1, n1 + m + 1, outs, &res, 300000)) {
+        fprintf(stderr, "rs: verification failed (layer=%d)\n", (int) c.layer);
+        return false;
+    }
+    if (!rs_take(ctx.get(), snaps)) { return false; }
+    int p = n1 + m + 1;
+    if (k < m) {
+        p = n1 + k + 1;
+        ev.push_back(llama_memory_seq_rm(mem, 0, p, -1) ? 1 : 0);
+    } else {
+        // everything accepted: the call itself taken back (m = 0: its single row)
+        ev.push_back(llama_memory_seq_rm(mem, 0, n1 + m, -1) ? 1 : 0);
+        p = n1 + m + (ev.back() ? 0 : 1);
+    }
+    if (!rs_take(ctx.get(), snaps)) { return false; }
+    pend = snaps.back().idx;
+    if (n3 > 0) {
+        set_layer_exec(c.layer);
+        const int runs1 = g_layer_runs;
+        const size_t masks1 = g_mask_modes.size();
+        llama_set_rs_prompt(ctx.get(), true);
+        const bool ok = decode_range(ctx.get(), toks, p, p + n3, { p + n3 - 1 }, &res, 500000);
+        llama_set_rs_prompt(ctx.get(), false);
+        set_layer_exec(false);
+        if (!ok) { fprintf(stderr, "rs: prompt after the rollback failed (layer=%d)\n", (int) c.layer); return false; }
+        if (!check_runs(c, runs1, masks1, n3 > (int) c.n_ubatch ? 1 : 0, { n3 })) { return false; }
+        p += n3;
+        if (!rs_take(ctx.get(), snaps)) { return false; }
+    }
+    for (int i = 0; i < 3; i++, p++) {
+        if (!decode_range(ctx.get(), toks, p, p + 1, { p }, &res, 400000)) {
+            fprintf(stderr, "rs: next token failed at %d (layer=%d)\n", p, (int) c.layer);
+            return false;
+        }
+        if (!rs_take(ctx.get(), snaps)) { return false; }
+    }
+    return true;
+}
+
+static bool rs_same(const std::vector<rs_snap> & a, const std::vector<rs_snap> & b, std::string & why) {
+    if (a.size() != b.size()) { why = "a different number of states"; return false; }
+    for (size_t i = 0; i < a.size(); i++) {
+        if (a[i].idx != b[i].idx || a[i].depth != b[i].depth) {
+            why = "state " + std::to_string(i) + ": pending " + std::to_string(a[i].idx) + "/" + std::to_string(b[i].idx) +
+                ", depth " + std::to_string(a[i].depth) + "/" + std::to_string(b[i].depth);
+            return false;
+        }
+        if (a[i].st.empty() || a[i].st.size() != b[i].st.size() || memcmp(a[i].st.data(), b[i].st.data(), a[i].st.size()) != 0) {
+            why = "state " + std::to_string(i) + ": the compressor planes differ";
+            return false;
+        }
+    }
+    return true;
+}
+
 int main(int argc, char ** argv) {
     uint64_t seed = 1234;
     std::string keep;
@@ -491,6 +738,7 @@ int main(int argc, char ** argv) {
     }
     llama_backend_init();
     llama_log_set(log_cb, nullptr);
+    const int n_fail_fixture = fixture_cut(cpu);
     if (getenv("RANMA_LAYER_EXEC_LOG") == nullptr) { set_env("RANMA_LAYER_EXEC_LOG", "1"); }
     set_env("GGML_CUDA_TOP_K_STABLE_TIES", "1");
 
@@ -511,7 +759,7 @@ int main(int argc, char ** argv) {
     std::vector<llama_token> toks((size_t) N_CTX);
     for (auto & t : toks) { t = 3 + rng() % (g_vocab - 3); }
 
-    int n_fail = 0;
+    int n_fail = n_fail_fixture;
     auto report = [&](const std::string & what, const diff_t & d, bool must_equal) {
         const bool bad = must_equal ? !(d.max_abs == 0.0) || !d.top1_same : !d.top1_same;
         if (bad && must_equal) { n_fail++; }
@@ -569,10 +817,68 @@ int main(int argc, char ** argv) {
         }
     }
 
+    // ngram-varlen: rollback planes (R) with a layer-major prompt
+    if (only[0] == 0) {
+        struct rs_t {
+            int n1; uint32_t ub; uint32_t R; int m; int k; const char * group;
+            int n3; uint32_t ub_ref; // ub_ref: the ubatch of the ubatch loop (0: ub)
+        };
+        std::vector<rs_t> rs = {
+            { 1000, 128, 32, 8, 8, nullptr, 0, 0 }, { 1000, 128, 32, 8, 4, nullptr, 0, 0 },
+            { 1000, 128, 32, 8, 0, nullptr, 0, 0 }, { 1000, 128, 32, 1, 0, nullptr, 0, 0 },
+            { 1000, 128, 32, 1, 1, nullptr, 0, 0 }, { 1000, 128, 32, 0, 0, nullptr, 0, 0 },
+            { 517, 96, 94, 8, 3, nullptr, 0, 0 }, { 1000, 64, 62, 8, 7, nullptr, 0, 0 },
+            { 1000, 64, 8, 8, 2, nullptr, 0, 0 }, { 1000, 128, 32, 8, 4, "256", 0, 0 },
+            { 130, 64, 32, 8, 0, nullptr, 0, 0 },
+            // the capacity of R = 5: m = 4, m = 5 (all accepted, none, part)
+            { 1000, 128, 5, 4, 2, nullptr, 0, 0 }, { 1000, 128, 5, 5, 5, nullptr, 0, 0 },
+            { 1000, 128, 5, 5, 0, nullptr, 0, 0 },
+            // a prompt of several ubatches with a rollback pending: plain, groups, R = 5, odd sizes
+            { 1000, 128, 32, 8, 4, nullptr, 700, 0 }, { 1000, 128, 32, 8, 0, "256", 900, 0 },
+            { 1000, 128, 5, 5, 2, nullptr, 600, 0 },
+            { 517, 96, 94, 8, 3, nullptr, 517, 0 },
+            // ... split again by the width rule (passes of at most 1536 tokens: ubatches of 768, those of the ubatch loop)
+            { 700, 1024, 32, 8, 4, "1536", 3000, 768 },
+        };
+        if (quick) { rs.resize(3); }
+        int n_rm_ok = 0, n_rm_no = 0, n_pend = 0;
+        for (const rs_t & r : rs) {
+            cfg_t a; a.n_ubatch = r.ub_ref > 0 ? r.ub_ref : r.ub; a.n_batch = 4096; a.n_rs = r.R;
+            a.group = r.ub_ref > 0 ? nullptr : r.group;
+            cfg_t b = a; b.n_ubatch = r.ub; b.group = r.group; b.layer = true;
+            logits_t ra, rb;
+            std::vector<int> ea, eb;
+            std::vector<rs_snap> sa, sb;
+            uint32_t pa = 0, pb = 0;
+            const int split0 = g_split;
+            const bool ok = scenario_rs(a, toks, r.n1, r.m, r.k, r.n3, ra, ea, sa, pa) &&
+                            scenario_rs(b, toks, r.n1, r.m, r.k, r.n3, rb, eb, sb, pb);
+            char buf[240];
+            snprintf(buf, sizeof buf, "rs R=%u n=%d ub=%u m=%d k=%d group=%s n3=%d rm=%d%d%d pend=%u states=%zu", r.R,
+                     r.n1, r.ub, r.m, r.k, r.group ? r.group : "-", r.n3, ea.size() > 0 ? ea[0] : -1,
+                     ea.size() > 1 ? ea[1] : -1, ea.size() > 2 ? ea[2] : -1, pa, sa.size());
+            if (!ok) { printf("%s: decode failed\n", buf); n_fail++; continue; }
+            bool bad = false;
+            if (ea != eb) { printf("%s: seq_rm results differ between the ubatch loop and layer-major <<<<<< MISMATCH\n", buf); bad = true; }
+            if (ea.size() < 3 || ea[0] != 0) { printf("%s: a removal of depth 2 after a prompt was accepted <<<<<< MISMATCH\n", buf); bad = true; }
+            if (r.m == 0 && ea.size() >= 3 && ea[2] != 0) { printf("%s: a removal after a plain decode was accepted <<<<<< MISMATCH\n", buf); bad = true; }
+            if (r.n3 > 0 && (pa == 0 || pb != pa)) { printf("%s: no rollback pending before the prompt (%u / %u) <<<<<< MISMATCH\n", buf, pa, pb); bad = true; }
+            if (r.ub_ref > 0 && g_split == split0) { printf("%s: the batch was not split again <<<<<< MISMATCH\n", buf); bad = true; }
+            std::string why;
+            if (!rs_same(sa, sb, why)) { printf("%s: %s <<<<<< MISMATCH\n", buf, why.c_str()); bad = true; }
+            n_fail += bad ? 1 : 0;
+            for (int e : ea) { (e ? n_rm_ok : n_rm_no)++; }
+            n_pend += r.n3 > 0 && pa > 0;
+            report(buf, compare(ra, rb), true);
+        }
+        printf("rs coverage: seq_rm accepted %d, refused %d, prompts with a rollback pending %d\n", n_rm_ok, n_rm_no, n_pend);
+        if (n_rm_ok < 1 || (!quick && n_pend < 5)) { printf("rs coverage missing\n"); n_fail++; }
+    }
+
     // the width rule splits the batch again: 3000 tokens in ubatches of 1024, passes of at most 1536 tokens, are two passes
     // of two ubatches of 768; the ubatch loop in ubatches of 768 gives the same logits bit for bit
     if (only[0] == 0) {
-        cfg_t a; a.n_ubatch = 768; a.n_batch = 4096;
+        cfg_t a; a.n_ubatch = 768; a.n_batch = 4096; a.n_rs = 32;
         cfg_t b = a; b.n_ubatch = 1024; b.layer = true; b.group = "1536";
         logits_t ra, rb;
         const int split0 = g_split;
