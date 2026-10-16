@@ -2358,6 +2358,7 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
                 n_ubatch_split = 1;
             }
         }
+        memory->set_rs_prompt(rs_prompt);
         mctx = memory->init_batch(*balloc, n_ubatch_split, embd_all);
         if (!mctx) {
             return -2;
@@ -4774,6 +4775,10 @@ void llama_set_embeddings(llama_context * ctx, bool embeddings) {
 
 void llama_set_causal_attn(llama_context * ctx, bool causal_attn) {
     ctx->set_causal_attn(causal_attn);
+}
+
+void llama_set_rs_prompt(llama_context * ctx, bool prompt) {
+    ctx->set_rs_prompt(prompt);
 }
 
 bool llama_get_causal_attn(const llama_context * ctx) {

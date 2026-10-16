@@ -86,6 +86,9 @@ struct llama_memory_i {
     // return a context object containing the ubatches and memory state required to process them
     // check the llama_memory_context_i::get_status() for the result
     // embd_all: keep all the tokens of a sequence in one ubatch (all tokens are output, or the attention is non-causal)
+    // the next init_batch() calls process a prompt (see llama_set_rs_prompt)
+    virtual void set_rs_prompt(bool /*prompt*/) {}
+
     virtual llama_memory_context_ptr init_batch(
             llama_batch_allocr & balloc,
             uint32_t n_ubatch,

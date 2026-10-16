@@ -1350,11 +1350,8 @@ void llama_model_deepseek41::graph::build_kv_source(
                 ctx0, latent, inp_comp.state_write_idxs, il));
 
     // carry whatever did not complete a row into the next ubatch
-    ggml_tensor * snapshot_kv    = ggml_concat(ctx0, restored.kv,    state_kv,    1);
-    ggml_tensor * snapshot_score = ggml_concat(ctx0, restored.score, state_score, 1);
-
     const dsv4_state_tensors snapshot = dsv4_build_state_snapshot(
-            ctx0, inp_comp, comp_state, snapshot_kv, snapshot_score, il);
+            ctx0, inp_comp, comp_state, restored, state_kv, state_score, il);
     if (snapshot.kv != nullptr) {
         ggml_build_forward_expand(gf, snapshot.kv);
     }

@@ -1141,6 +1141,12 @@ extern "C" {
     // If set to true, the model will only attend to the past tokens
     LLAMA_API void llama_set_causal_attn(struct llama_context * ctx, bool causal_attn);
 
+    // Mark the following llama_decode() calls as prompt processing (default: false)
+    // A recurrent-state rollback cache (DeepSeek V4) keeps one rollback step for a prompt call even when the call is a
+    // single token, so that the row can be removed again when a later prompt reuses it. A decode call of one token
+    // (generation) keeps none.
+    LLAMA_API void llama_set_rs_prompt(struct llama_context * ctx, bool prompt);
+
     // Returns whether the context is currently using causal attention
     LLAMA_API bool llama_get_causal_attn(const struct llama_context * ctx);
 
