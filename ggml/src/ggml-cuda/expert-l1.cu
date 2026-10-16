@@ -162,6 +162,10 @@ ggml_cuda_expert_lookup l1_arena::lookup(int layer, int kind) const noexcept {
             out.host_addresses = host_->device_addresses(layer, kind);
         }
     }
+    if (out.host_addresses == nullptr && pool_addresses_) {
+        // the decode pool publishes its slots through an address table of its own (expert-ub-pool.cuh)
+        out.host_addresses = pool_addresses_(layer, kind);
+    }
     return out;
 }
 
