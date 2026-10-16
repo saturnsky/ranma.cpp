@@ -2,6 +2,7 @@
 
 #include "expert.h"
 #include "fit.h"
+#include "speculative.h"
 #include "log.h"
 
 #include "ggml-cpp.h"
@@ -277,6 +278,168 @@ static bool lm_layer_major_lend(common_params & params, int64_t n_tokens, size_t
     return ok;
 }
 
+// ranma: the draft the layer mode plans for, a DFlash/DSpark DSV4 draft: every stage attends a standard sliding window
+// over the uncompressed KV of the injected target features (llama_model_dflash_feature_window). Its drafter takes the
+// target features of the last n_swa rows of a call only, so a prompt of many ubatches keeps the layer-major prefill and
+// the exact tail (llama_set_embeddings_layer_inp_last). Read from the GGUF, before any load.
+struct lm_draft {
+    int64_t n_swa   = 0;
+    int64_t block   = 0;
+    int64_t n_tap   = 0; // target layers it reads
+    int64_t n_vocab = 0;
+};
+
+static bool lm_read_draft(const std::string & path, lm_draft & d, std::string & why) {
+    gguf_init_params gp = { /*.no_alloc =*/ true, /*.ctx =*/ nullptr };
+    gguf_context_ptr g(gguf_init_from_file(path.c_str(), gp));
+    if (!g) {
+        why = "cannot read the GGUF metadata of the draft " + path;
+        return false;
+    }
+    const int64_t arch_id = gguf_find_key(g.get(), "general.architecture");
+    const std::string arch = arch_id >= 0 && gguf_get_kv_type(g.get(), arch_id) == GGUF_TYPE_STRING ?
+        gguf_get_val_str(g.get(), arch_id) : "";
+    if (arch != "dflash" || lm_kv_int(g.get(), "dflash.hyper_connection.count") <= 0) {
+        why = "the draft is not a DFlash/DSpark DSV4 draft (architecture '" + arch + "')";
+        return false;
+    }
+    const int64_t ratios = gguf_find_key(g.get(), "dflash.attention.compress_ratios");
+    if (ratios >= 0) {
+        const size_t n = gguf_get_arr_n(g.get(), ratios);
+        const gguf_type t = gguf_get_arr_type(g.get(), ratios);
+        const void * data = gguf_get_arr_data(g.get(), ratios);
+        for (size_t i = 0; i < n; ++i) {
+            const int64_t r = t == GGUF_TYPE_UINT32 || t == GGUF_TYPE_INT32 ? ((const int32_t *) data)[i] : 1;
+            if (r != 0) {
+                why = "the draft has compressed attention";
+                return false;
+            }
+        }
+    }
+    const int64_t taps = gguf_find_key(g.get(), "dflash.target_layers");
+    d.n_tap = taps >= 0 && gguf_get_kv_type(g.get(), taps) == GGUF_TYPE_ARRAY ? (int64_t) gguf_get_arr_n(g.get(), taps) : 0;
+    if (d.n_tap <= 0) {
+        why = "the draft names no target layers";
+        return false;
+    }
+    const int64_t toks = gguf_find_key(g.get(), "tokenizer.ggml.tokens");
+    d.n_vocab = toks >= 0 && gguf_get_kv_type(g.get(), toks) == GGUF_TYPE_ARRAY ? (int64_t) gguf_get_arr_n(g.get(), toks) : 0;
+    if (d.n_vocab <= 0) {
+        d.n_vocab = 131072; // a vocabulary of the target's size, for the logits of the blocks
+    }
+    d.n_swa = lm_kv_int(g.get(), "dflash.attention.sliding_window");
+    d.block = lm_kv_int(g.get(), "dflash.block_size");
+    if (d.block <= 0) {
+        d.block = 16; // the drafter's default
+    }
+    if (d.n_swa <= 0) {
+        why = "the draft has no sliding window";
+        return false;
+    }
+    return true;
+}
+
+// ranma: the memory the draft adds, from a no_alloc load of the target and the draft context on it as they will run
+// (ctx_other, the draft's ubatch): per buffer type of the draft's breakdown, on the first GPU of the target or in host
+// memory. Its compute on that GPU is a view of the target's compute buffer when the draft context shares it
+// (share_compute_init): then the larger of the two counts, not the sum.
+struct lm_draft_mem {
+    size_t dev_model    = 0;
+    size_t dev_context  = 0;
+    size_t dev_compute  = 0;
+    bool   dev_shared   = false;
+    size_t host_model   = 0;
+    size_t host_context = 0;
+    size_t host_compute = 0;
+};
+
+static bool lm_measure_draft(common_params & params, lm_draft_mem & out, std::string & why) {
+    struct quiet_t {
+        ggml_log_callback cb;
+        void * ud;
+    } q;
+    llama_log_get(&q.cb, &q.ud);
+    if (params.verbosity < LOG_LEVEL_DEBUG) {
+        llama_log_set([](ggml_log_level level, const char * text, void * ud) {
+            const quiet_t * q = (const quiet_t *) ud;
+            q->cb(level >= GGML_LOG_LEVEL_ERROR ? level : GGML_LOG_LEVEL_DEBUG, text, q->ud);
+        }, &q);
+    }
+    out = lm_draft_mem();
+    bool ok = false;
+    llama_model_params mp = common_model_params_to_llama(params);
+    mp.no_alloc  = true;
+    mp.load_mode = LLAMA_LOAD_MODE_NONE;
+    const llama_context_params cp = common_context_params_to_llama(params);
+
+    common_params params_dft = common_base_params_to_speculative(params);
+    llama_model_params mpd = common_model_params_to_llama(params_dft);
+    mpd.no_alloc  = true;
+    mpd.load_mode = LLAMA_LOAD_MODE_NONE;
+    llama_context_params cpd = common_context_params_to_llama(params_dft);
+    cpd.n_rs_seq = 0;
+
+    llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mp);
+    llama_context * ctx = model != nullptr ? llama_init_from_model(model, cp) : nullptr;
+    if (ctx == nullptr) {
+        why = "the target did not load for the measurement";
+    } else {
+        llama_model * model_dft = llama_model_load_from_file(params.speculative.draft.mparams.path.c_str(), mpd);
+        cpd.n_ctx     = llama_n_ctx(ctx);
+        cpd.ctx_other = ctx;
+        llama_context * ctx_dft = nullptr;
+        try {
+            ctx_dft = model_dft != nullptr ? llama_init_from_model(model_dft, cpd) : nullptr;
+        } catch (const std::exception & ex) {
+            why = std::string("the draft context failed: ") + ex.what();
+        }
+        if (ctx_dft == nullptr) {
+            if (why.empty()) {
+                why = "the draft did not load for the measurement";
+            }
+        } else if (llama_model_dflash_feature_window(model_dft) <= 0) {
+            why = "the loaded draft reads every row of the target features";
+        } else {
+            ggml_backend_dev_t dev0 = llama_model_n_devices(model) > 0 ? llama_model_get_device(model, 0) : nullptr;
+            const llama_memory_breakdown mt = llama_get_memory_breakdown(ctx);
+            const llama_memory_breakdown md = llama_get_memory_breakdown(ctx_dft);
+            ok = true;
+            for (const auto & [buft, mb] : md) {
+                if (ggml_backend_buft_is_host(buft)) {
+                    out.host_model   += mb.model;
+                    out.host_context += mb.context;
+                    out.host_compute += mb.compute;
+                    continue;
+                }
+                if (ggml_backend_buft_get_device(buft) != dev0) {
+                    if (mb.model + mb.context + mb.compute > 0) {
+                        why = "the draft has buffers on another device than the target's first GPU";
+                        ok = false;
+                    }
+                    continue;
+                }
+                out.dev_model   += mb.model;
+                out.dev_context += mb.context;
+                out.dev_compute += mb.compute;
+                const auto it = mt.find(buft);
+                out.dev_shared = out.dev_shared || (mb.compute > 0 && it != mt.end() && it->second.compute > 0);
+            }
+            llama_free(ctx_dft);
+        }
+        if (model_dft != nullptr) {
+            llama_model_free(model_dft);
+        }
+    }
+    if (ctx != nullptr) {
+        llama_free(ctx);
+    }
+    if (model != nullptr) {
+        llama_model_free(model);
+    }
+    llama_log_set(q.cb, q.ud);
+    return ok;
+}
+
 // DeepSeek-V4.1 with the layer mode off: its prompt processing is slow, and a small n_batch cuts the exact tail prefill short
 static void lm_warn_off(const common_params & params) {
     if (params.model.path.empty()) {
@@ -304,6 +467,7 @@ void common_layer_mode_apply(common_params & params) {
     auto off = [&](const std::string & why) {
         LOG_WRN("layer mode: %s; prompt processing runs as with --layer-mode off\n", why.c_str());
         params.layer_mode = 0;
+        params.speculative.draft.n_ubatch_lm = 0;
     };
 
     // ---- support ---------------------------------------------------------------------------------------------------
@@ -329,14 +493,38 @@ void common_layer_mode_apply(common_params & params) {
         off(m.merged ? "merged gate/up experts are not supported" : "only EXL3 routed experts are supported");
         return;
     }
-    // contexts the no_alloc measurement does not build (a draft or MTP context, a multimodal projector) are not planned
-    // for yet: the mode stays off with them rather than guessing their memory. ngram-varlen has no context of its own and
-    // reads no layer inputs; the rollback planes it asks of the target (n_rs_seq) are part of the KV cache that the
-    // measurement builds from the same context parameters
-    if (params.speculative.has_dft() || std::any_of(params.speculative.types.begin(), params.speculative.types.end(),
-            [](common_speculative_type t) { return t != COMMON_SPECULATIVE_TYPE_NONE && t != COMMON_SPECULATIVE_TYPE_NGRAM_VARLEN; })) {
-        off("a draft model or MTP context is not covered by the memory check yet");
+    // contexts the no_alloc measurement does not build (an MTP context, another draft, a multimodal projector) are not
+    // planned for: the mode stays off with them rather than guessing their memory. ngram-varlen has no context of its own
+    // and reads no layer inputs; the rollback planes it asks of the target (n_rs_seq) are part of the KV cache that the
+    // measurement builds from the same context parameters. A DFlash/DSpark DSV4 draft (lm_read_draft) is measured below
+    // with its context on the target's, and reads the target features of the last rows of a call only.
+    const bool block_draft = std::any_of(params.speculative.types.begin(), params.speculative.types.end(),
+            [](common_speculative_type t) { return t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK; });
+    if (std::any_of(params.speculative.types.begin(), params.speculative.types.end(), [](common_speculative_type t) {
+            return t != COMMON_SPECULATIVE_TYPE_NONE && t != COMMON_SPECULATIVE_TYPE_NGRAM_VARLEN &&
+                t != COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH && t != COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK; }) ||
+            (params.speculative.has_dft() && !block_draft)) {
+        off("a draft model or MTP context is not covered by the memory check yet (only a DFlash/DSpark DSV4 draft is)");
         return;
+    }
+    lm_draft draft;
+    if (block_draft) {
+        if (!params.speculative.has_dft()) {
+            off("a DFlash/DSpark drafter without a draft model");
+            return;
+        }
+        if (!lm_read_draft(params.speculative.draft.mparams.path, draft, why)) {
+            off(why);
+            return;
+        }
+        if (draft.n_swa < draft.block + 1) {
+            off("the draft's attention window (" + std::to_string(draft.n_swa) + ") is narrower than a verification of its "
+                "block");
+            return;
+        }
+        // the draft context: as wide as its window, its blocks of every sequence and their verification (64-row steps)
+        const int64_t w_dft = std::max<int64_t>(draft.n_swa, (int64_t) std::max(1, params.n_parallel)*(draft.block + 1));
+        params.speculative.draft.n_ubatch_lm = (int32_t) ((w_dft + 63)/64*64);
     }
     if (!params.mmproj.path.empty()) {
         off("a multimodal projector (--mmproj) is not covered by the memory check yet");
@@ -492,6 +680,31 @@ void common_layer_mode_apply(common_params & params) {
     lm_cfg.expert_major = true;
     lm_cfg.layer_exec   = lx_on;
     llama_layer_mode_set_config(lm_cfg);
+
+    // the draft: measured once, with its context on the target's (its width is its own, n_ubatch_lm). Every width below
+    // adds its weights and KV on the GPU, its compute as far as it exceeds the target's shared compute buffer, and in host
+    // memory its host compute, its routed experts (the joint cache places them there) and the outputs of the window: the
+    // target's features of n_swa rows per sequence and the draft's logits of its blocks
+    lm_draft_mem dmem;
+    int64_t draft_host = 0;
+    if (block_draft) {
+        std::string why_m;
+        if (!lm_measure_draft(params, dmem, why_m)) {
+            llama_layer_mode_set_config(lm_prev);
+            off("the memory of the draft could not be measured: " + why_m);
+            return;
+        }
+        const int64_t n_seq = std::max(1, params.n_parallel);
+        const int64_t n_ctx_all = params.n_ctx > 0 ? params.n_ctx : m.n_ctx_train;
+        const int64_t feat  = draft.n_tap*std::min<int64_t>(n_ctx_all, n_seq*draft.n_swa)*m.n_embd*(int64_t) sizeof(float);
+        const int64_t logit = 2*n_seq*(draft.block + 1)*draft.n_vocab*(int64_t) sizeof(float);
+        draft_host = (int64_t) (dmem.host_compute + dmem.host_context) + feat + logit;
+        LOG_INF("layer mode: draft (ubatch %d, window %lld rows, %lld target layers): GPU model %zu + KV %zu + compute %zu MiB "
+            "(%s the target's compute buffer); host model %zu + compute %zu + features %.1f + logits %.1f MiB\n",
+            params.speculative.draft.n_ubatch_lm, (long long) draft.n_swa, (long long) draft.n_tap, dmem.dev_model/MiB,
+            dmem.dev_context/MiB, dmem.dev_compute/MiB, dmem.dev_shared ? "shares" : "outside", dmem.host_model/MiB,
+            (dmem.host_compute + dmem.host_context)/MiB, feat/1048576.0, logit/1048576.0);
+    }
     const bool    chunked   = !(params.n_parallel > 1 && !params.kv_unified);
     const int32_t ub_prev   = params.n_ubatch;
     const int32_t b_prev    = params.n_batch;
@@ -539,14 +752,18 @@ void common_layer_mode_apply(common_params & params) {
             LOG_WRN("%s", "layer mode: the measurement found no GPU\n");
             return e;
         }
-        const common_device_memory_data & d = dm[0];
+        common_device_memory_data d = dm[0];
+        // the draft (lm_measure_draft): its compute shares the target's buffer, which is as large as the larger of the two
+        d.model   += dmem.dev_model;
+        d.context += dmem.dev_context;
+        d.compute  = dmem.dev_shared ? std::max(d.compute, dmem.dev_compute) : d.compute + dmem.dev_compute;
         // the op's buffers are lent from L1 (the prefill lend), not added to it
         const int64_t buffers = scratch_bytes(w);
         e.l1       = l1_auto ? (int64_t) expert_l1_auto_bytes(d.free, d.model, d.context, d.compute, (size_t) reserve) : l1;
         const bool    lent    = e.l1 > 0 && lend_fits(w, e.l1);
         e.dev_free = d.free;
         e.dev_need = (int64_t) (d.model + d.context + d.compute) + reserve + e.l1;
-        e.host     = (int64_t) dm.back().compute + meta;
+        e.host     = (int64_t) dm.back().compute + meta + draft_host;
         e.ok       = (l1_auto ? e.l1 > 0 : e.dev_need <= e.dev_free) && lent;
         LOG_INF("layer mode: width %lld, chunk %lld: GPU model %zu + KV %zu + compute %zu + L1 %lld%s + reserve %lld = %lld of %lld "
             "MiB free; op buffers %lld MiB lent from L1: %s; host compute %zu + graph %lld MiB (not a limit) -> %s\n", (long long) w,
@@ -651,8 +868,8 @@ void common_layer_mode_apply(common_params & params) {
     // the logical batch: the context (the context clamps it), so that a prompt is one call of several ubatches and a
     // model that computes only what the output of a call needs (the exact tail of DeepSeek-V4.1) does that once, at the
     // end of the prompt. The measurement above ran with -b = -ub: n_batch sizes no buffer of these contexts (KV cache
-    // and graphs follow n_ubatch, the outputs n_outputs_max), only the per-token target features a drafter reads, and a
-    // drafter turns the layer mode off (above)
+    // and graphs follow n_ubatch, the outputs n_outputs_max), only the per-token target features a drafter reads, and the
+    // one drafter the mode keeps (a DFlash/DSpark DSV4 draft) takes those of the last rows of a call only (above)
     if (!params.n_batch_explicit) {
         params.n_batch = (int32_t) std::max<int64_t>(ub, n_ctx);
     }

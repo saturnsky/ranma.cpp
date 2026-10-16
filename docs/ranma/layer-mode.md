@@ -47,8 +47,8 @@ of another slot takes 3000 ms of compute (below).
 
 `-b` is not tied to the width. The memory check runs with `-b` equal to the width, and the context is then built with
 `-b` equal to the context size: no buffer of the context grows with it (the KV cache and the graphs follow `-ub`, the
-output buffer the number of outputs), only the per-token target features a drafter reads, and a drafter turns the
-layer mode off. The ubatches of a long prompt are the same as with `-b` equal to the width; what changes is the end of
+output buffer the number of outputs), only the per-token target features a drafter reads, and the one drafter the
+mode keeps reads those of the last rows of a call only (below). The ubatches of a long prompt are the same as with `-b` equal to the width; what changes is the end of
 the call:
 
 - DeepSeek-V4.1's exact tail prefill computes the rows the output of a call needs. With one
@@ -123,8 +123,22 @@ The expert cache must be on (`--expert-l1-mib` or `--expert-l2-mib`), the model 
 (`deepseek4`) with
 EXL3 routed experts (separate gate and up). Anything else logs `layer mode: ...; prompt processing runs as with
 --layer-mode off` and runs as `off`. So does a setup with a context the memory check does not build yet: a draft
-model or an MTP context (`-md`, `--spec-type` other than `ngram-varlen`), or a multimodal projector (`--mmproj`).
-`ngram-varlen` alone has no context of its own, so the mode stays on with it.
+model or an MTP context (`-md`, `--spec-type` other than `ngram-varlen`, `draft-dflash` or `draft-dspark`), or a
+multimodal projector (`--mmproj`). `ngram-varlen` alone has no context of its own, so the mode stays on with it.
+
+A DFlash/DSpark drafter (`--spec-type draft-dflash` or `draft-dspark`) keeps the mode on when its draft is a DSV4
+draft: every stage attends a standard sliding window over uncompressed KV (the GGUF has `dflash.hyper_connection.count`,
+`dflash.attention.sliding_window` and no compressed stage). Such a draft reads back the target features of the last
+`n_swa` positions only: the injection of a target row writes the KV of that row alone, and a later query reaches no
+position older than its window. Its drafter therefore asks the target for the features of the last `n_swa` rows of
+every call (`llama_set_embeddings_layer_inp_last`), which keeps the exact tail of DeepSeek-V4.1 (its last layer then
+computes those rows instead of one) and the layer-major prefill (the features come out of the segment that makes
+them) on, and holds `n_swa` rows per sequence in the output buffer instead of `n_batch`. The draft context gets its
+own ubatch, as wide as the window and the blocks of every sequence with their verification, and its memory is
+measured once with a no_alloc load of the draft context on the target's: its weights and KV on the GPU, its compute as
+far as it exceeds the target's compute buffer it shares, and in host memory its compute, its routed experts and the
+window outputs. A measurement that fails keeps the mode off. A draft without a feature window, or one whose window is
+narrower than a verification of its block, needs the features of every row and keeps the mode off.
 
 - MTP blocks of their own (blocks with `nextn` tensors) are not counted as routed layers of a prompt step; the
   staging slot is sized for the largest routed layer.
