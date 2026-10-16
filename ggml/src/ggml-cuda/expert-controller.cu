@@ -141,61 +141,188 @@ struct plan_state {
     std::vector<uint8_t> keep;
 };
 
-// ---- the prefill lend's restore kernel (expert-lend.h) -------------------------------------------------------------
+// ---- the prefill lend's restore space (expert-lend.h) --------------------------------------------------------------
 
-// Per routed layer, on the device: where a restored expert comes from and goes to.
+// Per routed layer, on the device: where a copy into the restore space comes from and goes to.
 struct lend_restore_desc {
     int32_t        * slots        = nullptr;   // the layer's VRAM slot table
-    int32_t        * restore      = nullptr;   // [expert] lent slot to restore into, -1
-    uint32_t       * bits         = nullptr;   // [words] restored experts (the SSD tier's publish skips them), or null
+    int32_t        * restore      = nullptr;   // [expert] >= 0: a wanted expert not back yet (expert-lend.h)
+    uint32_t       * bits         = nullptr;   // [words] experts in the space (the SSD tier's publish skips them), or null
     char           * dst[3]       = {};        // arena base per kind
     const char     * src[3]       = {};        // host arena base (exclusive) or the mapped tensor (inclusive)
     const int32_t  * host_slots   = nullptr;   // exclusive: host slot of an expert, null otherwise
     const uint64_t * addresses[3] = {};        // the address table the kernels take first (the lookup's host_addresses), or null
     uint64_t         bytes[3]     = {};        // slot stride and copy size per kind
+    char           * aux_dst[3][2] = {};       // aux arena base per kind and aux tensor (the rows move with the slot)
+    const char     * aux_src[3][2] = {};       // the aux tensor (device address), rows by expert id
+    uint64_t         aux_bytes[3][2] = {};     // rows of one slot, and of one expert in the tensor (aux_nb1)
+    uint64_t         aux_nb1[3][2] = {};
+    int32_t          cls          = -1;
     int32_t          enabled      = 0;
 };
 
-struct lend_live {
-    unsigned long long restores, bytes;
+// The restore space of one class: lent slots first .. first + n - 1 (n = 0: no space), at `base` in the space arrays.
+struct lend_space_class {
+    int32_t  first, n, base;
+    uint32_t clock;
 };
 
-static constexpr int lend_restore_max    = 64;
-static constexpr int lend_restore_blocks = 64;
+struct lend_space_state {
+    int32_t          * own;         // [base + j] layer*n_experts + expert, -1
+    int32_t          * pin;         // [base + j] 1: a wanted expert
+    uint32_t         * stamp;       // [base + j] the class clock of its last use
+    lend_space_class * cls;         // [class]
+    uint32_t         * last_miss;   // [layer*n_experts + expert] the layer step of its last miss
+    uint32_t         * step;        // [layer]
+    lend_space_copy  * act;         // the copies of the current launch
+    int32_t          * n_act;
+    uint32_t           ghost;
+    int32_t            n_experts;
+    int32_t            lru;         // 0: the space admits wanted experts only (RANMA_EXPERT_LEND_LRU=0)
+};
 
-// One decode launch of a layer: every block decides the same list (lend_restore_list), copies its share of the bytes
-// and the last block publishes the slots. Nothing reads the tables a block decides from until the last block, so all
-// blocks see the same list. The layer's matmuls run after this kernel on the same stream.
-static __global__ void lend_restore_kernel(const lend_restore_desc * descs, int layer, const int32_t * ids, int rows,
-        int used, int stride, int n_experts, unsigned int * tickets, lend_live * live) {
-    const lend_restore_desc & d = descs[layer];
-    __shared__ int32_t list[lend_restore_max];
-    __shared__ int n;
-    __shared__ int last;
-    if (threadIdx.x == 0) {
-        n = d.enabled ? lend_restore_list(ids, rows, used, stride, n_experts, d.restore, d.slots, list, lend_restore_max) : 0;
-        // an expert without a readable source (no address and no host slot) stays where it is
-        int m = 0;
-        for (int i = 0; i < n; ++i) {
-            const int e = list[i];
-            bool ok = true;
-            for (int k = 0; k < 3; ++k) {
-                const uint64_t a = d.addresses[k] != nullptr ? d.addresses[k][e] : 0;
-                if (a == 0 && d.host_slots != nullptr && d.host_slots[e] < 0) { ok = false; }
-            }
-            if (ok) { list[m++] = e; }
+struct lend_live {
+    unsigned long long restores, bytes, lru_fills, lru_hits, evictions;
+};
+
+static constexpr int lend_restore_blocks = 64;
+static constexpr int lend_space_threads  = 256;
+
+static __device__ bool lend_readable(const lend_restore_desc & d, int e) {
+    for (int k = 0; k < 3; ++k) {
+        const uint64_t a = d.addresses[k] != nullptr ? d.addresses[k][e] : 0;
+        if (a == 0 && d.host_slots != nullptr && d.host_slots[e] < 0) {
+            return false;
         }
-        n = m;
+    }
+    return true;
+}
+
+// One decode launch of a layer: the decisions of lend_space_step (expert-lend.h), with the slot search spread over the
+// block. A replaced occupant leaves its own layer's table here, before the copy kernel overwrites its slot.
+static __global__ void __launch_bounds__(lend_space_threads) lend_space_decide_kernel(const lend_restore_desc * descs,
+        lend_space_state s, int layer, const int32_t * ids, int rows, int used, int stride, lend_live * live) {
+    const lend_restore_desc & d = descs[layer];
+    const int E = s.n_experts;
+    __shared__ int32_t cand[2][lend_space_max_ids];
+    __shared__ int32_t miss[lend_space_max_ids];
+    __shared__ int nc[2], nm, n_out, go, hits, evicted, found;
+    __shared__ uint32_t t, st;
+    __shared__ uint64_t red[lend_space_threads];
+    const int tid = threadIdx.x;
+    if (tid == 0) {
+        *s.n_act = 0;
+        go = 0;
+        if (d.enabled && d.cls >= 0 && s.cls[d.cls].n > 0) {
+            lend_space_class & c = s.cls[d.cls];
+            t  = ++c.clock;
+            st = ++s.step[layer];
+            nc[0] = nc[1] = nm = n_out = hits = evicted = 0;
+            uint32_t * lm = s.last_miss + (size_t) layer*E;
+            for (int r = 0; r < rows; ++r) {
+                for (int u = 0; u < used; ++u) {
+                    const int32_t e = ids[r*stride + u];
+                    if (e < 0 || e >= E) { continue; }
+                    const int32_t g = d.slots[e];
+                    if (g >= c.first && g < c.first + c.n && s.own[c.base + g - c.first] == layer*E + e) {
+                        s.stamp[c.base + g - c.first] = t;
+                        ++hits;
+                        continue;
+                    }
+                    bool seen = false;
+                    for (int i = 0; i < nm && !seen; ++i) { seen = miss[i] == e; }
+                    if (g >= 0 || seen || nm >= lend_space_max_ids) { continue; }
+                    miss[nm++] = e;
+                    const int w = d.restore[e] >= 0 ? 0 : 1;
+                    if (lend_readable(d, e) && lend_space_admit(w == 0, lm[e], st, s.ghost, s.lru != 0,
+                            s.ghost != 0 && w != 0 ? lend_rows_with(ids, rows, used, stride, e) : 1)) {
+                        cand[w][nc[w]++] = e;
+                    }
+                }
+            }
+            go = 1;
+        }
     }
     __syncthreads();
+    if (!go) {
+        return;
+    }
+    const lend_space_class c = s.cls[d.cls];
+    for (int w = 0; w < 2; ++w) {
+        for (int i = 0; i < nc[w]; ++i) {
+            uint64_t best = lend_space_none;
+            for (int j = tid; j < c.n; j += lend_space_threads) {
+                const uint64_t k = lend_space_key(s.own[c.base + j], s.pin[c.base + j], s.stamp[c.base + j], t, j);
+                best = k < best ? k : best;
+            }
+            red[tid] = best;
+            __syncthreads();
+            for (int h = lend_space_threads/2; h > 0; h >>= 1) {
+                if (tid < h && red[tid + h] < red[tid]) { red[tid] = red[tid + h]; }
+                __syncthreads();
+            }
+            if (tid == 0) {
+                found = red[0] != lend_space_none;
+            }
+            if (tid == 0 && found) {
+                const int j = (int) (red[0] & 0xFFFFFF);
+                const int32_t e = cand[w][i];
+                const int32_t o = s.own[c.base + j];
+                if (o >= 0) {
+                    // the occupant leaves its layer's table; its earlier launches are done (stream order)
+                    const lend_restore_desc & od = descs[o/E];
+                    od.slots[o%E] = -1;
+                    if (od.bits != nullptr) { atomicAnd(od.bits + (o%E)/32, ~(1u << ((o%E)%32))); }
+                    ++evicted;
+                }
+                lend_space_copy & a = s.act[n_out++];
+                a.expert = e; a.j = j; a.evicted = o; a.wanted = w == 0 ? 1 : 0;
+                s.own[c.base + j]   = layer*E + e;
+                s.pin[c.base + j]   = w == 0 ? 1 : 0;
+                s.stamp[c.base + j] = t;
+                if (w == 0) { d.restore[e] = -1; }
+            }
+            __syncthreads();
+            if (!found) { break; }
+        }
+    }
+    if (tid == 0) {
+        uint32_t * lm = s.last_miss + (size_t) layer*E;
+        for (int i = 0; i < nm; ++i) { lm[miss[i]] = st; }
+        *s.n_act = n_out;
+        if (live != nullptr) {
+            live->lru_hits  += (unsigned long long) hits;
+            live->evictions += (unsigned long long) evicted;
+        }
+        __threadfence_system();
+    }
+}
+
+static __device__ void lend_copy_bytes(const char * src, char * dst, size_t b, size_t tid, size_t nth) {
+    const size_t n16 = (((uintptr_t) src | (uintptr_t) dst) & 15) == 0 ? b/16 : 0;
+    for (size_t u = tid; u < n16; u += nth) {
+        ((int4 *) dst)[u] = ((const int4 *) src)[u];
+    }
+    for (size_t u = n16*16 + tid; u < b; u += nth) {
+        dst[u] = src[u];
+    }
+}
+
+// The copies the decide kernel listed: every block copies its share of the bytes (weights and aux rows) and the last
+// block publishes the slots. The layer's matmuls run after this kernel on the same stream.
+static __global__ void lend_space_copy_kernel(const lend_restore_desc * descs, lend_space_state s, int layer,
+        unsigned int * tickets, lend_live * live) {
+    const lend_restore_desc & d = descs[layer];
+    const int n = *s.n_act;
     if (n == 0) {
         return;
     }
+    const int first = s.cls[d.cls].first;
     const size_t tid = (size_t) blockIdx.x*blockDim.x + threadIdx.x;
     const size_t nth = (size_t) gridDim.x*blockDim.x;
     for (int i = 0; i < n; ++i) {
-        const int e    = list[i];
-        const int slot = d.restore[e];
+        const int e    = s.act[i].expert;
+        const int slot = first + s.act[i].j;
         for (int k = 0; k < 3; ++k) {
             const size_t b = (size_t) d.bytes[k];
             if (b == 0) {
@@ -204,18 +331,18 @@ static __global__ void lend_restore_kernel(const lend_restore_desc * descs, int 
             const uint64_t a = d.addresses[k] != nullptr ? d.addresses[k][e] : 0;
             const char * src = a != 0 ? (const char *) (uintptr_t) a :
                 d.host_slots != nullptr ? d.src[k] + (size_t) d.host_slots[e]*b : d.src[k] + (size_t) e*b;
-            char * dst = d.dst[k] + (size_t) slot*b;
-            const size_t n16 = (((uintptr_t) src | (uintptr_t) dst) & 15) == 0 ? b/16 : 0;
-            for (size_t u = tid; u < n16; u += nth) {
-                ((int4 *) dst)[u] = ((const int4 *) src)[u];
-            }
-            for (size_t u = n16*16 + tid; u < b; u += nth) {
-                dst[u] = src[u];
+            lend_copy_bytes(src, d.dst[k] + (size_t) slot*b, b, tid, nth);
+            for (int w = 0; w < 2; ++w) {
+                const size_t ab = (size_t) d.aux_bytes[k][w];
+                if (ab != 0) {
+                    lend_copy_bytes(d.aux_src[k][w] + (size_t) e*d.aux_nb1[k][w], d.aux_dst[k][w] + (size_t) slot*ab, ab, tid, nth);
+                }
             }
         }
     }
     __threadfence();
     __syncthreads();
+    __shared__ int last;
     if (threadIdx.x == 0) {
         last = atomicAdd(tickets + layer, 1u) == gridDim.x - 1;
     }
@@ -223,20 +350,25 @@ static __global__ void lend_restore_kernel(const lend_restore_desc * descs, int 
     if (!last || threadIdx.x != 0) {
         return;
     }
-    unsigned long long bytes = 0;
+    unsigned long long restores = 0, bytes = 0, fills = 0;
     for (int i = 0; i < n; ++i) {
-        const int e = list[i];
-        d.slots[e]   = d.restore[e];
-        d.restore[e] = -1;
+        const int e = s.act[i].expert;
+        d.slots[e] = first + s.act[i].j;
         if (d.bits != nullptr) {
             atomicOr(d.bits + e/32, 1u << (e%32));
         }
-        bytes += d.bytes[0] + d.bytes[1] + d.bytes[2];
+        if (s.act[i].wanted) {
+            ++restores;
+            bytes += d.bytes[0] + d.bytes[1] + d.bytes[2];
+        } else {
+            ++fills;
+        }
     }
     tickets[layer] = 0;
     if (live != nullptr) {
-        live->restores += (unsigned long long) n;
-        live->bytes    += bytes;
+        live->restores  += restores;
+        live->bytes     += bytes;
+        live->lru_fills += fills;
     }
     __threadfence_system();
 }
@@ -1199,14 +1331,24 @@ public:
         // The SSD tier needs the same ids: this is the one site that sees both the fused and the
         // unfused router, and it is ordered before the layer's MUL_MAT_ID on the same stream.
         tier_route(ctx, (int) joint, ids);
-        // The prefill lend: a decode launch copies the evicted experts it selects back into their lent slots, after the
-        // tier made their file bytes readable and before the layer's matmuls. It runs whether or not a restore is due
-        // (an empty list returns at once), so a captured graph stays valid either way.
+        // The prefill lend's restore space: a decode launch copies the experts it selects into the lent slots (the wanted
+        // ones pinned, recent misses as least recently used copies), after the tier made their file bytes readable and
+        // before the layer's matmuls. The kernels run whether or not the space is open (n = 0 returns at once), so a
+        // captured graph stays valid either way.
         if (lend_on_.load(std::memory_order_acquire) && member == 0 && ids->ne[1] <= (int64_t) lend_rows_) {
-            const ggml_cuda_kernel_launch_params lp(dim3(lend_restore_blocks), dim3(256), 0, ctx.stream());
-            ggml_cuda_kernel_launch(lend_restore_kernel, lp, (const lend_restore_desc *) lend_desc_dev_, (int) joint,
-                (const int32_t *) ids->data, (int) ids->ne[1], (int) ids->ne[0], (int) (ids->nb[1]/sizeof(int32_t)),
-                geo_.n_experts, lend_tickets_dev_, lend_live_dev_);
+            // the space copies all three kinds: a staged service (RANMA_EXPERT_L2_STAGED at or below the decode rows)
+            // releases them one kind at a time, so the copies wait for the other two kinds first
+            if (tier_ && tier_->layer_staged((int) joint)) {
+                tier_->wait_kind((int) joint, 1, ctx.stream());
+                tier_->wait_kind((int) joint, 2, ctx.stream());
+            }
+            const ggml_cuda_kernel_launch_params dp(dim3(1), dim3(lend_space_threads), 0, ctx.stream());
+            ggml_cuda_kernel_launch(lend_space_decide_kernel, dp, (const lend_restore_desc *) lend_desc_dev_, lend_space_,
+                (int) joint, (const int32_t *) ids->data, (int) ids->ne[1], (int) ids->ne[0], (int) (ids->nb[1]/sizeof(int32_t)),
+                lend_live_dev_);
+            const ggml_cuda_kernel_launch_params cp(dim3(lend_restore_blocks), dim3(256), 0, ctx.stream());
+            ggml_cuda_kernel_launch(lend_space_copy_kernel, cp, (const lend_restore_desc *) lend_desc_dev_, lend_space_, (int) joint,
+                lend_tickets_dev_, lend_live_dev_);
         }
     }
 
@@ -1325,11 +1467,12 @@ public:
     //     slots of each class, after the kept residents above them moved down), and the pieces point into the retired
     //     slots;
     //   held -> restore (lend_end_locked): the explicit release, or the first decode graph after an implicit lend
-    //     (graph_begin). Every lent slot is given an evicted expert (highest rank first), and a decode launch that
-    //     reads such an expert copies it into its slot first (lend_restore_kernel);
-    //   restore -> held: the restored copies leave the tables (they return to the mirror); more residents leave only
-    //     when the pieces need more slots. A plan install under a lease installs the plan inside the kept slots, and
-    //     the rest of the plan becomes the restore set (lend_install_locked).
+    //     (graph_begin). The lent slots of each class become its restore space (expert-lend.h): a decode launch copies
+    //     a wanted expert it reads into the space and pins it there, and a recent miss into a free or least recently
+    //     used unpinned slot (lend_space_decide_kernel, lend_space_copy_kernel);
+    //   restore -> held: the copies leave the tables (they return to the mirror); more residents leave only when the
+    //     pieces need more slots. A plan install under a lease installs the plan inside the kept slots, keeps the copies
+    //     of the new plan's experts pinned, and the rest of the plan becomes the wanted set (lend_install_locked).
 
     void lend_setup_locked() {
         lend_on_.store(false, std::memory_order_release);
@@ -1346,7 +1489,10 @@ public:
             return;
         }
         ggml_cuda_set_device(device_);
-        const size_t L = (size_t) geo_.n_layers, E = (size_t) geo_.n_experts, W = (E + 31)/32;
+        lend_.slots = l1_->slot_counts();
+        const size_t L = (size_t) geo_.n_layers, E = (size_t) geo_.n_experts, W = (E + 31)/32, nc = lend_.slots.size();
+        size_t n_slots = 0;
+        for (int n : lend_.slots) { n_slots += (size_t) std::max(n, 0); }
         CUDA_CHECK(cudaMalloc((void **) &lend_restore_dev_, L*E*sizeof(int32_t)));
         CUDA_CHECK(cudaMemset(lend_restore_dev_, 0xff, L*E*sizeof(int32_t)));
         CUDA_CHECK(cudaMalloc((void **) &lend_bits_dev_, L*W*sizeof(uint32_t)));
@@ -1355,6 +1501,27 @@ public:
         CUDA_CHECK(cudaMemset(lend_desc_dev_, 0, L*sizeof(lend_restore_desc)));
         CUDA_CHECK(cudaMalloc((void **) &lend_tickets_dev_, L*sizeof(unsigned int)));
         CUDA_CHECK(cudaMemset(lend_tickets_dev_, 0, L*sizeof(unsigned int)));
+        // the restore space: own, pin, stamp per slot, the classes, the ghost state, the copies of a launch
+        lend_space_ = {};
+        CUDA_CHECK(cudaMalloc((void **) &lend_space_.own, std::max<size_t>(n_slots, 1)*sizeof(int32_t)));
+        CUDA_CHECK(cudaMalloc((void **) &lend_space_.pin, std::max<size_t>(n_slots, 1)*sizeof(int32_t)));
+        CUDA_CHECK(cudaMalloc((void **) &lend_space_.stamp, std::max<size_t>(n_slots, 1)*sizeof(uint32_t)));
+        CUDA_CHECK(cudaMalloc((void **) &lend_space_.cls, std::max<size_t>(nc, 1)*sizeof(lend_space_class)));
+        CUDA_CHECK(cudaMalloc((void **) &lend_space_.last_miss, L*E*sizeof(uint32_t)));
+        CUDA_CHECK(cudaMemset(lend_space_.last_miss, 0xff, L*E*sizeof(uint32_t)));
+        CUDA_CHECK(cudaMalloc((void **) &lend_space_.step, L*sizeof(uint32_t)));
+        CUDA_CHECK(cudaMemset(lend_space_.step, 0, L*sizeof(uint32_t)));
+        CUDA_CHECK(cudaMalloc((void **) &lend_space_.act, lend_space_max_ids*sizeof(lend_space_copy)));
+        CUDA_CHECK(cudaMalloc((void **) &lend_space_.n_act, sizeof(int32_t)));
+        CUDA_CHECK(cudaMemset(lend_space_.n_act, 0, sizeof(int32_t)));
+        lend_space_.ghost     = (uint32_t) std::max(ub_pool_config_from_env().ghost, 0);
+        lend_space_.n_experts = geo_.n_experts;
+        {
+            // diagnostic: RANMA_EXPERT_LEND_LRU=0 turns the LRU part off (wanted experts only)
+            const char * v = getenv("RANMA_EXPERT_LEND_LRU");
+            lend_space_.lru = v != nullptr && strcmp(v, "0") == 0 ? 0 : 1;
+        }
+        lend_space_n_ = n_slots;
         CUDA_CHECK(cudaHostAlloc((void **) &lend_live_host_, sizeof(lend_live), cudaHostAllocMapped));
         memset(lend_live_host_, 0, sizeof(lend_live));
         CUDA_CHECK(cudaHostGetDevicePointer((void **) &lend_live_dev_, lend_live_host_, 0));
@@ -1362,9 +1529,11 @@ public:
         CUDA_CHECK(cudaDeviceSynchronize());
         tier_->set_restored_bits(lend_bits_dev_);
         lend_rows_ = (int) std::max<uint64_t>(1, cfg_.l2_decode_rows);
+        const std::vector<int> slots = lend_.slots;
         lend_ = lend_book();
-        lend_.slots = l1_->slot_counts();
+        lend_.slots = slots;
         lend_.limit = lend_.slots;
+        lend_.top   = lend_.slots;
         lend_guard_.assign(geo_.class_bytes.size()*geometry::n_kinds, 0);
         for (size_t c = 0; c < geo_.class_bytes.size(); ++c) {
             for (int k = 0; k < geometry::n_kinds; ++k) {
@@ -1372,9 +1541,13 @@ public:
             }
         }
         lend_upload_descs_locked();
+        lend_upload_space_locked({}, false);
         GGML_LOG_INFO("expert cache: prefill lend on: prompt buffers from the lowest ranked L1 experts (%s slots per class), "
-                      "none from host memory; the decode copies an evicted expert back when it reads it (launches of up to %d "
-                      "rows)\n", split_text(lend_.slots).c_str(), lend_rows_);
+                      "none from host memory; after a prompt the lent slots are a restore space: the decode copies an evicted "
+                      "expert of its plan in when it reads it, other misses use the rest as an LRU cache (%s; temporary "
+                      "policy) (launches of up to %d rows)\n", split_text(lend_.slots).c_str(),
+            lend_space_.lru ? (std::string("ghost:") + std::to_string(lend_space_.ghost)).c_str() : "off: RANMA_EXPERT_LEND_LRU=0",
+            lend_rows_);
         lend_on_.store(true, std::memory_order_release);
     }
 
@@ -1396,6 +1569,12 @@ public:
         if (lend_tickets_dev_)  { (void) cudaFree(lend_tickets_dev_); }
         if (lend_live_host_)    { (void) cudaFreeHost(lend_live_host_); }
         if (lend_stream_)       { (void) cudaStreamDestroy(lend_stream_); }
+        for (void * p : { (void *) lend_space_.own, (void *) lend_space_.pin, (void *) lend_space_.stamp, (void *) lend_space_.cls,
+                          (void *) lend_space_.last_miss, (void *) lend_space_.step, (void *) lend_space_.act, (void *) lend_space_.n_act }) {
+            if (p != nullptr) { (void) cudaFree(p); }
+        }
+        lend_space_ = {};
+        lend_space_n_ = 0;
         lend_restore_dev_ = nullptr;
         lend_bits_dev_ = nullptr;
         lend_desc_dev_ = nullptr;
@@ -1405,13 +1584,14 @@ public:
         lend_stream_ = nullptr;
         lend_holder_stream_ = nullptr;
         lend_ = lend_book();
+        lend_space_kept_.clear();
         lend_scores_.clear();
         lend_want_.clear();
         lend_counts_ = {};
-        lend_live_mark_ = 0;
+        lend_live_mark_ = {};
     }
 
-    // The per-layer source and destination of the restore kernel (the tier's address tables exist once it started).
+    // The per-layer source and destination of the restore space (the tier's address tables exist once it started).
     void lend_upload_descs_locked() {
         std::vector<lend_restore_desc> d((size_t) geo_.n_layers);
         const size_t W = ((size_t) geo_.n_experts + 31)/32;
@@ -1422,6 +1602,7 @@ public:
                 continue;
             }
             lend_restore_desc & x = d[(size_t) l];
+            bool aux_ok = true;
             for (int k = 0; k < geometry::n_kinds; ++k) {
                 const ggml_cuda_expert_lookup lk = l1_->lookup(l, k);
                 if (k == 0) {
@@ -1434,30 +1615,99 @@ public:
                     !owned && geo_.tensors[l][k] != nullptr ? (const char *) geo_.tensors[l][k]->data : nullptr;
                 x.addresses[k] = lk.host_addresses;
                 x.bytes[k] = geo_.class_bytes[(size_t) c][(size_t) k];
+                // the aux rows of a slot come with the copy: the kernels read them at the slot once the table names it
+                for (int w = 0; w < geometry::n_aux; ++w) {
+                    char * dst = l1_->aux_slice_address(c, k, w, 0);
+                    const size_t bytes = geo_.class_aux_bytes(c, k, w);
+                    if (dst == nullptr || bytes == 0) {
+                        continue;
+                    }
+                    const ggml_tensor * t = geo_.aux_tensor(l, k, w);
+                    const char * src = t == nullptr || t->data == nullptr ? nullptr :
+                        t->buffer != nullptr && ggml_backend_buffer_is_host(t->buffer) ?
+                            (const char *) ggml_hip_mapped_host_device_alias(t) : (const char *) t->data;
+                    if (src == nullptr) {
+                        aux_ok = false;
+                        continue;
+                    }
+                    x.aux_dst[k][w]   = dst;
+                    x.aux_src[k][w]   = src;
+                    x.aux_bytes[k][w] = bytes;
+                    x.aux_nb1[k][w]   = t->nb[1];
+                }
             }
             x.restore = lend_restore_dev_ + (size_t) l*(size_t) geo_.n_experts;
             x.bits    = tier_ ? lend_bits_dev_ + (size_t) l*W : nullptr;
-            x.enabled = x.slots != nullptr && x.dst[0] != nullptr ? 1 : 0;
+            x.cls     = c;
+            x.enabled = x.slots != nullptr && x.dst[0] != nullptr && aux_ok ? 1 : 0;
         }
         CUDA_CHECK(cudaMemcpyAsync(lend_desc_dev_, d.data(), d.size()*sizeof(lend_restore_desc), cudaMemcpyHostToDevice, lend_stream_));
         CUDA_CHECK(cudaStreamSynchronize(lend_stream_));
     }
 
-    // The restore table of lend_.restore and the restored bitmap of `kept` (experts already back at their slot).
-    void lend_upload_restore_locked(const std::vector<lend_restore> & kept) {
-        const size_t L = (size_t) geo_.n_layers, E = (size_t) geo_.n_experts, W = (E + 31)/32;
+    // The device idle: the wanted table of lend_.restore, and (`open`) the restore space of each lent class with the copies
+    // of `kept` pinned at their slots (they are in the tables already) and every other slot empty. Not open, or a class
+    // that lends nothing: no space. The aux rows record of the lent slots is dropped: the kernels write rows there.
+    void lend_upload_space_locked(const std::vector<lend_restore> & kept, bool open) {
+        const size_t L = (size_t) geo_.n_layers, E = (size_t) geo_.n_experts, W = (E + 31)/32, nc = lend_.slots.size();
         std::vector<int32_t> t(L*E, -1);
         for (const lend_restore & r : lend_.restore) {
-            t[(size_t) r.layer*E + (size_t) r.expert] = r.slot;
+            t[(size_t) r.layer*E + (size_t) r.expert] = 1;
         }
         std::vector<uint32_t> bits(L*W, 0);
+        std::vector<lend_space_class> cls(nc);
+        std::vector<int32_t> own(std::max<size_t>(lend_space_n_, 1), -1), pin(own.size(), 0);
+        std::vector<uint32_t> stamp(own.size(), 0);
+        int base = 0;
+        for (size_t c = 0; c < nc; ++c) {
+            cls[c].first = lend_.limit[c];
+            const int top = c < lend_.top.size() ? std::min(lend_.top[c], lend_.slots[c]) : lend_.slots[c];
+            cls[c].n     = open && lend_.lent((int) c) ? std::max(top - lend_.limit[c], 0) : 0;
+            cls[c].base  = base;
+            cls[c].clock = 0;
+            if (lend_.lent((int) c)) {
+                l1_->forget_aux((int) c, lend_.limit[c], lend_.slots[c] - lend_.limit[c]);
+            }
+            base += std::max(lend_.slots[c], 0);
+        }
         for (const lend_restore & r : kept) {
             bits[(size_t) r.layer*W + (size_t) r.expert/32] |= 1u << (r.expert%32);
+            const lend_space_class & c = cls[(size_t) r.cls];
+            if (r.slot >= c.first && r.slot < c.first + c.n) {
+                own[(size_t) (c.base + r.slot - c.first)] = r.layer*(int) E + r.expert;
+                pin[(size_t) (c.base + r.slot - c.first)] = r.pin ? 1 : 0;
+            }
         }
         CUDA_CHECK(cudaMemcpyAsync(lend_restore_dev_, t.data(), t.size()*sizeof(int32_t), cudaMemcpyHostToDevice, lend_stream_));
         CUDA_CHECK(cudaMemcpyAsync(lend_bits_dev_, bits.data(), bits.size()*sizeof(uint32_t), cudaMemcpyHostToDevice, lend_stream_));
+        CUDA_CHECK(cudaMemcpyAsync(lend_space_.own, own.data(), lend_space_n_*sizeof(int32_t), cudaMemcpyHostToDevice, lend_stream_));
+        CUDA_CHECK(cudaMemcpyAsync(lend_space_.pin, pin.data(), lend_space_n_*sizeof(int32_t), cudaMemcpyHostToDevice, lend_stream_));
+        CUDA_CHECK(cudaMemcpyAsync(lend_space_.stamp, stamp.data(), lend_space_n_*sizeof(uint32_t), cudaMemcpyHostToDevice, lend_stream_));
+        CUDA_CHECK(cudaMemcpyAsync(lend_space_.cls, cls.data(), nc*sizeof(lend_space_class), cudaMemcpyHostToDevice, lend_stream_));
         CUDA_CHECK(cudaStreamSynchronize(lend_stream_));
-        lend_upload_descs_locked();
+        lend_space_pinned_ = 0;
+        for (const lend_restore & r : kept) { lend_space_pinned_ += r.pin ? 1 : 0; }
+        lend_space_slots_ = 0;
+        for (const lend_space_class & c : cls) { lend_space_slots_ += (size_t) c.n; }
+    }
+
+    // The device idle: the pinned slots of the space now (each pinned expert took one slot from the LRU part).
+    size_t lend_space_pinned_locked() const {
+        if (lend_space_n_ == 0) {
+            return 0;
+        }
+        std::vector<int32_t> pin(lend_space_n_), own(lend_space_n_);
+        CUDA_CHECK(cudaMemcpy(pin.data(), lend_space_.pin, lend_space_n_*sizeof(int32_t), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(own.data(), lend_space_.own, lend_space_n_*sizeof(int32_t), cudaMemcpyDeviceToHost));
+        std::vector<lend_space_class> cls(lend_.slots.size());
+        CUDA_CHECK(cudaMemcpy(cls.data(), lend_space_.cls, cls.size()*sizeof(lend_space_class), cudaMemcpyDeviceToHost));
+        size_t n = 0;
+        for (const lend_space_class & c : cls) {
+            for (int j = 0; j < c.n; ++j) {
+                n += own[(size_t) (c.base + j)] >= 0 && pin[(size_t) (c.base + j)] != 0 ? 1 : 0;
+            }
+        }
+        return n;
     }
 
     std::vector<int> lend_held_locked() const {
@@ -1657,6 +1907,9 @@ public:
         ub_reclaim_sync_locked("prefill lend");
         for (std::vector<int32_t> & owners : stage_owner_) { stage_forget(owners); }
         const bool was_restore = lend_.state == lend_state::restore;
+        if (was_restore && lend_take_space_locked(cctx, req, expl, out, t0)) {
+            return true;
+        }
         if (was_restore) {
             lend_drop_restore_locked("a new lend");
         }
@@ -1743,6 +1996,122 @@ public:
         return true;
     }
 
+    // A new lend over the open restore space (the device is idle): the pieces take only the top slots of the space they
+    // need (plan_space_lend: empty slots, then LRU copies, then pinned copies of the lowest rank); the copies that stay
+    // move below that top and the space goes on under it. False, with nothing changed, when the pieces need more than
+    // the space: the caller then drops the space and evicts L1 residents.
+    bool lend_take_space_locked(ggml_backend_cuda_context * cctx, const std::vector<ggml_expert_lend_piece> & req, bool expl,
+            ggml_expert_lend_grant * out, std::chrono::steady_clock::time_point t0) {
+        if (lend_space_n_ == 0) {
+            return false;
+        }
+        const size_t nc = lend_.slots.size(), E = (size_t) geo_.n_experts;
+        std::vector<int32_t> own(lend_space_n_), pin(lend_space_n_);
+        std::vector<lend_space_class> cls(nc);
+        CUDA_CHECK(cudaMemcpy(own.data(), lend_space_.own, lend_space_n_*sizeof(int32_t), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(pin.data(), lend_space_.pin, lend_space_n_*sizeof(int32_t), cudaMemcpyDeviceToHost));
+        CUDA_CHECK(cudaMemcpy(cls.data(), lend_space_.cls, nc*sizeof(lend_space_class), cudaMemcpyDeviceToHost));
+        std::vector<lend_restore> copies;
+        for (size_t c = 0; c < nc; ++c) {
+            for (int j = 0; j < cls[c].n; ++j) {
+                const int32_t o = own[(size_t) (cls[c].base + j)];
+                if (o < 0) { continue; }
+                lend_restore r;
+                r.layer  = o/(int) E;
+                r.expert = o%(int) E;
+                r.cls    = (int) c;
+                r.slot   = cls[c].first + j;
+                r.pin    = pin[(size_t) (cls[c].base + j)] != 0 ? 1 : 0;
+                copies.push_back(r);
+            }
+        }
+        std::vector<size_t> bytes;
+        for (const auto & pc : req) { bytes.push_back(pc.bytes); }
+        const lend_space_take sp = plan_space_lend(lend_classes_locked(), lend_.limit, copies, lend_scores_, geo_.n_experts, bytes, 256);
+        if (!sp.ok) {
+            return false;
+        }
+        lend_log_restores_locked("a new lend");
+        // the copies that stay above the top move down; the tables then name the kept copies at their slots
+        std::vector<std::vector<std::pair<int, int>>> moves(nc);
+        for (const auto & m : sp.moves) { moves[(size_t) m[0]].push_back({ m[1], m[2] }); }
+        for (size_t c = 0; c < nc; ++c) {
+            if (!moves[c].empty() && !l1_->copy_slots((int) c, moves[c])) {
+                abort_locked("prefill lend: the moves of the restore space");
+            }
+            if (lend_.lent((int) c)) { l1_->forget_aux((int) c, lend_.limit[c], lend_.slots[c] - lend_.limit[c]); }
+        }
+        std::vector<l1_arena::slot_entry> keep_ent;
+        size_t kept_pinned = 0, dropped_pinned = 0;
+        for (const lend_restore & r : sp.kept) {
+            keep_ent.push_back({r.layer, r.expert, r.slot});
+            kept_pinned += r.pin ? 1 : 0;
+        }
+        if (!l1_->publish_overlay(keep_ent)) {
+            abort_locked("prefill lend: the tables of the restore space");
+        }
+        // a dropped pinned copy is wanted again
+        for (const lend_restore & r : sp.dropped) {
+            if (r.pin && lend_wanted(lend_want_, geo_.n_experts, r.layer, r.expert)) {
+                lend_restore w = r;
+                w.slot = -1;
+                lend_.restore.push_back(w);
+                ++dropped_pinned;
+            }
+        }
+        if (!lend_.hold_space(sp.plan.limit, cctx, expl)) {
+            abort_locked("prefill lend: the lease of the restore space");
+        }
+        lend_space_kept_ = sp.kept;
+        lend_upload_space_locked(sp.kept, true);
+        lend_holder_stream_ = cctx->stream();
+        lend_last_d2h_ = 0;
+        lend_last_moves_ = sp.moves.size();
+        // the pieces, and the zero head of the first lent slot (MMQ reads past the last row of the slot below it)
+        lend_pieces_.clear();
+        size_t di = 0, dev_bytes = 0, n_dev = 0;
+        for (const auto & pc : req) {
+            lend_held_piece h;
+            h.req = pc;
+            if (pc.bytes != 0) {
+                const lend_fit f = sp.plan.fits[di];
+                const lend_region & r = sp.plan.regions[(size_t) f.region];
+                h.ptr = l1_->gpu_slice_address(r.cls, r.kind, 0) + r.begin + f.offset;
+                h.buf = ggml_backend_cuda_buffer_wrap(device_, h.ptr, pc.bytes);
+                dev_bytes += pc.bytes;
+                n_dev++;
+            }
+            di++;
+            lend_pieces_.push_back(h);
+            if (pc.bytes != 0 && h.buf == nullptr) {
+                GGML_LOG_WARN("expert cache: prefill lend: a piece of %.1f MiB has no buffer\n", pc.bytes/1048576.0);
+                lend_end_locked("a piece failed");
+                return false;
+            }
+        }
+        int held_slots = 0, empty_taken = 0;
+        for (size_t c = 0; c < nc; ++c) {
+            if (sp.plan.limit[c] < lend_.slots[c]) {
+                size_t g[3];
+                for (int k = 0; k < 3; ++k) { g[k] = lend_guard_[c*3 + (size_t) k]; }
+                l1_->zero_heads((int) c, sp.plan.limit[c], 1, g);
+            }
+            held_slots += lend_.slots[c] - sp.plan.limit[c];
+            empty_taken += sp.empty_taken[c];
+        }
+        lend_counts_.acquires++;
+        lend_grant_locked(out);
+        const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        GGML_LOG_INFO("expert cache: prefill lend %llu (%s): %.1f MiB VRAM in %zu pieces from the top %d slots of the restore space "
+                      "(%d empty, %zu LRU copies and %zu pinned copies dropped, %zu copies moved down; %zu pinned and %zu LRU copies "
+                      "stay), no L1 resident evicted, in %.1f ms\n",
+            (unsigned long long) (lend_counts_.acquires + lend_counts_.retakes), expl ? "layer-major" : "ubatch op", dev_bytes/1048576.0,
+            n_dev, held_slots, empty_taken, sp.dropped.size() - dropped_pinned, dropped_pinned, sp.moves.size(), kept_pinned,
+            sp.kept.size() - kept_pinned, ms);
+        lend_log_packing_locked(lend_counts_.acquires + lend_counts_.retakes, req, sp.plan, {});
+        return true;
+    }
+
     bool lend_same_locked(const std::vector<ggml_expert_lend_piece> & req) const {
         if (req.size() != lend_pieces_.size()) {
             return false;
@@ -1781,63 +2150,96 @@ public:
             }
         }
         lend_pieces_.clear();
+        const std::vector<int> top = lend_.top;
         lend_.open_restore(geo_.layer_class, &lend_want_, geo_.n_experts);
+        // the copies a lease over the space left in place stay; they are not wanted again
+        auto kept_copy = [&](const lend_restore & r) {
+            for (const lend_restore & k : lend_space_kept_) {
+                if (k.layer == r.layer && k.expert == r.expert) { return true; }
+            }
+            return false;
+        };
+        lend_.restore.erase(std::remove_if(lend_.restore.begin(), lend_.restore.end(), kept_copy), lend_.restore.end());
         int held_slots = 0;
         for (size_t c = 0; c < lend_.slots.size(); ++c) {
             if (!lend_.lent((int) c)) {
                 continue;
             }
+            // the slots the pieces held get zero heads (MMQ reads past the slot below); the kept copies below are experts
+            const int from = c < top.size() ? std::max(top[c], lend_.limit[c]) : lend_.limit[c];
             size_t g[3];
             for (int k = 0; k < 3; ++k) { g[k] = lend_guard_[c*3 + (size_t) k]; }
-            l1_->zero_heads((int) c, lend_.limit[c], lend_.slots[c] - lend_.limit[c], g);
+            l1_->zero_heads((int) c, from, lend_.slots[c] - from, g);
             held_slots += lend_.slots[c] - lend_.limit[c];
         }
-        std::vector<l1_arena::slot_entry> ent;
-        for (const lend_restore & r : lend_.restore) {
-            ent.push_back({r.layer, r.expert, r.slot});
+        lend_upload_space_locked(lend_space_kept_, true);
+        if (tier_) {
+            const l2_counters c = tier_->counters_snapshot();
+            lend_ssd_mark_[0] = c.ssd_reads;
+            lend_ssd_mark_[1] = c.ssd_bytes;
         }
-        if (!l1_->stage_aux(ent)) {
-            abort_locked("prefill lend: the aux rows of the restore slots");
-        }
-        lend_upload_restore_locked({});
         lend_holder_stream_ = nullptr;
         lend_counts_.releases++;
-        size_t wanted = 0;
-        for (const lend_resident & v : lend_.victims) {
-            wanted += lend_wanted(lend_want_, geo_.n_experts, v.layer, v.expert) ? 1 : 0;
-        }
-        GGML_LOG_INFO("expert cache: prefill lend ends (%s): %zu evicted experts, %zu of them in the installed decode plan%s; "
-                      "%zu may come back into %d lent L1 slots as the decode reads them (no refill), the others are read "
-                      "where the L2 has them\n", why, lend_.victims.size(), wanted, lend_want_.empty() ? " (none: no decode plan)" : "",
-            lend_.restore.size(), held_slots);
+        size_t kept_pinned = 0;
+        for (const lend_restore & k : lend_space_kept_) { kept_pinned += k.pin ? 1 : 0; }
+        GGML_LOG_INFO("expert cache: prefill lend ends (%s): %d lent L1 slots are the restore space; %zu evicted experts, %zu of "
+                      "them in the installed decode plan%s come back pinned as the decode reads them (no refill), the others are "
+                      "read where the L2 has them; %zu pinned and %zu LRU copies stayed through the lend; LRU width %zu slots, "
+                      "less one per pinned expert\n", why, held_slots,
+            lend_.victims.size(), lend_.restore.size(), lend_want_.empty() ? " (none: no decode plan)" : "", kept_pinned,
+            lend_space_kept_.size() - kept_pinned, (size_t) held_slots - std::min((size_t) held_slots, kept_pinned));
+        lend_space_kept_.clear();
     }
 
-    // A restore space taken back (the device is idle): the restored copies leave the tables.
+    // A restore space taken back (the device is idle): the copies leave the tables.
     void lend_drop_restore_locked(const char * why) {
         if (lend_.state != lend_state::restore) {
             return;
         }
+        lend_log_restores_locked(why);
         if (!l1_->publish_overlay({})) {
             abort_locked("prefill lend: the tables of the restore space");
         }
         lend_.restore.clear();
-        lend_upload_restore_locked({});
-        lend_log_restores_locked(why);
+        lend_space_kept_.clear();
+        lend_upload_space_locked({}, false);
     }
 
+    // The device idle: what the restore space did since the last line, and its pinned slots (the LRU width is the rest).
     void lend_log_restores_locked(const char * why) {
         if (lend_live_host_ == nullptr) {
             return;
         }
         const volatile lend_live * live = lend_live_host_;
-        const unsigned long long n = live->restores, b = live->bytes;
-        lend_counts_.restores      = n;
-        lend_counts_.restore_bytes = b;
-        if (n != lend_live_mark_) {
-            GGML_LOG_INFO("expert cache: prefill lend: the decode restored %llu experts (%llu in all, %.1f MiB) before %s\n",
-                n - lend_live_mark_, n, b/1048576.0, why);
+        lend_live now;
+        now.restores  = live->restores;
+        now.bytes     = live->bytes;
+        now.lru_fills = live->lru_fills;
+        now.lru_hits  = live->lru_hits;
+        now.evictions = live->evictions;
+        lend_counts_.restores      = now.restores;
+        lend_counts_.restore_bytes = now.bytes;
+        const lend_live & m = lend_live_mark_;
+        if (lend_space_slots_ > 0 || now.restores != m.restores || now.lru_fills != m.lru_fills || now.lru_hits != m.lru_hits) {
+            const size_t pinned = lend_space_pinned_locked();
+            uint64_t reads = 0, bytes = 0;
+            if (tier_) {
+                const l2_counters c = tier_->counters_snapshot();
+                reads = c.ssd_reads - lend_ssd_mark_[0];
+                bytes = c.ssd_bytes - lend_ssd_mark_[1];
+                lend_ssd_mark_[0] = c.ssd_reads;
+                lend_ssd_mark_[1] = c.ssd_bytes;
+            }
+            GGML_LOG_INFO("expert cache: prefill lend: before %s the restore space took back %llu experts of the decode plan "
+                          "(%.1f MiB; %llu in all), admitted %llu LRU copies%s, replaced %llu occupants, served %llu hits; %zu of "
+                          "%zu slots pinned, LRU width %zu (was %zu at the start); the SSD tier read %llu slices / %.1f MiB "
+                          "since the prompt ended\n", why,
+                now.restores - m.restores, (now.bytes - m.bytes)/1048576.0, now.restores, now.lru_fills - m.lru_fills,
+                lend_space_.lru ? "" : " (LRU off)", now.evictions - m.evictions, now.lru_hits - m.lru_hits, pinned, lend_space_slots_,
+                lend_space_slots_ - std::min(pinned, lend_space_slots_), lend_space_slots_ - std::min(lend_space_pinned_, lend_space_slots_),
+                (unsigned long long) reads, bytes/1048576.0);
         }
-        lend_live_mark_ = n;
+        lend_live_mark_ = now;
     }
 
     // A plan install under a lease: the plan inside the kept slots; the rest of it is the restore set, and the experts the
@@ -1932,20 +2334,23 @@ public:
             }
         }
         lend_.victims = victims;
-        lend_.restore = plan_restore(victims, geo_.layer_class, lend_.limit, lend_.slots, &kept, &lend_want_, geo_.n_experts);
-        std::vector<l1_arena::slot_entry> ent, keep_ent;
-        for (const lend_restore & r : lend_.restore) {
-            ent.push_back({r.layer, r.expert, r.slot});
+        lend_.restore = plan_restore(victims, geo_.layer_class, &kept, &lend_want_, geo_.n_experts);
+        // the kept copies are pinned; the rows record of the lent slots is dropped first, so the publish copies their rows
+        for (size_t c = 0; c < lend_.slots.size(); ++c) {
+            if (lend_.lent((int) c)) { l1_->forget_aux((int) c, lend_.limit[c], lend_.slots[c] - lend_.limit[c]); }
         }
+        std::vector<l1_arena::slot_entry> keep_ent;
         for (const lend_restore & r : kept) {
             keep_ent.push_back({r.layer, r.expert, r.slot});
         }
-        if (!l1_->stage_aux(ent) || !l1_->publish_overlay(keep_ent)) {
+        if (!l1_->publish_overlay(keep_ent)) {
             abort_locked("prefill lend: the restore space after an install");
         }
-        lend_upload_restore_locked(kept);
-        GGML_LOG_INFO("expert cache: prefill lend: plan %u installed in the %s kept slots per class; %zu experts of it wait in the "
-                      "restore space (%zu restored copies kept)\n", id, split_text(lend_.limit).c_str(), lend_.restore.size(), kept.size());
+        lend_upload_space_locked(kept, true);
+        GGML_LOG_INFO("expert cache: prefill lend: plan %u installed in the %s kept slots per class; %zu experts of it come back "
+                      "as the decode reads them, %zu copies of it stay pinned (of %zu copies in the space), LRU width %zu\n", id,
+            split_text(lend_.limit).c_str(), lend_.restore.size(), kept.size(), restored.size(),
+            lend_space_slots_ - std::min(kept.size(), lend_space_slots_));
         return true;
     }
 
@@ -5399,7 +5804,13 @@ private:
     unsigned int * lend_tickets_dev_ = nullptr;    // [layer]
     lend_live * lend_live_host_ = nullptr;         // mapped
     lend_live * lend_live_dev_ = nullptr;
-    unsigned long long lend_live_mark_ = 0;        // restores at the last log line
+    lend_live lend_live_mark_ = {};                // the counters at the last log line
+    uint64_t lend_ssd_mark_[2] = {0, 0};           // the SSD tier's reads and bytes when the restore space opened / last logged
+    lend_space_state lend_space_ = {};             // the restore space on the device (fixed addresses: captured graphs)
+    size_t lend_space_n_ = 0;                      // slots of its arrays (every class's slot count)
+    size_t lend_space_slots_ = 0;                  // lent slots of the space now
+    size_t lend_space_pinned_ = 0;                 // pinned when it was last laid out
+    std::vector<lend_restore> lend_space_kept_;    // the copies a lease over the space left in place (lend_take_space_locked)
     ggml_expert_lend_counts lend_counts_{};
     bool lend_scratch_warned_ = false;
     // the expert prefetch (RANMA_EXPERT_PREFETCH)

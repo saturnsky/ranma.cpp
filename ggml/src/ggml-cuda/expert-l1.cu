@@ -573,6 +573,33 @@ bool l1_arena::stage_aux(const std::vector<slot_entry> & entries) {
     return true;
 }
 
+bool l1_arena::copy_slots(int cls, const std::vector<std::pair<int, int>> & moves) {
+    if (!allocated() || cls < 0 || (size_t) cls >= class_data_.size()) {
+        return false;
+    }
+    ggml_cuda_set_device(device_);
+    for (const auto & m : moves) {
+        for (int k = 0; k < geometry::n_kinds; ++k) {
+            const size_t bytes = geo_.class_bytes[cls][k];
+            if (bytes != 0) {
+                CUDA_CHECK(cudaMemcpyAsync(gpu_slice(cls, k, m.second), gpu_slice(cls, k, m.first), bytes, cudaMemcpyDeviceToDevice, copy_stream_));
+            }
+        }
+    }
+    CUDA_CHECK(cudaStreamSynchronize(copy_stream_));
+    return true;
+}
+
+void l1_arena::forget_aux(int cls, int first, int count) {
+    if (cls < 0 || (size_t) cls >= aux_owner_.size()) {
+        return;
+    }
+    std::vector<int32_t> & owner = aux_owner_[(size_t) cls];
+    for (int s = std::max(first, 0); s < first + count && (size_t) s < owner.size(); ++s) {
+        owner[(size_t) s] = -1;
+    }
+}
+
 bool l1_arena::zero_heads(int cls, int first, int count, const size_t bytes[3]) {
     if (!allocated() || cls < 0 || (size_t) cls >= class_data_.size() || first < 0 || count <= 0) {
         return count == 0;

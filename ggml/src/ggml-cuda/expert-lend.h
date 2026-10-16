@@ -1,6 +1,6 @@
 #pragma once
 
-// ranma: the prefill lend of the expert cache. Pure C++ (the restore list below is also a device function), shared by
+// ranma: the prefill lend of the expert cache. Pure C++ (the restore space's decisions are also device functions), shared by
 // the controller (expert-controller.cu) and its CPU test (tests/test-expert-lend.cpp).
 //
 // A prompt borrows its buffers (the layer-major edges, carried tensors and MoE output, the expert-major op's scratch,
@@ -11,12 +11,12 @@
 //      region stay zero: MMQ reads past the last row of the slot below.
 //   2. Nothing is lent from host memory, and what does not fit is not allocated elsewhere: the caller narrows its
 //      width (fewer rows per pass) and runs more passes. The L2 holds experts only.
-// The lend ends without a refill: the regions become the restore space. Every lent L1 slot gets one of the evicted
-// experts the installed decode plan keeps in L1 (the highest ranked first; none on a cold cache), and a decode launch that selects such an expert copies it into its slot before
-// the layer's matmuls and publishes it there (lend_restore_list is the decision both the kernel and the test run).
-// The next lend takes the restore space back: the tables return to the mirror of the installed plan.
+// The lend ends without a refill: the regions become the restore space (below). A decode launch that reads an evicted
+// expert the installed decode plan keeps in L1 copies it there and pins it; other recent misses use the free part as a
+// least recently used cache. The next lend takes the restore space back: the tables return to the mirror of the plan.
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <string>
@@ -38,11 +38,14 @@ struct lend_resident {
     int      expert = -1;
     int      slot   = -1;
     uint64_t score  = 0;    // the installed plan's profile score; 0 for every expert of a cold cache
+    uint8_t  tier   = 3;    // evicted in tier order: 0 an empty slot, 1 an LRU copy, 2 a pinned copy (of a restore space), 3 a resident
 };
 
-// The one rank function of the lend: lower first. Score ascending, then the later layer, then the higher expert id
-// (plan_placement keeps lower layers and ids first on a tie, so this evicts in the reverse of its fill order).
+// The one rank function of the lend: lower first. Tier ascending, then score ascending, then the later layer, then the
+// higher expert id (plan_placement keeps lower layers and ids first on a tie, so this evicts in the reverse of its fill
+// order).
 inline bool lend_rank_less(const lend_resident & a, const lend_resident & b) {
+    if (a.tier != b.tier) { return a.tier < b.tier; }
     if (a.score != b.score) { return a.score < b.score; }
     if (a.layer != b.layer) { return a.layer > b.layer; }
     return a.expert > b.expert;
@@ -165,7 +168,7 @@ inline std::vector<size_t> lend_region_used(const std::vector<lend_region> & reg
 }
 
 // The fewest residents, lowest rank first over every class, whose slots taken from the top of their class hold every
-// piece; of the last tie (score) only those of the classes the pieces need (below). `held[c]`: slots of class c the lend holds already (they hold no resident); the plan only adds to them, and its
+// piece; of the last tie (tier and score) only those of the classes the pieces need (below). `held[c]`: slots of class c the lend holds already (they hold no resident); the plan only adds to them, and its
 // victims are the residents it adds.
 inline lend_l1_plan plan_l1_lend(const std::vector<lend_class> & cls, const std::vector<size_t> & pieces, size_t align,
                                  const std::vector<int> * held = nullptr) {
@@ -216,16 +219,16 @@ inline lend_l1_plan plan_l1_lend(const std::vector<lend_class> & cls, const std:
         p.victims.clear();
         return p;
     }
-    // The last tie: the victims of the score the pieces stopped in rank alike (the later layer and the higher id
+    // The last tie: the victims of the tier and score the pieces stopped in rank alike (the later layer and the higher id
     // only order them), so the plan gives back those of a class the pieces turn out not to need. One class at a time, the
     // one of the largest experts first, its victims of the tie leave the plan from the highest ranked down while the pieces
-    // still fit, until no class gives one back. Nothing of a lower score stays while one of a higher leaves, and no
+    // still fit, until no class gives one back. Nothing of a lower tier or score stays while one of a higher leaves, and no
     // class loses more slots than before (e.g. a cold joint cache: the draft's class ranks first on the later layers, but
     // the target's regions hold every piece).
     if (!p.victims.empty()) {
         const lend_resident last = p.victims.back();
         size_t tie = p.victims.size();
-        while (tie > 0 && p.victims[tie - 1].score == last.score) { --tie; }
+        while (tie > 0 && p.victims[tie - 1].tier == last.tier && p.victims[tie - 1].score == last.score) { --tie; }
         std::vector<size_t> by(n_cls);
         std::vector<size_t> cls_bytes(n_cls, 0);
         for (size_t c = 0; c < n_cls; ++c) {
@@ -356,6 +359,14 @@ inline lend_width lend_width_rule(int64_t N, int64_t C_ctx, int64_t unit, int64_
 }
 
 // ---- the restore space ------------------------------------------------------------------------------------------
+//
+// Temporary policy (2026-10-15, not final): the decisions are lend_space_admit and lend_space_key, nothing else.
+// The lent slots of a class are one space shared by every layer of the class. A decode launch that reads an evicted
+// expert the installed decode plan keeps in L1 (a "wanted" expert) copies it into the space and pins it there. Any
+// other expert the launch misses may take an unpinned slot as a least recently used copy, when it passes the ghost
+// filter of the decode pool (ghost:K). A slot goes to the best key: an empty slot first,
+// else the least recently used unpinned slot that this launch does not read. Each pinned expert takes one slot from
+// the LRU part, so with every wanted expert back the LRU part is empty.
 
 // Whether the installed decode plan keeps (layer, expert) in L1: `want` [layer*n_experts + expert], empty = no plan.
 inline bool lend_wanted(const std::vector<uint8_t> & want, int n_experts, int layer, int expert) {
@@ -364,72 +375,258 @@ inline bool lend_wanted(const std::vector<uint8_t> & want, int n_experts, int la
 }
 
 struct lend_restore {
-    int layer = -1, expert = -1, cls = -1, slot = -1;
+    int layer = -1, expert = -1, cls = -1, slot = -1;   // slot: the lent slot it holds (a kept copy), -1 = none yet
+    int pin = 1;                                        // a kept copy: 1 pinned, 0 an LRU copy
 };
 
-// The evicted experts get the lent slots of their class, the highest ranked first, from the bottom of the range up.
-// `layer_class[layer]` gives the class of a victim. `keep`: experts the decode restored already, at their slots; they
-// stay there and are not in the result. More victims than slots: the lowest ranked get none. `want` (null = every
-// victim, see lend_wanted): only the victims the decode plan keeps in L1 get a slot; an empty vector gives none.
-inline std::vector<lend_restore> plan_restore(const std::vector<lend_resident> & victims_low_first,
-        const std::vector<int> & layer_class, const std::vector<int> & limit, const std::vector<int> & slots,
-        const std::vector<lend_restore> * keep = nullptr, const std::vector<uint8_t> * want = nullptr, int n_experts = 0) {
-    std::vector<lend_restore> out;
-    std::vector<std::vector<uint8_t>> used(limit.size());
-    for (size_t c = 0; c < limit.size(); ++c) {
-        used[c].assign((size_t) std::max(0, slots[c] - limit[c]), 0);
+// A new lend over an open restore space (the classes' spaces are [limit, slots)): the pieces take only as many top
+// slots of the space as they need. The slots come from the empty slots first, then the LRU copies, then the pinned
+// copies of the lowest rank (lend_rank_less over the tiers); the copies that stay and sit in the taken top move down into
+// the freed slots below it. ok = false when the pieces need more than the spaces hold: the caller then drops the spaces
+// and evicts L1 residents as before (every copy ranks below every resident, so nothing of a space would stay anyway).
+struct lend_space_take {
+    bool ok = false;
+    lend_l1_plan plan;                     // regions and fits; plan.limit [class] = the first slot of the pieces (`top`)
+    std::vector<lend_restore> kept;        // the copies that stay, at their final slots
+    std::vector<lend_restore> dropped;     // the copies the pieces take (they leave the tables)
+    std::vector<std::array<int, 3>> moves; // (class, from, to): a kept copy above the top moves down
+    std::vector<int> empty_taken;          // [class] empty slots of the space the pieces take
+};
+
+inline lend_space_take plan_space_lend(const std::vector<lend_class> & kinds, const std::vector<int> & limit,
+        const std::vector<lend_restore> & copies, const std::vector<uint64_t> & score, int n_experts,
+        const std::vector<size_t> & pieces, size_t align) {
+    lend_space_take out;
+    const size_t nc = kinds.size();
+    std::vector<lend_class> cls = kinds;
+    std::vector<std::vector<uint8_t>> taken(nc);
+    for (size_t c = 0; c < nc; ++c) {
+        cls[c].residents.clear();
+        taken[c].assign((size_t) std::max(cls[c].slots, 0), 0);
     }
-    auto kept = [&](int layer, int expert) {
-        if (keep == nullptr) { return false; }
-        for (const lend_restore & k : *keep) {
-            if (k.layer == layer && k.expert == expert) { return true; }
+    for (const lend_restore & r : copies) {
+        if (r.cls < 0 || (size_t) r.cls >= nc || r.slot < limit[(size_t) r.cls] || r.slot >= cls[(size_t) r.cls].slots) {
+            return out;
         }
-        return false;
-    };
-    if (keep != nullptr) {
-        for (const lend_restore & k : *keep) {
-            if (k.cls >= 0 && (size_t) k.cls < used.size() && k.slot >= limit[(size_t) k.cls] && k.slot < slots[(size_t) k.cls]) {
-                used[(size_t) k.cls][(size_t) (k.slot - limit[(size_t) k.cls])] = 1;
+        lend_resident x;
+        x.layer  = r.layer;
+        x.expert = r.expert;
+        x.slot   = r.slot;
+        x.score  = score.empty() ? 0 : score[(size_t) r.layer*(size_t) n_experts + (size_t) r.expert];
+        x.tier   = r.pin ? 2 : 1;
+        if (taken[(size_t) r.cls][(size_t) r.slot]) { return out; }
+        taken[(size_t) r.cls][(size_t) r.slot] = 1;
+        cls[(size_t) r.cls].residents.push_back(x);
+    }
+    // an empty slot of a space is a resident of tier 0 (layer -1 - class): the first a lend takes, and nothing leaves for it
+    for (size_t c = 0; c < nc; ++c) {
+        for (int slot = std::max(limit[c], 0); slot < cls[c].slots; ++slot) {
+            if (taken[c][(size_t) slot]) { continue; }
+            lend_resident x;
+            x.layer  = -1 - (int) c;   // the class of an empty slot
+            x.expert = slot;
+            x.slot   = slot;
+            x.tier   = 0;
+            cls[c].residents.push_back(x);
+        }
+    }
+    out.plan = plan_l1_lend(cls, pieces, align);
+    if (!out.plan.ok) {
+        return out;
+    }
+    out.empty_taken.assign(nc, 0);
+    std::vector<std::vector<uint8_t>> gone(nc), used(nc);
+    for (size_t c = 0; c < nc; ++c) {
+        gone[c].assign((size_t) std::max(cls[c].slots, 0), 0);
+        used[c].assign((size_t) std::max(cls[c].slots, 0), 0);
+    }
+    for (const lend_resident & v : out.plan.victims) {
+        if (v.layer < 0) {
+            ++out.empty_taken[(size_t) (-1 - v.layer)];
+            continue;
+        }
+        for (const lend_restore & r : copies) {
+            if (r.layer == v.layer && r.expert == v.expert) {
+                out.dropped.push_back(r);
+                gone[(size_t) r.cls][(size_t) r.slot] = 1;
             }
         }
     }
-    std::vector<size_t> next(limit.size(), 0);
+    for (const lend_restore & r : copies) {
+        if (!gone[(size_t) r.cls][(size_t) r.slot]) { used[(size_t) r.cls][(size_t) r.slot] = 1; }
+    }
+    // the kept copies above the top move into the free slots below it, lowest first
+    std::vector<int> next(limit);
+    for (const lend_restore & r : copies) {
+        if (gone[(size_t) r.cls][(size_t) r.slot]) { continue; }
+        lend_restore k = r;
+        const size_t c = (size_t) r.cls;
+        if (r.slot >= out.plan.limit[c]) {
+            while (next[c] < out.plan.limit[c] && used[c][(size_t) next[c]]) { ++next[c]; }
+            if (next[c] >= out.plan.limit[c]) { out = lend_space_take(); return out; }
+            used[c][(size_t) next[c]] = 1;
+            out.moves.push_back({ r.cls, r.slot, next[c] });
+            k.slot = next[c];
+        }
+        out.kept.push_back(k);
+    }
+    out.ok = true;
+    return out;
+}
+
+// The wanted victims: the evicted experts the decode plan `want` keeps in L1 (null = every victim; an empty vector:
+// none, a cold cache), highest rank first, without the ones in `keep` (back in their slot already).
+inline std::vector<lend_restore> plan_restore(const std::vector<lend_resident> & victims_low_first,
+        const std::vector<int> & layer_class, const std::vector<lend_restore> * keep = nullptr,
+        const std::vector<uint8_t> * want = nullptr, int n_experts = 0) {
+    std::vector<lend_restore> out;
     for (size_t i = victims_low_first.size(); i-- > 0;) {
         const lend_resident & v = victims_low_first[i];
-        if (v.layer < 0 || (size_t) v.layer >= layer_class.size() || kept(v.layer, v.expert)) { continue; }
+        if (v.layer < 0 || (size_t) v.layer >= layer_class.size() || layer_class[(size_t) v.layer] < 0) { continue; }
         if (want != nullptr && !lend_wanted(*want, n_experts, v.layer, v.expert)) { continue; }
-        const int c = layer_class[(size_t) v.layer];
-        if (c < 0 || (size_t) c >= used.size()) { continue; }
-        size_t & j = next[(size_t) c];
-        while (j < used[(size_t) c].size() && used[(size_t) c][j]) { ++j; }
-        if (j >= used[(size_t) c].size()) { continue; }
-        used[(size_t) c][j] = 1;
+        bool skip = false;
+        for (size_t k = 0; keep != nullptr && k < keep->size() && !skip; ++k) {
+            skip = (*keep)[k].layer == v.layer && (*keep)[k].expert == v.expert;
+        }
+        for (size_t k = 0; k < out.size() && !skip; ++k) {
+            skip = out[k].layer == v.layer && out[k].expert == v.expert;
+        }
+        if (skip) { continue; }
         lend_restore r;
         r.layer = v.layer;
         r.expert = v.expert;
-        r.cls = c;
-        r.slot = limit[(size_t) c] + (int) j;
+        r.cls = layer_class[(size_t) v.layer];
         out.push_back(r);
     }
     return out;
 }
 
-// The decode-time decision (the restore kernel, expert-controller.cu, runs exactly this in each block): the experts
-// of one launch of a layer that have a restore slot and no VRAM slot, each once, in the order the rows name them.
-// `ids`: rows x used ids, `stride` apart per row. Returns the count written to out_e (at most `max`).
-LEND_HD inline int lend_restore_list(const int32_t * ids, int rows, int used, int stride, int n_experts,
-                                     const int32_t * restore, const int32_t * slots, int32_t * out_e, int max) {
+static constexpr uint32_t lend_never = 0xFFFFFFFFu;   // last miss of an expert that never missed
+
+// Admission: a wanted expert always; with the LRU part off (`lru` false, RANMA_EXPERT_LEND_LRU=0) nothing else; any
+// other miss only when it missed in its layer within the last `ghost` steps of the layer before this one (`step`);
+// ghost 0 admits every miss. An expert that `n_rows` >= 2 rows of this launch selected has had its second access in this
+// very step, so it passes the ghost filter without a recorded earlier miss.
+LEND_HD inline bool lend_space_admit(bool wanted, uint32_t last_miss, uint32_t step, uint32_t ghost, bool lru = true,
+        int n_rows = 1) {
+    if (wanted) {
+        return true;
+    }
+    if (!lru) {
+        return false;
+    }
+    if (ghost == 0) {
+        return true;
+    }
+    if (n_rows >= 2) {
+        return true;
+    }
+    return last_miss != lend_never && last_miss != step && step - last_miss <= ghost;
+}
+
+// The rows of a launch that selected `e`.
+LEND_HD inline int lend_rows_with(const int32_t * ids, int rows, int used, int stride, int32_t e) {
     int n = 0;
     for (int r = 0; r < rows; ++r) {
         for (int u = 0; u < used; ++u) {
-            const int32_t e = ids[r*stride + u];
-            if (e < 0 || e >= n_experts || restore[e] < 0 || slots[e] >= 0) { continue; }
-            bool seen = false;
-            for (int j = 0; j < n && !seen; ++j) { seen = out_e[j] == e; }
-            if (!seen && n < max) { out_e[n++] = e; }
+            if (ids[r*stride + u] == e) { ++n; break; }
         }
     }
     return n;
+}
+
+// The victim order: the slot with the lowest key gets the next copy. An empty slot first (lowest index), then the
+// unpinned slot used longest ago (`t`: the class clock of this launch); a pinned slot or one this launch reads
+// (stamp == t) is never taken (the largest key).
+static constexpr uint64_t lend_space_none = ~(uint64_t) 0;
+LEND_HD inline uint64_t lend_space_key(int32_t own, int32_t pin, uint32_t stamp, uint32_t t, int j) {
+    if (own < 0) {
+        return (uint64_t) j;
+    }
+    if (pin != 0 || stamp == t) {
+        return lend_space_none;
+    }
+    return (uint64_t(1) << 62) | ((uint64_t) (0xFFFFFFFFu - (t - stamp)) << 24) | (uint64_t) (j & 0xFFFFFF);
+}
+
+// One copy the restore space makes: `expert` of the launch's layer into lent slot first + j, replacing the
+// occupant `evicted` (layer*n_experts + expert, or -1); `wanted` 1 pins it.
+struct lend_space_copy {
+    int32_t expert = -1, j = -1, evicted = -1, wanted = 0;
+};
+
+// Whether the copies of a launch may read their sources: every kind of the generation `seq` is in place. A staged SSD
+// service publishes the kinds one at a time (kind_ready) before the whole generation (ready); the controller therefore
+// waits for kinds 1 and 2 too, after the route's wait for kind 0, before the restore space copies.
+LEND_HD inline bool lend_space_sources_ready(uint32_t ready, const uint32_t kind_ready[3], uint32_t seq) {
+    return ready == seq || (kind_ready[0] == seq && kind_ready[1] == seq && kind_ready[2] == seq);
+}
+
+static constexpr int lend_space_max_ids = 64;   // distinct experts one launch considers
+
+// One decode launch of a layer against the restore space of its class: the CPU reference of the restore kernels
+// (expert-controller.cu), which take the same steps with lend_space_admit and lend_space_key.
+//   slots [expert]: the layer's VRAM table (lent slot j is first + j); want [expert] >= 0: a wanted expert not back
+//   yet; readable(e): it has a source to copy from; last_miss [expert], *step: the layer's ghost state; *clock: the
+//   class's clock; own/pin/stamp [n]: the space of the class.
+// Writes the copies (wanted ones first), updates own/pin/stamp, want, last_miss, the clocks and *hits. The caller
+// copies, publishes slots[e] = first + j, and clears the table entry of each evicted occupant in its own layer.
+template <typename Readable>
+inline int lend_space_step(const int32_t * ids, int rows, int used, int stride, int n_experts, int layer,
+        const int32_t * slots, int32_t * want, uint32_t * last_miss, uint32_t * step, uint32_t ghost,
+        int first, int n, int32_t * own, int32_t * pin, uint32_t * stamp, uint32_t * clock,
+        Readable readable, lend_space_copy * out, int max, int * hits = nullptr, bool lru = true) {
+    const uint32_t t  = ++*clock;
+    const uint32_t st = ++*step;
+    int32_t cand[2][lend_space_max_ids];
+    int nc[2] = {0, 0};
+    int32_t miss[lend_space_max_ids];
+    int nm = 0;
+    for (int r = 0; r < rows; ++r) {
+        for (int u = 0; u < used; ++u) {
+            const int32_t e = ids[r*stride + u];
+            if (e < 0 || e >= n_experts) { continue; }
+            const int32_t g = slots[e];
+            if (g >= first && g < first + n && own[g - first] == layer*n_experts + e) {
+                stamp[g - first] = t;
+                if (hits != nullptr) { ++*hits; }
+                continue;
+            }
+            bool seen = false;
+            for (int i = 0; i < nm && !seen; ++i) { seen = miss[i] == e; }
+            if (g >= 0 || seen || nm >= lend_space_max_ids) { continue; }
+            miss[nm++] = e;
+            const int w = want[e] >= 0 ? 0 : 1;
+            if (readable(e) && lend_space_admit(w == 0, last_miss[e], st, ghost, lru,
+                    ghost != 0 && w != 0 ? lend_rows_with(ids, rows, used, stride, e) : 1)) {
+                cand[w][nc[w]++] = e;
+            }
+        }
+    }
+    int n_out = 0;
+    for (int w = 0; w < 2; ++w) {
+        for (int i = 0; i < nc[w] && n_out < max; ++i) {
+            uint64_t best = lend_space_none;
+            int bj = -1;
+            for (int j = 0; j < n; ++j) {
+                const uint64_t k = lend_space_key(own[j], pin[j], stamp[j], t, j);
+                if (k < best) { best = k; bj = j; }
+            }
+            if (bj < 0) { break; }
+            const int32_t e = cand[w][i];
+            out[n_out].expert  = e;
+            out[n_out].j       = bj;
+            out[n_out].evicted = own[bj];
+            out[n_out].wanted  = w == 0 ? 1 : 0;
+            ++n_out;
+            own[bj]   = layer*n_experts + e;
+            pin[bj]   = w == 0 ? 1 : 0;
+            stamp[bj] = t;
+            if (w == 0) { want[e] = -1; }
+        }
+    }
+    for (int i = 0; i < nm; ++i) { last_miss[miss[i]] = st; }
+    return n_out;
 }
 
 // ---- the lease ------------------------------------------------------------------------------------------------------
@@ -449,6 +646,7 @@ struct lend_book {
     bool explicit_ = false;           // taken by lend_acquire (layer-major): only lend_release ends it
     std::vector<int> slots;           // [class] the slot counts before the lend
     std::vector<int> limit;           // [class] the slot counts the plan keeps (slots while none)
+    std::vector<int> top;             // [class] while held: the first slot of the pieces; [limit, top) stays a restore space
     std::vector<lend_resident> victims;
     std::vector<lend_restore> restore;
     uint64_t restored = 0;            // entries the decode published since the restore space opened
@@ -463,6 +661,7 @@ struct lend_book {
             if (new_limit[c] > limit[c] || new_limit[c] < 0) { return false; }
         }
         limit = new_limit;
+        top = new_limit;
         victims.insert(victims.end(), more.begin(), more.end());
         restore.clear();
         restored = 0;
@@ -472,12 +671,27 @@ struct lend_book {
         ++epoch;
         return true;
     }
-    // The prompt ended: the regions become the restore space of the victims the decode plan keeps in L1 (`want`, see
-    // plan_restore).
+    // A lease of the top of an open restore space (plan_space_lend): the pieces start at `new_top`, the plan keeps its
+    // slots and victims, and [limit, new_top) stays a restore space with its copies.
+    bool hold_space(const std::vector<int> & new_top, const void * who, bool expl) {
+        if (state != lend_state::restore || new_top.size() != slots.size()) { return false; }
+        for (size_t c = 0; c < slots.size(); ++c) {
+            if (new_top[c] < limit[c] || new_top[c] > slots[c]) { return false; }
+        }
+        top = new_top;
+        owner = who;
+        explicit_ = expl;
+        state = lend_state::held;
+        ++epoch;
+        return true;
+    }
+    // The prompt ended: the regions become the restore space of the victims the decode plan `want` keeps in L1
+    // (lend_wanted; null = every victim).
     bool open_restore(const std::vector<int> & layer_class, const std::vector<uint8_t> * want = nullptr, int n_experts = 0) {
         if (state != lend_state::held) { return false; }
         lend_rank_order(victims);
-        restore = plan_restore(victims, layer_class, limit, slots, nullptr, want, n_experts);
+        restore = plan_restore(victims, layer_class, nullptr, want, n_experts);
+        top = slots;
         state = lend_state::restore;
         owner = nullptr;
         explicit_ = false;
@@ -489,6 +703,7 @@ struct lend_book {
         owner = nullptr;
         explicit_ = false;
         limit = slots;
+        top = slots;
         victims.clear();
         restore.clear();
         restored = 0;
