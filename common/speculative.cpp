@@ -10,6 +10,7 @@
 #include "ngram-cache.h"
 #include "ngram-map.h"
 #include "ngram-mod.h"
+#include "ngram-varlen.h"
 #include "sampling.h"
 
 #include "../src/llama-ext.h" // staging API: llama_set_embeddings_nextn / llama_get_embeddings_nextn_ith (used by MTP)
@@ -83,7 +84,8 @@ const std::map<std::string, common_speculative_type> common_speculative_type_fro
     {"ngram-map-k",   COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K},
     {"ngram-map-k4v", COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V},
     {"ngram-mod",     COMMON_SPECULATIVE_TYPE_NGRAM_MOD},
-    {"ngram-cache",   COMMON_SPECULATIVE_TYPE_NGRAM_CACHE}
+    {"ngram-cache",   COMMON_SPECULATIVE_TYPE_NGRAM_CACHE},
+    {"ngram-varlen",  COMMON_SPECULATIVE_TYPE_NGRAM_VARLEN}
 };
 
 static std::string common_speculative_get_devices_str(const std::vector<ggml_backend_dev_t> & devices) {
@@ -291,6 +293,9 @@ struct common_speculative_impl {
     virtual void draft(common_speculative_draft_params_vec & dparams) = 0;
 
     virtual void accept(llama_seq_id seq_id, uint16_t n_accepted, bool is_other) = 0;
+
+    // (optional) the end of the request on the sequence, with the tokens it generated
+    virtual void end(llama_seq_id /*seq_id*/, const llama_tokens & /*generated*/) {}
 
     // (optional) serialize/restore per-seq internal state (e.g. eagle3's deferred boundary).
     virtual bool get_state(llama_seq_id /*seq_id*/, std::vector<uint8_t> & /*data*/) const { return false; }
@@ -3005,6 +3010,219 @@ struct common_speculative_impl_ngram_cache : public common_speculative_impl {
     }
 };
 
+// ranma: variable-length n-gram drafts from the history of the session (common/ngram-varlen.h). A draft longer than
+// n_max tokens is verified in parts: the rest is kept per sequence and the next round continues it when the whole
+// part was accepted and the token sampled after it is the next token of the rest; else the rest is dropped and the
+// next round looks up again.
+struct common_speculative_impl_ngram_varlen : public common_speculative_impl {
+    common_params_speculative_ngram_varlen params;
+
+    common_ngram_varlen ngram;
+
+    struct seq_info {
+        llama_tokens emitted; // the part of the draft in verification
+        llama_tokens rest;    // the draft after it
+        size_t n_hist = 0;    // tokens of the history when the part was drafted
+    };
+
+    std::vector<seq_info> sinfos;
+
+    FILE * log = nullptr; // LLAMA_SPEC_VARLEN_LOG: one JSON line per draft and per accept
+
+    // LLAMA_SPEC_VARLEN_CORRUPT=<draft>:<pos>[,<draft>:<pos>...] (diagnostic only): the token at position <pos> of the
+    // <draft>-th non-empty lookup draft (counted from 0 per process) is replaced by a different token, which forces a
+    // rejection there
+    std::vector<std::pair<size_t, size_t>> corrupt;
+    size_t n_lookup_drafts = 0;
+
+    static common_ngram_varlen_params ngram_params(const common_params_speculative_ngram_varlen & p) {
+        common_ngram_varlen_params res;
+        res.ladder = p.ladder;
+        res.p_min  = p.p_min;
+        return res;
+    }
+
+    common_speculative_impl_ngram_varlen(const common_params_speculative & params, uint32_t n_seq)
+        : common_speculative_impl(COMMON_SPECULATIVE_TYPE_NGRAM_VARLEN, n_seq, params.ngram_varlen.n_max)
+        , params(params.ngram_varlen)
+        , ngram(ngram_params(params.ngram_varlen), n_seq)
+        , sinfos(n_seq)
+    {
+        SPC_INF("ngram-varlen: n_max = %d, n_rs = %d, ladder = %d, p_min = %.3f\n",
+                this->params.n_max, this->params.n_rs, this->params.ladder, this->params.p_min);
+
+        if (const char * c = getenv("LLAMA_SPEC_VARLEN_CORRUPT"); c != nullptr && *c != '\0') {
+            size_t i = 0, p = 0;
+            int n = 0;
+            const char * cur = c;
+            while (sscanf(cur, "%zu:%zu%n", &i, &p, &n) == 2) {
+                corrupt.emplace_back(i, p);
+                cur += n;
+                if (*cur != ',') {
+                    break;
+                }
+                cur++;
+            }
+            SPC_WRN("ngram-varlen: LLAMA_SPEC_VARLEN_CORRUPT forces %zu wrong draft token(s), for diagnostics only\n", corrupt.size());
+        }
+
+        if (const char * path = getenv("LLAMA_SPEC_VARLEN_LOG"); path != nullptr && *path != '\0') {
+            log = fopen(path, "a");
+            if (log == nullptr) {
+                SPC_WRN("cannot open LLAMA_SPEC_VARLEN_LOG '%s'\n", path);
+            }
+        }
+    }
+
+    ~common_speculative_impl_ngram_varlen() override {
+        if (log) {
+            fclose(log);
+        }
+    }
+
+    void begin(llama_seq_id seq_id, const llama_tokens & prompt) override {
+        GGML_ASSERT(seq_id >= 0 && seq_id < (llama_seq_id) n_seq);
+
+        ngram.begin(seq_id, prompt);
+        sinfos[seq_id] = {};
+    }
+
+    void end(llama_seq_id seq_id, const llama_tokens & generated) override {
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq || !ngram.active(seq_id)) {
+            return;
+        }
+
+        // the tokens generated after the last draft
+        for (size_t i = ngram.n_generated(seq_id); i < generated.size(); ++i) {
+            ngram.add(seq_id, generated[i]);
+        }
+        ngram.end(seq_id);
+        sinfos[seq_id] = {};
+    }
+
+    bool process(const common_batch & /*batch*/) override {
+        return true;
+    }
+
+    // the history follows the accepted tokens: prompt is the text of the slot without id_last
+    bool sync(llama_seq_id seq_id, const llama_tokens & prompt, llama_token id_last) {
+        if (!ngram.active(seq_id)) {
+            return false;
+        }
+
+        const auto & hist = ngram.history(seq_id);
+        const size_t n_hist = hist.size();
+        if (n_hist > prompt.size() + 1 || (n_hist > 0 && n_hist <= prompt.size() && hist[n_hist - 1] != prompt[n_hist - 1])) {
+            // the text of the slot moved (a context shift): the request stops drafting
+            SPC_WRN("ngram-varlen: seq %d, the history (%zu tokens) does not continue in the prompt (%zu tokens), no more drafts in this request\n",
+                    seq_id, n_hist, prompt.size());
+            ngram.end(seq_id);
+            sinfos[seq_id] = {};
+            return false;
+        }
+
+        for (size_t i = n_hist; i < prompt.size(); ++i) {
+            ngram.add(seq_id, prompt[i]);
+        }
+        if (n_hist <= prompt.size()) {
+            ngram.add(seq_id, id_last);
+        }
+
+        return true;
+    }
+
+    void draft(common_speculative_draft_params_vec & dparams) override {
+        assert(dparams.size() == n_seq);
+
+        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+            auto & dp = dparams[seq_id];
+            if (!dp.drafting) {
+                continue;
+            }
+
+            if (!sync(seq_id, *dp.prompt, dp.id_last)) {
+                continue;
+            }
+
+            auto & si = sinfos[seq_id];
+
+            const auto & hist = ngram.history(seq_id);
+            const size_t n_hist = hist.size();
+
+            // the whole part was accepted and the sampled token is the next one of the rest: go on with the rest
+            llama_tokens next;
+            bool cont = false;
+            if (!si.rest.empty() && n_hist == si.n_hist + si.emitted.size() + 1 &&
+                    std::equal(si.emitted.begin(), si.emitted.end(), hist.begin() + si.n_hist) &&
+                    hist.back() == si.rest[0]) {
+                next.assign(si.rest.begin() + 1, si.rest.end());
+                cont = true;
+            }
+
+            common_ngram_varlen_draft d;
+            if (next.empty()) {
+                d = ngram.draft(seq_id);
+                next = std::move(d.tokens);
+                cont = false;
+
+                if (!next.empty()) {
+                    for (const auto & c : corrupt) {
+                        if (c.first == n_lookup_drafts && c.second < next.size()) {
+                            next[c.second] ^= 1; // a different token
+                        }
+                    }
+                    n_lookup_drafts++;
+                }
+            }
+
+            si = {};
+
+            int32_t n_max = params.n_max;
+            if (dp.n_max > 0) {
+                n_max = std::min(n_max, dp.n_max);
+            }
+            const size_t n_emit = std::min(next.size(), (size_t) std::max(0, n_max));
+
+            if (log) {
+                fprintf(log, "{\"seq\":%d,\"hist\":%zu,\"src\":\"%s\",\"n\":%d,\"s\":%d,\"len\":%zu,\"emit\":%zu,\"toks\":[",
+                        seq_id, n_hist, cont ? "rest" : "lookup", d.n, d.n_samples, next.size(), n_emit);
+                for (size_t i = 0; i < next.size(); ++i) {
+                    fprintf(log, "%s%d", i ? "," : "", next[i]);
+                }
+                fprintf(log, "]}\n");
+            }
+
+            if (n_emit == 0) {
+                continue;
+            }
+
+            dp.result->assign(next.begin(), next.begin() + n_emit);
+
+            si.emitted = *dp.result;
+            si.rest.assign(next.begin() + n_emit, next.end());
+            si.n_hist = n_hist;
+        }
+    }
+
+    void accept(llama_seq_id seq_id, uint16_t n_accepted, bool is_other) override {
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+            return;
+        }
+
+        auto & si = sinfos[seq_id];
+
+        if (log && !is_other) {
+            fprintf(log, "{\"seq\":%d,\"acc\":%u,\"of\":%zu}\n", seq_id, (unsigned) n_accepted, si.emitted.size());
+            fflush(log);
+        }
+
+        // another drafter verified this round, or a token of the part was rejected
+        if (is_other || n_accepted < si.emitted.size()) {
+            si = {};
+        }
+    }
+};
+
 struct common_speculative {
     common_speculative_draft_params_vec dparams;
 
@@ -3084,6 +3302,7 @@ std::string common_speculative_type_to_str(common_speculative_type type) {
         case COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V: return "ngram-map-k4v";
         case COMMON_SPECULATIVE_TYPE_NGRAM_MOD:     return "ngram-mod";
         case COMMON_SPECULATIVE_TYPE_NGRAM_CACHE:   return "ngram-cache";
+        case COMMON_SPECULATIVE_TYPE_NGRAM_VARLEN:  return "ngram-varlen";
         default:                                    return "unknown";
     }
 }
@@ -3257,6 +3476,9 @@ int32_t common_speculative_n_max(const common_params_speculative * spec) {
                 break;
             case COMMON_SPECULATIVE_TYPE_NGRAM_CACHE:
                 n_max = std::max(n_max, (int32_t) 8);
+                break;
+            case COMMON_SPECULATIVE_TYPE_NGRAM_VARLEN:
+                n_max = std::max(n_max, std::max(0, spec->ngram_varlen.n_max));
                 break;
             case COMMON_SPECULATIVE_TYPE_NONE:
             case COMMON_SPECULATIVE_TYPE_COUNT:
@@ -3539,10 +3761,12 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         };
 
         // when adding a new type - update here the logic above
-        static_assert(COMMON_SPECULATIVE_TYPE_COUNT == 11);
+        static_assert(COMMON_SPECULATIVE_TYPE_COUNT == 12);
 
         // this list here defines the priority of the speculators
         // the one with highest priority are listed first
+        // ranma: a round that ngram-varlen drafts skips the draft model
+        add_config_if_enabled(COMMON_SPECULATIVE_TYPE_NGRAM_VARLEN);
         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE);
         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K);
         add_config_if_enabled(COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V);
@@ -3618,6 +3842,10 @@ common_speculative * common_speculative_init(common_params_speculative & params,
                         std::make_unique<common_speculative_impl_ngram_mod>(config.params, n_seq));
                 break;
             }
+            case COMMON_SPECULATIVE_TYPE_NGRAM_VARLEN: {
+                impls.push_back(std::make_unique<common_speculative_impl_ngram_varlen>(config.params, n_seq));
+                break;
+            }
             case COMMON_SPECULATIVE_TYPE_NGRAM_CACHE: {
                 auto state = create_state_ngram_cache(
                         config, n_seq,
@@ -3634,6 +3862,12 @@ common_speculative * common_speculative_init(common_params_speculative & params,
     if (impls.empty()) {
         SPC_TRC("%s", "no implementations specified for speculative decoding\n");
         return nullptr;
+    }
+
+    // ranma: with a draft model next to ngram-varlen, a round that ngram-varlen drafts skips the draft model, but the
+    // --spec-smart controller still counts that round as its own
+    if (impls.size() > 1 && impls.front()->type == COMMON_SPECULATIVE_TYPE_NGRAM_VARLEN && params.draft.smart_on) {
+        SPC_WRN("%s", "ngram-varlen with --spec-smart: the controller also counts the rounds that ngram-varlen drafts (use --no-spec-smart)\n");
     }
 
     common_speculative_ptr result(new common_speculative {
@@ -3820,7 +4054,15 @@ void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, co
 }
 
 void common_speculative_end(common_speculative * spec, llama_seq_id seq_id, const llama_tokens & generated) {
-    if (spec == nullptr || !spec->smart) {
+    if (spec == nullptr) {
+        return;
+    }
+
+    for (auto & impl : spec->impls) {
+        impl->end(seq_id, generated);
+    }
+
+    if (!spec->smart) {
         return;
     }
     spec->smart->tconf_end(seq_id, generated.data(), generated.size());

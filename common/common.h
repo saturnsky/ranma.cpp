@@ -184,6 +184,7 @@ enum common_speculative_type {
     COMMON_SPECULATIVE_TYPE_NGRAM_MAP_K4V, // self-speculative decoding with n-gram keys and 4 m-gram values
     COMMON_SPECULATIVE_TYPE_NGRAM_MOD,
     COMMON_SPECULATIVE_TYPE_NGRAM_CACHE,   // self-speculative decoding with 3-level n-gram cache
+    COMMON_SPECULATIVE_TYPE_NGRAM_VARLEN,  // ranma: variable-length n-gram drafts from the session (common/ngram-varlen.h)
     COMMON_SPECULATIVE_TYPE_COUNT          // number of types, unknown type
 };
 
@@ -409,6 +410,15 @@ struct common_params_speculative_ngram_map {
     uint16_t min_hits = 1;  // minimum hits at ngram/mgram lookup for mgram to be proposed
 };
 
+// ranma: ngram-varlen (common/ngram-varlen.h)
+struct common_params_speculative_ngram_varlen {
+    int32_t n_max  = 8;   // draft tokens verified at once; a longer draft is verified in parts
+    int32_t n_rs   = -1;  // rollback depth of the target context (n_rs_seq), cut to n_ubatch - 2; -1: 7 for a model with
+                          // recurrent layers, else 127 (common_ngram_varlen_resolve_rs; a call is draft + 1 tokens wide)
+    int32_t ladder = 4;   // a draft of k tokens needs k <= ladder*(samples - 1)
+    double  p_min  = 0.9; // weight share of the samples that agree on every drafted token
+};
+
 struct common_params_speculative_ngram_cache {
     std::string lookup_cache_static;  // path of static ngram cache file for lookup decoding
     std::string lookup_cache_dynamic; // path of dynamic ngram cache file for lookup decoding
@@ -430,6 +440,8 @@ struct common_params_speculative {
 
     common_params_speculative_ngram_cache ngram_cache;
 
+    common_params_speculative_ngram_varlen ngram_varlen;
+
     bool has_dft() const {
         return !draft.mparams.empty();
     }
@@ -443,7 +455,15 @@ struct common_params_speculative {
             return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP || t == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 || t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
         });
 
-        return needs_rs_seq ? draft.n_max : 0u;
+        uint32_t n_rs_seq = needs_rs_seq ? draft.n_max : 0u;
+
+        // ranma: ngram-varlen verifies up to ngram_varlen.n_max tokens per call; the depth is a capacity, a call
+        // snapshots only as deep as its draft
+        if (std::find(types.begin(), types.end(), COMMON_SPECULATIVE_TYPE_NGRAM_VARLEN) != types.end()) {
+            n_rs_seq = std::max(n_rs_seq, (uint32_t) (ngram_varlen.n_rs >= 1 ? ngram_varlen.n_rs : 7)); // 7: not resolved yet
+        }
+
+        return n_rs_seq;
     }
 };
 
@@ -1091,6 +1111,11 @@ common_init_result_ptr common_init_from_params(common_params & params, bool mode
 
 struct llama_model_params   common_model_params_to_llama  (      common_params & params);
 struct llama_context_params common_context_params_to_llama(const common_params & params);
+
+// ranma: ngram-varlen with n_rs = -1 (auto) reads the layers of the model (metadata only, no weights) and sets n_rs to
+// 7 when it has recurrent layers (SSM state, one copy per rollback plane), else 127. Call it before the first
+// common_context_params_to_llama / common_fit_params. No-op without ngram-varlen or with an explicit n_rs.
+void common_ngram_varlen_resolve_rs(common_params & params);
 
 // clear LoRA adapters from context, then apply new list of adapters
 void common_set_adapter_lora(struct llama_context * ctx, std::vector<common_adapter_lora_info> & lora);

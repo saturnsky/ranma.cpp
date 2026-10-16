@@ -27,6 +27,8 @@ int llama_fit_params(int argc, char ** argv) {
     llama_backend_init();
     llama_numa_init(params.numa);
 
+    common_ngram_varlen_resolve_rs(params);
+
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
 

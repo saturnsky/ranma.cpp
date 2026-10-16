@@ -1240,6 +1240,9 @@ common_gguf_info common_get_gguf_info(const std::string & fname) {
 
 common_init_result::common_init_result(common_params & params, bool model_only) :
     pimpl(new impl{}) {
+    // ranma: ngram-varlen rollback depth by the layers of the model, before any context params are made (fit sizes with it)
+    common_ngram_varlen_resolve_rs(params);
+
     // ranma layer mode: sizes n_ubatch/n_batch and its switches before the params are converted (docs/ranma/layer-mode.md)
     common_layer_mode_apply(params);
 
@@ -1776,12 +1779,53 @@ static bool common_tensor_dump_cb(struct ggml_tensor * t, bool ask, void * user_
     return true;
 }
 
+void common_ngram_varlen_resolve_rs(common_params & params) {
+    auto & nv = params.speculative.ngram_varlen;
+    const auto & types = params.speculative.types;
+    if (nv.n_rs >= 1 || std::find(types.begin(), types.end(), COMMON_SPECULATIVE_TYPE_NGRAM_VARLEN) == types.end()) {
+        return;
+    }
+
+    // the layers are known after the hparams: a no_alloc load reads the metadata and creates no weights (as common_fit does)
+    llama_model_params mp = llama_model_default_params();
+    mp.no_alloc     = true;
+    mp.load_mode    = LLAMA_LOAD_MODE_NONE;
+    mp.n_gpu_layers = 0;
+
+    ggml_log_callback log_cb = nullptr;
+    void * log_ud = nullptr;
+    llama_log_get(&log_cb, &log_ud);
+    llama_log_set([](ggml_log_level, const char *, void *) {}, nullptr); // the load logs the whole model header
+    llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mp);
+    llama_log_set(log_cb, log_ud);
+
+    if (model == nullptr) {
+        nv.n_rs = 7;
+        LOG_WRN("%s: could not read the layers of %s, ngram-varlen rs = %d\n", __func__, params.model.path.c_str(), nv.n_rs);
+        return;
+    }
+    const bool recr = llama_model_has_recurrent_layers(model);
+    llama_model_free(model);
+
+    nv.n_rs = recr ? 7 : 127;
+    LOG_INF("%s: ngram-varlen rs = %d (model has %srecurrent layers)\n", __func__, nv.n_rs, recr ? "" : "no ");
+}
+
 struct llama_context_params common_context_params_to_llama(const common_params & params) {
     auto cparams = llama_context_default_params();
 
     cparams.n_ctx             = params.n_ctx;
     cparams.n_seq_max         = params.n_parallel;
     cparams.n_rs_seq          = params.speculative.need_n_rs_seq();
+    {
+        // the last n_rs_seq + 1 tokens of a sequence have to fit in one ubatch
+        const int32_t n_ubatch = std::min(params.n_batch, params.n_ubatch > 0 ? params.n_ubatch : params.n_batch);
+        if (cparams.n_rs_seq > 0 && (int64_t) cparams.n_rs_seq + 1 >= n_ubatch) {
+            const uint32_t n_rs_seq = n_ubatch > 2 ? (uint32_t) (n_ubatch - 2) : 0u;
+            LOG_INF("%s: n_rs_seq %u does not fit n_ubatch %d, using %u\n", __func__, cparams.n_rs_seq, n_ubatch, n_rs_seq);
+            cparams.n_rs_seq = n_rs_seq;
+        }
+    }
     cparams.n_outputs_max     = std::max(params.n_outputs_max, 0);
     cparams.n_outputs_max_per_seq = std::max(params.n_outputs_max_per_seq, 0);
     cparams.n_batch           = params.n_batch;

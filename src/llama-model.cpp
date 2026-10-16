@@ -3862,6 +3862,15 @@ bool llama_model_is_hybrid(const llama_model * model) {
     return llm_arch_is_hybrid(model->arch);
 }
 
+bool llama_model_has_recurrent_layers(const llama_model * model) {
+    for (uint32_t il = 0; il < model->hparams.n_layer(); ++il) {
+        if (model->hparams.is_recr(il)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 bool llama_model_is_diffusion(const llama_model * model) {
     return llm_arch_is_diffusion(model->arch);
 }
