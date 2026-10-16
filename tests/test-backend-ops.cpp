@@ -15187,6 +15187,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, 1}, 8192, 9, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true, 2051)); // more rows than the MLA kernel takes: regular kernel
     test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, 1}, 768, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, false, 0)); // V not a view of K: regular kernel
 
+    // MLA decode with attention sinks (DeepSeek V4.1 Flash: 64 heads, SWA 128 + top-k 512 = n_kv_max 640): dense and list forms,
+    // one and several partitions, several query rows; the sink joins the softmax exactly once across all partitions
+    for (int64_t kv : {48, 768, 4096, 8192}) { // dense
+        test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, 1}, kv, 1, true, true, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true, 0));
+    }
+    for (int64_t kv : {4096, 8192, 32768, 65536}) { // list (n_kv >= 2*n_kv_max)
+        test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, 1}, kv, 1, true, true, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true, 640));
+    }
+    test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, 1}, 4096, 1, true, true, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true, 64)); // list, one partition
+    for (int64_t nb : {2, 4, 8}) {
+        test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, 1}, 8192, nb, true, true, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true, 640));
+        test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, 1}, 768, nb, true, true, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true, 0));
+    }
+
     // sparse mask + quantized cache
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 1, { 8, 1}, 4096,  1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, false, 512));
     test_cases.emplace_back(new test_flash_attn_ext(128, 128, 1, { 8, 1}, 4096, 64, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q8_0, {0, 1, 2, 3}, true, false, 512));
@@ -15871,6 +15885,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         test_cases.emplace_back(new test_mul_mat(GGML_TYPE_F16, GGML_TYPE_F32, 512, 1, 256, {64, 1}, {1, 1}));
         for (int64_t kv : {768, 4096, 8192, 32768}) {
             test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, 1}, kv, 1, true, false, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true, std::min<int64_t>(2051, kv)));
+        }
+        return test_cases;
+    }
+
+    // TBO_DS41_DECODE=1: DeepSeek V4.1 Flash decode ops: the router (384 experts, top 6, sqrt-softplus with bias and norm)
+    // and the MLA attention with sinks (SWA 128 + top-k 512 = n_kv_max 640; dense below 2 x 640 cache rows)
+    if (getenv("TBO_DS41_DECODE") != nullptr && atoi(getenv("TBO_DS41_DECODE")) != 0) {
+        test_cases.emplace_back(new test_topk_moe({384, 1, 1, 1}, 6, true, true, GATING_FUNC_SQRT_SOFTPLUS, 2.0f));
+        for (int64_t kv : {768, 4096, 8192, 32768, 65536, 92160}) {
+            test_cases.emplace_back(new test_flash_attn_ext(512, 512, 1, {64, 1}, kv, 1, true, true, 0, 0, GGML_PREC_F32, GGML_TYPE_F16, GGML_TYPE_F16, {0, 1, 2, 3}, true, true, kv < 2*640 ? 0 : 640));
         }
         return test_cases;
     }

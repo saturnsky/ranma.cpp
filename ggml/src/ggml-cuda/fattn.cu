@@ -1545,7 +1545,7 @@ static __global__ void __launch_bounds__(256) fattn_mla_decode_kernel(
 }
 
 static __global__ void __launch_bounds__(512) fattn_mla_combine_kernel(
-        const float * __restrict__ Opart_all, const float2 * __restrict__ ML_all, const int n_part, float * __restrict__ dst_all) {
+        const float * __restrict__ Opart_all, const float2 * __restrict__ ML_all, const float * __restrict__ sinks, const int n_part, float * __restrict__ dst_all) {
     const int h = blockIdx.x, t = threadIdx.x, row = blockIdx.y;
     const float * Opart = Opart_all + (int64_t) row*n_part*fattn_mla_heads*fattn_mla_dim;
     const float2 * ML = ML_all + (int64_t) row*n_part*fattn_mla_heads;
@@ -1554,7 +1554,10 @@ static __global__ void __launch_bounds__(512) fattn_mla_combine_kernel(
     for (int g = 0; g < n_part; ++g) {
         M = fmaxf(M, ML[(int64_t) g*fattn_mla_heads + h].x);
     }
-    float L = 0.0f, acc = 0.0f;
+    // attention sink: one extra logit per head with no value, so it joins the maximum and the denominator exactly once, here
+    const float sink = sinks ? sinks[h] : -INFINITY;
+    M = fmaxf(M, sink);
+    float L = sinks ? expf(sink - M) : 0.0f, acc = 0.0f;
     for (int g = 0; g < n_part; ++g) {
         const float2 ml = ML[(int64_t) g*fattn_mla_heads + h];
         const float f = ml.x == -INFINITY ? 0.0f : expf(ml.x - M);
@@ -1577,7 +1580,10 @@ static bool ggml_cuda_flash_attn_ext_mla_decode(ggml_backend_cuda_context & ctx,
         return false;
     }
     if (Q->ne[0] != fattn_mla_dim || K->ne[0] != fattn_mla_dim || V->ne[0] != fattn_mla_dim || Q->ne[1] < 1 || Q->ne[1] > fattn_mla_max_rows || Q->ne[2] != fattn_mla_heads ||
-            Q->ne[3] != 1 || K->ne[2] != 1 || K->ne[3] != 1 || V->ne[2] != 1 || V->ne[3] != 1 || mask == nullptr || sinks != nullptr) {
+            Q->ne[3] != 1 || K->ne[2] != 1 || K->ne[3] != 1 || V->ne[2] != 1 || V->ne[3] != 1 || mask == nullptr) {
+        return false;
+    }
+    if (sinks != nullptr && (sinks->type != GGML_TYPE_F32 || sinks->ne[0] != Q->ne[2] || ggml_nelements(sinks) != Q->ne[2] || ((uintptr_t) sinks->data) % sizeof(float) != 0)) {
         return false;
     }
     if (Q->type != GGML_TYPE_F32 || K->type != GGML_TYPE_F16 || V->type != GGML_TYPE_F16 || mask->type != GGML_TYPE_F16 || dst->type != GGML_TYPE_F32) {
@@ -1643,7 +1649,7 @@ static bool ggml_cuda_flash_attn_ext_mla_decode(ggml_backend_cuda_context & ctx,
             (int) n_cells, (int64_t) n_kv_max, (const half *) mask->data, mask_row_stride, part.ptr, ml.ptr, n_part, scale);
     }
     CUDA_CHECK(cudaGetLastError());
-    fattn_mla_combine_kernel<<<dim3(fattn_mla_heads, n_rows), fattn_mla_dim, 0, stream>>>(part.ptr, ml.ptr, n_part, (float *) dst->data);
+    fattn_mla_combine_kernel<<<dim3(fattn_mla_heads, n_rows), fattn_mla_dim, 0, stream>>>(part.ptr, ml.ptr, sinks ? (const float *) sinks->data : nullptr, n_part, (float *) dst->data);
     CUDA_CHECK(cudaGetLastError());
     return true;
 }
