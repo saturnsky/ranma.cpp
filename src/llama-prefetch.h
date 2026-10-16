@@ -83,6 +83,17 @@ void llama_prefetch_table_pieces_rows(const std::vector<struct ggml_tensor *> & 
                                       const std::vector<int32_t> & rows, enum llama_ple_prefetch mode,
                                       llama_prefetch_stats * stats = nullptr);
 
+// Single-token decode hints run on one resident worker thread instead of in the serial stretch before the graph is submitted:
+// the caller hands over a copy of the rows and goes on, and llama_prefetch_decode_wait() (the scheduler calls it right before
+// the first CPU split, and the context drains it after the compute) blocks until every submitted hint has finished. The hint
+// is a performance hint only, so the gather result never depends on it; only the thread running the OS call changes.
+void llama_prefetch_decode_submit(const std::vector<struct ggml_tensor *> & parts, int64_t part_rows, std::vector<int32_t> rows,
+                                  enum llama_ple_prefetch mode, int layer, bool timing);
+bool llama_prefetch_decode_pending();
+void llama_prefetch_decode_wait();
+// the scheduler hook: waits only when this CPU split gathers rows of a table that has a hint in flight
+void llama_prefetch_decode_wait_split(const struct ggml_cgraph * split);
+
 // One ubatch owns its hints until submission finishes, including abort and error returns.
 class llama_prefetch_batch {
 public:

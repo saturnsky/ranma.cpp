@@ -17,6 +17,7 @@
 #include <utility>
 #include <vector>
 #include <condition_variable>
+#include <deque>
 #include <mutex>
 #include <map>
 #include <thread>
@@ -251,8 +252,7 @@ void llama_prefetch_batch::prepare(ggml_cgraph * graph, llama_ple_prefetch mode,
             const auto overlap = input_overlap.emplace(root, gpu_before).first;
             std::vector<int32_t> rows((size_t) ggml_nelements(ids));
             ggml_backend_tensor_get(ids, rows.data(), 0, rows.size()*sizeof(int32_t));
-            const bool large = prefetch_enough_rows(rows.size(), LLAMA_PLE_PREFETCH_PREFILL);
-            add(node->src[0], std::move(rows), mode, async && overlap->second && large);
+            add(node->src[0], std::move(rows), mode, async && overlap->second);
         }
     } catch (const std::exception & e) {
         LLAMA_LOG_WARN("table prefetch preparation: %s; using synchronous fallback\n", e.what());
@@ -617,4 +617,142 @@ void llama_prefetch_stats_log(const char * what, int layer, int64_t n_tokens, co
         sum.rows, sum.unique_rows, sum.row_ranges, sum.row_bytes, sum.page_bytes, sum.page_ranges, sum.page_runs, sum.unique_pages);
     out += buf;
     LLAMA_LOG_INFO("table_prefetch %s\n", out.c_str());
+}
+
+// Resident worker for the single-token decode hints. The state is leaked on purpose and the thread detached: this code lives in
+// a DLL, where joining a thread from a static destructor at process exit can deadlock on the loader lock.
+namespace {
+struct decode_hint_job {
+    std::vector<ggml_tensor *> parts;
+    int64_t part_rows;
+    std::vector<int32_t> rows;
+    llama_ple_prefetch mode;
+    int layer;
+    bool timing;
+};
+
+struct decode_hint_worker {
+    std::mutex mutex;
+    std::condition_variable work;
+    std::condition_variable done;
+    std::deque<decode_hint_job> queue;
+    bool running = false;   // a job is being executed
+    std::vector<ggml_tensor *> running_parts;   // the pieces of the job being executed
+    bool started = false;
+
+    static void run_job(decode_hint_job & job) noexcept {
+        try {
+            llama_prefetch_stats stats;
+            llama_prefetch_table_pieces_rows(job.parts, job.part_rows, job.rows, job.mode, job.timing ? &stats : nullptr);
+            if (job.timing) {
+                llama_prefetch_stats_log("engram_async", job.layer, 1, stats);
+            }
+        } catch (...) {
+            // A refused hint leaves ordinary demand paging as the final fallback.
+        }
+    }
+
+    void loop() noexcept {
+        std::unique_lock<std::mutex> lock(mutex);
+        for (;;) {
+            work.wait(lock, [&] { return !queue.empty(); });
+            decode_hint_job job = std::move(queue.front());
+            queue.pop_front();
+            running = true;
+            running_parts = job.parts;
+            lock.unlock();
+            run_job(job);
+            lock.lock();
+            running = false;
+            running_parts.clear();
+            done.notify_all();
+        }
+    }
+};
+
+decode_hint_worker & decode_hint_get() {
+    static decode_hint_worker * w = new decode_hint_worker;
+    return *w;
+}
+}
+
+void llama_prefetch_decode_submit(const std::vector<ggml_tensor *> & parts, int64_t part_rows, std::vector<int32_t> rows,
+                                  enum llama_ple_prefetch mode, int layer, bool timing) {
+    if (parts.empty() || !prefetch_enough_rows(rows.size(), mode)) {
+        return;
+    }
+    decode_hint_worker & w = decode_hint_get();
+    decode_hint_job job{parts, part_rows, std::move(rows), mode, layer, timing};
+    {
+        std::lock_guard<std::mutex> lock(w.mutex);
+        if (!w.started) {
+            try {
+                std::thread([&w] { w.loop(); }).detach();
+                w.started = true;
+            } catch (...) {
+                // no thread: do the hint here, in the serial stretch, as before
+            }
+        }
+        if (w.started) {
+            w.queue.push_back(std::move(job));
+            w.work.notify_one();
+            return;
+        }
+    }
+    decode_hint_worker::run_job(job);
+}
+
+bool llama_prefetch_decode_pending() {
+    decode_hint_worker & w = decode_hint_get();
+    std::lock_guard<std::mutex> lock(w.mutex);
+    return !w.queue.empty() || w.running;
+}
+
+void llama_prefetch_decode_wait_split(const ggml_cgraph * split) {
+    // only a split that gathers rows of a table with a hint in flight has to wait: the leading CPU split (token embedding) must
+    // not, or the hint would be waited for before the first GPU split and nothing would overlap
+    decode_hint_worker & w = decode_hint_get();
+    bool hit = false;
+    {
+        std::lock_guard<std::mutex> lock(w.mutex);
+        if (w.queue.empty() && !w.running) {
+            return;
+        }
+        auto has = [&](const std::vector<ggml_tensor *> & parts, const ggml_tensor * t) {
+            return std::find(parts.begin(), parts.end(), t) != parts.end();
+        };
+        for (int i = 0; i < ggml_graph_n_nodes(const_cast<ggml_cgraph *>(split)) && !hit; ++i) {
+            const ggml_tensor * node = ggml_graph_node(const_cast<ggml_cgraph *>(split), i);
+            if (node->op != GGML_OP_GET_ROWS) {
+                continue;
+            }
+            const ggml_tensor * weight = node->src[0];
+            while (weight->view_src) {
+                weight = weight->view_src;
+            }
+            hit = has(w.running_parts, weight) || has(w.running_parts, node->src[0]);
+            for (const auto & job : w.queue) {
+                hit = hit || has(job.parts, weight) || has(job.parts, node->src[0]);
+            }
+        }
+    }
+    if (hit) {
+        llama_prefetch_decode_wait();
+    }
+}
+
+void llama_prefetch_decode_wait() {
+    decode_hint_worker & w = decode_hint_get();
+    const bool account = ggml_account_enabled();
+    const int64_t t0 = account ? ggml_time_us() : 0;
+    {
+        std::unique_lock<std::mutex> lock(w.mutex);
+        if (w.queue.empty() && !w.running) {
+            return;
+        }
+        w.done.wait(lock, [&] { return w.queue.empty() && !w.running; });
+    }
+    if (account) {
+        ggml_account_add(GGML_ACCOUNT_ENGRAM_PREFETCH_MS, (ggml_time_us() - t0)/1000.0);
+    }
 }

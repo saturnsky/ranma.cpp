@@ -624,6 +624,7 @@ llama_context::llama_context(
 llama_context::~llama_context() {
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
+    llama_prefetch_decode_wait();
 
     if (account_ctx != 0) {
         ggml_account_flush(0);
@@ -1831,6 +1832,12 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         prefetch->prepare(res->get_gf(), cparams.ple_prefetch, ubatch.n_tokens);
     }
 
+    // single-token decode hints run on a resident worker; wait for them right before the first CPU split
+    const bool decode_hint = llama_prefetch_decode_pending();
+    if (decode_hint) {
+        ggml_backend_sched_set_cpu_ready_callback(sched.get(), [](ggml_cgraph * split, void *) { llama_prefetch_decode_wait_split(split); }, nullptr);
+    }
+
     const int64_t t_submit = account ? ggml_time_us() : 0;
     if (account) {
         ggml_account_add(GGML_ACCOUNT_BEGIN_MS, (t_input - t_acct)/1000.0 - build_ms);
@@ -1864,6 +1871,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1, (int32_t) ubatch.n_tokens);
     if (prefetch) {
         prefetch->finish();
+    }
+    if (decode_hint) {
+        ggml_backend_sched_set_cpu_ready_callback(sched.get(), nullptr, nullptr);
+        llama_prefetch_decode_wait();
     }
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);

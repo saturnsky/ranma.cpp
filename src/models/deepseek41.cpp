@@ -835,7 +835,8 @@ void llm_graph_input_engram::set_input(const llama_ubatch * ubatch) {
     const int64_t t_hashed = account || timing ? ggml_time_us() : 0;
     llama_prefetch_stats stats;   // LLAMA_PREFETCH_TIMING
     if (n_tokens <= 1 && pmodel.can_prefetch.count(table->parts[0])) {
-        llama_prefetch_table_pieces_rows(table->parts, table->part_rows, idx, prefetch, timing ? &stats : nullptr);
+        // handed to the resident worker (a copy of the rows); the scheduler waits for it before the first CPU split
+        llama_prefetch_decode_submit(table->parts, table->part_rows, idx, prefetch, (int) pmodel.hparams.engram_layer_ids[eg], timing);
     }
     if (account) {
         // logical rows: one per index, whatever the number of pieces
