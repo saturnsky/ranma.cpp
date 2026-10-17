@@ -419,6 +419,10 @@ struct common_params_speculative_ngram_varlen {
                           // recurrent layers, else 127 (common_ngram_varlen_resolve_rs; a call is draft + 1 tokens wide)
     int32_t ladder = 4;   // a draft of k tokens needs k <= ladder*(samples - 1)
     double  p_min  = 0.9; // weight share of the samples that agree on every drafted token
+
+    bool hazard = true;   // where nothing drafts, judge long single-sample matches with the online hazard model
+    bool hazard_shadow = true;  // hazard: also learn from the cohorts that were not drafted, with the tokens that followed
+    bool hazard_online = true;  // hazard: C(rows) from the shared verification cost, the table as its prior
 };
 
 struct common_params_speculative_ngram_cache {

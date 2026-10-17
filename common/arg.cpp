@@ -4755,6 +4755,31 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
     add_opt(common_arg(
+        {"--spec-ngram-varlen-hazard"},
+        {"--no-spec-ngram-varlen-hazard"},
+        string_format("ngram-varlen: where nothing drafts, draft a long match of one sample (at least 8 tokens, at most 8 drafted) when an online estimate of the acceptance says it pays (default: %s)", params.speculative.ngram_varlen.hazard ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.speculative.ngram_varlen.hazard = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--spec-ngram-varlen-hazard-shadow"},
+        {"--no-spec-ngram-varlen-hazard-shadow"},
+        string_format("ngram-varlen hazard: also learn the acceptance of cohorts that were not drafted, by comparing them with the tokens that follow (default: %s)", params.speculative.ngram_varlen.hazard_shadow ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.speculative.ngram_varlen.hazard_shadow = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--spec-ngram-varlen-hazard-online"},
+        {"--no-spec-ngram-varlen-hazard-online"},
+        string_format("ngram-varlen hazard: take the verification time per row count from the cost that all drafters measure and share, "
+                      "with the built-in table as its prior until a width is observed (default: %s)", params.speculative.ngram_varlen.hazard_online ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.speculative.ngram_varlen.hazard_online = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
         {"--spec-verify-cost-store"}, "PATH",
         "file that keeps the verification cost of the target, shared by all drafters, across restarts; it is used only "
         "with the same target, build and run settings (default: <--spec-smart-store>.vcost, or none)",

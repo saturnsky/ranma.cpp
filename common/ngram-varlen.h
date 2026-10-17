@@ -38,10 +38,47 @@ struct common_ngram_varlen_params {
     int64_t n_prior_max = 524288;  // tokens of earlier requests kept for the new-text test
 };
 
+// The supplement of the hazard model (common_ngram_varlen_hazard): when no cohort drafts, the cohorts of at least n_min
+// matched tokens are offered as candidates, each as long as the weight share of its heaviest continuation stays at
+// least raw_min (one agreeing sample is enough), at most max_len tokens.
+struct common_ngram_varlen_alt_params {
+    int32_t n_min   = 8;
+    double  raw_min = 0.95;
+    int32_t max_len = 8;
+};
+
+// a candidate draft of the supplement: the tokens with the raw weight share and the agreeing samples at every position
+struct common_ngram_varlen_cand {
+    std::vector<llama_token> tokens;
+    std::vector<double>      raw;
+    std::vector<int32_t>     support;
+    int32_t n         = 0;
+    int32_t n_samples = 0;
+};
+
+struct common_ngram_varlen_draft_opts {
+    bool meta = false; // fill raw and support of the drafted tokens
+    bool alt  = false; // when nothing drafts, offer the candidates of the supplement (implies meta)
+    common_ngram_varlen_alt_params alt_params;
+    bool    shadow     = false; // offer the representative cohorts for counterfactual labels (implies meta)
+    int32_t shadow_cap = 8;     // positions per cohort
+};
+
 struct common_ngram_varlen_draft {
     std::vector<llama_token> tokens; // the draft, empty when no cohort qualifies
     int32_t n         = 0;           // matched context length of the cohort
     int32_t n_samples = 0;           // samples in the cohort
+
+    // with opts.meta: per drafted token, the weight share of the cohort that agrees on it (at most 1) and the samples
+    // that agree on every token so far
+    std::vector<double>  raw;
+    std::vector<int32_t> support;
+
+    // with opts.alt, when tokens is empty: the candidates of the supplement, longest matched context first
+    std::vector<common_ngram_varlen_cand> alt;
+
+    // with opts.shadow: up to 3 representative cohorts (longest n, longest n whose first token has 2 samples, shortest n)
+    std::vector<common_ngram_varlen_cand> shadow;
 };
 
 class common_ngram_varlen {
@@ -58,7 +95,7 @@ public:
     void end(llama_seq_id seq_id);
 
     // the draft that continues prompt + generated tokens of the current request
-    common_ngram_varlen_draft draft(llama_seq_id seq_id) const;
+    common_ngram_varlen_draft draft(llama_seq_id seq_id, const common_ngram_varlen_draft_opts * opts = nullptr) const;
 
     bool   active     (llama_seq_id seq_id) const;
     size_t n_prompt   (llama_seq_id seq_id) const;
@@ -123,4 +160,123 @@ private:
     void     rebuild_seen();
     std::vector<uint8_t> new_mask(const std::vector<llama_token> & prompt) const;
     void     purge();
+};
+
+//
+// common_ngram_varlen_hazard
+//
+// ranma: an online correction of the draft length. It never changes a draft of the base rule. Where the base rule drafts
+// nothing, it judges the candidates of the supplement (common_ngram_varlen_alt_params) and drafts the first one whose
+// best length costs less per output token than no draft.
+//
+// P_j, the chance that the first j drafted tokens are accepted, is the product of q_1..q_j. q_l is the chance that the
+// token at position l is accepted when the ones before it were, counted per bucket (position 7 x n 4 x support 5 x raw 4)
+// and pulled to the mean of (position, support) with prior_strength samples. Counts decay with 2^(-age/half_life).
+// A draft of m tokens in pieces of width tokens costs sum(reach*C(m_piece + 1)) per sum(reach + sum P_j) output tokens.
+// Only the positions that the verification reached count as feedback. A draft that ends unverified counts nothing.
+// The definition follows the CPU replay (codex/draft-calib/replay_calib.py, hazard-fallback-n8). The state is not stored.
+
+struct common_ngram_varlen_hazard_params {
+    double  prior_strength = 16.0;
+    double  half_life      = 16384.0; // tokens
+    int32_t width          = 8;       // draft tokens verified in one piece
+
+    // C(rows) in ms, index = rows - 1, the last step goes on beyond the table
+    // rows 1..6: DS4.1F mix (dspark-q2): 39.2/56.9/72.4/109.7 ms for 1/2/3/6 rows, linear between
+    // rows 7..9: C(6) plus the steps of the fixed-width curve (width-curve): 14.68 ms/row for 6 -> 8 rows, 23.38 ms for 8 -> 9
+    std::vector<double> cost = { 39.2, 56.9, 72.4, 72.4 + (109.7 - 72.4)/3.0, 72.4 + 2.0*(109.7 - 72.4)/3.0, 109.7,
+                                 109.7 + 14.68, 109.7 + 2.0*14.68, 109.7 + 2.0*14.68 + 23.38 };
+};
+
+class common_ngram_varlen_hazard {
+public:
+    // a drafted position as it was when drafted
+    struct feat {
+        int32_t n       = 0;
+        double  raw     = 0.0;
+        int32_t support = 0;
+    };
+
+    // the feedback of one draft, which may be verified in pieces
+    struct track {
+        std::vector<feat> feats;
+        int64_t clock0  = 0;     // session clock when drafted
+        int64_t outputs = 0;     // tokens output by the pieces so far
+        int32_t offset  = 0;     // draft positions behind the last piece
+        bool    live    = false; // the last piece was accepted whole and the draft goes on
+        bool    used    = false;
+    };
+
+    // counterfactual labels: a cohort that was not drafted is compared with the tokens that follow
+    struct shadow_pick {
+        std::vector<feat>        feats;
+        std::vector<llama_token> tokens;
+        std::vector<uint8_t>     y;   // labels so far: positions up to the first mismatch
+        double                   w = 1.0;
+        bool                     fin = false;
+    };
+
+    struct shadow_anchor {
+        int64_t  clock0 = 0;
+        size_t   n_hist = 0; // history length when the cohorts were taken
+        std::vector<shadow_pick> picks;
+    };
+
+    using shadow_list = std::vector<shadow_anchor>;
+
+    explicit common_ngram_varlen_hazard(const common_ngram_varlen_hazard_params & params);
+
+    // the first candidate with a length m > 0 below the cost of no draft; m = 0 when none. cost: C(rows) in ms for rows
+    // 1, 2, ... (the last step goes on beyond it; nullptr: the table of the parameters), e.g. the shared verification
+    // cost; width: draft tokens verified in one piece (0: the width of the parameters)
+    size_t select(const std::vector<common_ngram_varlen_cand> & alt, int64_t clock, size_t & m,
+                  const std::vector<double> * cost = nullptr, int32_t width = 0) const;
+
+    // C(rows) in ms of the table of the parameters
+    double cost(size_t rows) const;
+    // ... of a given table
+    static double cost_at(const std::vector<double> & c, size_t rows);
+
+    // a draft with these positions is made at the session clock
+    void start(track & t, std::vector<feat> feats, int64_t clock);
+
+    // a piece of m_emitted tokens was verified, n_accepted of them accepted
+    void piece(track & t, size_t m_emitted, size_t n_accepted);
+
+    // the round after a piece accepted whole: the sampled token is the next token of the draft or not
+    void gate(track & t, bool match);
+
+    // the draft ends without feedback
+    static void drop(track & t);
+
+    size_t n_cells() const { return cells.size(); }
+
+    // the cohorts of a decision point wait in the list; each gets weight 1/n of the cohorts
+    static void shadow_add(shadow_list & list, const std::vector<common_ngram_varlen_cand> & picks, size_t n_hist, int64_t clock);
+
+    // label the positions whose tokens are in hist; at the end of a request the rest is not observed
+    static void shadow_step(shadow_list & list, const std::vector<llama_token> & hist, bool end);
+
+    // count the anchors whose last label is not newer than clock, with that stamp; returns the labels counted
+    size_t shadow_flush(shadow_list & list, int64_t clock);
+
+private:
+    struct cell {
+        double  s     = 0.0;
+        double  c     = 0.0;
+        int64_t clock = 0;
+    };
+
+    common_ngram_varlen_hazard_params params;
+
+    std::unordered_map<uint32_t, cell> cells;  // (position, n, support, raw) buckets
+    std::unordered_map<uint32_t, cell> global; // (position, support) buckets
+
+    static uint32_t key_global(int32_t j, int32_t support);
+    static uint32_t key_cell  (int32_t j, const feat & f);
+
+    void   read(const std::unordered_map<uint32_t, cell> & table, uint32_t key, int64_t clock, double & s, double & c) const;
+    void   add (const feat & f, int32_t j, int y, double w, int64_t clock);
+    void   finish(track & t, int32_t accepted);
+    double expected(const std::vector<double> & ps, size_t length, const std::vector<double> & c, size_t width) const;
 };
