@@ -1170,6 +1170,7 @@ public:
             if (lend_.state == lend_state::held && lend_.owner == key) {
                 lend_end_locked("context freed");
             }
+            lend_order_forget(lend_order_, key);
             if (ub_last_cctx_ == key) {
                 ub_last_cctx_   = nullptr;
                 ub_last_stream_ = nullptr;
@@ -1345,7 +1346,8 @@ public:
         // ones pinned, recent misses as least recently used copies), after the tier made their file bytes readable and
         // before the layer's matmuls. The kernels run whether or not the space is open (n = 0 returns at once), so a
         // captured graph stays valid either way.
-        if (lend_on_.load(std::memory_order_acquire) && member == 0 && ids->ne[1] <= (int64_t) lend_rows_) {
+        // Every member of a joint cache: a layer of a member that is not ready has its descriptor disabled (the kernels return).
+        if (lend_on_.load(std::memory_order_acquire) && member >= 0 && ids->ne[1] <= (int64_t) lend_rows_) {
             // the space copies all three kinds: a staged service (RANMA_EXPERT_L2_STAGED at or below the decode rows)
             // releases them one kind at a time, so the copies wait for the other two kinds first
             if (tier_ && tier_->layer_staged((int) joint)) {
@@ -1557,6 +1559,18 @@ public:
     // batch, e.g. a K-shift). Lends the part above the decode graphs, and takes it back before a
     // graph that reaches into it.
     bool compute_spare(ggml_backend_t backend, void * base, size_t size, size_t extent, int32_t n_tokens) {
+        if (joint_ && lend_on_.load(std::memory_order_acquire) && backend != nullptr && ggml_backend_is_cuda(backend)) {
+            // a joint cache: the restore kernels of two members never run at once (expert-lend.h, lend_order_switch)
+            ggml_backend_cuda_context * lctx = (ggml_backend_cuda_context *) backend->context;
+            if (lctx->device == device_ && member_of(lctx) >= 0) {
+                std::lock_guard<std::mutex> lock(mutex_);
+                void * drain = lend_order_switch(lend_order_, lctx, (void *) lctx->stream());
+                if (drain != nullptr) {
+                    ggml_cuda_set_device(device_);
+                    CUDA_CHECK(cudaStreamSynchronize((cudaStream_t) drain));
+                }
+            }
+        }
         if (lend_on_.load(std::memory_order_acquire) && backend != nullptr && ggml_backend_is_cuda(backend) &&
                 n_tokens >= 1 && n_tokens <= lend_rows_) {
             // a decode graph: the prompt's implicit lend (graph_begin) ends here, without a refill
@@ -1678,8 +1692,8 @@ public:
             return;
         }
         const char * why = nullptr;
-        if (joint_ || members_.size() > 1) {
-            why = "a joint cache";
+        // a joint cache lends over every member's layers (expert-lend.h)
+        if (!l1_ || !l1_->allocated() || !tier_) {
             why = "no L1 arena or L2";
         }
         if (why != nullptr) {
@@ -1751,6 +1765,15 @@ public:
         }
         lend_upload_descs_locked();
         lend_upload_space_locked({}, false);
+        lend_order_ = lend_order();
+        lend_joint_warned_ = false;
+        if (joint_) {
+            std::string jwhy;
+            const bool jready = lend_members_ready(lend_members_locked(), tier_ != nullptr, &jwhy);
+            GGML_LOG_INFO("expert cache: prefill lend of a joint cache: %zu models, %d joint layers x %d experts; the lend evicts "
+                          "and restores the experts of every model%s%s\n", members_.size(), geo_.n_layers, geo_.n_experts,
+                jready ? "" : "; it waits until ", jready ? "" : jwhy.c_str());
+        }
         GGML_LOG_INFO("expert cache: prefill lend on: prompt buffers from the lowest ranked L1 experts (%s slots per class), "
                       "none from host memory; after a prompt the lent slots are a restore space: the decode copies an evicted "
                       "expert of its plan in %s, other misses use the rest as an LRU cache (%s; temporary "
@@ -1805,14 +1828,50 @@ public:
         lend_live_mark_ = {};
     }
 
-    // The per-layer source and destination of the restore space (the tier's address tables exist once it started).
+    // The members of the cache as the lend sees them (expert-lend.h); one member without a joint cache.
+    std::vector<lend_member> lend_members_locked() const {
+        std::vector<lend_member> out;
+        for (const member_state & m : members_) {
+            lend_member x;
+            x.offset     = m.offset;
+            x.n_layers   = m.geo.n_layers;
+            x.bound      = m.bound;
+            x.loaded     = m.loaded;
+            x.dropped    = m.dropped;
+            x.tier_ready = m.tier_ready;   // the first model's files open with the tier (start_tier_locked)
+            out.push_back(x);
+        }
+        return out;
+    }
+
+    // Whether a lend may evict now: every member of a joint cache that is not dropped is ready (said once).
+    bool lend_joint_ready_locked() {
+        if (!joint_) {
+            return true;
+        }
+        std::string why;
+        if (lend_members_ready(lend_members_locked(), tier_ != nullptr, &why)) {
+            return true;
+        }
+        if (!lend_joint_warned_) {
+            lend_joint_warned_ = true;
+            GGML_LOG_WARN("expert cache: prefill lend refused: %s\n", why.c_str());
+        }
+        return false;
+    }
+
+    // The per-layer source and destination of the restore space (the tier's address tables exist once it started). A
+    // layer of a joint member that is not ready (or dropped) stays disabled: its aux rows and homes are not final. The
+    // join uploads them again (finalize_joined_locked).
     void lend_upload_descs_locked() {
         std::vector<lend_restore_desc> d((size_t) geo_.n_layers);
         const size_t W = ((size_t) geo_.n_experts + 31)/32;
         const bool owned = l1_->owns_host_storage();
+        const std::vector<uint8_t> ready = joint_ ? lend_layers_ready(lend_members_locked(), geo_.n_layers, tier_ != nullptr) :
+            std::vector<uint8_t>((size_t) geo_.n_layers, 1);
         for (int l = 0; l < geo_.n_layers; ++l) {
             const int c = geo_.layer_class[l];
-            if (c < 0) {
+            if (c < 0 || !ready[(size_t) l]) {
                 continue;
             }
             lend_restore_desc & x = d[(size_t) l];
@@ -2126,6 +2185,9 @@ public:
                           ggml_expert_lend_grant * out) {
         if (!lend_on_.load(std::memory_order_acquire) || state_ != state_t::installed || req.empty() ||
                 req.size() > GGML_EXPERT_LEND_MAX_PIECES) {
+            return false;
+        }
+        if (!lend_joint_ready_locked()) {
             return false;
         }
         if (lend_.state == lend_state::held) {
@@ -2720,6 +2782,10 @@ public:
             cfg_.lend_scratch_of(cfg_.lend_scratch_user, n_tok, w);
             for (int i = 0; i < 3; ++i) { need[i] = std::min(need[i], w[i]); }
         }
+        // a joint cache: the scratch is sized for the first model's op (lend_scratch_of); a draft's graphs use the pool
+        if (joint_ && member_of(cctx) != 0) {
+            return;
+        }
         std::lock_guard<std::mutex> lock(mutex_);
         if (lend_.state == lend_state::held && lend_.explicit_) {
             return;
@@ -2788,7 +2854,7 @@ public:
             return false;
         }
         std::lock_guard<std::mutex> lock(mutex_);
-        return state_ == state_t::installed && lend_fits_locked(req);
+        return state_ == state_t::installed && lend_joint_ready_locked() && lend_fits_locked(req);
     }
 
     bool iface_lend_acquire(ggml_backend_t backend, const ggml_expert_lend_request * request, ggml_expert_lend_grant * out) {
@@ -4531,6 +4597,17 @@ private:
             report_tier_plan_locked("after a model joined");
         }
         log_members_locked("after a model joined");
+        // the prefill lend: the joined model's layers get their restore descriptors now (aux rows and homes are final)
+        if (lend_on_.load(std::memory_order_acquire)) {
+            if (lend_.state == lend_state::held) {
+                abort_locked("a model joined while a prompt holds the prefill lend");
+            }
+            lend_upload_descs_locked();
+            std::string why;
+            const bool ready = lend_members_ready(lend_members_locked(), tier_ != nullptr, &why);
+            GGML_LOG_INFO("expert cache: prefill lend: the restore space serves the joined model's layers too%s%s\n",
+                ready ? "; every model is ready" : "; waiting: ", ready ? "" : why.c_str());
+        }
         return true;
     }
 
@@ -6790,6 +6867,8 @@ private:
     size_t   ub_max_size_ = 0;              // the largest compute buffer (view) seen
     std::map<const void *, size_t> ub_hwm_of_;   // decode high-water mark per compute buffer base
     // the prefill lend (expert-lend.h)
+    lend_order lend_order_;                         // a joint cache: the last context that ran restore kernels
+    bool lend_joint_warned_ = false;
     std::atomic<bool> lend_on_{ false };           // read by compute_spare, graph_begin and profile_ids without the mutex
     int lend_rows_ = 1;                            // decode launches of at most this many rows end an implicit lend
     lend_book lend_;

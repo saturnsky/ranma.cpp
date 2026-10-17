@@ -140,6 +140,15 @@ far as it exceeds the target's compute buffer it shares, and in host memory its 
 window outputs. A measurement that fails keeps the mode off. A draft without a feature window, or one whose window is
 narrower than a verification of its block, needs the features of every row and keeps the mode off.
 
+With the draft in the joint expert cache (`expert-cache-joint.md`) the prefill lend works over the layers of both
+models: a prompt evicts the lowest ranked L1 residents of every class, whichever model they belong to, and the decode
+of both models brings the experts of the decode plan back into the restore space as it reads them. A lend waits until
+the draft has joined (its weights loaded, its aux rows final, its files open in the SSD tier). The restore kernels of
+the two models share one restore space, so their graphs never run at once: the draft computes in the target's compute
+buffer, and the cache also drains the other context's stream whenever the computing context changes. The target
+features of the window are copied to the host output buffer inside the layer-major call, so nothing of them lives in
+lent memory after it.
+
 - MTP blocks of their own (blocks with `nextn` tensors) are not counted as routed layers of a prompt step; the
   staging slot is sized for the largest routed layer.
 - LoRA on routed experts: F16/F32 deltas are added by the expert-major op itself; the largest rank of the adapters'

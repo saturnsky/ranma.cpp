@@ -1056,6 +1056,13 @@ int64_t lx_cfg_i64(int64_t llama_layer_mode_config::* field) {
 
 } // namespace
 
+// the prefill lend a CPU layer device takes in place of host buffers of its own (tests only; null: its own buffers)
+static const ggml_expert_iface * lx_test_lend = nullptr;
+
+void llama_layer_exec_set_test_lend(const ggml_expert_iface * iface) {
+    lx_test_lend = iface;
+}
+
 int llama_context::layer_exec_decode(llama_memory_context_i * mctx, uint32_t n_tokens_all, uint32_t n_outputs_all) {
     if (!llama_layer_exec_enabled() || mctx == nullptr) {
         return 1;
@@ -1538,10 +1545,14 @@ int llama_context::layer_exec_decode(llama_memory_context_i * mctx, uint32_t n_t
     auto host_inputs_bytes = [&](int64_t w, int64_t g) -> size_t {
         return (input_bytes_max + 4096)*(size_t) g + 8*(size_t) w*sizeof(llama_token) + 65536;
     };
-    // A CPU layer device has no expert cache to lend from: its buffers are host memory of their own (the CPU tests)
+    // A CPU layer device has no expert cache to lend from: its buffers are host memory of their own (the CPU tests), or
+    // those of a test's lend (llama_layer_exec_set_test_lend)
     const bool cpu_dev = ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU;
-    const bool lend_on = cpu_dev || (expert_iface != nullptr && expert_backend == backend_dev && expert_iface->lend_fits != nullptr &&
-        expert_iface->lend_acquire != nullptr);
+    const ggml_expert_iface * lend_iface = cpu_dev && lx_test_lend != nullptr ? lx_test_lend : expert_iface;
+    ggml_backend_t lend_backend = cpu_dev && lx_test_lend != nullptr ? backend_dev : expert_backend;
+    const bool own_bufs = cpu_dev && lx_test_lend == nullptr;
+    const bool lend_on = own_bufs || (lend_iface != nullptr && lend_backend == backend_dev && lend_iface->lend_fits != nullptr &&
+        lend_iface->lend_acquire != nullptr);
     auto sched_growth = [&](int64_t w) -> size_t {
         const int64_t rows = B > 0 ? std::min(B, w) : w;
         const double need = moe_pt*(double) rows;
@@ -1552,12 +1563,12 @@ int llama_context::layer_exec_decode(llama_memory_context_i * mctx, uint32_t n_t
         if (!lend_on) {
             return false;
         }
-        if (cpu_dev) {
+        if (own_bufs) {
             return true;
         }
         ggml_expert_lend_request rq;
         lend_request(w, rq);
-        return expert_iface->lend_fits(expert_backend, &rq);
+        return lend_iface->lend_fits(lend_backend, &rq);
     };
     // The width rule (ggml_cuda_expert::lend_width_rule, the budget is L1): P = ceil(N / W_max) passes of W = ceil(N / P)
     // tokens, in ubatches of C' (the batch is split again when C' is narrower than the context's ubatch). W_max is the
@@ -1604,8 +1615,8 @@ int llama_context::layer_exec_decode(llama_memory_context_i * mctx, uint32_t n_t
     auto useful = [&](const lx_width & x) { return x.P > 0 && (x.P == 1 || x.P < K); };
     if (fused && once_env != "off") {
         ggml_expert_lend_counts lc = {};
-        if (!cpu_dev && expert_iface->lend_counts != nullptr) {
-            expert_iface->lend_counts(&lc);
+        if (!own_bufs && lend_iface->lend_counts != nullptr) {
+            lend_iface->lend_counts(&lc);
         }
         once_slots = stage_slots(lc.lendable_bytes);
         lx_width w_exact, w_partial;
@@ -1758,13 +1769,13 @@ int llama_context::layer_exec_decode(llama_memory_context_i * mctx, uint32_t n_t
     lend_request(W_max, lend_rq);
     ggml_expert_lend_grant lend_grant = {};
     std::vector<ggml_backend_buffer_ptr> cpu_bufs;
-    if (cpu_dev) {
+    if (own_bufs) {
         for (int i = 0; i < lend_rq.n_pieces; ++i) {
             cpu_bufs.emplace_back(ggml_backend_buft_alloc_buffer(ggml_backend_dev_buffer_type(dev),
                 std::max<size_t>(lend_rq.pieces[i].bytes, 256)));
             lend_grant.buffers[i] = cpu_bufs.back().get();
         }
-    } else if (!expert_iface->lend_acquire(expert_backend, &lend_rq, &lend_grant)) {
+    } else if (!lend_iface->lend_acquire(lend_backend, &lend_rq, &lend_grant)) {
         n_outputs = save_n_outputs;
         return skip("the prefill lend refused the buffers");
     }
@@ -1777,7 +1788,7 @@ int llama_context::layer_exec_decode(llama_memory_context_i * mctx, uint32_t n_t
                 iface->lend_release(backend);
             }
         }
-    } lend_guard { cpu_dev ? nullptr : expert_iface, expert_backend };
+    } lend_guard { own_bufs ? nullptr : lend_iface, lend_backend };
     size_t edge_bytes = 0;
     size_t lend_dev_bytes = 0;
     for (int i = 0; i < lend_rq.n_pieces; ++i) {

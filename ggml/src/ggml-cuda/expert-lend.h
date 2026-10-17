@@ -14,6 +14,7 @@
 // The lend ends without a refill: the regions become the restore space (below). A decode launch that reads an evicted
 // expert the installed decode plan keeps in L1 copies it there and pins it; other recent misses use the free part as a
 // least recently used cache. The next lend takes the restore space back: the tables return to the mirror of the plan.
+// A joint cache (a draft model in the cache) lends over the layers of every model (see "a joint cache" below).
 
 #include <algorithm>
 #include <array>
@@ -639,6 +640,76 @@ inline int lend_space_step(const int32_t * ids, int rows, int used, int stride, 
     }
     for (int i = 0; i < nm; ++i) { last_miss[miss[i]] = st; }
     return n_out;
+}
+
+// ---- a joint cache (a draft model in the cache) ------------------------------------------------------------------------
+//
+// The lend of a joint cache is the one of a single model over the joint layers: the planner, the restore space and the
+// rank see every member's layers (the joint layer offsets and the joint expert stride). What a joint cache adds:
+//   - a member must be ready before its experts may be evicted or restored: bound (its weights context arrived), loaded
+//     (its slices are in their homes), its aux rows final and its files open in the SSD tier. A dropped member's
+//     layers keep their slots, unused: they are never restored. A lend waits until every member that is not dropped is
+//     ready (a draft joins after the target's load; nothing computes before that);
+//   - the restore kernels of every member write the one restore space (own/pin/stamp, the launch's copy list), so two
+//     members' graphs must not run at once. They do not with a drafting context that computes in its target's compute
+//     buffer (llama_context::share_compute_wait); the controller drains the previous context's stream at every change
+//     of the context besides (lend_order_switch), which costs nothing when its outputs were read already.
+
+struct lend_member {
+    int  offset = 0, n_layers = 0;   // its joint layers
+    bool bound = false, loaded = false, dropped = false, tier_ready = false;
+};
+
+// Whether a lend may evict any expert: every member that is not dropped is bound, loaded and (with an SSD tier) open in it.
+inline bool lend_members_ready(const std::vector<lend_member> & members, bool tier, std::string * why = nullptr) {
+    for (size_t m = 0; m < members.size(); ++m) {
+        const lend_member & mb = members[m];
+        if (mb.dropped) {
+            continue;
+        }
+        const char * w = !mb.bound ? "is not bound" : !mb.loaded ? "is not loaded" : tier && !mb.tier_ready ? "is not open in the SSD tier" : nullptr;
+        if (w != nullptr) {
+            if (why != nullptr) { *why = "model " + std::to_string(m) + " of the joint cache " + w; }
+            return false;
+        }
+    }
+    return true;
+}
+
+// [joint layer] 1: the restore space may copy into that layer's table (its member is ready and not dropped).
+inline std::vector<uint8_t> lend_layers_ready(const std::vector<lend_member> & members, int n_layers, bool tier) {
+    std::vector<uint8_t> out((size_t) std::max(n_layers, 0), 0);
+    for (const lend_member & mb : members) {
+        const bool ok = !mb.dropped && mb.bound && mb.loaded && (!tier || mb.tier_ready);
+        for (int l = mb.offset; ok && l < mb.offset + mb.n_layers && l < n_layers; ++l) {
+            if (l >= 0) { out[(size_t) l] = 1; }
+        }
+    }
+    return out;
+}
+
+// The order of the contexts that run restore kernels: before a graph of `ctx` the stream of the previous context is
+// drained when the context changed. Returns that stream (null: nothing to drain) and records `ctx`, `stream`.
+struct lend_order {
+    const void * ctx    = nullptr;
+    void       * stream = nullptr;
+    uint64_t     drains = 0;
+};
+
+inline void * lend_order_switch(lend_order & o, const void * ctx, void * stream) {
+    void * drain = o.ctx != nullptr && o.ctx != ctx ? o.stream : nullptr;
+    o.drains += drain != nullptr ? 1 : 0;
+    o.ctx    = ctx;
+    o.stream = stream;
+    return drain;
+}
+
+// A context freed: its stream is no longer drained.
+inline void lend_order_forget(lend_order & o, const void * ctx) {
+    if (o.ctx == ctx) {
+        o.ctx    = nullptr;
+        o.stream = nullptr;
+    }
 }
 
 // ---- the lease ------------------------------------------------------------------------------------------------------
