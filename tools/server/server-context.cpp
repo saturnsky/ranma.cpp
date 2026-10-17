@@ -21,6 +21,7 @@
 #include "sampling.h"
 #include "speculative.h"
 #include "speculative-smart.h"
+#include "speculative-verify-cost.h"
 #include "mtmd.h"
 #include "mtmd-helper.h"
 
@@ -68,6 +69,24 @@ static std::string server_spec_smart_key(const common_params & params) {
             common_spec_smart_build_id(llama_build_info()).c_str(),
             params.expert_l1_mib, params.expert_l2_mib, params.expert_cache_mode.c_str(), (int) params.expert_cache_draft,
             (double) params.expert_weight_target, (double) params.expert_weight_draft, dft.n_gpu_layers);
+}
+
+// the store key of the verification cost that all drafters share: the target and everything that changes how its calls
+// run (the build, the expert cache tiers and placement, the batch, the KV cache, the layer mode, the draft model in the
+// joint cache and the contexts loaded next to the target, the switches in the environment), not the drafter of a round
+static std::string server_spec_verify_cost_key(const common_params & params) {
+    const auto & spec = params.speculative;
+    const auto & dft  = spec.draft;
+    return string_format("target=%s@%s build=%s l1=%d l2=%d mode=%s cache_draft=%d weights=%g/%g draft=%s@%s ngld=%d "
+                         "types=%s b=%d ub=%d ctk=%s ctv=%s fa=%d layer_mode=%d env=[%s]",
+            params.model.path.c_str(), common_spec_smart_file_id(params.model.path).c_str(),
+            common_spec_smart_build_id(llama_build_info()).c_str(),
+            params.expert_l1_mib, params.expert_l2_mib, params.expert_cache_mode.c_str(), (int) params.expert_cache_draft,
+            (double) params.expert_weight_target, (double) params.expert_weight_draft,
+            dft.mparams.path.c_str(), common_spec_smart_file_id(dft.mparams.path).c_str(), dft.n_gpu_layers,
+            common_speculative_type_name_str(spec.types).c_str(), params.n_batch, params.n_ubatch,
+            ggml_type_name(params.cache_type_k), ggml_type_name(params.cache_type_v), (int) params.flash_attn_type,
+            params.layer_mode, common_spec_verify_cost_env_key().c_str());
 }
 
 // --spec-smart trigram confidence: the role markers of the chat template. A conversation with one message per role and
@@ -1595,6 +1614,7 @@ private:
 
         // try speculative decoding
         if (ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
+            params_base.speculative.verify_cost_key = server_spec_verify_cost_key(params_base);
             if (params_base.speculative.draft.smart_on) {
                 params_base.speculative.draft.smart_key = server_spec_smart_key(params_base);
                 // the trigram profile keeps the coefficients of the trigram confidence per target and draft model
@@ -4879,6 +4899,41 @@ private:
         }
     }
 
+    // ranma: the target call of the sub-batch [off, off + view) for the shared verification cost of the drafters: the
+    // sequence it verifies and its rows (common_speculative_call_end learns a call of one sequence that generates)
+    common_speculative_call spec_call_info(int32_t off) const {
+        common_speculative_call c;
+        std::vector<int32_t> rows(slots.size(), 0);
+        std::vector<uint8_t> seen(slots.size(), 0);
+        for (int i = off; i < off + batch.view.size(); ++i) {
+            const auto & t = batch.tokens[i];
+            if (t.id_slot < 0 || (size_t) t.id_slot >= slots.size()) {
+                continue;
+            }
+            if (!seen[t.id_slot]) {
+                seen[t.id_slot] = 1;
+                c.n_seq++;
+                c.seq = t.id_slot;
+            }
+            if (t.is_prompt) {
+                c.n_prompt++;
+            } else {
+                rows[t.id_slot]++;
+            }
+        }
+        const bool whole = off == 0 && batch.view.size() == (int32_t) batch.size();
+        if (c.n_seq != 1 || !whole) {
+            c.seq   = -1;
+            c.n_seq = std::max(c.n_seq, 2); // a part of a batch counts as several: not learnt
+            return c;
+        }
+        const server_slot & slot = slots[c.seq];
+        c.n_rows = rows[c.seq];
+        c.replay = slot.spec_is_replay;
+        c.pos    = slot.prompt.n_tokens();
+        return c;
+    }
+
     bool decode(int32_t & n_batch, int32_t off) {
         SRV_DBG("n_batch (effective) = %d, off = %d\n", n_batch, off);
 
@@ -4922,11 +4977,18 @@ private:
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
+        // ranma: the call and its synchronisation are measured for the drafters' shared verification cost
+        common_speculative_call vcall;
+        if (spec) {
+            vcall = spec_call_info(off);
+        }
         queue_tasks.yield_to_queue([&]() {
+            common_speculative_call_begin(spec.get(), ctx_tgt, vcall);
             ret = llama_process(ctx_tgt, LLAMA_PROCESS_TYPE_DECODE, batch.view.get());
             if (ret == 0 && has_output) {
                 llama_synchronize(ctx_tgt);
             }
+            common_speculative_call_end(spec.get(), ctx_tgt, vcall, ret == 0 && has_output);
         });
 
         llama_set_rs_prompt(ctx_tgt, false);

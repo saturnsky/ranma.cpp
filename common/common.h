@@ -444,6 +444,11 @@ struct common_params_speculative {
 
     common_params_speculative_ngram_varlen ngram_varlen;
 
+    // ranma: the verification cost of the target shared by every drafter (docs/ranma/spec-smart.md)
+    std::string verify_cost_store; // file across restarts (empty: <--spec-smart-store>.vcost, or none)
+    std::string verify_cost_key;   // set by the server: the target and how it runs
+    std::string verify_cost_log;   // one JSON line per target call and per round, for diagnosis (empty: none)
+
     bool has_dft() const {
         return !draft.mparams.empty();
     }

@@ -117,6 +117,27 @@ void common_speculative_smart_accepted(common_speculative * spec, llama_seq_id s
 // --spec-smart: one diagnostic line for the request of this sequence; empty when --spec-smart is off
 std::string common_speculative_smart_summary(const common_speculative * spec, llama_seq_id seq_id);
 
+// ranma: a call of the target context, measured for the verification cost that every drafter shares
+// (docs/ranma/spec-smart.md, "Shared verification cost"). The caller describes the call, then brackets the call and its
+// synchronisation with begin and end; a call that is not a single verification is counted but not learnt
+struct common_speculative_call {
+    llama_seq_id seq      = -1;    // the only sequence with tokens in the call, -1: several (or a part of a batch)
+    int32_t      n_rows   = 0;     // its generated tokens in the call: the last sampled token and the draft
+    int32_t      n_prompt = 0;     // prompt tokens in the call (all sequences)
+    int32_t      n_seq    = 0;     // sequences with tokens in the call
+    bool         replay   = false; // the tokens replay an accepted draft after a checkpoint restore
+    int32_t      pos      = -1;    // the context length of the sequence (log only)
+
+    // set by begin
+    bool    active   = false;
+    int64_t t0       = 0;
+    double  graph_us = 0.0;
+};
+
+void common_speculative_call_begin(common_speculative * spec, llama_context * ctx_tgt, common_speculative_call & call);
+// ok: the call completed and was synchronised
+void common_speculative_call_end(common_speculative * spec, llama_context * ctx_tgt, common_speculative_call & call, bool ok);
+
 // (optional) get/set internal state
 bool common_speculative_get_state(common_speculative * spec, llama_seq_id seq_id, std::vector<uint8_t> & data);
 void common_speculative_set_state(common_speculative * spec, llama_seq_id seq_id, const std::vector<uint8_t> & data);

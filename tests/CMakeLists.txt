@@ -408,6 +408,7 @@ llama_build_and_test(test-engram-tables-load.cpp)
 llama_build_and_test(test-server-expert.cpp)
 llama_build_and_test(test-spec-smart.cpp) # ranma: --spec-smart controller (no GPU)
 llama_build_and_test(test-ngram-varlen.cpp) # ranma: ngram-varlen drafter (no GPU)
+llama_build_and_test(test-spec-verify-cost.cpp) # ranma: verification cost shared by the drafters (no GPU)
 
 llama_build(test-export-graph-ops.cpp)
 

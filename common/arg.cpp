@@ -4754,6 +4754,22 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.speculative.ngram_varlen.p_min = p;
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}));
+    add_opt(common_arg(
+        {"--spec-verify-cost-store"}, "PATH",
+        "file that keeps the verification cost of the target, shared by all drafters, across restarts; it is used only "
+        "with the same target, build and run settings (default: <--spec-smart-store>.vcost, or none)",
+        [](common_params & params, const std::string & value) {
+            params.speculative.verify_cost_store = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_VERIFY_COST_STORE"));
+    add_opt(common_arg(
+        {"--spec-verify-cost-log"}, "PATH",
+        "append one JSON line per target call and per round to PATH (rows, drafter, measured and predicted times) for "
+        "diagnosis of the shared verification cost; nothing else changes (default: none)",
+        [](common_params & params, const std::string & value) {
+            params.speculative.verify_cost_log = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_VERIFY_COST_LOG"));
 
     add_opt(common_arg(
         {"--spec-ngram-simple-size-n"}, "N",

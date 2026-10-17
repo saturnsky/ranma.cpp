@@ -1,5 +1,6 @@
 #include "speculative.h"
 #include "speculative-smart.h"
+#include "speculative-verify-cost.h"
 
 #include "common.h"
 #include "expert.h"
@@ -119,11 +120,11 @@ static const ggml_expert_iface * spec_expert_iface() {
     return iface;
 }
 
-// the counts now; invalid when the controller does not use them, without a cache, or without a decode pool. Never waits for the device: it is read
-// right after the host has the results of the draft steps or of the verification
-static common_spec_smart_pool spec_smart_pool(const common_spec_smart * smart) {
+// the counts now; invalid when not wanted, without a cache, or without a decode pool. Never waits for the device: it is
+// read right after the host has the results of the draft steps or of the verification
+static common_spec_smart_pool spec_pool_counts(bool want) {
     common_spec_smart_pool out;
-    const ggml_expert_iface * iface = smart != nullptr && smart->wants_counts() ? spec_expert_iface() : nullptr;
+    const ggml_expert_iface * iface = want ? spec_expert_iface() : nullptr;
     ggml_expert_pool_counts c{};
     if (iface != nullptr && iface->pool_counts(&c)) {
         out.valid      = true;
@@ -134,6 +135,11 @@ static common_spec_smart_pool spec_smart_pool(const common_spec_smart * smart) {
         out.fill_bytes = c.fill_bytes;
     }
     return out;
+}
+
+// ... when the controller uses them
+static common_spec_smart_pool spec_smart_pool(const common_spec_smart * smart) {
+    return spec_pool_counts(smart != nullptr && smart->wants_counts());
 }
 
 static common_spec_smart_graph spec_smart_graph(const llama_context * ctx) {
@@ -165,6 +171,12 @@ static common_spec_smart_graphs spec_smart_graphs(const common_spec_smart * smar
         out.dft = spec_smart_graph(ctx_dft);
     }
     return out;
+}
+
+// the host time of the graph builds and captures of a context so far (cumulative, us); 0 without the counts
+static double spec_graph_us(const llama_context * ctx) {
+    const common_spec_smart_graph g = spec_smart_graph(ctx);
+    return g.valid ? (double) (g.build_us + g.capture_us) : 0.0;
 }
 
 static std::string spec_threshold_list_str(const std::vector<float> & thresholds) {
@@ -1506,15 +1518,12 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             }
 
             if (smart) {
-                // --spec-smart: the previous round of this sequence ends here (its verification time is known now);
-                // a round that verified nothing gets no accept(), its DSpark round log line is written here
+                // --spec-smart: the previous round of this sequence ended where this round started
+                // (common_speculative_draft closes it for every drafter); a round that verified nothing gets no
+                // accept(), its DSpark round log line is written here
                 if (dspark_log) {
                     dspark_log_round(seq_id, 0, (double) (ggml_time_us() - dspark_rounds[seq_id].t_drafted_us), true);
                 }
-                const int64_t t_close = ggml_time_us();
-                const common_spec_smart_pool   pool   = spec_smart_pool(smart);
-                const common_spec_smart_graphs graphs = spec_smart_graphs(smart, params.ctx_tgt, params.ctx_dft);
-                smart->close_round(seq_id, t_close, &pool, &graphs);
                 if (smart->tconf_on() && dp.prompt != nullptr) {
                     smart->tconf_begin(seq_id, dp.prompt->data(), dp.prompt->size(), dp.id_last, dp.pos0);
                 }
@@ -2340,11 +2349,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             }
 
             if (smart) {
-                // the previous round of this sequence ends here: its verification time is known now
-                const int64_t t_close = ggml_time_us();
-                const common_spec_smart_pool   pool   = spec_smart_pool(smart);
-                const common_spec_smart_graphs graphs = spec_smart_graphs(smart, params.ctx_tgt, params.ctx_dft);
-                smart->close_round(seq_id, t_close, &pool, &graphs);
+                // the previous round of this sequence ended where this round started (common_speculative_draft closes
+                // it for every drafter)
                 if (smart->tconf_on() && dp.prompt != nullptr) {
                     smart->tconf_begin(seq_id, dp.prompt->data(), dp.prompt->size(), dp.id_last, dp.pos0);
                 }
@@ -3323,6 +3329,15 @@ struct common_speculative {
 
     // --spec-smart (draft-mtp, or draft-dspark when given), nullptr when off
     std::unique_ptr<common_spec_smart> smart;
+
+    // ranma: the verification cost of the target shared by every drafter, and the rounds of the sequences (who drafted
+    // how many tokens, the time from the end of a draft to the start of the next one); see docs/ranma/spec-smart.md
+    std::unique_ptr<common_spec_verify_cost>   vcost;
+    std::unique_ptr<common_spec_verify_rounds> rounds;
+    int32_t         smart_type = -1;      // the drafter type of --spec-smart, -1: none
+    llama_context * ctx_tgt    = nullptr; // the contexts of the draft model (--spec-smart round log, rounds)
+    llama_context * ctx_dft    = nullptr; // ... whose graph builds the rounds take out of their time
+    int64_t         n_call     = 0;       // target calls measured (the call id)
 };
 
 static common_ngram_map get_common_ngram_map(
@@ -3962,19 +3977,43 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         return nullptr;
     }
 
-    // ranma: with a draft model next to ngram-varlen, a round that ngram-varlen drafts skips the draft model, but the
-    // --spec-smart controller still counts that round as its own
-    if (impls.size() > 1 && impls.front()->type == COMMON_SPECULATIVE_TYPE_NGRAM_VARLEN && params.draft.smart_on) {
-        SPC_WRN("%s", "ngram-varlen with --spec-smart: the controller also counts the rounds that ngram-varlen drafts (use --no-spec-smart)\n");
-    }
-
     common_speculative_ptr result(new common_speculative {
         /* .dparams     = */ common_speculative_draft_params_vec(n_seq),
         /* .impls       = */ std::move(impls),
         /* .impl_last   = */ std::vector<common_speculative_impl *>(n_seq, nullptr),
         /* .synth_probs = */ {},
         /* .smart       = */ nullptr,
+        /* .vcost       = */ nullptr,
+        /* .rounds      = */ nullptr,
+        /* .smart_type  = */ -1,
+        /* .ctx_tgt     = */ nullptr,
+        /* .ctx_dft     = */ nullptr,
+        /* .n_call      = */ 0,
     });
+
+    // ranma: the shared verification cost: every target call of a sequence is measured (common_speculative_call_end),
+    // as wide as the widest piece any drafter verifies
+    {
+        common_spec_verify_cost_config vcfg;
+        vcfg.r_max      = std::max<int32_t>(1, common_speculative_n_max(result.get()) + 1);
+        vcfg.half_life  = params.draft.smart_half_life;
+        vcfg.store_path = params.verify_cost_store;
+        if (vcfg.store_path.empty() && !params.draft.smart_store.empty()) {
+            vcfg.store_path = params.draft.smart_store + ".vcost"; // next to the --spec-smart store
+        }
+        vcfg.store_key  = params.verify_cost_key;
+        vcfg.log_path   = params.verify_cost_log;
+        result->vcost   = std::make_unique<common_spec_verify_cost>(vcfg);
+        result->rounds  = std::make_unique<common_spec_verify_rounds>(result->vcost.get(), (int32_t) n_seq);
+        for (int32_t t = 0; t < COMMON_SPECULATIVE_TYPE_COUNT; ++t) {
+            result->rounds->type_names.push_back(common_speculative_type_to_str((common_speculative_type) t));
+        }
+        result->ctx_tgt = params.draft.ctx_tgt;
+        result->ctx_dft = params.draft.ctx_dft;
+        SPC_INF("shared verification cost: up to %d rows, store %s, log %s\n", vcfg.r_max,
+                vcfg.store_path.empty() ? "none" : vcfg.store_path.c_str(),
+                vcfg.log_path.empty() ? "none" : vcfg.log_path.c_str());
+    }
 
     if (params.draft.smart_on) {
         common_speculative_impl_draft_mtp * mtp = nullptr;
@@ -4033,8 +4072,10 @@ common_speculative * common_speculative_init(common_params_speculative & params,
             result->smart = std::make_unique<common_spec_smart>(cfg, (int32_t) n_seq);
             if (mtp != nullptr) {
                 mtp->smart = result->smart.get();
+                result->smart_type = COMMON_SPECULATIVE_TYPE_DRAFT_MTP;
             } else {
                 dspark->smart = result->smart.get();
+                result->smart_type = COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
             }
 
             if (cfg.tconf) {
@@ -4145,6 +4186,10 @@ void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, co
         impl->n_call_begin++;
     }
 
+    if (spec->rounds) {
+        spec->rounds->request_end(seq_id); // the last round of the previous request: its time has the idle gap
+    }
+
     if (spec->smart) {
         spec->smart->request_begin(seq_id);
         spec->smart->tconf_request(seq_id, prompt.data(), prompt.size());
@@ -4158,6 +4203,11 @@ void common_speculative_end(common_speculative * spec, llama_seq_id seq_id, cons
 
     for (auto & impl : spec->impls) {
         impl->end(seq_id, generated);
+    }
+
+    if (spec->rounds) {
+        spec->rounds->request_end(seq_id); // the target call of the last round was observed, the rest of it is not known
+        spec->vcost->log_flush();
     }
 
     if (!spec->smart) {
@@ -4219,7 +4269,44 @@ void common_speculative_draft(common_speculative * spec) {
         }
     }
 
+    // ranma: a round of every drafting sequence starts here, whichever drafter drafts it: the previous round of the
+    // sequence ends (the shared cost takes its time besides the target call, --spec-smart closes its own round), the
+    // drafter of the last round is forgotten
+    const size_t n_seq_all = dparams.size();
+    std::vector<uint8_t>  began(n_seq_all, 0);
+    std::vector<uint32_t> attempted(n_seq_all, 0);
+    std::vector<int32_t>  owner(n_seq_all, -1);
+    {
+        const int64_t t_begin  = ggml_time_us();
+        const double  g_begin  = spec->rounds ? spec_graph_us(spec->ctx_dft) : 0.0;
+        common_spec_smart_pool   pool;
+        common_spec_smart_graphs graphs;
+        if (spec->smart) {
+            pool   = spec_smart_pool(spec->smart.get());
+            graphs = spec_smart_graphs(spec->smart.get(), spec->ctx_tgt, spec->ctx_dft);
+        }
+        for (size_t s = 0; s < n_seq_all; ++s) {
+            if (!dparams[s].drafting) {
+                continue;
+            }
+            began[s] = 1;
+            spec->impl_last[s] = nullptr;
+            if (spec->rounds) {
+                spec->rounds->draft_begin((int32_t) s, t_begin, g_begin);
+            }
+            if (spec->smart) {
+                spec->smart->close_round((int32_t) s, t_begin, &pool, &graphs);
+            }
+        }
+    }
+
     for (auto & impl : spec->impls) {
+        for (size_t s = 0; s < n_seq_all; ++s) {
+            if (dparams[s].drafting) {
+                static_assert(COMMON_SPECULATIVE_TYPE_COUNT <= 32, "a bit per drafter type");
+                attempted[s] |= 1u << impl->type; // asked to draft this round
+            }
+        }
         {
             common_time_meas tm(impl->t_draft_us, !impl->gen_perf);
             impl->draft(dparams);
@@ -4260,6 +4347,7 @@ void common_speculative_draft(common_speculative * spec) {
 
                     // remember which implementation was used
                     spec->impl_last[seq_id] = impl.get();
+                    owner[seq_id] = impl->type;
 
                     impl->n_gen_drafts++;
                     impl->n_gen_tokens += result.size();
@@ -4283,6 +4371,61 @@ void common_speculative_draft(common_speculative * spec) {
         if (dp.drafting) {
             dp.drafting = false;
         }
+    }
+
+    // ranma: the round of every sequence that began one: who drafted how many tokens (verified next with m + 1 rows)
+    if (spec->rounds) {
+        const int64_t t_end = ggml_time_us();
+        const double  g_end = spec_graph_us(spec->ctx_dft);
+        for (size_t s = 0; s < n_seq_all; ++s) {
+            if (began[s]) {
+                const int32_t m = dparams[s].result != nullptr ? (int32_t) dparams[s].result->size() : 0;
+                spec->rounds->drafted((int32_t) s, t_end, m, m > 0 ? owner[s] : -1, attempted[s], g_end);
+            }
+        }
+    }
+}
+
+//
+// ranma: the target calls, measured for the shared verification cost
+//
+
+void common_speculative_call_begin(common_speculative * spec, llama_context * ctx_tgt, common_speculative_call & call) {
+    call.active = false;
+    if (spec == nullptr || !spec->vcost) {
+        return;
+    }
+    call.active   = true;
+    call.graph_us = spec_graph_us(ctx_tgt);
+    call.t0       = ggml_time_us(); // last: the reading of the counts is not in the time
+}
+
+void common_speculative_call_end(common_speculative * spec, llama_context * ctx_tgt, common_speculative_call & call, bool ok) {
+    if (spec == nullptr || !spec->vcost || !call.active) {
+        return;
+    }
+    call.active = false;
+    const int64_t t1 = ggml_time_us();
+
+    common_spec_verify_sample s;
+    s.call_id   = spec->n_call++;
+    s.r         = call.n_rows;
+    s.target_us = (double) (t1 - call.t0);
+    s.graph_us  = std::max(0.0, spec_graph_us(ctx_tgt) - call.graph_us);
+    s.ok        = ok;
+    s.replay    = call.replay;
+    s.n_seq     = call.n_seq;
+    s.n_prompt  = call.n_prompt;
+    s.seq       = call.seq;
+    s.pos       = call.pos;
+    const common_spec_smart_pool pool = spec_pool_counts(spec->vcost->cfg.lend_skip > 0);
+    s.pool_valid = pool.valid;
+    s.lends      = pool.lends;
+
+    common_spec_verify_obs obs;
+    const char * why = spec->vcost->observe(s, &obs);
+    if (spec->rounds) {
+        spec->rounds->call(s, why, &obs);
     }
 }
 
@@ -4324,6 +4467,11 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, u
 
 void common_speculative_smart_accepted(common_speculative * spec, llama_seq_id seq_id, int32_t n_accepted) {
     if (spec == nullptr || !spec->smart) {
+        return;
+    }
+    // the round of another drafter (ngram-varlen) is not the controller's: its calibration and trigram coefficients
+    // learn from their own drafts only
+    if (spec->rounds && spec->rounds->owner(seq_id) != spec->smart_type) {
         return;
     }
 
