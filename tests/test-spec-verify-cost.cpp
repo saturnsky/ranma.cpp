@@ -1,10 +1,11 @@
 // The verification cost of the target shared by every drafter (common/speculative-verify-cost.h) on the CPU: a fixed
 // curve followed, a change common to all widths, sparse widths and the blend with a prior table, variance and decay,
 // the store (round trip, another key or width, damaged files), the widths 1, 9 and 17 of a 9-row learner, bad values,
-// the graph builds taken out, the calls after a lend of the decode pool, an incomplete call, a duplicate call and the
-// rounds (the time besides the target call, a drafter that adds its own work, a replay, calls of other sequences, the
-// drafter of a round).
+// the graph builds taken out, the calls after a lend of the decode pool, an incomplete call, a duplicate call, the rounds
+// (the time besides the target call, a drafter that adds its own work, a replay, calls of other sequences, the drafter
+// of a round) and the hazard model of ngram-varlen with a cost table given.
 #include "common.h"
+#include "ngram-varlen.h"
 #include "speculative-verify-cost.h"
 
 #include <cmath>
@@ -497,6 +498,48 @@ static int test_rounds_edges() {
     return 0;
 }
 
+//
+// the hazard model of ngram-varlen with a cost table given
+//
+
+static int test_hazard_table() {
+    common_ngram_varlen_hazard_params hp;
+    common_ngram_varlen_hazard hz(hp);
+    // a candidate of 8 tokens of one long match, confident
+    common_ngram_varlen_cand cand;
+    cand.n = 12;
+    cand.n_samples = 1;
+    for (int j = 0; j < 8; ++j) {
+        cand.tokens.push_back(100 + j);
+        cand.raw.push_back(0.99);
+        cand.support.push_back(1);
+    }
+    const std::vector<common_ngram_varlen_cand> alt = { cand };
+    size_t m0 = 0, m1 = 0, m2 = 0;
+    hz.select(alt, 0, m0);
+    // the table of the parameters given explicitly, and a blend before any observation (the prior): the same choice
+    common_spec_verify_cost_config c;
+    c.r_max = 9;
+    common_spec_verify_cost vc(c);
+    const auto prior = vc.blend_ms(hp.cost, 9);
+    hz.select(alt, 0, m1, &hp.cost);
+    hz.select(alt, 0, m2, &prior, hp.width);
+    CHECK(m0 == m1 && m1 == m2);
+    // a flat cost: the longest; a steep one: none
+    const std::vector<double> flat  = { 40, 40.1, 40.2, 40.3, 40.4, 40.5, 40.6, 40.7, 40.8 };
+    const std::vector<double> steep = { 40, 400, 800, 1200, 1600, 2000, 2400, 2800, 3200 };
+    size_t mf = 0, ms = 9;
+    hz.select(alt, 0, mf, &flat);
+    hz.select(alt, 0, ms, &steep);
+    CHECK(mf >= 6 && ms == 0); // flat: a long draft (the 8th token adds less than its row costs), steep: none
+    // a narrower piece (a request near its end): its own pieces
+    size_t mw = 0;
+    hz.select(alt, 0, mw, &flat, 2);
+    CHECK(mw >= 1);
+    fprintf(stderr, "hazard: m table %zu, flat %zu, steep %zu, width 2 %zu\n", m0, mf, ms, mw);
+    return 0;
+}
+
 int main() {
     struct { const char * name; int (*fn)(); } tests[] = {
         { "curve_and_level",  test_curve_and_level },
@@ -507,6 +550,7 @@ int main() {
         { "store",            test_store },
         { "rounds_split",     test_rounds_split },
         { "rounds_edges",     test_rounds_edges },
+        { "hazard_table",     test_hazard_table },
     };
     for (const auto & t : tests) {
         if (t.fn() != 0) {

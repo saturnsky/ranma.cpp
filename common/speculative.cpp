@@ -19,6 +19,7 @@
 #include <algorithm>
 #include <array>
 #include <cassert>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <iomanip>
@@ -3075,9 +3076,39 @@ struct common_speculative_impl_ngram_varlen : public common_speculative_impl {
         llama_tokens emitted; // the part of the draft in verification
         llama_tokens rest;    // the draft after it
         size_t n_hist = 0;    // tokens of the history when the part was drafted
+        common_ngram_varlen_hazard::track hz; // the feedback of the draft, when the hazard model is on
     };
 
     std::vector<seq_info> sinfos;
+
+    // --spec-ngram-varlen-hazard: nullptr when off
+    std::unique_ptr<common_ngram_varlen_hazard> hz;
+    std::vector<double> hz_prior; // its table C(rows) in ms (the built-in one)
+
+    // --spec-ngram-varlen-hazard-online: the hazard model reads C(rows) from the shared verification cost (owned by
+    // common_speculative), blended with hz_prior; nullptr: the table
+    const common_spec_verify_cost * vcost = nullptr;
+
+    struct hz_stats {
+        uint64_t lookups   = 0; // lookups of the drafter (not the continuation of a draft in parts)
+        uint64_t base      = 0; // lookups drafted by the base rule
+        uint64_t alt_calls = 0; // lookups without a base draft but with candidates of the supplement
+        uint64_t alt_cands = 0; // candidates offered
+        uint64_t alt_draft = 0; // lookups drafted by the supplement
+        uint64_t alt_tok   = 0; // tokens drafted by the supplement
+        uint64_t feedback  = 0; // calls to the feedback of the hazard model
+        double   t_lookup  = 0; // ns in ngram.draft()
+        double   t_select  = 0; // ns in the choice among the candidates
+        double   t_feed    = 0; // ns in the feedback
+        uint64_t sh_labels = 0; // counterfactual labels counted
+        uint64_t sh_pend   = 0; // most anchors waiting at once
+        double   t_shadow  = 0; // ns in the counterfactual bookkeeping (cohorts excluded)
+        uint64_t online    = 0; // choices with the shared verification cost
+    } st;
+    std::vector<common_ngram_varlen_hazard::shadow_list> shadows; // per sequence, with --spec-ngram-varlen-hazard-shadow
+    bool shadow = false;
+    bool st_log = false;
+    uint64_t st_printed = 0; // st.lookups at the last print (exit does not repeat the stats of the last request)
 
     FILE * log = nullptr; // LLAMA_SPEC_VARLEN_LOG: one JSON line per draft and per accept
 
@@ -3103,6 +3134,18 @@ struct common_speculative_impl_ngram_varlen : public common_speculative_impl {
         SPC_INF("ngram-varlen: n_max = %d, n_rs = %d, ladder = %d, p_min = %.3f\n",
                 this->params.n_max, this->params.n_rs, this->params.ladder, this->params.p_min);
 
+        if (this->params.hazard) {
+            common_ngram_varlen_hazard_params hp;
+            hp.width = std::max(1, this->params.n_max);
+            hz = std::make_unique<common_ngram_varlen_hazard>(hp);
+            hz_prior = hp.cost;
+            shadow = this->params.hazard_shadow;
+            shadows.resize(n_seq);
+            SPC_INF("ngram-varlen: hazard supplement on (n >= 8, raw >= 0.95, up to 8 tokens), C(1..%zu rows) = %.1f ... %.1f ms\n",
+                    hp.cost.size(), hp.cost.front(), hp.cost.back());
+        }
+        st_log = hz != nullptr || getenv("LLAMA_SPEC_VARLEN_STATS") != nullptr;
+
         if (const char * c = getenv("LLAMA_SPEC_VARLEN_CORRUPT"); c != nullptr && *c != '\0') {
             size_t i = 0, p = 0;
             int n = 0;
@@ -3127,6 +3170,9 @@ struct common_speculative_impl_ngram_varlen : public common_speculative_impl {
     }
 
     ~common_speculative_impl_ngram_varlen() override {
+        if (st_log && st.lookups != st_printed) {
+            print_stats();
+        }
         if (log) {
             fclose(log);
         }
@@ -3148,8 +3194,39 @@ struct common_speculative_impl_ngram_varlen : public common_speculative_impl {
         for (size_t i = ngram.n_generated(seq_id); i < generated.size(); ++i) {
             ngram.add(seq_id, generated[i]);
         }
+        if (shadow) {
+            hz->shadow_step(shadows[seq_id], ngram.history(seq_id), true);
+        }
         ngram.end(seq_id);
         sinfos[seq_id] = {};
+
+        if (st_log) {
+            print_stats();
+            st_printed = st.lookups;
+        }
+    }
+
+    void print_stats() const {
+        SPC_INF("ngram-varlen stats: lookups %llu, base %llu, alt calls %llu, alt cands %llu, alt drafts %llu (%llu tokens), "
+                "feedback calls %llu, cells %zu; us/call: lookup %.3f, select %.3f (per alt call), feedback %.3f; "
+                "shadow labels %llu, most anchors waiting %llu, %.3f us per lookup; choices with the shared cost %llu\n",
+                (unsigned long long) st.lookups, (unsigned long long) st.base, (unsigned long long) st.alt_calls,
+                (unsigned long long) st.alt_cands, (unsigned long long) st.alt_draft, (unsigned long long) st.alt_tok,
+                (unsigned long long) st.feedback, hz ? hz->n_cells() : (size_t) 0,
+                st.lookups ? st.t_lookup/1e3/(double) st.lookups : 0.0,
+                st.alt_calls ? st.t_select/1e3/(double) st.alt_calls : 0.0,
+                st.feedback ? st.t_feed/1e3/(double) st.feedback : 0.0,
+                (unsigned long long) st.sh_labels, (unsigned long long) st.sh_pend,
+                st.lookups ? st.t_shadow/1e3/(double) st.lookups : 0.0, (unsigned long long) st.online);
+        if (vcost != nullptr && hz) {
+            // what the hazard model would use now for 1 .. n_max + 1 rows
+            const auto c = vcost->blend_ms(hz_prior, std::max(1, params.n_max) + 1);
+            std::string t;
+            for (size_t i = 0; i < c.size(); ++i) {
+                t += string_format("%s%.1f", i ? "/" : "", c[i]);
+            }
+            SPC_INF("ngram-varlen hazard: C(1..%zu rows) = %s ms (shared cost blended with the table)\n", c.size(), t.c_str());
+        }
     }
 
     bool process(const common_batch & /*batch*/) override {
@@ -3168,6 +3245,9 @@ struct common_speculative_impl_ngram_varlen : public common_speculative_impl {
             // the text of the slot moved (a context shift): the request stops drafting
             SPC_WRN("ngram-varlen: seq %d, the history (%zu tokens) does not continue in the prompt (%zu tokens), no more drafts in this request\n",
                     seq_id, n_hist, prompt.size());
+            if (shadow) {
+                hz->shadow_step(shadows[seq_id], hist, true);
+            }
             ngram.end(seq_id);
             sinfos[seq_id] = {};
             return false;
@@ -3204,16 +3284,103 @@ struct common_speculative_impl_ngram_varlen : public common_speculative_impl {
             // the whole part was accepted and the sampled token is the next one of the rest: go on with the rest
             llama_tokens next;
             bool cont = false;
-            if (!si.rest.empty() && n_hist == si.n_hist + si.emitted.size() + 1 &&
-                    std::equal(si.emitted.begin(), si.emitted.end(), hist.begin() + si.n_hist) &&
-                    hist.back() == si.rest[0]) {
+            const bool whole = !si.rest.empty() && n_hist == si.n_hist + si.emitted.size() + 1 &&
+                    std::equal(si.emitted.begin(), si.emitted.end(), hist.begin() + si.n_hist);
+            if (whole && hist.back() == si.rest[0]) {
                 next.assign(si.rest.begin() + 1, si.rest.end());
                 cont = true;
             }
 
+            // the feedback of a draft in parts: the sampled token after a part is a position of the draft too
+            common_ngram_varlen_hazard::track track = std::move(si.hz);
+            if (hz) {
+                const auto t0 = std::chrono::steady_clock::now();
+                if (track.live && whole) {
+                    hz->gate(track, cont);
+                    st.feedback++;
+                } else {
+                    common_ngram_varlen_hazard::drop(track);
+                }
+                st.t_feed += std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now() - t0).count();
+            }
+
             common_ngram_varlen_draft d;
+            bool fb = false;
             if (next.empty()) {
-                d = ngram.draft(seq_id);
+                common_ngram_varlen_hazard::drop(track);
+
+                common_ngram_varlen_draft_opts opts;
+                opts.alt    = hz != nullptr;
+                opts.shadow = shadow;
+
+                if (shadow) {
+                    // the cohorts of earlier decision points whose tokens are known now
+                    const auto ts = std::chrono::steady_clock::now();
+                    hz->shadow_step(shadows[seq_id], hist, false);
+                    st.sh_labels += hz->shadow_flush(shadows[seq_id], ngram.get_clock());
+                    st.t_shadow += std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now() - ts).count();
+                }
+
+                const auto t0 = std::chrono::steady_clock::now();
+                d = ngram.draft(seq_id, hz ? &opts : nullptr);
+                const auto t1 = std::chrono::steady_clock::now();
+                st.t_lookup += std::chrono::duration<double, std::nano>(t1 - t0).count();
+                st.lookups++;
+
+                std::vector<common_ngram_varlen_hazard::feat> feats;
+                if (!d.tokens.empty()) {
+                    st.base++;
+                    if (hz) {
+                        for (size_t j = 0; j < d.tokens.size(); ++j) {
+                            feats.push_back({ d.n, d.raw[j], d.support[j] });
+                        }
+                    }
+                } else if (hz && !d.alt.empty()) {
+                    st.alt_calls++;
+                    st.alt_cands += d.alt.size();
+
+                    // the pieces are as wide as this round allows (a request near its end verifies fewer tokens)
+                    int32_t width = std::max(1, params.n_max);
+                    if (dp.n_max > 0) {
+                        width = std::max(1, std::min(width, dp.n_max));
+                    }
+                    std::vector<double> c_online;
+                    if (vcost != nullptr) {
+                        c_online = vcost->blend_ms(hz_prior, width + 1);
+                        st.online++;
+                    }
+                    size_t m = 0;
+                    const size_t ci = hz->select(d.alt, ngram.get_clock(), m, vcost != nullptr ? &c_online : nullptr,
+                                                 width);
+                    st.t_select += std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now() - t1).count();
+                    if (m > 0) {
+                        const auto & c = d.alt[ci];
+                        d.tokens.assign(c.tokens.begin(), c.tokens.begin() + m);
+                        d.n         = c.n;
+                        d.n_samples = c.n_samples;
+                        for (size_t j = 0; j < m; ++j) {
+                            feats.push_back({ c.n, c.raw[j], c.support[j] });
+                        }
+                        fb = true;
+                        st.alt_draft++;
+                        st.alt_tok += m;
+                    }
+                }
+                if (shadow) {
+                    // a drafted cohort that is among the representatives is counted there, not again from its draft
+                    const auto ts = std::chrono::steady_clock::now();
+                    const int32_t n_drafted = d.n;
+                    if (std::any_of(d.shadow.begin(), d.shadow.end(), [&](const auto & c) { return c.n == n_drafted; })) {
+                        feats.clear();
+                    }
+                    hz->shadow_add(shadows[seq_id], d.shadow, n_hist, ngram.get_clock());
+                    st.sh_pend = std::max<uint64_t>(st.sh_pend, shadows[seq_id].size());
+                    st.t_shadow += std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now() - ts).count();
+                }
+                if (hz && !feats.empty()) {
+                    hz->start(track, std::move(feats), ngram.get_clock());
+                }
+
                 next = std::move(d.tokens);
                 cont = false;
 
@@ -3228,6 +3395,7 @@ struct common_speculative_impl_ngram_varlen : public common_speculative_impl {
             }
 
             si = {};
+            si.hz = std::move(track);
 
             int32_t n_max = params.n_max;
             if (dp.n_max > 0) {
@@ -3236,8 +3404,8 @@ struct common_speculative_impl_ngram_varlen : public common_speculative_impl {
             const size_t n_emit = std::min(next.size(), (size_t) std::max(0, n_max));
 
             if (log) {
-                fprintf(log, "{\"seq\":%d,\"hist\":%zu,\"src\":\"%s\",\"n\":%d,\"s\":%d,\"len\":%zu,\"emit\":%zu,\"toks\":[",
-                        seq_id, n_hist, cont ? "rest" : "lookup", d.n, d.n_samples, next.size(), n_emit);
+                fprintf(log, "{\"seq\":%d,\"hist\":%zu,\"src\":\"%s\",\"n\":%d,\"s\":%d,\"len\":%zu,\"emit\":%zu,%s\"toks\":[",
+                        seq_id, n_hist, cont ? "rest" : "lookup", d.n, d.n_samples, next.size(), n_emit, fb ? "\"fb\":1," : "");
                 for (size_t i = 0; i < next.size(); ++i) {
                     fprintf(log, "%s%d", i ? "," : "", next[i]);
                 }
@@ -3245,6 +3413,7 @@ struct common_speculative_impl_ngram_varlen : public common_speculative_impl {
             }
 
             if (n_emit == 0) {
+                common_ngram_varlen_hazard::drop(si.hz);
                 continue;
             }
 
@@ -3266,6 +3435,17 @@ struct common_speculative_impl_ngram_varlen : public common_speculative_impl {
         if (log && !is_other) {
             fprintf(log, "{\"seq\":%d,\"acc\":%u,\"of\":%zu}\n", seq_id, (unsigned) n_accepted, si.emitted.size());
             fflush(log);
+        }
+
+        if (hz) {
+            const auto t0 = std::chrono::steady_clock::now();
+            if (is_other) {
+                common_ngram_varlen_hazard::drop(si.hz);
+            } else if (si.hz.used) {
+                hz->piece(si.hz, si.emitted.size(), n_accepted);
+                st.feedback++;
+            }
+            st.t_feed += std::chrono::duration<double, std::nano>(std::chrono::steady_clock::now() - t0).count();
         }
 
         // another drafter verified this round, or a token of the part was rejected
@@ -3968,6 +4148,23 @@ common_speculative * common_speculative_init(common_params_speculative & params,
         SPC_INF("shared verification cost: up to %d rows, store %s, log %s\n", vcfg.r_max,
                 vcfg.store_path.empty() ? "none" : vcfg.store_path.c_str(),
                 vcfg.log_path.empty() ? "none" : vcfg.log_path.c_str());
+
+        // ngram-varlen hazard: its table is the prior of the shared cost; --spec-ngram-varlen-hazard-online reads the
+        // shared cost
+        for (auto & impl : result->impls) {
+            if (impl->type != COMMON_SPECULATIVE_TYPE_NGRAM_VARLEN) {
+                continue;
+            }
+            auto * vl = static_cast<common_speculative_impl_ngram_varlen *>(impl.get());
+            if (!vl->hz) {
+                continue;
+            }
+            result->vcost->set_log_prior(vl->hz_prior);
+            if (params.ngram_varlen.hazard_online) {
+                vl->vcost = result->vcost.get();
+                SPC_INF("%s", "ngram-varlen hazard: C(rows) from the shared verification cost, the table until it is observed\n");
+            }
+        }
     }
 
     if (params.draft.smart_on) {

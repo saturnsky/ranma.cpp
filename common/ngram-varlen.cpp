@@ -1,6 +1,7 @@
 #include "ngram-varlen.h"
 
 #include <algorithm>
+#include <cstdint>
 #include <cmath>
 #include <functional>
 
@@ -237,7 +238,7 @@ void common_ngram_varlen::end(llama_seq_id seq_id) {
     purge();
 }
 
-common_ngram_varlen_draft common_ngram_varlen::draft(llama_seq_id seq_id) const {
+common_ngram_varlen_draft common_ngram_varlen::draft(llama_seq_id seq_id, const common_ngram_varlen_draft_opts * opts) const {
     common_ngram_varlen_draft res;
 
     if (!active(seq_id)) {
@@ -291,15 +292,16 @@ common_ngram_varlen_draft common_ngram_varlen::draft(llama_seq_id seq_id) const 
     ns.erase(std::unique(ns.begin(), ns.end()), ns.end());
 
     const size_t n_support = (size_t) std::max(2, params.n_support);
+    const bool   meta      = opts && (opts->meta || opts->alt || opts->shadow);
 
     std::vector<int32_t> active;
     std::vector<int32_t> keep;
     std::vector<std::pair<llama_token, double>> counts;
 
-    for (const int32_t n : ns) {
-        if (n < params.n_min) {
-            break;
-        }
+    // the draft that follows the cohort of the samples that match at least n tokens
+    auto walk = [&](int32_t n, size_t min_support, bool ladder, double p_min, size_t cap, int32_t & n_cohort,
+            std::vector<double> * raw, std::vector<int32_t> * sup) {
+        std::vector<llama_token> path;
 
         // the cohort: every sample that matches at least n tokens, in sample order
         active.clear();
@@ -308,9 +310,9 @@ common_ngram_varlen_draft common_ngram_varlen::draft(llama_seq_id seq_id) const 
                 active.push_back(k);
             }
         }
-        const int32_t n_cohort = (int32_t) active.size();
-        if ((size_t) n_cohort < n_support) {
-            continue;
+        n_cohort = (int32_t) active.size();
+        if ((size_t) n_cohort < min_support) {
+            return path;
         }
 
         // the weight of the cohort, summed as the replay does (Python 3.12 sum(): Neumaier compensation)
@@ -326,7 +328,6 @@ common_ngram_varlen_draft common_ngram_varlen::draft(llama_seq_id seq_id) const 
             total += comp;
         }
 
-        std::vector<llama_token> path;
         for (size_t j = 0; !active.empty(); ++j) {
             counts.clear();
             for (const int32_t k : active) {
@@ -355,7 +356,7 @@ common_ngram_varlen_draft common_ngram_varlen::draft(llama_seq_id seq_id) const 
             }
             const llama_token token = best->first;
             const double prob = best->second/total;
-            if (prob + 1e-12 < params.p_min) {
+            if (prob + 1e-12 < p_min) {
                 break;
             }
 
@@ -370,19 +371,348 @@ common_ngram_varlen_draft common_ngram_varlen::draft(llama_seq_id seq_id) const 
             active.swap(keep);
 
             const size_t support = active.size();
-            if (support < n_support || (int64_t) j + 1 > (int64_t) params.ladder*(int64_t) (support - 1)) {
+            if (support < min_support || (ladder && (int64_t) j + 1 > (int64_t) params.ladder*(int64_t) (support - 1))) {
                 break;
             }
             path.push_back(token);
+            if (raw) {
+                raw->push_back(std::min(1.0, prob));
+                sup->push_back((int32_t) support);
+            }
+            if (path.size() >= cap) {
+                break;
+            }
         }
+
+        return path;
+    };
+
+    if (opts && opts->shadow && !ns.empty()) {
+        // the representative cohorts of the replay: longest n, the longest n whose first token has 2 samples, shortest n
+        const size_t cap = (size_t) std::max(1, opts->shadow_cap);
+        auto cohort = [&](int32_t n) {
+            common_ngram_varlen_cand c;
+            auto path = walk(n, 1, false, 0.0, cap, c.n_samples, &c.raw, &c.support);
+            c.tokens = std::move(path);
+            c.n      = n;
+            return c;
+        };
+        auto have = [&](int32_t n) {
+            return std::any_of(res.shadow.begin(), res.shadow.end(), [&](const auto & c) { return c.n == n; });
+        };
+        auto first = cohort(ns.front());
+        bool two = !first.tokens.empty() && first.support[0] >= 2;
+        if (!first.tokens.empty()) {
+            res.shadow.push_back(std::move(first));
+        }
+        for (size_t k = 1; !two && k < ns.size(); ++k) {
+            auto c = cohort(ns[k]);
+            if (!c.tokens.empty() && c.support[0] >= 2) {
+                two = true;
+                res.shadow.push_back(std::move(c));
+            }
+        }
+        if (!have(ns.back())) {
+            auto c = cohort(ns.back());
+            if (!c.tokens.empty()) {
+                res.shadow.push_back(std::move(c));
+            }
+        }
+    }
+
+    for (const int32_t n : ns) {
+        if (n < params.n_min) {
+            break;
+        }
+
+        int32_t n_cohort = 0;
+        std::vector<double>  raw;
+        std::vector<int32_t> sup;
+        auto path = walk(n, n_support, true, params.p_min, SIZE_MAX, n_cohort, meta ? &raw : nullptr, &sup);
 
         if (!path.empty()) {
             res.tokens    = std::move(path);
             res.n         = n;
             res.n_samples = n_cohort;
+            res.raw       = std::move(raw);
+            res.support   = std::move(sup);
             return res;
         }
     }
 
+    if (opts && opts->alt) {
+        const auto & ap = opts->alt_params;
+        for (const int32_t n : ns) {
+            if (n < std::max(params.n_min, ap.n_min)) {
+                break;
+            }
+
+            common_ngram_varlen_cand cand;
+            auto path = walk(n, 1, false, ap.raw_min, (size_t) std::max(1, ap.max_len), cand.n_samples, &cand.raw, &cand.support);
+            if (!path.empty()) {
+                cand.tokens = std::move(path);
+                cand.n      = n;
+                res.alt.push_back(std::move(cand));
+            }
+        }
+    }
+
     return res;
+}
+
+//
+// common_ngram_varlen_hazard
+//
+
+common_ngram_varlen_hazard::common_ngram_varlen_hazard(const common_ngram_varlen_hazard_params & params) : params(params) {
+    GGML_ASSERT(!this->params.cost.empty() && this->params.width >= 1);
+}
+
+static int32_t hazard_pos_bucket(int32_t j) {
+    return j <= 4 ? j : j <= 8 ? 5 : j <= 16 ? 6 : 7;
+}
+
+static int32_t hazard_support_bucket(int32_t s) {
+    return s == 1 ? 0 : s == 2 ? 1 : s <= 4 ? 2 : s <= 8 ? 3 : 4;
+}
+
+static int32_t hazard_n_bucket(int32_t n) {
+    return n < 5 ? 0 : n < 8 ? 1 : n < 16 ? 2 : 3;
+}
+
+static int32_t hazard_raw_bucket(double p) {
+    return p < 0.5 ? 0 : p < 0.8 ? 1 : p < 0.95 ? 2 : 3;
+}
+
+uint32_t common_ngram_varlen_hazard::key_global(int32_t j, int32_t support) {
+    return (uint32_t) (hazard_pos_bucket(j)*8 + hazard_support_bucket(support));
+}
+
+uint32_t common_ngram_varlen_hazard::key_cell(int32_t j, const feat & f) {
+    return (uint32_t) (((hazard_pos_bucket(j)*4 + hazard_n_bucket(f.n))*8 + hazard_support_bucket(f.support))*4 + hazard_raw_bucket(f.raw));
+}
+
+double common_ngram_varlen_hazard::cost(size_t rows) const {
+    return cost_at(params.cost, rows);
+}
+
+double common_ngram_varlen_hazard::cost_at(const std::vector<double> & c, size_t rows) {
+    if (c.empty()) {
+        return 0.0;
+    }
+    if (rows >= 1 && rows <= c.size()) {
+        return c[rows - 1];
+    }
+    const double step = c.size() > 1 ? c.back() - c[c.size() - 2] : 0.0;
+    return c.back() + step*(double) (rows - c.size());
+}
+
+void common_ngram_varlen_hazard::read(const std::unordered_map<uint32_t, cell> & table, uint32_t key, int64_t clock,
+        double & s, double & c) const {
+    const auto it = table.find(key);
+    if (it == table.end()) {
+        s = c = 0.0;
+        return;
+    }
+    const double f = std::pow(2.0, -(double) std::max<int64_t>(0, clock - it->second.clock)/params.half_life);
+    s = it->second.s*f;
+    c = it->second.c*f;
+}
+
+void common_ngram_varlen_hazard::add(const feat & f, int32_t j, int y, double w, int64_t clock) {
+    double s, c;
+
+    read(cells, key_cell(j, f), clock, s, c);
+    cells[key_cell(j, f)] = { s + w*y, c + w, clock };
+
+    read(global, key_global(j, f.support), clock, s, c);
+    global[key_global(j, f.support)] = { s + w*y, c + w, clock };
+}
+
+void common_ngram_varlen_hazard::shadow_add(shadow_list & list, const std::vector<common_ngram_varlen_cand> & picks,
+        size_t n_hist, int64_t clock) {
+    if (picks.empty()) {
+        return;
+    }
+    shadow_anchor a;
+    a.clock0 = clock;
+    a.n_hist = n_hist;
+    for (const auto & c : picks) {
+        shadow_pick p;
+        p.tokens = c.tokens;
+        p.w      = 1.0/(double) picks.size();
+        for (size_t j = 0; j < c.tokens.size(); ++j) {
+            p.feats.push_back({ c.n, c.raw[j], c.support[j] });
+        }
+        a.picks.push_back(std::move(p));
+    }
+    list.push_back(std::move(a));
+}
+
+void common_ngram_varlen_hazard::shadow_step(shadow_list & list, const std::vector<llama_token> & hist, bool end) {
+    for (auto & a : list) {
+        for (auto & p : a.picks) {
+            while (!p.fin) {
+                const size_t j = p.y.size();
+                if (a.n_hist + j >= hist.size()) {
+                    break;
+                }
+                const bool hit = p.tokens[j] == hist[a.n_hist + j];
+                p.y.push_back(hit ? 1 : 0);
+                if (!hit || p.y.size() == p.tokens.size()) {
+                    p.fin = true;
+                }
+            }
+            if (end) {
+                p.fin = true;
+            }
+        }
+    }
+}
+
+size_t common_ngram_varlen_hazard::shadow_flush(shadow_list & list, int64_t clock) {
+    size_t n = 0;
+    for (auto it = list.begin(); it != list.end();) {
+        size_t last = 0;
+        bool   done = true;
+        for (const auto & p : it->picks) {
+            done = done && p.fin;
+            last = std::max(last, p.y.size());
+        }
+        const int64_t ready = it->clock0 + (int64_t) last;
+        if (!done || ready > clock) {
+            ++it;
+            continue;
+        }
+        for (const auto & p : it->picks) {
+            for (size_t j = 0; j < p.y.size(); ++j) {
+                add(p.feats[j], (int32_t) j + 1, p.y[j], p.w, ready);
+                n++;
+            }
+        }
+        it = list.erase(it);
+    }
+    return n;
+}
+
+// the cost per output token of a draft with these P_j, in pieces of width tokens
+double common_ngram_varlen_hazard::expected(const std::vector<double> & ps, size_t length, const std::vector<double> & c,
+        size_t width) const {
+    double cost_sum = 0.0;
+    double out_sum  = 0.0;
+    for (size_t offset = 0; offset < length; offset += width + 1) {
+        const size_t m     = std::min(width, length - offset);
+        const double reach = offset == 0 ? 1.0 : ps[offset - 1];
+        double sum = 0.0;
+        for (size_t j = offset; j < offset + m; ++j) {
+            sum += ps[j];
+        }
+        cost_sum += reach*cost_at(c, m + 1);
+        out_sum  += reach + sum;
+    }
+    return cost_sum/out_sum;
+}
+
+size_t common_ngram_varlen_hazard::select(const std::vector<common_ngram_varlen_cand> & alt, int64_t clock, size_t & m,
+        const std::vector<double> * cost_in, int32_t width_in) const {
+    m = 0;
+
+    const std::vector<double> & c = cost_in != nullptr && !cost_in->empty() ? *cost_in : params.cost;
+    const size_t width = (size_t) (width_in > 0 ? width_in : params.width);
+
+    for (size_t ci = 0; ci < alt.size(); ++ci) {
+        const auto & cand = alt[ci];
+        const size_t len  = cand.tokens.size();
+
+        std::vector<double> ps(len);
+        double cumulative = 1.0;
+        double last       = 1.0;
+        for (size_t j = 1; j <= len; ++j) {
+            const feat f = { cand.n, cand.raw[j - 1], cand.support[j - 1] };
+
+            double s, c;
+            read(global, key_global((int32_t) j, f.support), clock, s, c);
+            const double prior = (s + 1.0)/(c + 2.0);
+            read(cells, key_cell((int32_t) j, f), clock, s, c);
+            const double q = (s + params.prior_strength*prior)/(c + params.prior_strength);
+
+            cumulative *= q;
+            last = std::min(last, std::max(0.001, std::min(0.999, cumulative)));
+            ps[j - 1] = last;
+        }
+
+        double best = cost_at(c, 1);
+        for (size_t j = 1; j <= len; ++j) {
+            const double value = expected(ps, j, c, width);
+            if (value < best - 1e-10) {
+                best = value;
+                m    = j;
+            }
+        }
+        if (m > 0) {
+            return ci;
+        }
+    }
+
+    return 0;
+}
+
+void common_ngram_varlen_hazard::start(track & t, std::vector<feat> feats, int64_t clock) {
+    t.feats   = std::move(feats);
+    t.clock0  = clock;
+    t.outputs = 0;
+    t.offset  = 0;
+    t.live    = false;
+    t.used    = !t.feats.empty();
+}
+
+void common_ngram_varlen_hazard::finish(track & t, int32_t accepted) {
+    const int64_t stamp = t.clock0 + t.outputs;
+    for (int32_t j = 1; j <= (int32_t) t.feats.size() && j <= accepted + 1; ++j) {
+        add(t.feats[j - 1], j, accepted >= j ? 1 : 0, 1.0, stamp);
+    }
+    drop(t);
+}
+
+void common_ngram_varlen_hazard::piece(track & t, size_t m_emitted, size_t n_accepted) {
+    if (!t.used) {
+        return;
+    }
+
+    t.outputs += (int64_t) n_accepted + 1;
+    t.live = false;
+    if (n_accepted < m_emitted) {
+        finish(t, t.offset + (int32_t) n_accepted);
+        return;
+    }
+
+    t.offset += (int32_t) m_emitted;
+    if (t.offset >= (int32_t) t.feats.size()) {
+        finish(t, (int32_t) t.feats.size());
+        return;
+    }
+    t.live = true;
+}
+
+void common_ngram_varlen_hazard::gate(track & t, bool match) {
+    if (!t.used || !t.live) {
+        return;
+    }
+
+    t.live = false;
+    if (!match) {
+        finish(t, t.offset);
+        return;
+    }
+
+    t.offset += 1;
+    if (t.offset >= (int32_t) t.feats.size()) {
+        finish(t, (int32_t) t.feats.size());
+    }
+}
+
+void common_ngram_varlen_hazard::drop(track & t) {
+    t.feats.clear();
+    t.used = false;
+    t.live = false;
 }
