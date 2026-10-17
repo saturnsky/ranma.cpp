@@ -62,9 +62,10 @@ struct ub_pool_config {
     bool   log       = false;
     int    ghost     = 8;                 // admission filter ghost:K; 0 = admit every admissible miss
     bool   ring      = false;             // also admit the SSD tier's ring occupants (see "Ring admission" below); the controller sets it
+    int    trace     = 0;                 // RANMA_EXPERT_PCIE_TRACE=1: diagnostic, the host reads of every decode launch are tallied (below)
 };
 
-// RANMA_EXPERT_UB_POOL_LOG=0|1. Read once.
+// RANMA_EXPERT_UB_POOL_LOG=0|1 and RANMA_EXPERT_PCIE_TRACE=0|1. Read once.
 ub_pool_config ub_pool_config_from_env();
 
 static constexpr int ub_pool_max_experts = 1024;
@@ -86,6 +87,44 @@ enum ub_pool_counter : int {
     ub_pool_ring_fills,    // fills of ring occupants (ring admission), part of ub_pool_fills
     ub_pool_fixed_hits,    // hits on positions in L1 slots (the LRU part of L1), part of ub_pool_hits
     ub_pool_n_counters,
+};
+
+// Diagnostic tallies (device memory, read at a reclaim): per layer class (0 the cached model, 1 a joined draft model) a block
+// of ub_tr_n words. Level 1 (RANMA_EXPERT_UB_POOL_LOG or the trace) counts the step's decisions per distinct expert and
+// the rows that use a copy filled in the same launch; level 2 (RANMA_EXPERT_PCIE_TRACE=1) also tallies, for every
+// decode-sized launch (a launch that steps no pool, too), the experts a matmul reads from host memory and the passes
+// each takes: ceil(rows of the expert / rows per pass), 1 for T=1, 2 for T=2, 4 for T=3..8, 16 above (mul-mat-had.cu).
+// An expert with 2 passes or more is read again over the link (a "reread").
+enum ub_tr_word : int {
+    ub_tr_steps = 0,        // step launches with positions
+    ub_tr_hit_rows,         // rows served by a position that existed before the launch
+    ub_tr_fill_old,         // fills approved by the temporal ghost rule
+    ub_tr_fill_same,        // fills approved only because 2 or more rows of the launch select the expert
+    ub_tr_fill_other,       // fills with the filter off or a staged expert
+    ub_tr_use_old,          // rows that use a fill of the same launch, by the approval of the fill
+    ub_tr_use_same,
+    ub_tr_use_other,
+    ub_tr_rej_ghost,        // distinct experts turned away: the ghost rule
+    ub_tr_rej_slot_old,     //   approved, no position free (over; includes the positions this launch uses), by approval
+    ub_tr_rej_slot_same,
+    ub_tr_rej_ring,         //   the SSD worker serves it and no ring slot is admissible (not ready, or ring admission off)
+    ub_tr_rej_nohome,       //   no host home
+    ub_tr_rej_noadmit,      //   the launch does not admit
+    ub_tr_host_experts,     // level 2: experts read from host memory (not static, not in a position, not filled)
+    ub_tr_host_passes,
+    ub_tr_host_rows,
+    ub_tr_copy_experts,     // level 2: experts copied over the link into a position (= fills)
+    ub_tr_launches,         // level 2: launches tallied (stepped or not)
+    ub_tr_reason0 = 20,     // per reason (below): experts, rereads (experts with 2+ passes), extra passes, extra bytes
+    ub_tr_hist0 = 20 + 4*10, // host experts by rows: 1..8, 9 or more
+    ub_tr_n = 80,
+};
+enum ub_tr_reason : int {
+    ub_why_other = 0, ub_why_ghost, ub_why_slot, ub_why_ring, ub_why_nohome, ub_why_noadmit,
+    ub_why_bigt,      // T above the rows that step the pool
+    ub_why_nopool,    // the layer has no positions (a model without them, an early layer) or the pool is off
+    ub_why_notlent,   // the layer's positions are not active (r = 0)
+    ub_why_n = 10,
 };
 
 // Where a miss of one kind of a layer reads its expert, as the matmul would without the pool, and
@@ -340,6 +379,13 @@ public:
 
     // Device must be idle (or `stream` synchronized by the caller). Cumulative since allocate.
     bool read_counters(std::array<uint64_t, ub_pool_n_counters> & out) const;
+    // The diagnostic tallies, [2][ub_tr_n]; false when they are off.
+    bool read_trace(std::vector<uint64_t> & out) const;
+    int  trace_level() const { return trace_level_; }
+    // A launch that steps no pool (level 2): tallies its host reads. `slots`: the layer's VRAM slot table (or null),
+    // `bytes`: the three kinds of one expert, `cls`: 0 the cached model, 1 a joined one.
+    void launch_trace(const int32_t * ids, int n_rows, int row_stride, int n_used, const int32_t * slots, size_t bytes, int cls,
+        int reason, cudaStream_t stream);
     // The same counts from the per-layer values in mapped host memory: never waits for the device, and misses
     // the launches that have not finished. Cumulative since allocate. False without the host memory.
     bool read_live(uint64_t & hits, uint64_t & fills, uint64_t & fill_bytes) const;
@@ -360,6 +406,9 @@ private:
     int    r_      = 0;
     int    r2_     = 0;      // positions per layer in the second region (the last r2_ of r_)
     int    ghost_  = 0;
+    int    trace_level_ = 0;
+    unsigned long long * d_trace_ = nullptr;   // [2][ub_tr_n]
+    unsigned long long * h_trace_ = nullptr;
     void * base_   = nullptr;
     size_t lent_bytes_ = 0;
 

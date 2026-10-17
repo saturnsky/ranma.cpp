@@ -1338,6 +1338,12 @@ public:
                 profiler_ ? profiler_->n_counts() : 0, profiler_ ? profiler_->n_banks() : 0,
                 profiler_ ? profiler_->selection((uint32_t) member) : nullptr);
             ub_->launch_copy((int) joint, ctx.stream(), (int) ids->ne[1], (int) ids->ne[0]);
+        } else if (ub_ && ub_->allocated() && ub_->trace_level() >= 2 && ids->ne[1] <= 64) {
+            // RANMA_EXPERT_PCIE_TRACE: a decode-sized launch that steps no pool reads every non-static expert from host memory
+            ub_->launch_trace((const int32_t *) ids->data, (int) ids->ne[1], (int) (ids->nb[1]/sizeof(int32_t)), (int) ids->ne[0],
+                l1_->lookup((int) joint, 0).slots, geo_.class_total_bytes(geo_.layer_class[(size_t) joint]),
+                member_of_layer((int) joint) == 0 ? 0 : 1,
+                !ub_on_.load(std::memory_order_acquire) || !ub_layer_[(size_t) joint] ? ub_why_nopool : ub_why_bigt, ctx.stream());
         }
         // The SSD tier needs the same ids: this is the one site that sees both the fused and the
         // unfused router, and it is ordered before the layer's MUL_MAT_ID on the same stream.
@@ -3029,6 +3035,49 @@ public:
             (unsigned long long) c[ub_pool_fixed_hits], (unsigned long long) c[ub_pool_fills], c[ub_pool_fill_bytes]/1048576.0, (unsigned long long) c[ub_pool_over],
             (unsigned long long) c[ub_pool_evictions], (unsigned long long) c[ub_pool_rejected],
             (unsigned long long) c[ub_pool_pf_fills], (unsigned long long) c[ub_pool_pf_arrived], ring_text);
+        std::vector<uint64_t> tr;
+        if (ub_->trace_level() != 0 && ub_->read_trace(tr)) {
+            static const char * const why_name[ub_why_n] = { "other", "ghost", "slot", "ring", "nohome", "noadmit", "bigT", "nopool", "notlent", "spare" };
+            for (int cls = 0; cls < 2; ++cls) {
+                const uint64_t * t = tr.data() + (size_t) cls*ub_tr_n;
+                std::string line;
+                char buf[512];   // the first line alone is up to about 410 characters (14 counters of up to 20 digits)
+                snprintf(buf, sizeof(buf), "steps=%llu hit_rows=%llu fills(old/same/other)=%llu/%llu/%llu fill_use_rows(old/same/other)=%llu/%llu/%llu "
+                    "rej(ghost/slot_old/slot_same/ring/nohome/noadmit)=%llu/%llu/%llu/%llu/%llu/%llu",
+                    (unsigned long long) t[ub_tr_steps], (unsigned long long) t[ub_tr_hit_rows],
+                    (unsigned long long) t[ub_tr_fill_old], (unsigned long long) t[ub_tr_fill_same], (unsigned long long) t[ub_tr_fill_other],
+                    (unsigned long long) t[ub_tr_use_old], (unsigned long long) t[ub_tr_use_same], (unsigned long long) t[ub_tr_use_other],
+                    (unsigned long long) t[ub_tr_rej_ghost], (unsigned long long) t[ub_tr_rej_slot_old], (unsigned long long) t[ub_tr_rej_slot_same],
+                    (unsigned long long) t[ub_tr_rej_ring], (unsigned long long) t[ub_tr_rej_nohome], (unsigned long long) t[ub_tr_rej_noadmit]);
+                line = buf;
+                GGML_LOG_INFO("expert cache: pool trace (%s) class=%s: %s\n", why, cls == 0 ? "target" : "drafter", line.c_str());
+                if (ub_->trace_level() >= 2) {
+                    snprintf(buf, sizeof(buf), "launches=%llu host_experts=%llu host_passes=%llu host_rows=%llu copy_experts=%llu",
+                        (unsigned long long) t[ub_tr_launches], (unsigned long long) t[ub_tr_host_experts],
+                        (unsigned long long) t[ub_tr_host_passes], (unsigned long long) t[ub_tr_host_rows], (unsigned long long) t[ub_tr_copy_experts]);
+                    line = buf;
+                    uint64_t re = 0, ex = 0, kib = 0;
+                    for (int w = 0; w < ub_why_n; ++w) {
+                        const uint64_t * q = t + ub_tr_reason0 + 4*w;
+                        re += q[1]; ex += q[2]; kib += q[3];
+                        if (q[0] != 0) {
+                            snprintf(buf, sizeof(buf), " %s=%llu/%llu/%llu/%.1fMiB", why_name[w], (unsigned long long) q[0], (unsigned long long) q[1],
+                                (unsigned long long) q[2], q[3]/1024.0);
+                            line += buf;
+                        }
+                    }
+                    snprintf(buf, sizeof(buf), " reread_total=%llu extra_passes=%llu extra=%.1fMiB hist_rows(1..8,9+)=", (unsigned long long) re,
+                        (unsigned long long) ex, kib/1024.0);
+                    line += buf;
+                    for (int h = 0; h < 9; ++h) {
+                        snprintf(buf, sizeof(buf), "%s%llu", h ? "/" : "", (unsigned long long) t[ub_tr_hist0 + h]);
+                        line += buf;
+                    }
+                    GGML_LOG_INFO("expert cache: pcie trace (%s) class=%s: %s [reason=host_experts/rereads/extra_passes/extra_bytes]\n", why,
+                        cls == 0 ? "target" : "drafter", line.c_str());
+                }
+            }
+        }
     }
 
     // ---- the LRU part of L1 (--expert-l1-lru-pct; expert-l1-lru.h) -------------------------------------------------
