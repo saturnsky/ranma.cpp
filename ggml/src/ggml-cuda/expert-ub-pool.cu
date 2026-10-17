@@ -17,6 +17,7 @@ ub_pool_config ub_pool_config_from_env() {
     ub_pool_config c;
     c.enabled   = true;   // regions of at least 256 MiB, 64 MiB of margin, 64 positions per layer, the decode rows, ghost:8
     c.log       = ub_env_int("RANMA_EXPERT_UB_POOL_LOG", 0) != 0;
+    c.trace     = ub_env_int("RANMA_EXPERT_PCIE_TRACE", 0) != 0 ? 1 : 0;
     return c;
 }
 
@@ -50,7 +51,81 @@ struct ub_step_args {
     size_t prof_bank_stride;
     uint32_t prof_n_banks;
     const profile_selection * prof_selection;
+    unsigned long long * tr;   // [2][ub_tr_n] diagnostic tallies, or null
+    int trace_level;           // 0 off, 1 decisions, 2 also the host reads
 };
+
+// ---- diagnostic tallies (ub_tr_word) ------------------------------------------------------------------
+
+// rows per pass of the host-direct matmul (mul-mat-had.cu: GEMV 1, 2 or 4 rows per pass; above 8 tokens the WMMA tile of 16)
+static __device__ __forceinline__ int ub_pass_rows(const int T) {
+    return T <= 1 ? 1 : T == 2 ? 2 : T <= 8 ? 4 : 16;
+}
+
+// One expert a matmul reads from host memory: `rows` rows of the launch select it.
+static __device__ __forceinline__ void ub_trace_host(unsigned int * t, const unsigned int rows, const int T, const int why, const uint64_t bytes) {
+    const int p = ub_pass_rows(T);
+    const unsigned int passes = (rows + (unsigned) p - 1)/(unsigned) p;
+    atomicAdd(&t[ub_tr_host_experts], 1u);
+    atomicAdd(&t[ub_tr_host_passes], passes);
+    atomicAdd(&t[ub_tr_host_rows], rows);
+    unsigned int * w = t + ub_tr_reason0 + 4*why;
+    atomicAdd(&w[0], 1u);
+    if (passes >= 2) {
+        atomicAdd(&w[1], 1u);
+        atomicAdd(&w[2], passes - 1);
+        atomicAdd(&w[3], (unsigned int) ((uint64_t(passes - 1)*bytes) >> 10));   // KiB
+    }
+    atomicAdd(&t[ub_tr_hist0 + (int) min(rows, 9u) - 1], 1u);
+}
+
+static __device__ __forceinline__ void ub_trace_flush(unsigned long long * tr_cls, const unsigned int * t, const int tid, const int nthreads) {
+    for (int i = tid; i < ub_tr_n; i += nthreads) {
+        if (t[i] != 0) {
+            atomicAdd(&tr_cls[i], (unsigned long long) t[i]);
+        }
+    }
+}
+
+// A launch whose experts are all read from host memory unless they are static (`slots`): every thread of the block calls
+// it; `s_rows` [E] and `t` [ub_tr_n] are zeroed by the caller before a barrier, and flushed by the caller after one.
+static __device__ void ub_trace_bypass(unsigned int * s_rows, unsigned int * t, const int32_t * ids, const int n_rows, const int row_stride,
+        const int n_used, const int E, const int32_t * slots, const uint64_t bytes, const int why) {
+    const int tid = threadIdx.x;
+    const int n = n_rows*n_used;
+    for (int i = tid; i < n; i += blockDim.x) {
+        const int row = i/n_used;
+        const int id  = ids[row*row_stride + i - row*n_used];
+        if ((unsigned) id < (unsigned) E) {
+            atomicAdd(&s_rows[id], 1U);
+        }
+    }
+    __syncthreads();
+    for (int e = tid; e < E; e += blockDim.x) {
+        if (s_rows[e] != 0 && !(slots != nullptr && slots[e] >= 0)) {
+            ub_trace_host(t, s_rows[e], n_rows, why, bytes);
+        }
+    }
+    if (tid == 0) {
+        t[ub_tr_launches] += 1;
+    }
+    __syncthreads();
+}
+
+static __global__ void __launch_bounds__(ub_pool_threads) ub_trace_kernel(unsigned long long * tr, const int32_t * ids, const int n_rows,
+        const int row_stride, const int n_used, const int E, const int32_t * slots, const uint64_t bytes, const int cls, const int why) {
+    __shared__ unsigned int s_rows[ub_pool_max_experts];
+    __shared__ unsigned int s_tr[ub_tr_n];
+    for (int e = threadIdx.x; e < E; e += blockDim.x) { s_rows[e] = 0; }
+    for (int i = threadIdx.x; i < ub_tr_n; i += blockDim.x) { s_tr[i] = 0; }
+    __syncthreads();
+    ub_trace_bypass(s_rows, s_tr, ids, n_rows, row_stride, n_used, E, slots, bytes, why);
+    ub_trace_flush(tr + (size_t) cls*ub_tr_n, s_tr, threadIdx.x, blockDim.x);
+}
+
+// the decision of a step for a distinct expert (s_why)
+enum : uint8_t { uw_none = 0, uw_fill_old, uw_fill_same, uw_fill_other, uw_rej_ghost, uw_rej_noadmit, uw_rej_ring, uw_rej_nohome,
+    uw_rej_slot_old, uw_rej_slot_same };
 
 // ring admission: the layer's bitmap of positions admitted from the ring, into both copies (after the layer's
 // positions changed; every thread of the block calls it, after a barrier)
@@ -201,6 +276,8 @@ static __global__ void __launch_bounds__(ub_pool_threads) ub_step_kernel(const u
     __shared__ int32_t s_victim[ub_pool_max_rcap];
     __shared__ uint64_t s_rank_key[ub_pool_max_rcap];
     __shared__ unsigned int s_rows_w[ub_pool_max_experts];   // ghost filter: the selections (= rows) of the expert in this launch
+    __shared__ uint8_t s_why[ub_pool_max_experts];      // trace: the decision for the expert (uw_*)
+    __shared__ unsigned int s_tr[ub_tr_n];               // trace: the tallies of this launch
     __shared__ uint8_t s_missed[ub_pool_max_experts];   // ghost filter: 1 a miss, 2 an admissible miss it rejected
     __shared__ int8_t  s_pfidx[ub_pool_max_experts];    // prefetch: the arrived staging slot holding the expert, -1
     __shared__ int32_t s_pf_owner[ub_pf_max_slots];
@@ -276,9 +353,18 @@ static __global__ void __launch_bounds__(ub_pool_threads) ub_step_kernel(const u
             }
         }
     }
+    if (a.trace_level != 0) {
+        for (int i = tid; i < ub_tr_n; i += blockDim.x) { s_tr[i] = 0; }
+    }
     __syncthreads();
     const int r = s_r;
     if (r <= 0) {
+        if (a.trace_level >= 2) {
+            for (int e = tid; e < E; e += blockDim.x) { s_rows_w[e] = 0; }
+            __syncthreads();
+            ub_trace_bypass(s_rows_w, s_tr, a.ids, a.n_rows, a.row_stride, a.n_used, E, L.slots, a.pos_bytes, ub_why_notlent);
+            ub_trace_flush(a.tr + (size_t) (L.no_lend ? 1 : 0)*ub_tr_n, s_tr, tid, blockDim.x);
+        }
         return;
     }
     const uint32_t t = s_t;
@@ -290,6 +376,7 @@ static __global__ void __launch_bounds__(ub_pool_threads) ub_step_kernel(const u
         s_key[e] = -1;
         s_missed[e] = 0;
         s_rows_w[e] = 0;
+        s_why[e] = uw_none;
         s_pfidx[e] = -1;
         s_viaring[e] = 0;
     }
@@ -307,7 +394,7 @@ static __global__ void __launch_bounds__(ub_pool_threads) ub_step_kernel(const u
     }
 
     const int n = a.n_rows*a.n_used;
-    if (ghost) {
+    if (ghost || a.trace_level != 0) {
         // an expert two rows of this launch selected has its second access in this step: it passes the filter
         // (the router picks distinct experts within a row, so each selection is one row)
         for (int i = tid; i < n; i += blockDim.x) {
@@ -341,6 +428,8 @@ static __global__ void __launch_bounds__(ub_pool_threads) ub_step_kernel(const u
         if (!a.admit || !ub_admissible(L, id)) {
             if (!(ring_on && a.admit && ub_ring_admissible(L, id))) {
                 if (ghost) { s_missed[id] = 1; }
+                s_why[id] = !a.admit ? uw_rej_noadmit :
+                    (L.serve != nullptr && (L.serve[id/32] & (1u << (id%32))) != 0) ? uw_rej_ring : uw_rej_nohome;
                 continue;
             }
             via_ring = true;
@@ -349,11 +438,17 @@ static __global__ void __launch_bounds__(ub_pool_threads) ub_step_kernel(const u
         const bool staged = pf_on && s_pfidx[id] >= 0;
         if (ghost) {
             // every selection of one expert in this launch reads the same stamp and row count, so they agree
-            if (!staged && s_rows_w[id] < 2 && !ub_ghost_ok(a.last_miss[id], t, (uint32_t) a.ghost)) {
+            const bool gok  = ub_ghost_ok(a.last_miss[id], t, (uint32_t) a.ghost);
+            const bool same = s_rows_w[id] >= 2;
+            if (!staged && !same && !gok) {
                 s_missed[id] = 2;
+                s_why[id] = uw_rej_ghost;
                 continue;
             }
             s_missed[id] = 1;
+            s_why[id] = staged ? uw_fill_other : gok ? uw_fill_old : uw_fill_same;
+        } else {
+            s_why[id] = uw_fill_other;
         }
         if (via_ring) {
             s_viaring[id] = 1;   // every selection of the expert in this launch agrees
@@ -420,6 +515,7 @@ static __global__ void __launch_bounds__(ub_pool_threads) ub_step_kernel(const u
             }
             if (rank >= n_fill) {
                 over++;
+                s_why[s_miss[j]] = s_why[s_miss[j]] == uw_fill_same ? uw_rej_slot_same : uw_rej_slot_old;
                 continue;
             }
             const int p = s_victim[rank];
@@ -473,6 +569,49 @@ static __global__ void __launch_bounds__(ub_pool_threads) ub_step_kernel(const u
     // the tables may be mapped host memory, which the next kernels read
     __threadfence_system();
     __syncthreads();
+    if (a.trace_level != 0) {
+        const bool host_level = a.trace_level >= 2;
+        for (int e = tid; e < E; e += blockDim.x) {
+            const unsigned int rows = s_rows_w[e];
+            if (rows == 0) {
+                continue;
+            }
+            const int c = s_why[e];
+            if (c >= uw_fill_old && c <= uw_fill_other) {
+                atomicAdd(&s_tr[ub_tr_fill_old + c - uw_fill_old], 1u);
+                atomicAdd(&s_tr[ub_tr_use_old + c - uw_fill_old], rows);
+                if (host_level) { atomicAdd(&s_tr[ub_tr_copy_experts], 1u); }
+                continue;
+            }
+            if (c == uw_none && pos_of[e] >= 0 && pos_of[e] < r) {
+                continue;   // a hit
+            }
+            if (L.slots[e] >= 0) {
+                continue;   // static
+            }
+            int why = ub_why_other;
+            switch (c) {
+                case uw_rej_ghost:      atomicAdd(&s_tr[ub_tr_rej_ghost], 1u);      why = ub_why_ghost;   break;
+                case uw_rej_slot_old:   atomicAdd(&s_tr[ub_tr_rej_slot_old], 1u);   why = ub_why_slot;    break;
+                case uw_rej_slot_same:  atomicAdd(&s_tr[ub_tr_rej_slot_same], 1u);  why = ub_why_slot;    break;
+                case uw_rej_ring:       atomicAdd(&s_tr[ub_tr_rej_ring], 1u);       why = ub_why_ring;    break;
+                case uw_rej_nohome:     atomicAdd(&s_tr[ub_tr_rej_nohome], 1u);     why = ub_why_nohome;  break;
+                case uw_rej_noadmit:    atomicAdd(&s_tr[ub_tr_rej_noadmit], 1u);    why = ub_why_noadmit; break;
+                default: break;
+            }
+            if (host_level) {
+                ub_trace_host(s_tr, rows, a.n_rows, why, a.pos_bytes);
+            }
+        }
+        __syncthreads();
+        if (tid == 0) {
+            s_tr[ub_tr_steps] += 1;
+            s_tr[ub_tr_hit_rows] += s_hits;
+            if (host_level) { s_tr[ub_tr_launches] += 1; }
+        }
+        __syncthreads();
+        ub_trace_flush(a.tr + (size_t) (L.no_lend ? 1 : 0)*ub_tr_n, s_tr, tid, blockDim.x);
+    }
     if (ring_on && s_fills != 0) {
         // the positions changed: the tier's publish kernel (next on the stream) and the worker see the new set
         ub_ring_bits(a, pos_of, off, r);
@@ -918,6 +1057,8 @@ ub_pool::~ub_pool() {
     }
     if (h_addr_ != nullptr) { (void) cudaFreeHost(h_addr_); }
     if (h_counters_ != nullptr) { (void) cudaFreeHost(h_counters_); }
+    if (d_trace_ != nullptr) { (void) cudaFree(d_trace_); }
+    if (h_trace_ != nullptr) { (void) cudaFreeHost(h_trace_); }
     if (h_live_ != nullptr) { (void) hipHostFree(h_live_); }
     if (pf_alloc_ != nullptr) { (void) cudaFree(pf_alloc_); }
     if (pf_staging_ != nullptr) { (void) cudaFree(pf_staging_); }
@@ -1011,6 +1152,15 @@ bool ub_pool::allocate(int device, const std::vector<ub_pool_layer> & layers,
     CUDA_CHECK(cudaMemcpy(d_meta_, meta.data(), L*sizeof(ub_pool_meta), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMallocHost((void **) &h_addr_, P*3*sizeof(uint64_t)));
     CUDA_CHECK(cudaMallocHost((void **) &h_counters_, ub_pool_n_counters*sizeof(unsigned long long)));
+    {
+        const ub_pool_config tc = ub_pool_config_from_env();
+        trace_level_ = tc.trace != 0 ? 2 : tc.log ? 1 : 0;
+        if (trace_level_ != 0) {
+            CUDA_CHECK(cudaMalloc((void **) &d_trace_, 2*ub_tr_n*sizeof(unsigned long long)));
+            CUDA_CHECK(cudaMemset(d_trace_, 0, 2*ub_tr_n*sizeof(unsigned long long)));
+            CUDA_CHECK(cudaMallocHost((void **) &h_trace_, 2*ub_tr_n*sizeof(unsigned long long)));
+        }
+    }
     // the per-layer counts the host reads without a synchronize (read_live); without them only read_live fails
     if (hipHostMalloc((void **) &h_live_, L*sizeof(ub_pool_live), hipHostMallocMapped | hipHostMallocCoherent) == hipSuccess) {
         memset(h_live_, 0, L*sizeof(ub_pool_live));
@@ -1171,6 +1321,8 @@ void ub_pool::launch_step(int layer, const int32_t * ids, int n_rows, int row_st
     a.prof_bank_stride = prof_bank_stride;
     a.prof_n_banks     = prof_n_banks;
     a.prof_selection   = prof_selection;
+    a.tr               = d_trace_;
+    a.trace_level      = trace_level_;
     const ggml_cuda_kernel_launch_params launch(dim3(1), dim3(ub_pool_threads), 0, stream);
     ggml_cuda_kernel_launch(ub_step_kernel, launch, a);
 }
@@ -1378,6 +1530,29 @@ bool ub_pool::read_counters(std::array<uint64_t, ub_pool_n_counters> & out) cons
         out[(size_t) i] = v[i];
     }
     return true;
+}
+
+bool ub_pool::read_trace(std::vector<uint64_t> & out) const {
+    if (blob_ == nullptr || d_trace_ == nullptr || h_trace_ == nullptr) {
+        return false;
+    }
+    ggml_cuda_set_device(device_);
+    if (cudaMemcpy(h_trace_, d_trace_, 2*ub_tr_n*sizeof(unsigned long long), cudaMemcpyDeviceToHost) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return false;
+    }
+    out.assign(h_trace_, h_trace_ + 2*ub_tr_n);
+    return true;
+}
+
+void ub_pool::launch_trace(const int32_t * ids, int n_rows, int row_stride, int n_used, const int32_t * slots, size_t bytes, int cls,
+        int reason, cudaStream_t stream) {
+    if (trace_level_ < 2 || d_trace_ == nullptr || n_rows*n_used <= 0) {
+        return;
+    }
+    const ggml_cuda_kernel_launch_params launch(dim3(1), dim3(ub_pool_threads), 0, stream);
+    ggml_cuda_kernel_launch(ub_trace_kernel, launch, d_trace_, ids, n_rows, row_stride, n_used, n_experts_, slots, (uint64_t) bytes,
+        cls != 0 ? 1 : 0, reason);
 }
 
 bool ub_pool::read_live(uint64_t & hits, uint64_t & fills, uint64_t & fill_bytes) const {
