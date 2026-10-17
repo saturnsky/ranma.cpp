@@ -455,31 +455,177 @@ double common_spec_verify_cost::prior_at(const std::vector<double> & c, int32_t 
     return c.back() + step * (double) (rows - (int32_t) c.size());
 }
 
-std::vector<double> common_spec_verify_cost::blend_ms(const std::vector<double> & prior_ms, int32_t n_rows) const {
+// The widths are smoothed in segments. A segment is a run of widths whose cost is expected to rise with the width:
+// neither the neighbour ratios nor the monotone projection cross the border, so a real step or a fall across it
+// stays. The border is after the 8th row: the EXL3 GEMV of the target (ggml-cuda/mul-mat-had.cu, MMH_GEMV_TOKENS)
+// takes at most 8 rows and the 9th row goes to another kernel. A constant of the learner, not a backend contract.
+static constexpr int32_t VC_SEG_ROWS = 8;
+static constexpr double  VC_MIN_W    = 1e-6; // weight of a width without a confidence (projection only)
+
+// the weighted isotonic (non-decreasing) fit of v[0..n) by w, in place (pool adjacent violators). The three scratch
+// arrays hold n values each.
+static void vc_pav(double * v, const double * w, int32_t n, double * bv, double * bw, int32_t * bc) {
+    int32_t nb = 0;
+    for (int32_t i = 0; i < n; ++i) {
+        bv[nb] = v[i];
+        bw[nb] = std::max(w[i], 1e-12);
+        bc[nb] = 1;
+        ++nb;
+        while (nb > 1 && bv[nb - 2] > bv[nb - 1]) {
+            const double sw = bw[nb - 2] + bw[nb - 1];
+            bv[nb - 2] = (bv[nb - 2] * bw[nb - 2] + bv[nb - 1] * bw[nb - 1]) / sw;
+            bw[nb - 2] = sw;
+            bc[nb - 2] += bc[nb - 1];
+            --nb;
+        }
+    }
+    int32_t i = 0;
+    for (int32_t b = 0; b < nb; ++b) {
+        for (int32_t c = 0; c < bc[b]; ++c) {
+            v[i++] = bv[b];
+        }
+    }
+}
+
+void common_spec_verify_cost::weighted_pav(std::vector<double> & v, const std::vector<double> & w) {
+    const int32_t n = (int32_t) std::min(v.size(), w.size());
+    std::vector<double>  bv(n), bw(n);
+    std::vector<int32_t> bc(n);
+    vc_pav(v.data(), w.data(), n, bv.data(), bw.data(), bc.data());
+}
+
+std::vector<double> common_spec_verify_cost::smooth_table(const std::vector<double> & prior, double unit,
+                                                          int32_t n_rows) const {
+    const int32_t R = cfg.r_max;
     std::vector<double> out(std::max<int32_t>(n_rows, 0));
-    if (!(level_cell.mean > 0.0)) {
+    if (!prior.empty() && !(level_cell.mean > 0.0)) {
         for (int32_t r = 1; r <= n_rows; ++r) {
-            out[r - 1] = prior_at(prior_ms, r); // nothing observed: the prior
+            out[r - 1] = prior_at(prior, r); // nothing observed: the prior
         }
         return out;
     }
-    const std::vector<double> eff = eff_table_m(cfg.r_max);
-    // the prior curve at the level of r = 1, by the weight of that estimate
-    const double p1 = prior_at(prior_ms, 1);
-    const double n1 = conf(shape_cells[0]);
-    const double w1 = n1 / (n1 + cfg.prior_n);
-    const double s  = p1 > 0.0 && n1 > 0.0 ? w1 * (eff[0] / 1000.0) / p1 + (1.0 - w1) : 1.0;
-    for (int32_t r = 1; r <= n_rows; ++r) {
-        const double pr = prior_at(prior_ms, r) * s;
-        if (r > cfg.r_max) {
-            out[r - 1] = pr;
-            continue;
+    // a usable prior is positive and finite over the whole learner width; else the estimates are only projected
+    bool use_prior = !prior.empty();
+    for (int32_t r = 1; r <= R && use_prior; ++r) {
+        const double p = prior_at(prior, r);
+        use_prior = std::isfinite(p) && p > 0.0;
+    }
+    const std::vector<double> eff = eff_table_m(R);
+    const double k = std::max(cfg.prior_n, 0.0);
+
+    // scratch of the whole width (no allocation for the usual widths)
+    double  stack_d[6 * 16];
+    int32_t stack_i[2 * 16];
+    std::vector<double>  heap_d;
+    std::vector<int32_t> heap_i;
+    double  * d  = stack_d;
+    int32_t * ix = stack_i;
+    if (R > 16) {
+        heap_d.resize(6 * (size_t) R);
+        heap_i.resize(2 * (size_t) R);
+        d  = heap_d.data();
+        ix = heap_i.data();
+    }
+    double * n  = d;         // confidence of the shape
+    double * B  = d + R;     // the table before the projection
+    double * W  = d + 2 * R; // weight of the projection
+    double * s0 = d + 3 * R; // projection scratch
+    double * s1 = d + 4 * R;
+    int32_t * lft = ix;      // nearest width with a confidence on the left / right inside the segment, -1: none
+    int32_t * rgt = ix + R;
+
+    for (int32_t i = 0; i < R; ++i) {
+        n[i] = conf(shape_cells[i]);
+    }
+
+    // a segment without any observation keeps the prior curve at the level of r = 1 (by the weight of that estimate)
+    double s = 1.0;
+    if (use_prior && n[0] > 0.0) {
+        const double w1 = n[0] / (n[0] + cfg.prior_n);
+        s = w1 * (eff[0] / unit) / prior_at(prior, 1) + (1.0 - w1);
+    }
+
+    for (int32_t lo = 0; lo < R;) {
+        const int32_t hi = lo < VC_SEG_ROWS ? std::min(VC_SEG_ROWS, R) : R;
+        int32_t last = -1;
+        bool any = false;
+        for (int32_t i = lo; i < hi; ++i) {
+            lft[i] = last;
+            if (n[i] > 0.0) {
+                last = i;
+                any = true;
+            }
         }
-        const double n = conf(shape_cells[r - 1]);
-        const double w = n > 0.0 ? n / (n + cfg.prior_n) : 0.0;
-        out[r - 1] = w * (eff[r - 1] / 1000.0) + (1.0 - w) * pr;
+        last = -1;
+        for (int32_t i = hi - 1; i >= lo; --i) {
+            rgt[i] = last;
+            if (n[i] > 0.0) {
+                last = i;
+            }
+        }
+        for (int32_t i = lo; i < hi; ++i) {
+            const double E = eff[i] / unit;
+            if (!use_prior) {
+                B[i] = E;
+                W[i] = std::max(n[i], VC_MIN_W);
+                continue;
+            }
+            const double P = prior_at(prior, i + 1);
+            // the ratio observed / prior of the nearest observed widths of the segment (self excluded), weighted by
+            // the distance (linear) and the confidence; what is borrowed adds nothing to the confidence of i
+            double b = 1.0;
+            if (!any) {
+                b = s;
+            } else {
+                const int32_t l = lft[i];
+                const int32_t g = rgt[i];
+                double lw = 0.0, gw = 0.0;
+                if (l >= 0 && g >= 0) {
+                    lw = (double) (g - i) / (double) (g - l);
+                    gw = (double) (i - l) / (double) (g - l);
+                } else if (l >= 0) {
+                    lw = 1.0;
+                } else if (g >= 0) {
+                    gw = 1.0;
+                }
+                double num = k, den = k;
+                if (lw > 0.0) {
+                    num += lw * n[l] * (eff[l] / unit) / prior_at(prior, l + 1);
+                    den += lw * n[l];
+                }
+                if (gw > 0.0) {
+                    num += gw * n[g] * (eff[g] / unit) / prior_at(prior, g + 1);
+                    den += gw * n[g];
+                }
+                b = den > 0.0 ? num / den : 1.0;
+            }
+            B[i] = n[i] + k > 0.0 ? (n[i] * E + k * P * b) / (n[i] + k) : P * b;
+            W[i] = std::max(n[i] + k, VC_MIN_W);
+        }
+        // the right neighbours are dead here: their storage holds the block counts of the projection
+        vc_pav(B + lo, W + lo, hi - lo, s0, s1, rgt + lo);
+        lo = hi;
+    }
+
+    for (int32_t r = 1; r <= n_rows; ++r) {
+        if (r <= R) {
+            out[r - 1] = B[r - 1];
+        } else if (use_prior) {
+            // beyond the learner: the prior goes on at the ratio of the last width, never falling
+            out[r - 1] = std::max(out[r - 2], B[R - 1] * prior_at(prior, r) / prior_at(prior, R));
+        } else {
+            out[r - 1] = B[R - 1]; // as eff_table_m()
+        }
     }
     return out;
+}
+
+std::vector<double> common_spec_verify_cost::blend_ms(const std::vector<double> & prior_ms, int32_t n_rows) const {
+    return smooth_table(prior_ms, 1000.0, n_rows);
+}
+
+std::vector<double> common_spec_verify_cost::smooth_us(int32_t n_rows) const {
+    return smooth_table({}, 1.0, n_rows);
 }
 
 std::string common_spec_verify_cost::summary() const {

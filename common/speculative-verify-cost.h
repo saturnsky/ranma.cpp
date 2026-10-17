@@ -141,10 +141,24 @@ struct common_spec_verify_cost {
     std::vector<double> aux_table_m(int32_t n) const;  // aux by m, 0 where nothing is known
     std::vector<double> eff_table_m(int32_t n) const;  // core + aux by m
 
-    // a prior table (ms per row count, index rows - 1; the last step goes on beyond it) blended with the estimates:
-    // C(r) = w eff(r) + (1 - w) prior(r) s, w = n / (n + prior_n) with n the shape confidence of r, and s the prior
-    // rescaled to the level of r = 1 (by its own weight). Before any observation: the prior. Rows 1 .. n_rows, ms
+    // The looked-up cost of the target call, smoothed over the widths (a lookup only: the cells, the confidences, the
+    // observations and the store are not changed). The widths are smoothed in segments (the border after the 8th row,
+    // VC_SEG_ROWS in the .cpp); nothing is borrowed or projected across it. Inside a segment:
+    //  - a prior table (ms per row count, index rows - 1; the last step goes on beyond it) is blended with the estimates:
+    //    B(r) = (n E(r) + k P(r) b(r)) / (n + k), E = core + aux, n the shape confidence of r, k = prior_n, and b(r) the
+    //    ratio estimate / prior of the nearest observed width on each side of r (self excluded; linear distance weights,
+    //    confidence weights, k votes of 1); 1 where there is no neighbour. A segment without any observation keeps the
+    //    prior at the level of r = 1 (by its weight). What is borrowed does not add to n.
+    //  - a non-decreasing fit of B, weighted by n + k (pool adjacent violators), makes the table rise with the width.
+    // Without a prior (or one that is not positive and finite over r_max) B = E, weighted by n. Before any observation
+    // with a prior: the prior. The whole width r_max is computed once and rows 1 .. n_rows are its prefix (beyond r_max:
+    // the prior at the ratio of the last width, never falling; without a prior the last value). Rows 1 .. n_rows, ms
     std::vector<double> blend_ms(const std::vector<double> & prior_ms, int32_t n_rows) const;
+    // the same function without a prior, in us (--spec-smart): only the unit differs
+    std::vector<double> smooth_us(int32_t n_rows) const;
+    std::vector<double> smooth_table(const std::vector<double> & prior, double unit, int32_t n_rows) const; // unit: us per table unit
+    // the weighted non-decreasing fit in place (pool adjacent violators): the weighted mean is kept
+    static void weighted_pav(std::vector<double> & v, const std::vector<double> & w);
     static double prior_at(const std::vector<double> & prior_ms, int32_t rows);
     void set_log_prior(const std::vector<double> & prior_ms) { log_prior = prior_ms; } // round log only
 

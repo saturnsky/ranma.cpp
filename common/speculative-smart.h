@@ -5,6 +5,7 @@
 // See docs/ranma/spec-smart.md. This file has no llama dependency, so that the controller can be tested on the CPU.
 
 #include "speculative-tprof.h"
+#include "speculative-verify-cost.h"
 
 #include <algorithm>
 #include <cmath>
@@ -117,35 +118,9 @@ struct common_spec_smart_graphs {
     common_spec_smart_graph dft;
 };
 
-// decayed mean over time: the weight of an observation halves every half_life closed rounds of the controller,
-// whether or not the cell is observed. The decay is lazy: n is the confidence at round t and is read as
-// n * decay^(now - t). Time lowers only the confidence; the mean and the variance change only with a new observation.
-// The variance is the weighted (population) variance of the same decayed weights, kept by weighted Welford. Since all
-// weights decay by the same factor, the variance itself does not change with time.
-struct common_spec_smart_cell {
-    double  mean = 0.0;
-    double  n    = 0.0; // virtual observations (confidence) at round t
-    int64_t t    = 0;   // round of the last update
-    double  var  = 0.0; // weighted variance of the observations
-
-    double n_at(int64_t now, double decay) const {
-        return now > t ? n * std::pow(decay, (double) (now - t)) : n;
-    }
-
-    void add(double x, double decay, int64_t now) {
-        const double w0 = n_at(now, decay);
-        n = w0 + 1.0;
-        t = std::max(t, now);
-        const double d = x - mean;
-        mean += d / n;
-        var = std::max(0.0, (w0 * var + d * (x - mean)) / n);
-    }
-
-    void cap(double c, double decay, int64_t now) {
-        n = std::min(n_at(now, decay), c);
-        t = std::max(t, now);
-    }
-};
+// decayed mean (common_spec_cost_cell): the clock of the calibration cells and of the draft step is the controller's
+// closed rounds
+using common_spec_smart_cell = common_spec_cost_cell;
 
 // trigram counts of one request: the next tokens after every two-token context of its prompt and generated tokens,
 // counted apart by the role of the next token (common_spec_roles: ASSIST, OTHER)
@@ -219,7 +194,10 @@ struct common_spec_smart {
     static constexpr int32_t N_QBAR_MAX = 16; // mean acceptance per position 0..n_max, the last cell for all beyond
     using tconf_pos = common_spec_tconf_pos;
 
-    common_spec_smart(const common_spec_smart_config & cfg, int32_t n_seq);
+    // shared: the verification cost of the target shared by the drafters (common_speculative); the controller reads it
+    // and never observes it (the caller measures the target calls). nullptr: the controller keeps its own, observed at
+    // close_round from the time since drafted() (the round protocol below; the CPU tests)
+    common_spec_smart(const common_spec_smart_config & cfg, int32_t n_seq, common_spec_verify_cost * shared = nullptr);
     ~common_spec_smart();
 
     common_spec_smart(const common_spec_smart &) = delete;
@@ -228,6 +206,8 @@ struct common_spec_smart {
     // round protocol, per sequence, all times in microseconds:
     //   request_begin   at the start of a generation (drops an unfinished round, shrinks the calibration confidence)
     //   close_round     when the sequence drafts again: the time since drafted() is the verification of the last round
+    //                   (with a shared cost: the end of the round only; the caller closes it where any drafter starts
+    //                   the next round of the sequence)
     //   begin_round     before the first draft step; false: draft nothing (k = 0)
     //   after_step      after each draft step with its top probability; -1: one more step, else keep that many tokens
     //   drafted         with the final draft length
@@ -306,15 +286,16 @@ struct common_spec_smart {
     // again with the costs of now (each block decided as after its forward, the draft step added); -1: none kept
     double  block_value(int32_t seq, int32_t n_lim) const;
 
-    std::vector<double> cost_table() const; // predicted verification time per width 0..n_max: level x shape
+    std::vector<double> cost_table() const; // predicted time of a round per width 0..n_max: level x shape (the target
+                                            // call) + the rest of the round (a shared cost only)
     double cost(int32_t k) const { return cost_table()[k]; }
     double q(int32_t i, float p) const;     // calibrated acceptance of a draft token at position i with top probability p
     double qbar(int32_t i) const;           // mean acceptance at position i (lookahead for steps not drafted yet)
     double lookahead(int32_t j, const float * p, int32_t n_drafted, const double * qd = nullptr) const; // predicted acceptance at position j >= n_drafted
     double draft_step() const;              // time of one draft step (its mean)
-    double conf(const common_spec_smart_cell & c) const { return c.n_at(n_closed, decay); } // confidence now
-    double level_conf() const { return level_cell.n_at(n_closed, level_decay); }            // confidence of the level
-    double level() const { return level_cell.mean; }                                         // 0: not set yet
+    double conf(const common_spec_smart_cell & c) const { return c.n_at(n_closed, decay); } // confidence now (calibration)
+    double level_conf() const { return vc->level_conf(); }                                   // confidence of the level
+    double level() const { return vc->level(); }                                             // 0: not set yet
     bool   level_source(int32_t k) const;   // an observation of width k updates the level
     double wait_conf(int32_t w) const;      // shape confidence of width w capped at conf_cap: decides the wait only
     bool   waiting(int32_t w) const;        // width w has a wait confidence below reprobe_n (waits for an extension)
@@ -338,33 +319,41 @@ struct common_spec_smart {
     int32_t bin(float p) const;
 
     common_spec_smart_config cfg;
-    double decay;       // per closed round
-    double level_decay; // per closed round, for the level
+
+    // the verification cost: shared (vc_own empty) or the controller's own (vc = vc_own). The members below until
+    // pool_since_lend are its fields; with its own, n_closed is its clock as well
+    std::unique_ptr<common_spec_verify_cost> vc_own;
+    common_spec_verify_cost *                vc;
+    bool shared() const { return vc_own == nullptr; }
+    int64_t n_closed_own = 0;
+
+    double decay;        // per closed round (calibration, draft step; with its own cost: the shape as well)
+    double & level_decay; // per tick of the cost clock, for the level
 
     // verification time of width k = level x shape[k]. The level follows fast the change common to all widths, the
-    // shape (ratio of the widths) slowly.
-    common_spec_smart_cell              level_cell;  // us; mean 0: not set (the first observation sets it)
-    std::vector<common_spec_smart_cell> shape_cells; // [n_max + 1], time / level per width; n 0: no value
-    std::vector<double>                 shape_over;  // [n_max + 1], confidence of the shape above the wait confidence
-                                                     // at the round of the cell (wait = n - over, decays alike)
+    // shape (ratio of the widths) slowly. Indexed by the draft length k = rows - 1.
+    common_spec_smart_cell &              level_cell;  // us; mean 0: not set (the first observation sets it)
+    std::vector<common_spec_smart_cell> & shape_cells; // [n_max + 1 or more], time / level per width; n 0: no value
+    std::vector<double> &                 shape_over;  // confidence of the shape above the wait confidence at the
+                                                       // tick of the cell (wait = n - over, decays alike)
+    std::vector<int64_t> & cost_n_run;   // verification times observed by this process per width
+    std::vector<uint8_t> & used_run;     // width verified once by this process: its first time is not observed
+    int64_t & n_closed;     // the clock of the decay: closed rounds of this process (0 when the store is loaded)
+    int64_t & n_wait_reset; // observations of a waiting width: the old mean counted with the wait confidence
+    bool    & wr_last;      // the last observe_cost() was one (round log)
+    double  & wr_n_before;  // ... the confidence of the mean before it and after the cut (before the observation)
+    double  & wr_n_after;
+    uint64_t & pool_lends;  // the lend count at the last close_round
+    int64_t  & pool_since_lend; // closed rounds since the last lend (0: a lend in this round), -1: none seen
+
     int32_t                             n_groups;   // position groups of the calibration (cfg.n_groups)
     std::vector<common_spec_smart_cell> cal_cells;  // [n_groups * n_bins], acceptance per position group and bin
     std::vector<common_spec_smart_cell> qbar_cells; // [min(n_max + 1, N_QBAR_MAX)], acceptance per position
     common_spec_smart_cell              draft_cell; // time of one draft step; never stored
 
-    std::vector<int64_t> cost_n_run;     // verification times observed by this process per width
-    std::vector<uint8_t> used_run;       // width verified (closed) once by this process: its first time is not observed
-
     bool    store_loaded = false;
-    int64_t n_closed     = 0; // the clock of the decay: closed rounds of this process (0 when the store is loaded)
     int64_t n_extend     = 0; // rounds extended by one width to verify a waiting width
-    int64_t n_wait_reset = 0; // observations of a waiting width: the old mean counted with the wait confidence
-    bool    wr_last      = false; // the last observe_cost() was one (round log)
-    double  wr_n_before  = 0.0;   // ... the confidence of the mean before it and after the cut (before the observation)
-    double  wr_n_after   = 0.0;
     int64_t last_extend  = 0; // n_closed at the last one
-    uint64_t pool_lends  = 0;  // the lend count at the last close_round
-    int64_t pool_since_lend = -1; // closed rounds since the last lend (0: a lend in this round), -1: none seen
     int64_t n_closed_saved = 0;
     bool    save_failed  = false;
 
