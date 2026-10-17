@@ -25,6 +25,8 @@
 #include "llama.h"
 #include "llama-cpp.h"
 #include "../src/llama-ext.h"
+#include "ggml-expert.h"
+#include "../ggml/src/ggml-cuda/expert-lend.h"
 
 #include <algorithm>
 #include <chrono>
@@ -269,6 +271,7 @@ static int g_carried_max = 0; // the most carried tensors a layer-major prefill 
 static int g_groups_max = 0;
 static int g_bundles = 0;     // layer-major prefills that ran the MoE in bundles
 static int g_split   = 0;     // layer-major prefills whose width rule split the batch into narrower ubatches
+static int g_passes_last = 0; // the passes of the last layer-major prefill (layer_exec_passes)
 static int g_edges_cut = 0;   // layer-major prefills whose edge slots were lent in pieces of ubatches (layer_exec_lend)
 
 static int g_tail_exact_n = 0;  // dsv41_tail_log lines of an exact tail
@@ -300,6 +303,9 @@ static void log_cb(ggml_log_level level, const char * text, void * /*user*/) {
                 n_cut > 0 && n_edge > (size_t) n_slots) {
             g_edges_cut++;
         }
+    }
+    if (const char * ps = strstr(text, "layer_exec_passes: ")) {
+        if (const char * ti = strstr(ps, " tokens in ")) { g_passes_last = atoi(ti + strlen(" tokens in ")); }
     }
     if (strstr(text, "layer_exec_passes: ") != nullptr && strstr(text, "ubatch 768 of the context's 1024") != nullptr) {
         g_split++;
@@ -1014,6 +1020,201 @@ static bool scenario_garble(const std::vector<llama_token> & toks, int n, int g_
     return d_block(ctx_dft.get(), toks[n], n, 0, res);
 }
 
+// A lease mock: the prefill lend of a joint expert cache (the target's class and the draft's), with the planner of the
+// CUDA cache (expert-lend.h) over byte arenas, given to the layer-major prefill of the CPU fixture in place of its own
+// host buffers (llama_layer_exec_set_test_lend). Every slot holds a resident with its own bytes or is empty; a lease
+// evicts the lowest ranked residents of both classes, moves the kept ones above the new top down, writes zero heads and
+// fills the rest of each lent region with a canary; the release checks that the residents, the zero heads and the
+// canaries outside the pieces are untouched (a write out of a piece shows), and that it comes once per lease.
+struct lmock_t {
+    std::vector<ggml_cuda_expert::lend_class> shape;          // kind_bytes, guard, slots per class (no residents)
+    std::vector<std::vector<std::vector<uint8_t>>> arena;     // [class][kind]
+    std::vector<std::vector<int>> own;                        // [class][slot] resident id, -1 empty
+    std::vector<uint64_t> score;                              // [id]
+    std::vector<int> id_class;                                // [id]
+    bool held = false;
+    int acquires = 0, releases = 0, refused_held = 0, release_unheld = 0, fits_calls = 0, evicted = 0, moved = 0;
+    bool intact = true;
+    std::string why;
+    std::vector<ggml_backend_buffer_t> bufs;
+    std::vector<std::pair<size_t, size_t>> piece_at[2][3];    // [class][kind] (offset, bytes) of the held pieces
+    std::vector<int> limit;
+
+    static uint8_t pat(int id, int k, size_t i) { return (uint8_t) (((size_t) id*97u + (size_t) k*13u + i*5u) ^ 0xA5u); }
+    void write(int c, int slot, int id) {
+        for (int k = 0; k < 3; k++) {
+            const size_t b = shape[(size_t) c].kind_bytes[(size_t) k];
+            for (size_t i = 0; i < b; i++) { arena[(size_t) c][(size_t) k][(size_t) slot*b + i] = pat(id, k, i); }
+        }
+    }
+    bool holds(int c, int slot, int id) const {
+        for (int k = 0; k < 3; k++) {
+            const size_t b = shape[(size_t) c].kind_bytes[(size_t) k];
+            for (size_t i = 0; i < b; i++) {
+                if (arena[(size_t) c][(size_t) k][(size_t) slot*b + i] != pat(id, k, i)) { return false; }
+            }
+        }
+        return true;
+    }
+    // what lend_classes_locked gives the planner: the residents (layer = class, expert = id), the empty slots as tier 0
+    std::vector<ggml_cuda_expert::lend_class> classes() const {
+        std::vector<ggml_cuda_expert::lend_class> out = shape;
+        for (size_t c = 0; c < out.size(); c++) {
+            for (int s = 0; s < out[c].slots; s++) {
+                ggml_cuda_expert::lend_resident r;
+                r.slot = s;
+                if (own[c][(size_t) s] < 0) {
+                    r.layer = -1 - (int) c; r.expert = s; r.tier = 0;
+                } else {
+                    r.layer = (int) c; r.expert = own[c][(size_t) s]; r.score = score[(size_t) own[c][(size_t) s]];
+                }
+                out[c].residents.push_back(r);
+            }
+        }
+        return out;
+    }
+    void init(uint64_t seed, size_t capacity) {
+        *this = lmock_t();
+        std::mt19937 rng((uint32_t) seed);
+        // the target's class holds three quarters in about 160 slots, the draft's a quarter in about 120 (slots small next to
+        // the pieces, so a lease keeps some residents above its top and moves them down)
+        const size_t B0 = std::max<size_t>(1024, capacity*3/4/(4*160)/256*256), B1 = std::max<size_t>(512, capacity/4/(2*120)/256*256);
+        const int s0 = (int) (capacity*3/4/(4*B0)) + 1, s1 = (int) (capacity/4/(2*B1)) + 1;
+        shape.resize(2);
+        shape[0].kind_bytes = { B0, B0, 2*B0 }; shape[0].guard = { 256, 256, 256 }; shape[0].slots = s0;
+        shape[1].kind_bytes = { B1, B1, 2*B1 }; shape[1].guard = { 256, 256, 256 }; shape[1].slots = s1;
+        arena.resize(2);
+        own.resize(2);
+        for (int c = 0; c < 2; c++) {
+            for (int k = 0; k < 3; k++) { arena[(size_t) c].push_back(std::vector<uint8_t>((size_t) shape[(size_t) c].slots*shape[(size_t) c].kind_bytes[(size_t) k], 0)); }
+            own[(size_t) c].assign((size_t) shape[(size_t) c].slots, -1);
+            for (int s = 0; s + 1 < shape[(size_t) c].slots; s++) {   // the top slot of each class empty (a spare)
+                const int id = (int) score.size();
+                score.push_back(rng() % 1000);
+                id_class.push_back(c);
+                own[(size_t) c][(size_t) s] = id;
+                write(c, s, id);
+            }
+        }
+        limit = { s0, s1 };
+    }
+    void fail(const std::string & w) { if (intact) { why = w; } intact = false; }
+    void check_residents() {
+        for (int c = 0; c < 2; c++) {
+            for (int s = 0; s < shape[(size_t) c].slots; s++) {
+                const int id = own[(size_t) c][(size_t) s];
+                if (id >= 0 && !holds(c, s, id)) { fail("resident " + std::to_string(id) + " lost its bytes"); }
+            }
+        }
+    }
+    bool fits(const ggml_expert_lend_request * rq) {
+        fits_calls++;
+        std::vector<size_t> pieces;
+        for (int i = 0; i < rq->n_pieces; i++) { pieces.push_back(rq->pieces[i].bytes); }
+        return ggml_cuda_expert::plan_l1_lend(classes(), pieces, 256).ok;
+    }
+    bool acquire(const ggml_expert_lend_request * rq, ggml_expert_lend_grant * out) {
+        if (held) { refused_held++; return false; }
+        std::vector<size_t> pieces;
+        for (int i = 0; i < rq->n_pieces; i++) { pieces.push_back(rq->pieces[i].bytes); }
+        const auto cls = classes();
+        const ggml_cuda_expert::lend_l1_plan p = ggml_cuda_expert::plan_l1_lend(cls, pieces, 256);
+        if (!p.ok) { return false; }
+        // the victims leave; the kept residents at or above the new top move into the freed slots below it
+        for (const auto & v : p.victims) {
+            if (v.layer < 0) { continue; }
+            own[(size_t) v.layer][(size_t) v.slot] = -1;
+            evicted++;
+        }
+        for (int c = 0; c < 2; c++) {
+            int next = 0;
+            for (int s = p.limit[(size_t) c]; s < shape[(size_t) c].slots; s++) {
+                const int id = own[(size_t) c][(size_t) s];
+                if (id < 0) { continue; }
+                while (next < p.limit[(size_t) c] && own[(size_t) c][(size_t) next] >= 0) { next++; }
+                if (next >= p.limit[(size_t) c]) { fail("no free slot below the top"); return false; }
+                write(c, next, id);
+                own[(size_t) c][(size_t) next] = id;
+                own[(size_t) c][(size_t) s] = -1;
+                moved++;
+            }
+        }
+        check_residents();
+        // zero heads, the canary over the lent regions, then the pieces
+        for (int c = 0; c < 2; c++) {
+            for (int k = 0; k < 3; k++) {
+                piece_at[c][k].clear();
+                const size_t b = shape[(size_t) c].kind_bytes[(size_t) k];
+                auto & a = arena[(size_t) c][(size_t) k];
+                const size_t top = (size_t) p.limit[(size_t) c]*b;
+                if (p.limit[(size_t) c] >= shape[(size_t) c].slots) { continue; }
+                std::fill(a.begin() + (ptrdiff_t) top, a.begin() + (ptrdiff_t) (top + 256), 0);
+                std::fill(a.begin() + (ptrdiff_t) (top + 256), a.end(), 0xEE);
+            }
+        }
+        memset(out, 0, sizeof(*out));
+        bufs.clear();
+        for (int i = 0; i < rq->n_pieces; i++) {
+            if (pieces[(size_t) i] == 0) { continue; }
+            const auto & f = p.fits[(size_t) i];
+            const auto & r = p.regions[(size_t) f.region];
+            uint8_t * at = arena[(size_t) r.cls][(size_t) r.kind].data() + r.begin + f.offset;
+            out->buffers[i] = ggml_backend_cpu_buffer_from_ptr(at, pieces[(size_t) i]);
+            bufs.push_back(out->buffers[i]);
+            piece_at[r.cls][r.kind].push_back({ r.begin + f.offset, pieces[(size_t) i] });
+        }
+        limit = p.limit;
+        held = true;
+        acquires++;
+        return true;
+    }
+    bool release() {
+        if (!held) { release_unheld++; return false; }
+        for (ggml_backend_buffer_t b : bufs) { ggml_backend_buffer_free(b); }
+        bufs.clear();
+        check_residents();
+        for (int c = 0; c < 2; c++) {
+            for (int k = 0; k < 3; k++) {
+                if (limit[(size_t) c] >= shape[(size_t) c].slots) { continue; }
+                const size_t b = shape[(size_t) c].kind_bytes[(size_t) k];
+                const auto & a = arena[(size_t) c][(size_t) k];
+                const size_t top = (size_t) limit[(size_t) c]*b;
+                for (size_t i = top; i < top + 256; i++) { if (a[i] != 0) { fail("a zero head was written"); } }
+                for (size_t i = top + 256; i < a.size(); i++) {
+                    bool in = false;
+                    for (const auto & pa : piece_at[c][k]) { in = in || (i >= pa.first && i < pa.first + pa.second); }
+                    if (!in && a[i] != 0xEE) { fail("a write outside the pieces"); break; }
+                }
+            }
+        }
+        held = false;
+        releases++;
+        return true;
+    }
+};
+
+static lmock_t g_lmock;
+static bool lm_fits(ggml_backend_t, const ggml_expert_lend_request * rq) { return g_lmock.fits(rq); }
+static bool lm_acquire(ggml_backend_t, const ggml_expert_lend_request * rq, ggml_expert_lend_grant * out) { return g_lmock.acquire(rq, out); }
+static bool lm_release(ggml_backend_t) { return g_lmock.release(); }
+static bool lm_counts(ggml_expert_lend_counts * out) {
+    memset(out, 0, sizeof(*out));
+    size_t total = 0, largest = 0;
+    ggml_cuda_expert::lend_l1_capacity(g_lmock.classes(), { 0, 0 }, total, largest);
+    out->lendable_bytes = total;
+    return true;
+}
+static ggml_expert_iface make_lmock_iface() {
+    ggml_expert_iface f;
+    memset(&f, 0, sizeof(f));
+    f.abi_version  = GGML_EXPERT_ABI_VERSION;
+    f.lend_fits    = lm_fits;
+    f.lend_acquire = lm_acquire;
+    f.lend_release = lm_release;
+    f.lend_counts  = lm_counts;
+    return f;
+}
+
 int main(int argc, char ** argv) {
     uint64_t seed = 1234;
     std::string keep;
@@ -1270,6 +1471,44 @@ int main(int argc, char ** argv) {
             expect("the window prompt ran layer-major" + tag, r2.layer_runs == 1);
             printf("dspark%s: tail lines w1 %d w2 %d, layer-major runs w2 %d\n", tag.c_str(), r1.tail_exact,
                    r2.tail_exact, r2.layer_runs);
+            // the lease mock of a joint cache: an L1 that holds a pass of about 2/3 of the prompt, so the width rule
+            // narrows it to two passes; the logits stay those of the ubatch loop bit for bit
+            if (n == 1000) {
+                size_t cap = 0;
+                {
+                    cfg_t c; c.n_ubatch = w2.ub; c.n_batch = 4096; c.n_rs = 5; c.layer = true;
+                    auto cx = make_ctx(c);
+                    uint64_t out[2] = { 0, 0 };
+                    if (cx && llama_layer_exec_lend_bytes(cx.get(), 448, 0, out, nullptr, nullptr)) { cap = (size_t) out[0]*3/2; }
+                    set_layer_exec(false);
+                }
+                expect("lease mock: the size query of a pass" + tag, cap > 0);
+                if (cap > 0) {
+                    g_lmock.init(seed, cap);
+                    const ggml_expert_iface mi = make_lmock_iface();
+                    llama_layer_exec_set_test_lend(&mi);
+                    drec_t rm;
+                    g_passes_last = 0;
+                    const int cut0 = g_edges_cut;
+                    const bool okm = drun(w2, n, rm, "w2 lease mock");
+                    llama_layer_exec_set_test_lend(nullptr);
+                    if (okm) {
+                        dcmp("window layer-major, joint lease mock vs ubatches" + tag, rm, r1, true);
+                        expect("lease mock: the prompt ran layer-major" + tag, rm.layer_runs == 1);
+                        expect("lease mock: the width rule narrowed it to several passes" + tag, g_passes_last > 1);
+                        expect("lease mock: one release per lease, none held" + tag, g_lmock.acquires >= 1 &&
+                               g_lmock.acquires == g_lmock.releases && !g_lmock.held && g_lmock.refused_held == 0 &&
+                               g_lmock.release_unheld == 0);
+                        expect("lease mock: residents, zero heads and canaries intact (" + g_lmock.why + ")" + tag, g_lmock.intact);
+                        expect("lease mock: residents evicted" + tag, g_lmock.evicted > 0);
+                        expect("lease mock: the edge slots lent per ubatch" + tag, g_edges_cut > cut0);
+                    }
+                    printf("dspark%s: lease mock: %d passes, %d leases, %d releases, %d fits queries, %d evicted, %d moved down, "
+                           "slots kept %d/%d and %d/%d, intact %s\n", tag.c_str(), g_passes_last, g_lmock.acquires, g_lmock.releases,
+                           g_lmock.fits_calls, g_lmock.evicted, g_lmock.moved, g_lmock.limit[0], g_lmock.shape[0].slots,
+                           g_lmock.limit[1], g_lmock.shape[1].slots, g_lmock.intact ? "yes" : g_lmock.why.c_str());
+                }
+            }
             // prompts of two calls (the checkpoint cut of the server, two long calls) and E: a prefix without layer inputs,
             // then the window as a call of its own. The reference is the ubatch loop with the same cut: another cut moves
             // the ubatch edges, and the random fixture amplifies the rounding of that (a weight change of 1e-7 moves the

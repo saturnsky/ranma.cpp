@@ -68,6 +68,11 @@ struct llama_layer_mode_config {
 LLAMA_API llama_layer_mode_config llama_layer_mode_get_config();
 LLAMA_API void                    llama_layer_mode_set_config(const llama_layer_mode_config & cfg);
 
+// ranma (tests): the prefill lend a layer-major prefill on a CPU layer device takes (its lend_fits, lend_acquire,
+// lend_release and lend_counts, called with the CPU backend) in place of host buffers of its own; NULL restores those.
+// Process-wide; set it while no context computes.
+LLAMA_API void llama_layer_exec_set_test_lend(const struct ggml_expert_iface * iface);
+
 // ranma (tests): the cut of a graph by the layer-major prefill (llama_lx_analyze), the MoE of layer il between the nodes
 // named "<moe_in>-<il>" and "<moe_out>-<il>". seg (room for the nodes of gf) gets, per node, the segment that computes
 // it, -1 for none and -2 for several (a view or a pure node each segment makes again). false, with err, when it does

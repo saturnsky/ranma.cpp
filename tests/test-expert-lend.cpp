@@ -7,6 +7,9 @@
 //       first, then the least recently used unpinned slot); a later lend takes the space back.
 //   P4: the LRU part of L1 (expert-l1-lru.h): the shares, the layout, a lend that keeps the most recently used copies
 //       below its top (and moves them there), the slots coming back, and a lend that takes the LRU part first.
+//   P5: a joint cache (a draft model in it): the lend, the width rule, the restore space and a later lend over the
+//       layers of both models, against byte arenas with canaries; the members' readiness, the order of their contexts
+//       and the lease through a failed prompt.
 
 #include "expert-l1-lru.h"
 #include "expert-l2-class-ledger.h"
@@ -1005,6 +1008,419 @@ bool test_pack_edges() {
     return true;
 }
 
+// ---- P5: a joint cache (a draft model in the cache) ----------------------------------------------------------------
+//
+// The target's layers (384 experts) and the draft's (128 experts) share one L1 under the joint stride (384). A lend
+// evicts the lowest ranked residents of both models, its pieces take the top of the classes, the restore space serves
+// the decode launches of both models, and a later lend takes only the top it needs. Checked against byte arenas: every
+// kept resident keeps its bytes, every piece its canary, every zero head stays zero, every copy in the space holds its
+// expert's bytes, and nothing is placed outside the arenas.
+
+struct joint_sim {
+    int Lt = 0, Ld = 0, Et = 384, Ed = 128, stride = 384;
+    std::vector<int> layer_class;                         // [joint layer]
+    std::vector<int> slots, lru;                          // [class] all slots; the LRU part at the top (tier 0, empty)
+    std::vector<std::vector<size_t>> kind_bytes, guard;   // [class][kind]
+    std::vector<std::vector<int32_t>> table;              // [joint layer][stride] slot or -1
+    std::vector<uint64_t> score;                          // [layer*stride + expert]
+    std::vector<std::vector<std::vector<uint8_t>>> arena; // [class][kind] bytes
+    int layers() const { return Lt + Ld; }
+    int experts(int l) const { return l < Lt ? Et : Ed; }
+    int static_slots(int c) const { return slots[(size_t) c] - lru[(size_t) c]; }
+
+    static uint8_t pat(int l, int e, int k, size_t i) { return (uint8_t) (((size_t) l*131u + (size_t) e*7u + (size_t) k*29u + i*3u) ^ 0x5Au); }
+    void write(int c, int slot, int l, int e) {
+        for (int k = 0; k < 3; ++k) {
+            const size_t b = kind_bytes[(size_t) c][(size_t) k];
+            for (size_t i = 0; i < b; ++i) { arena[(size_t) c][(size_t) k][(size_t) slot*b + i] = pat(l, e, k, i); }
+        }
+    }
+    bool holds(int c, int slot, int l, int e) const {
+        for (int k = 0; k < 3; ++k) {
+            const size_t b = kind_bytes[(size_t) c][(size_t) k];
+            for (size_t i = 0; i < b; ++i) {
+                if (arena[(size_t) c][(size_t) k][(size_t) slot*b + i] != pat(l, e, k, i)) { return false; }
+            }
+        }
+        return true;
+    }
+    // what lend_classes_locked builds: the residents with their scores, and (nothing lent) the LRU part's slots as tier 0
+    std::vector<lend_class> classes(bool nothing_lent) const {
+        std::vector<lend_class> out(slots.size());
+        for (size_t c = 0; c < slots.size(); ++c) {
+            out[c].kind_bytes = kind_bytes[c];
+            out[c].guard = guard[c];
+            out[c].slots = slots[c];
+        }
+        for (int l = 0; l < layers(); ++l) {
+            for (int e = 0; e < experts(l); ++e) {
+                const int g = table[(size_t) l][(size_t) e];
+                if (g < 0) { continue; }
+                lend_resident r;
+                r.layer = l; r.expert = e; r.slot = g; r.score = score[(size_t) l*stride + e];
+                out[(size_t) layer_class[(size_t) l]].residents.push_back(r);
+            }
+        }
+        for (size_t c = 0; nothing_lent && c < slots.size(); ++c) {
+            for (int s = static_slots((int) c); s < slots[c]; ++s) {
+                lend_resident r;
+                r.layer = -1 - (int) c; r.expert = s; r.slot = s; r.tier = 0;
+                out[c].residents.push_back(r);
+            }
+        }
+        return out;
+    }
+};
+
+static int n_joint_plans = 0, n_joint_draft_victims = 0, n_joint_same_class = 0, n_joint_draft_lru_only = 0;
+static int n_joint_draft_restores = 0, n_joint_cross_evict = 0, n_joint_multi_pass = 0, n_joint_refused = 0;
+static int n_joint_relend_short = 0, n_joint_relend_long = 0, n_joint_moves = 0;
+
+// kind: 0 the draft in a class of its own, 1 the draft in a target class, 2 the draft's class all LRU part (static 0)
+joint_sim make_joint(std::mt19937 & rng, int kind, int scores) {
+    joint_sim s;
+    s.Lt = 3 + (int) (rng() % 3);
+    s.Ld = 1 + (int) (rng() % 3);
+    const int nt = 1 + (int) (rng() % 2);
+    const int dcls = kind == 1 ? (int) (rng() % (uint32_t) nt) : nt;
+    const int n_cls = kind == 1 ? nt : nt + 1;
+    s.layer_class.resize((size_t) s.layers());
+    for (int l = 0; l < s.layers(); ++l) { s.layer_class[(size_t) l] = l < s.Lt ? l % nt : dcls; }
+    s.slots.resize((size_t) n_cls);
+    s.lru.assign((size_t) n_cls, 0);
+    s.kind_bytes.resize((size_t) n_cls);
+    s.guard.resize((size_t) n_cls);
+    for (int c = 0; c < n_cls; ++c) {
+        s.slots[(size_t) c] = 24 + (int) (rng() % 60);
+        s.kind_bytes[(size_t) c] = { (size_t) (16 + rng() % 48)*16, (size_t) (16 + rng() % 48)*16, (size_t) (32 + rng() % 48)*16 };
+        s.guard[(size_t) c] = { 32, 32, 32 };
+        s.lru[(size_t) c] = kind == 2 && c == dcls ? s.slots[(size_t) c] : rng() % 3 == 0 ? (int) (rng() % 6) : 0;
+        s.arena.push_back({});
+        for (int k = 0; k < 3; ++k) {
+            s.arena.back().push_back(std::vector<uint8_t>((size_t) s.slots[(size_t) c]*s.kind_bytes[(size_t) c][(size_t) k], 0));
+        }
+    }
+    s.table.assign((size_t) s.layers(), std::vector<int32_t>((size_t) s.stride, -1));
+    s.score.assign((size_t) s.layers()*s.stride, 0);
+    for (int l = 0; l < s.layers(); ++l) {
+        for (int e = 0; e < s.experts(l); ++e) {
+            s.score[(size_t) l*s.stride + e] = scores == 0 ? 0 : scores == 1 ? (uint64_t) (rng() % 3) : (uint64_t) (rng() % 100000);
+        }
+    }
+    for (int c = 0; c < n_cls; ++c) {
+        std::vector<std::pair<int, int>> cand;
+        for (int l = 0; l < s.layers(); ++l) {
+            if (s.layer_class[(size_t) l] != c) { continue; }
+            for (int e = 0; e < s.experts(l); ++e) { cand.push_back({l, e}); }
+        }
+        std::shuffle(cand.begin(), cand.end(), rng);
+        std::vector<int> free_slots;
+        for (int sl = 0; sl < s.static_slots(c); ++sl) { free_slots.push_back(sl); }
+        std::shuffle(free_slots.begin(), free_slots.end(), rng);
+        const size_t spares = rng() % 3;
+        for (size_t i = 0; i + spares < free_slots.size() && i < cand.size(); ++i) {
+            s.table[(size_t) cand[i].first][(size_t) cand[i].second] = free_slots[i];
+            s.write(c, free_slots[i], cand[i].first, cand[i].second);
+        }
+    }
+    return s;
+}
+
+// every resident is below the limit of its class and holds its own bytes, one expert per slot
+bool joint_residents_intact(const joint_sim & s, const std::vector<int> & limit) {
+    std::vector<std::set<int>> used(s.slots.size());
+    for (int l = 0; l < s.layers(); ++l) {
+        for (int e = 0; e < s.stride; ++e) {
+            const int g = s.table[(size_t) l][(size_t) e];
+            if (g < 0) { continue; }
+            CHECK(e < s.experts(l));   // a draft expert id never reaches past the draft's own count
+            const int c = s.layer_class[(size_t) l];
+            CHECK(g < limit[(size_t) c] && used[(size_t) c].insert(g).second);
+            CHECK(s.holds(c, g, l, e));
+        }
+    }
+    return true;
+}
+
+bool test_joint(uint32_t seed) {
+    std::mt19937 rng(seed);
+    const int kind = (int) (seed % 3), scores = (int) ((seed/3) % 3);
+    joint_sim s = make_joint(rng, kind, scores);
+    // ---- a long prompt: the pieces of a pass of w tokens (two per-token parts and a fixed one)
+    // one prompt in eight has a fixed piece larger than any class region: no width fits, the prefill is refused
+    const size_t per0 = 16 + rng() % 64, per1 = 16 + rng() % 64, fixed = seed % 8 == 5 ? (size_t) 1 << 24 : rng() % 4096;
+    auto request = [&](int64_t w) { return std::vector<size_t>{ (size_t) w*per0, (size_t) w*per1, fixed }; };
+    const std::vector<lend_class> cls0 = s.classes(true);
+    auto fits = [&](int64_t w) { return plan_l1_lend(cls0, request(w), 256).ok; };
+    // L1 short of the whole prompt: the width shrinks (more passes); nothing is placed in host memory
+    const int64_t N = 64 + (int64_t) (rng() % 4000), C_ctx = 64, unit = 16;
+    const lend_width wr = lend_width_rule(N, C_ctx, unit, 0, fits);
+    if (wr.P == 0) {
+        // no pass fits, or the passes are not fewer than the ubatches: the layer-major prefill is refused
+        CHECK(wr.W_max == 0 || (N + wr.W_max - 1)/wr.W_max >= (N + C_ctx - 1)/C_ctx);
+        ++n_joint_refused;
+        return true;
+    }
+    CHECK(wr.P == 1 ? fits(N) : fits(wr.W));
+    CHECK(wr.P*wr.W >= N);
+    n_joint_multi_pass += wr.P > 1 ? 1 : 0;
+    n_joint_same_class += kind == 1 ? 1 : 0;
+    n_joint_draft_lru_only += kind == 2 ? 1 : 0;
+    const std::vector<size_t> pieces = request(std::min<int64_t>(wr.W, N));
+    lend_l1_plan p = plan_l1_lend(cls0, pieces, 256);
+    CHECK(p.ok);
+    n_untied += p.untied > 0 ? 1 : 0;
+    if (!check_rank(cls0, p) || !check_regions(cls0, p, pieces, 256)) { return false; }
+    // the controller drops the LRU part's slots from the victims (no resident leaves for them)
+    p.victims.erase(std::remove_if(p.victims.begin(), p.victims.end(), [](const lend_resident & v) { return v.layer < 0; }), p.victims.end());
+    for (const lend_resident & v : p.victims) {
+        CHECK(v.layer >= 0 && v.layer < s.layers() && v.expert < s.experts(v.layer));
+        n_joint_draft_victims += v.layer >= s.Lt ? 1 : 0;
+    }
+    ++n_joint_plans;
+    // the evictions: the kept residents above the limit move down with their bytes, the victims leave L1
+    {
+        std::set<std::pair<int, int>> gone;
+        for (const auto & v : p.victims) { gone.insert({v.layer, v.expert}); }
+        expert_slot_table keep((size_t) s.layers());
+        for (int l = 0; l < s.layers(); ++l) {
+            for (int e = 0; e < s.experts(l); ++e) {
+                if (s.table[(size_t) l][(size_t) e] >= 0 && gone.count({l, e}) == 0) { keep[(size_t) l].push_back(e); }
+            }
+        }
+        std::vector<int> stat(s.slots.size());
+        std::vector<std::vector<uint8_t>> other(s.slots.size());
+        for (size_t c = 0; c < s.slots.size(); ++c) { stat[c] = s.static_slots((int) c); other[c].assign((size_t) stat[c], 0); }
+        const evac_plan ev = plan_evacuation(s.layer_class, s.stride, s.table, keep, other, stat, p.limit);
+        CHECK(ev.valid);
+        for (const evac_op & op : ev.ops) {
+            s.write(op.cls, op.to, op.layer, op.expert);
+            if (op.victim_layer >= 0) {
+                s.write(op.cls, op.from, op.victim_layer, op.victim_expert);
+                s.table[(size_t) op.victim_layer][(size_t) op.victim_expert] = op.from;
+            }
+            s.table[(size_t) op.layer][(size_t) op.expert] = op.to;
+            ++n_joint_moves;
+        }
+        for (const auto & v : p.victims) { s.table[(size_t) v.layer][(size_t) v.expert] = -1; }
+    }
+    if (!joint_residents_intact(s, p.limit)) { return false; }
+    // the zero heads, then the pieces' canaries, all inside the arenas
+    for (size_t c = 0; c < s.slots.size(); ++c) {
+        for (int k = 0; k < 3 && p.limit[c] < s.slots[c]; ++k) {
+            const size_t b = s.kind_bytes[c][(size_t) k];
+            std::fill(s.arena[c][(size_t) k].begin() + (ptrdiff_t) ((size_t) p.limit[c]*b),
+                      s.arena[c][(size_t) k].begin() + (ptrdiff_t) ((size_t) p.limit[c]*b + s.guard[c][(size_t) k]), 0);
+        }
+    }
+    for (size_t i = 0; i < pieces.size(); ++i) {
+        if (pieces[i] == 0) { continue; }
+        const lend_region & r = p.regions[(size_t) p.fits[i].region];
+        auto & a = s.arena[(size_t) r.cls][(size_t) r.kind];
+        const size_t at = r.begin + p.fits[i].offset;
+        CHECK(at >= (size_t) p.limit[(size_t) r.cls]*s.kind_bytes[(size_t) r.cls][(size_t) r.kind] + s.guard[(size_t) r.cls][(size_t) r.kind]);
+        CHECK(at + pieces[i] <= a.size());
+        std::fill(a.begin() + (ptrdiff_t) at, a.begin() + (ptrdiff_t) (at + pieces[i]), (uint8_t) (0xC0 + i));
+    }
+    for (size_t i = 0; i < pieces.size(); ++i) {
+        if (pieces[i] == 0) { continue; }
+        const lend_region & r = p.regions[(size_t) p.fits[i].region];
+        const auto & a = s.arena[(size_t) r.cls][(size_t) r.kind];
+        const size_t at = r.begin + p.fits[i].offset;
+        for (size_t j = 0; j < pieces[i]; ++j) { CHECK(a[at + j] == (uint8_t) (0xC0 + i)); }
+    }
+    for (size_t c = 0; c < s.slots.size(); ++c) {
+        for (int k = 0; k < 3 && p.limit[c] < s.slots[c]; ++k) {
+            const size_t b = s.kind_bytes[c][(size_t) k];
+            for (size_t j = 0; j < s.guard[c][(size_t) k]; ++j) { CHECK(s.arena[c][(size_t) k][(size_t) p.limit[c]*b + j] == 0); }
+        }
+    }
+    if (!joint_residents_intact(s, p.limit)) { return false; }
+    // ---- the lease ends once; the restore space serves the decode plan's victims of both models
+    lend_book book;
+    book.slots = s.slots;
+    book.limit = s.slots;
+    book.top   = s.slots;
+    CHECK(book.hold(p.limit, p.victims, &s, true));
+    CHECK(book.explicit_ && book.owner == &s && book.state == lend_state::held);
+    std::vector<uint8_t> want_plan((size_t) s.layers()*s.stride, 0);
+    for (const auto & v : p.victims) {
+        if (rng() % 3) { want_plan[(size_t) v.layer*s.stride + v.expert] = 1; }
+    }
+    CHECK(book.open_restore(s.layer_class, &want_plan, s.stride));
+    CHECK(!book.open_restore(s.layer_class, &want_plan, s.stride));   // a second release changes nothing
+    for (const auto & r : book.restore) {
+        CHECK(want_plan[(size_t) r.layer*s.stride + r.expert] == 1 && r.cls == s.layer_class[(size_t) r.layer]);
+    }
+    std::vector<sim_space> sp(s.slots.size());
+    for (size_t c = 0; c < s.slots.size(); ++c) { sp[c].open(book.limit[c], book.lent((int) c) ? book.slots[c] - book.limit[c] : 0); }
+    std::vector<std::vector<int32_t>> dev = s.table;
+    std::vector<std::vector<int32_t>> want((size_t) s.layers(), std::vector<int32_t>((size_t) s.stride, -1));
+    for (const auto & r : book.restore) { want[(size_t) r.layer][(size_t) r.expert] = 1; }
+    std::vector<std::vector<uint32_t>> last_miss((size_t) s.layers(), std::vector<uint32_t>((size_t) s.stride, lend_never));
+    std::vector<uint32_t> step((size_t) s.layers(), 0);
+    auto all = [](int) { return true; };
+    int nc = 0, ne = 0, nw = 0;
+    // one launch of joint layer l; its copies land in the arena (the copy kernel)
+    auto launch = [&](int l, const std::vector<int32_t> & ids) {
+        const int c = s.layer_class[(size_t) l];
+        sim_space & x = sp[(size_t) c];
+        if (x.n == 0) { return true; }
+        const std::vector<int32_t> own0 = x.own;
+        if (!space_launch(x, l, s.stride, ids, 1, (int) ids.size(), dev, want, last_miss, step, 2, all, nc, ne, nw)) { return false; }
+        for (int j = 0; j < x.n; ++j) {
+            const int32_t o = x.own[(size_t) j];
+            if (o >= 0 && o != own0[(size_t) j]) {
+                s.write(c, x.first + j, o/s.stride, o%s.stride);
+                if (own0[(size_t) j] >= 0 && (own0[(size_t) j]/s.stride < s.Lt) != (l < s.Lt)) { ++n_joint_cross_evict; }
+                n_joint_draft_restores += l >= s.Lt && want_plan[(size_t) o] ? 1 : 0;
+            }
+        }
+        // every copy of the space holds its expert's bytes, at the slot its own layer's table names
+        for (int j = 0; j < x.n; ++j) {
+            const int32_t o = x.own[(size_t) j];
+            if (o < 0) { continue; }
+            CHECK(o % s.stride < s.experts(o/s.stride));
+            CHECK(s.holds(c, x.first + j, o/s.stride, o%s.stride));
+            CHECK(dev[(size_t) (o/s.stride)][(size_t) (o%s.stride)] == x.first + j);
+        }
+        return true;
+    };
+    // decode steps: the target's layers, then the draft's (its block), alternating
+    auto decode = [&](int tokens) {
+        for (int t = 0; t < tokens; ++t) {
+            for (int l = 0; l < s.layers(); ++l) {
+                std::vector<int32_t> ids(4);
+                for (auto & id : ids) {
+                    id = (int32_t) (rng() % (uint32_t) s.experts(l));
+                    if (rng() % 2 && !p.victims.empty()) {
+                        const auto & v = p.victims[rng() % p.victims.size()];
+                        if (v.layer == l) { id = v.expert; }
+                    }
+                }
+                if (!launch(l, ids)) { return false; }
+            }
+        }
+        return true;
+    };
+    if (!decode(4 + (int) (rng() % 30))) { return false; }
+    if (!joint_residents_intact(s, book.limit)) { return false; }   // the decode never wrote below the space
+    // ---- a short prompt over the open space: only the top slots it needs; the copies that stay move down with their bytes
+    std::vector<lend_restore> copies;
+    for (size_t c = 0; c < s.slots.size(); ++c) {
+        for (int j = 0; j < sp[c].n; ++j) {
+            if (sp[c].own[(size_t) j] < 0) { continue; }
+            lend_restore r;
+            r.layer = sp[c].own[(size_t) j]/s.stride; r.expert = sp[c].own[(size_t) j]%s.stride; r.cls = (int) c;
+            r.slot = sp[c].first + j; r.pin = sp[c].pin[(size_t) j];
+            copies.push_back(r);
+        }
+    }
+    std::vector<lend_class> kinds = s.classes(false);
+    for (auto & k : kinds) { k.residents.clear(); }
+    const std::vector<size_t> small = request(1 + (int64_t) (rng() % 8));
+    const lend_space_take t = plan_space_lend(kinds, book.limit, copies, s.score, s.stride, small, 256);
+    if (t.ok) {
+        ++n_joint_relend_short;
+        const uint64_t e0 = book.epoch;
+        CHECK(book.hold_space(t.plan.limit, &s, true) && book.epoch == e0 + 1);
+        CHECK(!book.hold_space(t.plan.limit, &s, true));   // one lease at a time
+        for (const auto & m : t.moves) {
+            const int32_t o = sp[(size_t) m[0]].own[(size_t) (m[1] - sp[(size_t) m[0]].first)];
+            CHECK(o >= 0 && m[2] < m[1]);
+            s.write(m[0], m[2], o/s.stride, o%s.stride);
+        }
+        for (const lend_restore & k : t.kept) {
+            CHECK(k.slot >= book.limit[(size_t) k.cls] && k.slot < t.plan.limit[(size_t) k.cls]);
+            CHECK(s.holds(k.cls, k.slot, k.layer, k.expert));
+        }
+        for (const lend_restore & d : t.dropped) { CHECK(d.slot >= book.limit[(size_t) d.cls]); }
+        CHECK(t.kept.size() + t.dropped.size() == copies.size());
+        CHECK(book.open_restore(s.layer_class, &want_plan, s.stride));
+        if (!joint_residents_intact(s, book.limit)) { return false; }
+    }
+    // ---- a long prompt again: the space is dropped; the slots held before hold the same pieces, no new eviction
+    std::vector<int> held(s.slots.size());
+    for (size_t c = 0; c < held.size(); ++c) { held[c] = book.slots[c] - book.limit[c]; }
+    const lend_l1_plan again = plan_l1_lend(s.classes(false), pieces, 256, &held);
+    CHECK(again.ok && again.victims.empty());
+    CHECK(book.hold(again.limit, again.victims, &s, true));
+    ++n_joint_relend_long;
+    return true;
+}
+
+// The members of a joint cache: a lend waits for every member that is not dropped (bound, loaded, open in the tier); the
+// restore descriptors of a layer are enabled only when its member is ready; a dropped member's layers stay disabled.
+bool test_joint_members() {
+    std::vector<lend_member> m(2);
+    m[0].offset = 0; m[0].n_layers = 4; m[0].bound = m[0].loaded = m[0].tier_ready = true;
+    m[1].offset = 4; m[1].n_layers = 2;
+    std::string why;
+    CHECK(!lend_members_ready(m, true, &why) && why.find("not bound") != std::string::npos);
+    auto ready = lend_layers_ready(m, 6, true);
+    CHECK((ready == std::vector<uint8_t>{ 1, 1, 1, 1, 0, 0 }));
+    m[1].bound = true;
+    CHECK(!lend_members_ready(m, true, &why) && why.find("not loaded") != std::string::npos);
+    m[1].loaded = true;
+    CHECK(!lend_members_ready(m, true, &why) && why.find("SSD tier") != std::string::npos);
+    CHECK(lend_members_ready(m, false));                 // no tier: loaded is enough
+    CHECK((lend_layers_ready(m, 6, false) == std::vector<uint8_t>{ 1, 1, 1, 1, 1, 1 }));
+    m[1].tier_ready = true;
+    CHECK(lend_members_ready(m, true));
+    CHECK((lend_layers_ready(m, 6, true) == std::vector<uint8_t>{ 1, 1, 1, 1, 1, 1 }));
+    m[1].dropped = true;                                 // a dropped model: the lend goes on, its layers are never restored
+    CHECK(lend_members_ready(m, true));
+    CHECK((lend_layers_ready(m, 6, true) == std::vector<uint8_t>{ 1, 1, 1, 1, 0, 0 }));
+    // the order of the contexts: a change of context drains the previous context's stream, once per change
+    lend_order o;
+    int s_t = 0, s_d = 0;
+    const void * target = &m[0];
+    const void * draft  = &m[1];
+    CHECK(lend_order_switch(o, target, &s_t) == nullptr);   // the first graph
+    CHECK(lend_order_switch(o, target, &s_t) == nullptr);   // the same context
+    CHECK(lend_order_switch(o, draft, &s_d) == &s_t);       // target -> draft: the target's stream
+    CHECK(lend_order_switch(o, draft, &s_d) == nullptr);
+    CHECK(lend_order_switch(o, target, &s_t) == &s_d);      // draft -> target: the draft's stream
+    CHECK(o.drains == 2);
+    lend_order_forget(o, target);                          // a freed context is not drained
+    CHECK(lend_order_switch(o, draft, &s_d) == nullptr);
+    lend_order_forget(o, target);                          // another context's forget changes nothing
+    CHECK(o.ctx == draft);
+    return true;
+}
+
+// The lease through a cancelled or failed prompt: a release ends it exactly once; a new lease is a new epoch; a lease
+// over the space while one is held is refused; a stale epoch is told apart.
+bool test_joint_lease_cancel() {
+    lend_book b;
+    b.slots = { 10, 6 };
+    b.limit = b.slots;
+    b.top = b.slots;
+    std::vector<lend_resident> v(2);
+    v[0].layer = 0; v[0].expert = 300;   // a target expert past the draft's count
+    v[1].layer = 4; v[1].expert = 100;   // a draft expert
+    const std::vector<int> layer_class = { 0, 0, 0, 0, 1, 1 };
+    CHECK(b.hold({ 8, 5 }, v, &b, true));
+    const uint64_t e1 = b.epoch;
+    CHECK(!b.hold({ 8, 5 }, {}, &v, false));             // another holder while held: refused, nothing changes
+    CHECK(b.epoch == e1 && b.owner == &b && b.explicit_);
+    // the prompt fails (a seed or a pass): the release still runs once
+    std::vector<uint8_t> want(6*384, 0);
+    want[0*384 + 300] = want[4*384 + 100] = 1;
+    CHECK(b.open_restore(layer_class, &want, 384));
+    CHECK(!b.open_restore(layer_class, &want, 384));
+    CHECK(b.restore.size() == 2 && b.restore[0].cls != b.restore[1].cls);
+    // a later lease over the space: a new epoch; the old one is stale
+    CHECK(b.hold_space({ 9, 5 }, &v, false) && b.epoch == e1 + 1);
+    CHECK(!b.hold_space({ 9, 5 }, &v, false));
+    b.clear();
+    CHECK(b.state == lend_state::none && b.limit == b.slots && b.victims.empty() && b.restore.empty());
+    // the staged service: the copies of a draft layer wait for the three kinds like the target's
+    const uint32_t seq = 9, part[3] = { seq, seq - 1, seq };
+    CHECK(!lend_space_sources_ready(seq - 1, part, seq));
+    return true;
+}
+
 } // namespace
 
 // ---- P4: the LRU part of L1 ---------------------------------------------------------------------------------------
@@ -1363,6 +1779,8 @@ int main(int argc, char ** argv) {
     test_space_staged();
     test_file_only_restore();
     test_eager_install();
+    test_joint_members();
+    test_joint_lease_cancel();
     if (!test_x_examples()) { fprintf(stderr, "the LRU part of L1: the examples fail\n"); }
     if (!test_x_reshare_examples()) { fprintf(stderr, "the LRU part of L1: the install examples fail\n"); }
     int n = 0;
@@ -1376,6 +1794,7 @@ int main(int argc, char ** argv) {
         n += test_x_random(seed) ? 1 : 0;
         n += test_x_lend(seed) ? 1 : 0;
         n += test_x_keep(seed) ? 1 : 0;
+        n += test_joint(seed) ? 1 : 0;
         if (g_fail > 0) {
             fprintf(stderr, "first failure at seed %u\n", seed);
             break;
@@ -1392,7 +1811,15 @@ int main(int argc, char ** argv) {
         "lends beyond it %d\n", n_x_moves, n_x_drops, n_x_capped, n_x_lend_inside, n_x_lend_beyond);
     printf("test-expert-lend: the LRU part of L1 through an install: copies over a new share %d, copies that leave %d, "
         "shares that shrink %d, lends after it with moves %d\n", n_x_keep_over, n_x_keep_left, n_x_keep_shrunk, n_x_keep_lend_moves);
-    const bool covered = n_l1_plans > 0 && n_l1_regrow > 0 && n_multi_pass > 0 && n_restores > 0 && n_sticky > 0 && n_bounds > 0 &&
+    printf("test-expert-lend: a joint cache (target 384 / draft 128 experts): plans %d (draft in a target class %d, draft class "
+        "all LRU %d), draft victims %d, moves %d, widths of several passes %d, refused widths %d, draft restores %d, copies "
+        "replacing the other model's %d, short lends over the space %d, long lends again %d\n", n_joint_plans, n_joint_same_class,
+        n_joint_draft_lru_only, n_joint_draft_victims, n_joint_moves, n_joint_multi_pass, n_joint_refused, n_joint_draft_restores,
+        n_joint_cross_evict, n_joint_relend_short, n_joint_relend_long);
+    const bool joint_covered = n_joint_plans > 0 && n_joint_same_class > 0 && n_joint_draft_lru_only > 0 && n_joint_draft_victims > 0 &&
+        n_joint_moves > 0 && n_joint_multi_pass > 0 && n_joint_refused > 0 && n_joint_draft_restores > 0 && n_joint_cross_evict > 0 &&
+        n_joint_relend_short > 0 && n_joint_relend_long > 0;
+    const bool covered = joint_covered && n_l1_plans > 0 && n_l1_regrow > 0 && n_multi_pass > 0 && n_restores > 0 && n_sticky > 0 && n_bounds > 0 &&
         n_wanted > 0 && n_lru_evictions > 0 && n_space_short > 0 && n_space_pinned_kept > 0 && n_x_moves > 0 && n_x_drops > 0 &&
         n_x_capped > 0 && n_x_lend_inside > 0 && n_x_lend_beyond > 0 && n_x_keep_over > 0 && n_x_keep_left > 0 &&
         n_x_keep_shrunk > 0 && n_x_keep_lend_moves > 0 && n_untied > 0;
