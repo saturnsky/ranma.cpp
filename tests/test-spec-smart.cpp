@@ -103,6 +103,13 @@ static std::vector<double> ref_cost_table_mean(const common_spec_smart & s) {
     for (auto & x : out) {
         x *= std::max(s.level_cell.mean, 0.0);
     }
+    // the lookup is smoothed over the widths (shared with the hazard model; at most 8 rows here, one segment): the
+    // non-decreasing fit weighted by the confidence of the shape
+    std::vector<double> w(N);
+    for (int k = 0; k < N; ++k) {
+        w[k] = std::max(s.vc->conf(s.shape_cells[k]), 1e-6);
+    }
+    common_spec_verify_cost::weighted_pav(out, w);
     return out;
 }
 
@@ -186,15 +193,19 @@ static int test_cost_prediction() {
         CHECK(std::fabs(C[3] - 130.0) < 1e-9);
         CHECK(std::fabs(C[4] - 140.0) < 1e-9);
     }
-    // never cheaper than the nearest narrower measured width
+    // never cheaper than the nearest narrower measured width, and the table rises with the width: a measured width
+    // cheaper than a narrower one is pooled with it (the interpolation 83.3 / 66.7 is raised to width 0 first; the
+    // weights are the confidences, 1 for the two measured widths and 1e-6 for the others)
     {
         common_spec_smart s(base_cfg(4), 1);
         s.observe_cost(0, 100.0);
         s.observe_cost(3, 50.0);
         const auto C = s.cost_table();
-        CHECK(C[1] == 100.0 && C[2] == 100.0); // interpolation 83.3 / 66.7 raised to width 0
-        CHECK(C[3] == 50.0);                   // measured widths are taken as measured
-        CHECK(C[4] == 50.0);                   // extrapolation 33.3 raised to width 3
+        for (int k = 1; k <= 4; ++k) {
+            CHECK(C[k] == C[0]);
+        }
+        CHECK(std::fabs(C[0] - 75.0) < 0.5);
+        CHECK(s.vc->known(0) && s.vc->known(3) && !s.vc->known(1) && !s.vc->known(2)); // the observations are those measured
     }
     // the first observation sets the level; a width without a shape gets time / level
     {

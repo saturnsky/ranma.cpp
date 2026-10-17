@@ -15,6 +15,9 @@ flat.
 | `--spec-smart-log PATH` | `LLAMA_ARG_SPEC_SMART_LOG` | none | Append one JSON line per round to PATH for diagnosis (see "Round log"). The decisions do not change. |
 | `--spec-trigram-profile`, `--no-spec-trigram-profile` | `LLAMA_ARG_SPEC_TRIGRAM_PROFILE` | on | Keep the trigram counts of every request across requests and restarts in `<--spec-smart-store>.trigram` (see "Trigram profile"). Without `--spec-smart-store` there is none. |
 | `--spec-trigram-profile-mib N` | `LLAMA_ARG_SPEC_TRIGRAM_PROFILE_MIB` | 64 | Memory of the trigram profile's tables in MiB. |
+| `--spec-verify-cost-store PATH` | `LLAMA_ARG_SPEC_VERIFY_COST_STORE` | `<--spec-smart-store>.vcost` | File of the verification cost that all drafters share (see "Shared verification cost"). Without it and without `--spec-smart-store` nothing is kept. |
+| `--spec-verify-cost-log PATH` | `LLAMA_ARG_SPEC_VERIFY_COST_LOG` | none | Append one JSON line per target call and per round to PATH for diagnosis. |
+| `--spec-ngram-varlen-hazard-online`, `--no-spec-ngram-varlen-hazard-online` | | on | The hazard supplement of `ngram-varlen` takes C(rows) from the shared verification cost (see there). |
 
 `--spec-draft-n-max` is the upper bound of the draft length. Without it the bound is 7 (the default of 3 belongs to
 the single-argument rule and is unchanged). The bound also sizes the target batch, the recurrent state rollback and
@@ -128,7 +131,9 @@ computed when a cell is read or updated, not every round.
   batch, the draft catch-up, sampling, a checkpoint replay if one happened, and the per-token server work. A round
   whose request ended is not timed (the gap to the next request is not verification), nor the first verification of
   a width in the process (graph builds). What the graph runtime and the expert cache add now and then is taken out
-  (see "Cost decomposition").
+  (see "Cost decomposition"). In the server this time is the shared verification cost (below): the target call and
+  the rest of the round are measured apart for every round of every drafter, and the controller reads their sum; the
+  level, shape and clock described here are those of the shared cost.
 - **Level x shape.** The predicted time of width k is `L * S_k`. The level L is one number for all widths; the shape
   S_k is the ratio of width k. A change of task changes the experts in use, and often makes every width slower or
   faster by about the same factor (a change of level), while the ratios of the widths change less. So the level
@@ -178,6 +183,80 @@ below.
   4-9 ms; from the fifth round on the times are those of the steady state. About five rounds of a few hundred per
   request.
 - Without the counts (another backend, the pool off) the times are taken as measured, as before.
+
+## Shared verification cost
+
+A round verifies m draft tokens in one target call of r = m + 1 rows. How long that call takes depends on the target
+and how it runs (the model, the expert cache tiers, the batch, the contexts loaded next to it), not on which drafter
+made the draft. So the server keeps one cost per target and run condition, and every drafter's rounds feed it:
+`ngram-varlen`, `draft-dspark` and `draft-mtp` alone or together (`common/speculative-verify-cost.h`). What a drafter
+adds on its own stays with it: its draft steps (the controller's draft step time) and its acceptance (the
+controller's calibration and trigram coefficients, the hazard model of `ngram-varlen`). A drafter that drafts long
+pieces with confidence (`ngram-varlen` on repeated text) therefore keeps the wide widths of the table current for a
+draft model that seldom drafts that far, without a forced extension; `ngram-varlen` never extends a round to probe a
+width (the extensions of the controller stay as they are, for its own rounds).
+
+- **Two parts.** `core(r)`: the target call, from `llama_process` to `llama_synchronize` in the server's decode
+  callback, without the host time of the target's graph builds and captures. Level x shape exactly as above (level
+  half-life 64, shape half-life `--spec-smart-half-life`, the wait confidence, the extension threshold 4).
+  `aux(r)`: the rest of the round, from the end of the draft to the start of the next one of the sequence, without
+  the target call and without the graph builds of the draft context: the processing of the batch by the drafters'
+  contexts (DSpark feature injection, MTP hidden rows), sampling and acceptance, the rollback, a checkpoint replay, the
+  output. One decayed mean per width over all rounds observed. The cost of a round is `core(r) + aux(r)`; the
+  controller and the hazard model read that sum.
+- **The lookup is smoothed.** The controller and the hazard model read the cost through one function that smooths the
+  learnt table over the widths when it is looked up; the cells, the confidences, the observations and the store are
+  not changed, and a width that is only interpolated does not become known or gain confidence from it. The widths are
+  smoothed in two segments, rows 1 to 8 and rows 9 on (the EXL3 GEMV of the target takes at most 8 rows): inside a
+  segment the table is made non-decreasing by a projection weighted by the confidence (pool adjacent violators), and
+  across the border nothing is pooled or borrowed, so a fall or a step at the 9th row stays. The controller gets the
+  projection of its learnt table (us); the hazard model gets the same function with its prior table (ms), see below.
+- **The clock** is the target calls of the server (every completed call that generates, whichever drafter), not the
+  rounds of one drafter. The controller keeps its own clock (its closed rounds) for its calibration, its draft step and
+  the interval of its extensions.
+- **What is learnt.** A call of one sequence that generates and verifies its round: not a prompt call, not a call
+  with prompt tokens of another request, not several sequences in one call (`--parallel` with two slots generating),
+  not a checkpoint replay (its time goes to `aux` of the round it replays), not a failed call. As before: the first
+  call of a width in the process is not timed, nor the call that sees a lend of the decode pool and the next four.
+  A round is learnt for `aux` only when its first call was its verification and no other call came in between (a call
+  of another slot, a call without a round). The last round of a request is learnt for `core` (its call completed) and
+  not for `aux` (no next draft). Times that are not finite or negative are not learnt.
+- **Rounds are closed centrally.** A round of a sequence ends where the next one starts, whichever drafter drafts it:
+  the controller's round is closed there too, so that a round of another drafter never extends one of its own (before,
+  a round of `ngram-varlen` did not close the controller's round, whose time then spanned several rounds), and the
+  controller learns its acceptance only from its own rounds.
+- **Store.** `--spec-verify-cost-store` (default `<--spec-smart-store>.vcost`), format `ranma-spec-verify-cost 1`:
+  the level, shape and aux per row count, written every 256 calls and at exit, read with the caps of the controller's
+  store (32, the level 2, the wait 16). Its key is the target file, the build, the expert cache tiers and placement,
+  the draft model (joint cache, the contexts loaded), the speculative types, `-b`, `-ub`, the KV types, flash
+  attention, the layer mode and the `GGML_*`, `RANMA_*` and `LLAMA_*` switches of the environment (not those of the
+  logs, options and speculative drafters); not the drafter of a round. Another key is a cold start. The controller's
+  own store keeps the acceptance only (format 7); the level and shapes of an older store (6) are not carried over,
+  since they timed another span.
+- **Width.** As wide as the widest piece any drafter verifies (`max(n_max) + 1` rows over the drafters loaded; 9 for
+  `ngram-varlen` with its default 8). A store of another width is read for the widths both have.
+
+### The hazard model of `ngram-varlen` on the shared cost
+
+With `--spec-type ngram-varlen` the hazard supplement, its shadow learning and this online cost are on by default
+(`--no-spec-ngram-varlen-hazard`, `--no-spec-ngram-varlen-hazard-shadow` and `--no-spec-ngram-varlen-hazard-online`
+turn them off one by one). The hazard supplement takes C(rows) from the shared cost instead of its fixed
+table. The table stays the prior: before any observation C is the table. A width observed with confidence n weighs
+`w = n / (n + 2)`: `C(r) = w (core(r) + aux(r)) + (1 - w) P(r) b(r)`, P the table and b(r) the ratio observed / table of
+the nearest observed width on each side of r inside its segment (rows 1 to 8, rows 9 on; distance weighted, weighted
+by the confidences, two votes of 1; what is borrowed adds nothing to the confidence of r), then the projection above.
+A segment without any observation is the table at the level of r = 1 (by the weight of r = 1). The pieces the model prices are
+as wide as the round allows (fewer draft tokens near the end of a request). It still drafts only where the base rule
+drafts nothing; its counterfactual labels make no cost observation (only the pieces verified are timed).
+
+### Verification cost log
+
+`--spec-verify-cost-log PATH` appends `{"ev":"call", ...}` per target call (call id, sequence, rows, sequences and
+prompt tokens in the call, replay, the drafter of the round, `target_us`, `graph_us`, `obs_us`, the prediction before
+the call `pred_core` / `pred_eff`, with the hazard model also `pred_blend_ms` and `prior_ms`, the clock, the calls since
+a lend, `skip`: why it was not learnt) and `{"ev":"round", ...}` per round (drafter, drafters asked, m, the call,
+`wall_us`, `target_us`, `aux_us`, `pred_aux`, `pred_eff`, `skip`). The lines are kept in memory and written at the end
+of every request and at exit.
 
 ## Trigram confidence
 
@@ -305,6 +384,10 @@ learnt like the others; they start at 0, so an empty profile changes nothing.
 
 ## The store
 
+In the server the level and the shapes live in the store of the shared verification cost (`PATH.vcost`, see "Shared
+verification cost"), and `PATH` itself holds the acceptance only (format `ranma-spec-smart 7`). The text below
+describes both parts as one store, as the controller keeps them without a shared cost (the CPU tests).
+
 `--spec-smart-store PATH` is a cache. It holds the level, the shape per width (mean and variance), the acceptance cells and the
 mean acceptance per position, each
 with its confidence decayed to the time of the save, and is written every 256 rounds and at exit (through a temporary file and
@@ -374,7 +457,7 @@ exit, and whenever 1 MiB is buffered.
 | `cost_table` | the predicted verification time of every width 0..n-max (us) |
 | `draft_us` | the measured time of the draft steps of the round (us) |
 | `verify_us` | the measured time from the end of the draft to the next draft (the verification time, see above); null when the round ended with the request or was not verified |
-| `obs_us`, `obs_skip` | closed rounds: the time the cost model took for the round (`verify_us` without graph builds and captures, see "Cost decomposition"), null when it took none, and why: `untimed` (first verification of the width) or `lend` (a decode pool lend round or one of the next four) |
+| `obs_us`, `obs_skip` | closed rounds: the time the cost model took for the round (`verify_us` without graph builds and captures, see "Cost decomposition"), null when it took none, and why: `untimed` (first verification of the width) or `lend` (a decode pool lend round or one of the next four); in the server always null with `shared` (the shared verification cost observed the round, see its log) |
 | `accepted` | draft tokens accepted (0 when k = 0); null when the draft was not verified |
 | `pool` | only with the expert cache's decode pool and its counts read at the round's start, end of draft and end of verification: `draft` and `verify`, the pool's work in the draft steps (round start to the end of the draft) and in the verification (end of the draft to the next draft), each with `fills` (positions copied by the step of a launch) and `fill_mib`, `hits`, `lends` and `reclaims`; `since_lend`, the closed rounds since the last lend (0: a lend in this round, -1: none seen); `lend`, the lends so far. The counts are read from host memory the pool's kernels write, without a synchronize, right after the host has the results of the draft or of the verification; work still running then counts in the next part |
 | `graph` | the graphs of the target (`tgt`) and the draft context (`dft`) in the draft steps (`draft`) and in the verification (`verify`): `calls` (ubatch graphs computed), `builds` (of them built and allocated anew, not reused or resumed), `build_ms` (host time of the builds and allocations), `nt` (rows of the last graph built, null without a build), `extent_mib` and `pos` (the last graph computed in the part: how far it reached into the compute buffer of the expert backend, and the highest position of its ubatch; only when a graph was computed), and with a GPU backend that counts its graph calls `captures` / `capture_ms` (calls that captured a HIP graph, host time of those calls) and `direct` / `direct_ms` (calls run without a graph, e.g. a warmup call). A context whose counts could not be read is null. Read from host state, without a synchronize, like `pool` |
@@ -472,3 +555,8 @@ not measured in the server yet.
 - The decode pool counts of the round log are those of the whole process: with `--parallel` > 1 a round's counts
   include the work of other slots.
 - The controller cost per step is a few microseconds (tables of at most n-max + 1 widths); not measured in the server.
+- Shared verification cost: the rest of a round is one mean per width over the acceptance of every drafter that
+  verified that width (a rollback or a checkpoint replay costs more when fewer tokens are accepted); it is not split
+  by the acceptance of the round. Work of a draft context that runs on the GPU after the host returns (an injection
+  that is not waited for) lands in the next call that waits for the device: the draft forward of the next round, or
+  the next target call when another drafter drafts that round. Calls of several sequences are not learnt yet.

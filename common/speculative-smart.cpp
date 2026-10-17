@@ -1,5 +1,6 @@
 #include "speculative-smart.h"
 
+#include "ggml.h"
 #include "log.h"
 
 #include <algorithm>
@@ -24,7 +25,11 @@
 #define SMT_WRN(fmt, ...) LOG_WRN("spec-smart: " fmt, __VA_ARGS__)
 #define SMT_ERR(fmt, ...) LOG_ERR("spec-smart: " fmt, __VA_ARGS__)
 
-static const char * SMART_STORE_MAGIC = "ranma-spec-smart 6";
+// 6: the verification cost (level, ratio) and the calibration; 7: the calibration only, the cost is kept by the shared
+// learner (common_spec_verify_cost, its own store). A controller with a shared cost reads a 6 store without its cost
+// lines (their time was another one: the round, not the target call)
+static const char * SMART_STORE_MAGIC   = "ranma-spec-smart 6";
+static const char * SMART_STORE_MAGIC_7 = "ranma-spec-smart 7";
 
 //
 // round log (--spec-smart-log): one JSON object per line, buffered, written at the end of a request and at exit
@@ -82,21 +87,51 @@ static void smart_json_arr(std::string & out, const std::vector<T> & v, const ch
     out += ']';
 }
 
-common_spec_smart::common_spec_smart(const common_spec_smart_config & cfg_in, int32_t n_seq) : cfg(cfg_in) {
+// the controller's own verification cost: the constants of the controller, a width per draft length 0..n_max, no store
+// (the controller's store keeps it)
+static common_spec_verify_cost_config smart_own_cost_cfg(const common_spec_smart_config & c) {
+    common_spec_verify_cost_config v;
+    v.r_max           = std::max<int32_t>(0, c.n_max) + 1;
+    v.half_life       = c.half_life;
+    v.level_half_life = c.level_half_life;
+    v.reprobe_n       = c.reprobe_n;
+    v.conf_cap        = c.conf_cap;
+    v.wait_reset      = c.wait_reset;
+    v.cap_load        = c.cap_load;
+    v.level_cap_load  = c.level_cap_load;
+    v.lend_skip       = c.lend_skip;
+    v.cost_graph      = c.cost_graph;
+    return v;
+}
+
+common_spec_smart::common_spec_smart(const common_spec_smart_config & cfg_in, int32_t n_seq,
+                                     common_spec_verify_cost * shared_cost)
+    : cfg(cfg_in)
+    , vc_own(shared_cost == nullptr ? std::make_unique<common_spec_verify_cost>(smart_own_cost_cfg(cfg_in)) : nullptr)
+    , vc(shared_cost != nullptr ? shared_cost : vc_own.get())
+    , level_decay(vc->level_decay)
+    , level_cell(vc->level_cell)
+    , shape_cells(vc->shape_cells)
+    , shape_over(vc->shape_over)
+    , cost_n_run(vc->cost_n_run)
+    , used_run(vc->used_run)
+    , n_closed(shared_cost != nullptr ? n_closed_own : vc->clock)
+    , n_wait_reset(vc->n_wait_reset)
+    , wr_last(vc->wr_last)
+    , wr_n_before(vc->wr_n_before)
+    , wr_n_after(vc->wr_n_after)
+    , pool_lends(vc->pool_lends)
+    , pool_since_lend(vc->pool_since_lend) {
     cfg.n_max  = std::max<int32_t>(0, cfg.n_max);
     cfg.n_bins = std::max<int32_t>(1, cfg.n_bins);
     decay       = std::pow(0.5, 1.0 / std::max(1.0, cfg.half_life));
-    level_decay = std::pow(0.5, 1.0 / std::max(1.0, cfg.level_half_life));
+    GGML_ASSERT(vc->cfg.r_max >= cfg.n_max + 1 && "the shared verification cost is narrower than the controller");
 
-    shape_cells.assign(cfg.n_max + 1, {});
-    shape_over.assign(cfg.n_max + 1, 0.0);
     n_groups = std::max<int32_t>(1, cfg.n_groups);
     cal_cells.assign((size_t) n_groups * cfg.n_bins, {});
     qbar_cells.assign(std::min<int32_t>(cfg.n_max + 1, N_QBAR_MAX), {});
     cfg.lookahead_mix = std::clamp(cfg.lookahead_mix, 0.0, 1.0);
     cfg.conf_cap = cfg.conf_cap > 0.0 ? std::max(cfg.conf_cap, 1.0) : 0.0;
-    cost_n_run.assign(cfg.n_max + 1, 0);
-    used_run.assign(cfg.n_max + 1, 0);
     cfg.tconf_k = std::clamp<int32_t>(cfg.tconf_k, 1, common_spec_tconf::K_MAX);
     tconf_model.reset(cfg.tconf_k);
     if (cfg.tconf_per_pos && n_groups > 1) {
@@ -231,59 +266,10 @@ double common_spec_smart::draft_step() const {
 }
 
 std::vector<double> common_spec_smart::cost_table() const {
-    const int32_t N = cfg.n_max + 1;
-
-    // shape values; a width without one takes the line through the two nearest widths with one (the narrower one
-    // first on a tie)
-    std::vector<double>  val(N, 0.0);
-    std::vector<uint8_t> known(N, 0);
-    for (int32_t k = 0; k < N; ++k) {
-        if (shape_cells[k].n > 0.0) {
-            val[k]   = shape_cells[k].mean;
-            known[k] = 1;
-        }
-    }
-    std::vector<double> out = val;
-    for (int32_t k = 0; k < N; ++k) {
-        if (known[k]) {
-            continue;
-        }
-        int32_t j[2];
-        int32_t nj = 0;
-        for (int32_t d = 1; d < N && nj < 2; ++d) {
-            if (k - d >= 0 && known[k - d]) {
-                j[nj++] = k - d;
-            }
-            if (nj < 2 && k + d < N && known[k + d]) {
-                j[nj++] = k + d;
-            }
-        }
-        if (nj == 2) {
-            out[k] = val[j[0]] + (val[j[1]] - val[j[0]]) * (double) (k - j[0]) / (double) (j[1] - j[0]);
-        } else if (nj == 1) {
-            out[k] = val[j[0]];
-        } else {
-            out[k] = 0.0;
-        }
-    }
-
-    // a width not measured by this process is never cheaper than the nearest narrower width that was
-    int32_t last_run = -1;
-    for (int32_t k = 0; k < N; ++k) {
-        if (cost_n_run[k] > 0) {
-            last_run = k;
-        } else if (last_run >= 0) {
-            out[k] = std::max(out[k], out[last_run]);
-        }
-        out[k] = std::max(out[k], 0.0);
-    }
-
-    // time = level x shape (no level yet: no value)
-    const double L = std::max(level_cell.mean, 0.0);
-    for (auto & x : out) {
-        x *= L;
-    }
-    return out;
+    // level x shape of the target call (the line through the nearest widths for a width without a shape, never cheaper
+    // than a narrower width measured by this process), plus the rest of the round where it is measured (a shared cost),
+    // smoothed over the widths by the lookup the hazard model uses (without its prior; the observations are not changed)
+    return vc->smooth_us(cfg.n_max + 1);
 }
 
 int32_t common_spec_smart::decide(const float * p, int32_t n_drafted, int32_t n_max_seq,
@@ -534,58 +520,14 @@ void common_spec_smart::block_last(int32_t seq, int32_t j, float p, double qd) {
 }
 
 bool common_spec_smart::level_source(int32_t k) const {
-    // widths with a confident shape only; when there is none, every width with a shape
-    if (conf(shape_cells[k]) >= cfg.reprobe_n) {
-        return true;
-    }
-    for (const auto & c : shape_cells) {
-        if (conf(c) >= cfg.reprobe_n) {
-            return false;
-        }
-    }
-    return true;
+    return vc->level_source(k);
 }
 
 void common_spec_smart::observe_cost(int32_t k, double us) {
-    if (k < 0 || k > cfg.n_max || !(us >= 0.0)) {
+    if (k < 0 || k > cfg.n_max) {
         return;
     }
-    const double x = std::max(us, 1.0); // the ratios need a time above 0
-    auto & S = shape_cells[k];
-    const bool has_shape = S.n > 0.0 && S.mean > 0.0;
-
-    // the level: the first observation sets it; later x / the shape of the width, both before this observation
-    double L = level_cell.mean;
-    if (!(L > 0.0)) {
-        level_cell = {};
-        level_cell.add(has_shape ? x / S.mean : x, level_decay, n_closed);
-        L = level_cell.mean;
-    } else if (has_shape && level_source(k)) {
-        level_cell.add(x / S.mean, level_decay, n_closed);
-    }
-
-    // the shape of the width: x / the level before this observation. The wait confidence takes the same observation
-    // but stays at most conf_cap, so that a width used much and then left waits for an extension again after a bounded
-    // time; the mean and its confidence do not see the cap
-    const double wc = wait_conf(k);
-    // a waiting width: its old mean counts only with the wait confidence (below reprobe_n), so that a few extensions
-    // move a mean that stayed high long after the width was left. The weighted variance does not change when all old
-    // weights shrink by the same factor; only the confidence is cut. The level above took this observation as before.
-    wr_last = false;
-    if (cfg.wait_reset && waiting(k)) {
-        const double n0 = S.n_at(n_closed, decay);
-        if (wc < n0) {
-            S.n = wc;
-            S.t = std::max(S.t, n_closed);
-            wr_last     = true;
-            wr_n_before = n0;
-            wr_n_after  = wc;
-            n_wait_reset++;
-        }
-    }
-    S.add(x / L, decay, n_closed);
-    shape_over[k] = cfg.conf_cap > 0.0 ? std::max(0.0, S.n - std::min(wc + 1.0, cfg.conf_cap)) : 0.0;
-    cost_n_run[k]++;
+    vc->observe_core(k, us);
 }
 
 void common_spec_smart::observe_acceptance(const float * p, int32_t k, int32_t n_accepted) {
@@ -674,6 +616,36 @@ void common_spec_smart::close_round(int32_t seq, int64_t t_us, const common_spec
     st.graph_start = st.graph_next;
     st.graph_end   = graphs != nullptr ? *graphs : common_spec_smart_graphs();
     st.graph_next  = st.graph_end;
+    if (shared()) {
+        // a shared cost: the caller observed the target call; here the round ends (the acceptance was counted at
+        // accepted()), its time goes to the round log only
+        if (!st.active) {
+            return;
+        }
+        st.active = false;
+        if (st.k > 0 && !st.has_acc) {
+            if (log) {
+                log_round(seq, "unverified", -1.0);
+            }
+            return;
+        }
+        st.timed      = true;
+        st.log_obs_us = -1.0;
+        st.log_skip   = "shared";
+        if (log) {
+            log_round(seq, "closed", (double) (t_us - st.t_drafted));
+        }
+        n_closed++;
+        if (!cfg.store_path.empty() && cfg.save_every > 0 && n_closed - n_closed_saved >= cfg.save_every) {
+            if (save(cfg.store_path)) {
+                n_closed_saved = n_closed;
+            } else if (!save_failed) {
+                save_failed = true;
+                SMT_WRN("cannot write %s\n", cfg.store_path.c_str());
+            }
+        }
+        return;
+    }
     if (now.valid) {
         if (now.lends != pool_lends) {
             pool_since_lend = 0;
@@ -778,7 +750,7 @@ bool common_spec_smart::begin_round(int32_t seq, int32_t n_max_seq) {
 int32_t common_spec_smart::frontier() const {
     int32_t f = 0;
     for (int32_t k = 1; k <= cfg.n_max; ++k) {
-        if (!used_run[k] && !(shape_cells[k].n > 0.0)) {
+        if (!vc->known(k)) {
             break;
         }
         f = k;
@@ -787,15 +759,11 @@ int32_t common_spec_smart::frontier() const {
 }
 
 double common_spec_smart::wait_conf(int32_t w) const {
-    common_spec_smart_cell c = shape_cells[w];
-    if (cfg.conf_cap > 0.0) {
-        c.n = std::max(0.0, c.n - shape_over[w]);
-    }
-    return conf(c);
+    return vc->wait_conf(w);
 }
 
 bool common_spec_smart::waiting(int32_t w) const {
-    return w >= 0 && w <= cfg.n_max && wait_conf(w) < cfg.reprobe_n;
+    return w >= 0 && w <= cfg.n_max && vc->waiting(w);
 }
 
 bool common_spec_smart::can_extend(int32_t w, int32_t n_max_seq) const {
@@ -1079,7 +1047,7 @@ void common_spec_smart::log_round(int32_t seq, const char * end, double verify_u
         l += ",\"skips\":" + std::to_string(st.blk_skips) + ",\"kept\":" + std::to_string(st.blk.size()) + "}";
     }
     l += ",\"wait_reset\":";
-    const bool wr = std::string(end) == "closed" && wr_last;
+    const bool wr = std::string(end) == "closed" && !shared() && wr_last; // a shared cost: not the controller's
     l += wr ? "true" : "false";
     if (wr) {
         l += ",\"wr_n\":[";
@@ -1134,7 +1102,7 @@ std::string common_spec_smart::request_summary(int32_t seq) const {
     snprintf(buf, sizeof(buf), ", level %.2f ms n %.1f, shape (confidence):", level_cell.mean / 1000.0, level_conf());
     s += buf;
     for (int32_t k = 0; k <= cfg.n_max; ++k) {
-        snprintf(buf, sizeof(buf), " k%d %.3f (%.1f)", k, shape_cells[k].mean, conf(shape_cells[k]));
+        snprintf(buf, sizeof(buf), " k%d %.3f (%.1f)", k, shape_cells[k].mean, vc->conf(shape_cells[k]));
         s += buf;
     }
     snprintf(buf, sizeof(buf), ", draft step mean %.3f sd %.3f n %.1f", draft_cell.mean / 1000.0,
@@ -1707,18 +1675,20 @@ static std::string smart_key_line(const std::string & key) {
 
 bool common_spec_smart::save(const std::string & path) const {
     std::string out;
-    out += SMART_STORE_MAGIC;
+    out += shared() ? SMART_STORE_MAGIC_7 : SMART_STORE_MAGIC;
     out += "\nkey ";
     out += smart_key_line(cfg.store_key);
     out += "\nshape " + std::to_string(cfg.n_max) + " " + std::to_string(cfg.n_bins) + " " + std::to_string(n_groups) + "\n";
-    out += "level ";
-    smart_put(out, level_cell.mean); out += " ";
-    smart_put(out, level_conf()); out += "\n";
-    for (int32_t k = 0; k <= cfg.n_max; ++k) {
-        out += "ratio " + std::to_string(k) + " ";
-        smart_put(out, shape_cells[k].mean); out += " ";
-        smart_put(out, conf(shape_cells[k])); out += " ";
-        smart_put(out, shape_cells[k].var); out += "\n";
+    if (!shared()) {
+        out += "level ";
+        smart_put(out, level_cell.mean); out += " ";
+        smart_put(out, level_conf()); out += "\n";
+        for (int32_t k = 0; k <= cfg.n_max; ++k) {
+            out += "ratio " + std::to_string(k) + " ";
+            smart_put(out, shape_cells[k].mean); out += " ";
+            smart_put(out, conf(shape_cells[k])); out += " ";
+            smart_put(out, shape_cells[k].var); out += "\n";
+        }
     }
     for (int32_t g = 0; g < n_groups; ++g) {
         for (int32_t b = 0; b < cfg.n_bins; ++b) {
@@ -1770,9 +1740,10 @@ bool common_spec_smart::load(const std::string & path, std::string * why) {
     }
 
     std::string line;
-    if (!std::getline(f, line) || line != SMART_STORE_MAGIC) {
+    if (!std::getline(f, line) || (line != SMART_STORE_MAGIC && line != SMART_STORE_MAGIC_7)) {
         return fail("unknown format");
     }
+    const bool v7 = line == SMART_STORE_MAGIC_7;
     if (!std::getline(f, line) || line.rfind("key ", 0) != 0) {
         return fail("no key");
     }
@@ -1848,7 +1819,7 @@ bool common_spec_smart::load(const std::string & path, std::string * why) {
             return fail("unknown line");
         }
     }
-    if (!shape_ok || !level_ok || !end_ok) {
+    if (!shape_ok || (!level_ok && !v7) || !end_ok) {
         return fail("truncated");
     }
 
@@ -1861,15 +1832,18 @@ bool common_spec_smart::load(const std::string & path, std::string * why) {
         c.n = std::min(c.n, cap_n);
         c.t = n_closed;
     };
-    // the level with a small confidence: the first observations of this process move it
-    cap(level_new, cfg.level_cap_load);
-    level_cell = level_new;
-    for (int32_t k = 0; k <= cfg.n_max; ++k) {
-        cap(shape_new[k], cfg.cap_load);
-        shape_cells[k] = shape_new[k];
-        // the wait confidence at the running cap as well (the store keeps only the confidence of the mean)
-        shape_over[k]  = cfg.conf_cap > 0.0 ? std::max(0.0, shape_cells[k].n - cfg.conf_cap) : 0.0;
-        cost_n_run[k]  = 0;
+    // the controller's own cost (a shared one has its own store; the cost lines of a 6 store are not its time)
+    if (!shared() && level_ok) {
+        // the level with a small confidence: the first observations of this process move it
+        cap(level_new, cfg.level_cap_load);
+        level_cell = level_new;
+        for (int32_t k = 0; k <= cfg.n_max; ++k) {
+            cap(shape_new[k], cfg.cap_load);
+            shape_cells[k] = shape_new[k];
+            // the wait confidence at the running cap as well (the store keeps only the confidence of the mean)
+            shape_over[k]  = cfg.conf_cap > 0.0 ? std::max(0.0, shape_cells[k].n - cfg.conf_cap) : 0.0;
+            cost_n_run[k]  = 0;
+        }
     }
     for (size_t i = 0; i < cal_new.size(); ++i) {
         cap(cal_new[i], cfg.cap_load);

@@ -3,11 +3,14 @@
 // the store (round trip, another key or width, damaged files), the widths 1, 9 and 17 of a 9-row learner, bad values,
 // the graph builds taken out, the calls after a lend of the decode pool, an incomplete call, a duplicate call, the rounds
 // (the time besides the target call, a drafter that adds its own work, a replay, calls of other sequences, the drafter
-// of a round) and the hazard model of ngram-varlen with a cost table given.
+// of a round), the --spec-smart controller on the shared cost (the same decisions as on its own cost, its calibration
+// learnt from its own rounds only) and the hazard model of ngram-varlen with a cost table given.
 #include "common.h"
 #include "ngram-varlen.h"
+#include "speculative-smart.h"
 #include "speculative-verify-cost.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <filesystem>
@@ -196,6 +199,96 @@ static int test_lend() {
     return 0;
 }
 
+// A plain reference of the smoothed lookup (O(R^2), the isotonic fit by the min-max formula): the contract of
+// blend_ms() / smooth_us(). segment border: after the 8th row.
+static std::vector<double> ref_smooth(const common_spec_verify_cost & vc, const std::vector<double> & prior, double unit) {
+    const int R = vc.cfg.r_max;
+    const int SEG = 8;
+    const double k = vc.cfg.prior_n;
+    const std::vector<double> eff = vc.eff_table_m(R);
+    std::vector<double> n(R);
+    for (int i = 0; i < R; ++i) {
+        n[i] = vc.conf(vc.shape_cells[i]);
+    }
+    bool use_prior = !prior.empty();
+    for (int r = 1; r <= R; ++r) {
+        const double p = common_spec_verify_cost::prior_at(prior, r);
+        use_prior = use_prior && std::isfinite(p) && p > 0.0;
+    }
+    double s = 1.0;
+    if (use_prior && n[0] > 0.0) {
+        const double w1 = n[0] / (n[0] + k);
+        s = w1 * eff[0] / unit / prior[0] + (1.0 - w1);
+    }
+    std::vector<double> B(R), W(R);
+    for (int lo = 0; lo < R; lo = (lo < SEG ? std::min(SEG, R) : R)) {
+        const int hi = lo < SEG ? std::min(SEG, R) : R;
+        bool any = false;
+        for (int i = lo; i < hi; ++i) {
+            any = any || n[i] > 0.0;
+        }
+        for (int i = lo; i < hi; ++i) {
+            const double E = eff[i] / unit;
+            if (!use_prior) {
+                B[i] = E;
+                W[i] = std::max(n[i], 1e-6);
+                continue;
+            }
+            const double P = common_spec_verify_cost::prior_at(prior, i + 1);
+            int l = -1, g = -1;
+            for (int j = i - 1; j >= lo && l < 0; --j) {
+                if (n[j] > 0.0) { l = j; }
+            }
+            for (int j = i + 1; j < hi && g < 0; ++j) {
+                if (n[j] > 0.0) { g = j; }
+            }
+            double b = 1.0;
+            if (!any) {
+                b = s;
+            } else {
+                double lw = 0.0, gw = 0.0;
+                if (l >= 0 && g >= 0) { lw = (double) (g - i) / (g - l); gw = (double) (i - l) / (g - l); }
+                else if (l >= 0)      { lw = 1.0; }
+                else if (g >= 0)      { gw = 1.0; }
+                double num = k, den = k;
+                if (l >= 0) { num += lw * n[l] * eff[l] / unit / prior[l]; den += lw * n[l]; }
+                if (g >= 0) { num += gw * n[g] * eff[g] / unit / prior[g]; den += gw * n[g]; }
+                b = den > 0.0 ? num / den : 1.0;
+            }
+            B[i] = (n[i] * E + k * P * b) / (n[i] + k);
+            W[i] = std::max(n[i] + k, 1e-6);
+        }
+        std::vector<double> C(hi - lo);
+        for (int i = lo; i < hi; ++i) { // iso(i) = max over s <= i of min over t >= i of the weighted mean of s..t
+            double best = -1e300;
+            for (int a = lo; a <= i; ++a) {
+                double lowest = 1e300;
+                for (int t = i; t < hi; ++t) {
+                    double sw = 0.0, sv = 0.0;
+                    for (int j = a; j <= t; ++j) { sw += W[j]; sv += W[j] * B[j]; }
+                    lowest = std::min(lowest, sv / sw);
+                }
+                best = std::max(best, lowest);
+            }
+            C[i - lo] = best;
+        }
+        for (int i = lo; i < hi; ++i) {
+            B[i] = C[i - lo];
+        }
+    }
+    return std::vector<double>(B.begin(), B.end());
+}
+
+// width r (1 ..) observed `count` times at `us` after its untimed first call
+static void observe_width(common_spec_verify_cost & vc, int64_t & id, int r, int count, double us) {
+    vc.observe(call(id++, r, 1.0)); // the first call of a width in a process is not observed
+    for (int i = 0; i < count; ++i) {
+        vc.observe(call(id++, r, us));
+    }
+}
+
+static const std::vector<double> SMOOTH_PRIOR = { 39.2, 56.9, 72.4, 84.8, 97.3, 109.7, 124.4, 139.0, 162.4 };
+
 static int test_sparse_blend() {
     common_spec_verify_cost_config c;
     c.r_max = 9;
@@ -224,22 +317,26 @@ static int test_sparse_blend() {
         CHECK(std::fabs(b[r - 1] / (0.8 * prior[r - 1]) - 1.0) < 0.01); // not observed: the prior ratio
         CHECK(vc.estimate(r).origin == COMMON_SPEC_COST_INTERP && vc.estimate(r).shape_n == 0.0);
     }
-    // a width observed twice: weight 2 / (2 + 2) between its observation and the prior ratio
+    // a width observed twice: weight 2 / (2 + 2) between its observation and the neighbours' ratio (the nearest observed
+    // width on its left, width 3; nothing observed on its right), then the rise with the width
     vc.observe(call(id++, 7, 1.0)); // untimed
     vc.observe(call(id++, 7, 150000.0));
     vc.observe(call(id++, 7, 150000.0));
     const auto b7 = vc.blend_ms(prior, 9);
     const double n7 = vc.conf(vc.shape_cells[6]);
     const double w7 = n7 / (n7 + 2.0);
-    const double s1 = [&] {
-        const double n1 = vc.conf(vc.shape_cells[0]);
-        const double w1 = n1 / (n1 + 2.0);
-        return w1 * (vc.eff_table_m(9)[0] / 1000.0) / prior[0] + (1.0 - w1);
-    }();
-    CHECK(std::fabs(b7[6] - (w7 * vc.eff_table_m(9)[6] / 1000.0 + (1.0 - w7) * prior[6] * s1)) < 1e-9);
+    const double n3 = vc.conf(vc.shape_cells[2]);
+    const double r3 = vc.eff_table_m(9)[2] / 1000.0 / prior[2];
+    const double bn = (2.0 + n3 * r3) / (2.0 + n3);
+    CHECK(std::fabs(b7[6] - (n7 * vc.eff_table_m(9)[6] / 1000.0 + 2.0 * prior[6] * bn) / (n7 + 2.0)) < 1e-9);
     CHECK(w7 > 0.4 && w7 < 0.5);
-    fprintf(stderr, "blend: r=7 %.1f ms (observed %.1f, prior x level %.1f), r=9 %.1f ms\n", b7[6],
-            vc.eff_table_m(9)[6] / 1000.0, prior[6] * s1, b7[8]);
+    const auto ref7 = ref_smooth(vc, prior, 1000.0);
+    for (int r = 1; r <= 9; ++r) {
+        CHECK(std::fabs(b7[r - 1] - ref7[r - 1]) < 1e-9);
+        CHECK(r == 1 || r == 9 || b7[r - 1] >= b7[r - 2]);
+    }
+    fprintf(stderr, "blend: r=7 %.1f ms (observed %.1f, prior x neighbours %.1f), r=9 %.1f ms\n", b7[6],
+            vc.eff_table_m(9)[6] / 1000.0, prior[6] * bn, b7[8]);
     return 0;
 }
 
@@ -499,6 +596,421 @@ static int test_rounds_edges() {
 }
 
 //
+// the --spec-smart controller on the shared cost
+//
+
+static common_spec_smart_config smart_cfg(int n_max) {
+    common_spec_smart_config c;
+    c.n_max = n_max;
+    c.lookahead_mix = 0.0;
+    return c;
+}
+
+static int test_smart_shared_same() {
+    // the controller on its own cost and on a shared one wider than it, with the same target times: the same table and
+    // the same decisions (no rest of the round measured)
+    common_spec_smart own(smart_cfg(3), 1);
+    common_spec_verify_cost_config c;
+    c.r_max = 9;
+    common_spec_verify_cost vc(c);
+    common_spec_smart sh(smart_cfg(3), 1, &vc);
+    CHECK(!own.shared() && sh.shared() && own.vc->cfg.r_max == 4);
+    std::mt19937 rng(9);
+    std::uniform_int_distribution<int> w(0, 3);
+    for (int i = 0; i < 500; ++i) {
+        const int k = w(rng);
+        const double us = curve(k + 1) * (1.0 + 0.05 * std::sin((double) i));
+        own.observe_cost(k, us);
+        own.n_closed++;
+        vc.observe_core(k, us);
+        vc.clock++;
+    }
+    const auto a = own.cost_table();
+    const auto b = sh.cost_table();
+    CHECK(a.size() == 4 && b.size() == 4);
+    for (int k = 0; k < 4; ++k) {
+        CHECK(a[k] == b[k]);
+        CHECK(own.wait_conf(k) == sh.wait_conf(k) && own.waiting(k) == sh.waiting(k));
+    }
+    CHECK(own.frontier() == sh.frontier());
+    for (auto * s : { &own, &sh }) {
+        for (auto & x : s->cal_cells) { x = { 0.8, 1e9 }; }
+        for (auto & x : s->qbar_cells) { x = { 0.8, 1e9 }; }
+        s->add_draft_step(1000.0);
+    }
+    for (float p : { 0.1f, 0.5f, 0.9f, 0.99f }) {
+        const float pp[3] = { p, p, p };
+        for (int n = 0; n <= 3; ++n) {
+            CHECK(own.decide(pp, n, 3) == sh.decide(pp, n, 3));
+        }
+    }
+    // the controller's store with a shared cost keeps the calibration only (7); its own keeps the cost (6)
+    const std::string p6 = tmp("test-spec-verify-cost-smart6.txt");
+    const std::string p7 = tmp("test-spec-verify-cost-smart7.txt");
+    CHECK(own.save(p6) && sh.save(p7));
+    CHECK(read_file(p6).rfind("ranma-spec-smart 6\n", 0) == 0 && read_file(p6).find("\nratio 2 ") != std::string::npos);
+    CHECK(read_file(p7).rfind("ranma-spec-smart 7\n", 0) == 0 && read_file(p7).find("\nratio ") == std::string::npos);
+    // a 6 store read with a shared cost: the calibration is taken, the cost lines are not (another time)
+    common_spec_verify_cost vc2(c);
+    common_spec_smart sh2(smart_cfg(3), 1, &vc2);
+    CHECK(sh2.load(p6) && vc2.level() == 0.0 && sh2.cal_cells[5].mean == 0.8);
+    // a 7 store read on its own cost: the calibration, the cost stays cold
+    common_spec_smart own2(smart_cfg(3), 1);
+    CHECK(own2.load(p7) && own2.level() == 0.0 && own2.cal_cells[5].mean == 0.8);
+    std::filesystem::remove(p6);
+    std::filesystem::remove(p7);
+    return 0;
+}
+
+static int test_smoothing_contract() {
+    // random sparse states, a fall and a rise across the border included: the lookup is the contract above, finite,
+    // non-negative, and rises with the width inside each segment (rows 1..8, and 9 on); a longer prefix is the same
+    // table (the whole width is computed once)
+    std::mt19937 rng(77);
+    std::uniform_real_distribution<double> u(0.0, 1.0);
+    for (int it = 0; it < 300; ++it) {
+        common_spec_verify_cost_config c;
+        c.r_max = 9 + (it % 3) * 4; // 9, 13, 17 (the scratch of the usual width and the one beyond it)
+        common_spec_verify_cost vc(c);
+        std::vector<double> prior;
+        for (int r = 1; r <= 9; ++r) {
+            prior.push_back(SMOOTH_PRIOR[r - 1]);
+        }
+        const double step = SMOOTH_PRIOR[8] - SMOOTH_PRIOR[7];
+        while ((int) prior.size() < c.r_max) {
+            prior.push_back(prior.back() + step);
+        }
+        int64_t id = 0;
+        for (int r = 1; r <= c.r_max; ++r) {
+            if (u(rng) < 0.5) {
+                const double f = 0.5 + 1.5 * u(rng); // some widths far from the prior, up or down
+                observe_width(vc, id, r, 1 + (int) (u(rng) * 40), prior[r - 1] * 1000.0 * f);
+            }
+        }
+        for (const auto & pr : { prior, std::vector<double>() }) {
+            const int rows = c.r_max + 3;
+            const auto b = vc.blend_ms(pr, rows);
+            CHECK((int) b.size() == rows);
+            if (pr.empty()) {
+                const auto ref = ref_smooth(vc, pr, 1000.0);
+                for (int r = 1; r <= c.r_max; ++r) {
+                    CHECK(std::fabs(b[r - 1] - ref[r - 1]) <= 1e-9 * (1.0 + std::fabs(ref[r - 1])));
+                }
+            } else if (vc.level() > 0.0) {
+                const auto ref = ref_smooth(vc, pr, 1000.0);
+                for (int r = 1; r <= c.r_max; ++r) {
+                    CHECK(std::fabs(b[r - 1] - ref[r - 1]) <= 1e-9 * (1.0 + std::fabs(ref[r - 1])));
+                }
+            }
+            for (int r = 1; r <= rows; ++r) {
+                CHECK(std::isfinite(b[r - 1]) && b[r - 1] >= 0.0);
+                if (r >= 2 && r != 9) { // r = 9 starts the second segment: free to fall or rise
+                    CHECK(b[r - 1] >= b[r - 2] - 1e-12);
+                }
+            }
+            const auto s = vc.blend_ms(pr, 4); // the prefix of the same table
+            for (int r = 1; r <= 4; ++r) {
+                CHECK(s[r - 1] == b[r - 1]);
+            }
+        }
+        // the unit: the table in us is the same values (no prior: nothing but the unit differs)
+        const auto us = vc.smooth_us(c.r_max + 2);
+        const auto ms = vc.blend_ms({}, c.r_max + 2);
+        for (size_t i = 0; i < us.size(); ++i) {
+            CHECK(std::fabs(us[i] - 1000.0 * ms[i]) <= 1e-9 * (1.0 + std::fabs(us[i])));
+        }
+    }
+    return 0;
+}
+
+static int test_weighted_pav() {
+    std::mt19937 rng(5);
+    std::uniform_real_distribution<double> u(0.0, 100.0);
+    std::uniform_real_distribution<double> uw(0.01, 5.0);
+    for (int it = 0; it < 1000; ++it) {
+        const int n = 1 + it % 12;
+        std::vector<double> v(n), w(n);
+        for (int i = 0; i < n; ++i) {
+            v[i] = u(rng);
+            w[i] = uw(rng);
+        }
+        double sv = 0.0;
+        for (int i = 0; i < n; ++i) { sv += w[i] * v[i]; }
+        std::vector<double> p = v;
+        common_spec_verify_cost::weighted_pav(p, w);
+        double pv = 0.0;
+        for (int i = 0; i < n; ++i) {
+            pv += w[i] * p[i];
+            CHECK(i == 0 || p[i] >= p[i - 1]);
+        }
+        CHECK(std::fabs(pv - sv) <= 1e-9 * sv);        // the weighted mean is kept
+        std::vector<double> q = p;
+        common_spec_verify_cost::weighted_pav(q, w);   // idempotent
+        for (int i = 0; i < n; ++i) {
+            CHECK(std::fabs(q[i] - p[i]) <= 1e-12 * (1.0 + p[i]));
+        }
+        std::vector<double> m = v; // an already rising input is not changed
+        std::sort(m.begin(), m.end());
+        std::vector<double> m2 = m;
+        common_spec_verify_cost::weighted_pav(m2, w);
+        CHECK(m2 == m);
+    }
+    return 0;
+}
+
+static int test_smoothing_segments() {
+    common_spec_verify_cost_config c;
+    c.r_max = 9;
+    c.half_life = 1e9; // no decay: the confidence of a width is its number of observations
+    int64_t id = 0;
+    // a fall across the border stays (r = 9 cheaper than r = 8), the second segment is its own
+    {
+        common_spec_verify_cost vc(c);
+        for (int r = 1; r <= 9; ++r) {
+            const double ms = r <= 8 ? SMOOTH_PRIOR[r - 1] : 100.0; // the 9th row on another kernel: cheaper
+            observe_width(vc, id, r, 60, ms * 1000.0);
+        }
+        const auto b = vc.blend_ms(SMOOTH_PRIOR, 9);
+        CHECK(b[8] < b[7] - 20.0);
+        CHECK(std::fabs(b[8] - 100.0) < 5.0 && std::fabs(b[7] - SMOOTH_PRIOR[7]) < 5.0);
+    }
+    // a rise across the border stays (a step of 60 ms), and a rising step inside a segment (r = 5) is kept
+    {
+        common_spec_verify_cost vc(c);
+        for (int r = 1; r <= 9; ++r) {
+            double ms = SMOOTH_PRIOR[r - 1];
+            if (r >= 5) { ms += 30.0; }
+            if (r == 9) { ms += 60.0; }
+            observe_width(vc, id, r, 60, ms * 1000.0);
+        }
+        const auto b = vc.blend_ms(SMOOTH_PRIOR, 9);
+        CHECK((b[4] - b[3]) > 0.9 * (SMOOTH_PRIOR[4] - SMOOTH_PRIOR[3] + 30.0));
+        CHECK((b[8] - b[7]) > 0.9 * (SMOOTH_PRIOR[8] - SMOOTH_PRIOR[7] + 60.0));
+    }
+    // a fall inside a segment is not kept (r = 6 cheaper than r = 5 by measurement): pooled, non-decreasing
+    {
+        common_spec_verify_cost vc(c);
+        for (int r = 1; r <= 8; ++r) {
+            observe_width(vc, id, r, 60, (r == 6 ? SMOOTH_PRIOR[3] : SMOOTH_PRIOR[r - 1]) * 1000.0);
+        }
+        const auto b = vc.blend_ms(SMOOTH_PRIOR, 9);
+        CHECK(b[5] >= b[4] - 1e-12);
+        CHECK(b[5] > SMOOTH_PRIOR[3] + 1.0); // lifted by the pool, not the measurement alone
+    }
+    // an unobserved segment keeps the prior step at the level of r = 1: the ratio of r = 1 (0.8) carries over to r = 9,
+    // while the neighbours of the first segment do not reach it
+    {
+        common_spec_verify_cost vc(c);
+        for (int r = 1; r <= 8; ++r) {
+            observe_width(vc, id, r, 200, 0.8 * SMOOTH_PRIOR[r - 1] * 1000.0);
+        }
+        const auto b = vc.blend_ms(SMOOTH_PRIOR, 9);
+        const double n1 = vc.conf(vc.shape_cells[0]);
+        const double w1 = n1 / (n1 + 2.0);
+        const double s  = w1 * vc.eff_table_m(9)[0] / 1000.0 / SMOOTH_PRIOR[0] + (1.0 - w1);
+        CHECK(std::fabs(b[8] - SMOOTH_PRIOR[8] * s) <= 1e-9 * b[8]);
+        CHECK(s > 0.79 && s < 0.81 && b[8] - b[7] > 0.9 * (SMOOTH_PRIOR[8] - SMOOTH_PRIOR[7]) * 0.8); // the step is kept
+    }
+    return 0;
+}
+
+static int test_smoothing_sparse() {
+    common_spec_verify_cost_config c;
+    c.r_max = 9;
+    c.half_life = 1e9;
+    common_spec_verify_cost vc(c);
+    int64_t id = 0;
+    // r = 1 never observed, widths 2..4 are 30 % above the prior: r = 1 follows them (a cold r = 1), r = 6 also
+    for (int r = 2; r <= 4; ++r) {
+        observe_width(vc, id, r, 150, 1.3 * SMOOTH_PRIOR[r - 1] * 1000.0);
+    }
+    CHECK(vc.estimate(1).shape_n == 0.0);
+    const auto b = vc.blend_ms(SMOOTH_PRIOR, 9);
+    CHECK(std::fabs(b[0] / SMOOTH_PRIOR[0] - 1.3) < 0.04);   // converged to the neighbours' ratio
+    CHECK(b[5] / SMOOTH_PRIOR[5] > 1.25);                     // r = 6 follows the nearest observed width
+    CHECK(b[8] == SMOOTH_PRIOR[8]);                           // the other segment: the prior (r = 1 has no estimate)
+    // the borrowed ratio adds nothing to the confidence
+    CHECK(vc.estimate(1).shape_n == 0.0 && vc.estimate(6).shape_n == 0.0 && !vc.known(0) && !vc.known(5));
+    // the cold learner: only the prior, any prefix of it, and a prior that is not usable only projects the estimates
+    common_spec_verify_cost cold(c);
+    const auto p = cold.blend_ms(SMOOTH_PRIOR, 9);
+    for (int r = 1; r <= 9; ++r) {
+        CHECK(p[r - 1] == SMOOTH_PRIOR[r - 1]);
+    }
+    std::vector<double> bad = SMOOTH_PRIOR;
+    bad[4] = 0.0;
+    const auto q = vc.blend_ms(bad, 9);
+    const auto raw = vc.blend_ms({}, 9);
+    CHECK(q == raw);
+    return 0;
+}
+
+static int test_smoothing_is_a_lookup() {
+    // the lookup changes neither the learned state nor the store
+    common_spec_verify_cost_config c;
+    c.r_max = 9;
+    common_spec_verify_cost vc(c);
+    std::mt19937 rng(3);
+    int64_t id = 0;
+    for (int r = 1; r <= 9; ++r) {
+        vc.observe(call(id++, r, 1.0));
+    }
+    feed(vc, id, 400, 1.0, rng, 0.1);
+    const std::string p0 = tmp("test-spec-verify-cost-lookup-0.txt");
+    const std::string p1 = tmp("test-spec-verify-cost-lookup-1.txt");
+    CHECK(vc.save(p0));
+    const auto cells = vc.shape_cells;
+    const auto aux = vc.aux_cells;
+    const int64_t clock = vc.clock;
+    const auto eff = vc.eff_table_m(9);
+    for (int i = 0; i < 20; ++i) {
+        (void) vc.blend_ms(SMOOTH_PRIOR, 12);
+        (void) vc.smooth_us(10);
+    }
+    CHECK(vc.save(p1));
+    CHECK(read_file(p0) == read_file(p1));
+    CHECK(read_file(p0).rfind("ranma-spec-verify-cost 1\n", 0) == 0);
+    CHECK(vc.clock == clock && vc.eff_table_m(9) == eff);
+    for (int i = 0; i < 9; ++i) {
+        CHECK(vc.shape_cells[i].mean == cells[i].mean && vc.shape_cells[i].n == cells[i].n &&
+              vc.shape_cells[i].t == cells[i].t && vc.shape_cells[i].var == cells[i].var);
+        CHECK(vc.aux_cells[i].mean == aux[i].mean && vc.aux_cells[i].n == aux[i].n);
+    }
+    std::filesystem::remove(p0);
+    std::filesystem::remove(p1);
+    return 0;
+}
+
+static int test_smoothing_smart_same() {
+    // --spec-smart and the hazard model get the same smoothed values (the unit apart), and the smart frontier, the
+    // known and wait inputs do not change with a lookup
+    common_spec_verify_cost_config c;
+    c.r_max = 9;
+    common_spec_verify_cost vc(c);
+    common_spec_smart sh(smart_cfg(3), 1, &vc);
+    std::mt19937 rng(11);
+    std::uniform_int_distribution<int> w(0, 3);
+    for (int i = 0; i < 300; ++i) {
+        const int k = w(rng);
+        // the 4th row (k = 3) is cheaper than the 3rd: a fall inside the segment
+        const double us = k == 3 ? 0.9 * curve(3) : curve(k + 1) * (1.0 + 0.05 * std::sin((double) i));
+        vc.observe_core(k, us);
+        vc.clock++;
+    }
+    const auto t = sh.cost_table();
+    const auto h = vc.blend_ms({}, 4);
+    CHECK(t.size() == 4 && h.size() == 4);
+    for (int k = 0; k < 4; ++k) {
+        CHECK(std::fabs(t[k] - 1000.0 * h[k]) <= 1e-9 * (1.0 + t[k]));
+        CHECK(k == 0 || t[k] >= t[k - 1]);
+    }
+    CHECK(t[3] == t[2] && t[3] > vc.eff_table_m(4)[3] + 100.0); // raw: 0.9 x the 3rd row, smoothed: pooled with it
+    // the inputs of the frontier and of the wait are the raw observations
+    std::vector<int> known, waiting;
+    std::vector<double> wc;
+    for (int m = 0; m < 9; ++m) {
+        known.push_back(vc.known(m));
+        waiting.push_back(vc.waiting(m));
+        wc.push_back(vc.wait_conf(m));
+    }
+    const int32_t fr = sh.frontier();
+    for (int i = 0; i < 10; ++i) {
+        (void) sh.cost_table();
+        (void) vc.blend_ms(SMOOTH_PRIOR, 9);
+    }
+    CHECK(sh.frontier() == fr);
+    for (int m = 0; m < 9; ++m) {
+        CHECK(vc.known(m) == (bool) known[m] && vc.waiting(m) == (bool) waiting[m] && vc.wait_conf(m) == wc[m]);
+    }
+    // an unobserved width is not known because the lookup interpolates it
+    CHECK(!vc.known(6));
+    return 0;
+}
+
+static int test_owner_alternation() {
+    // rounds of ngram, DSpark (the --spec-smart drafter), none, MTP on one sequence. The central protocol: every round
+    // starts by closing the controller's round; the controller drafts only when ngram did not; accepted() reaches it
+    // only for its own rounds. Its calibration learns from its own rounds only, its rounds never span another
+    // drafter's, and the shared cost learns every round
+    common_spec_verify_cost_config c;
+    c.r_max = 9;
+    common_spec_verify_cost vc(c);
+    common_spec_verify_rounds rd(&vc, 1);
+    common_spec_smart_config sc = smart_cfg(4);
+    sc.block = true;
+    sc.n_groups = 4;
+    sc.log_path = tmp("test-spec-verify-cost-smart.log");
+    std::filesystem::remove(sc.log_path);
+    {
+        common_spec_smart sm(sc, 1, &vc);
+        int64_t t = 1000000;
+        int64_t id = 0;
+        int64_t smart_rounds = 0;
+        const int32_t seq[8] = { T_NGRAM, T_DSPARK, -1, T_MTP, T_NGRAM, T_NGRAM, T_DSPARK, T_DSPARK };
+        for (int i = 0; i < 64; ++i) {
+            const int32_t who = seq[i % 8];
+            // the round starts: the shared rounds and the controller close the previous one
+            rd.draft_begin(0, t, 0.0);
+            sm.close_round(0, t);
+            int32_t m = 0;
+            if (who == T_DSPARK) {
+                if (sm.begin_block(0, 4)) {
+                    const float p[4] = { 0.9f, 0.9f, 0.9f, 0.9f };
+                    m = sm.block_drafted(0, p, 4);
+                    sm.add_draft_step(15000.0);
+                    t += 15000;
+                }
+                sm.drafted(0, m, t);
+                smart_rounds++;
+            } else {
+                // another drafter (or none): the controller has no round open, none spans this one
+                CHECK(!sm.seqs[0].active);
+                m = who >= 0 ? 3 : 0;
+            }
+            rd.drafted(0, t, m, m > 0 ? who : -1, who >= 0 ? 1u << who : 0u, 0.0);
+            auto s = call(id++, m + 1, curve(m + 1));
+            rd.call(s, vc.observe(s));
+            t += (int64_t) curve(m + 1) + 3000;
+            // accepted: the gate of common_speculative_smart_accepted
+            const auto cal0 = sm.cal_cells;
+            if (rd.owner(0) == T_DSPARK) {
+                sm.accepted(0, 1);
+            }
+            if (rd.owner(0) != T_DSPARK) {
+                for (size_t j = 0; j < cal0.size(); ++j) {
+                    CHECK(sm.cal_cells[j].mean == cal0[j].mean && sm.cal_cells[j].n == cal0[j].n);
+                }
+            }
+        }
+        rd.draft_begin(0, t, 0.0);
+        sm.close_round(0, t);
+        CHECK(sm.n_closed == smart_rounds); // its clock: its own closed rounds
+        CHECK(vc.clock == 64);              // the shared clock: every target call
+        CHECK(vc.n_core > 0 && vc.n_aux > 0);
+        sm.log_flush();
+    }
+    // the controller's rounds end where the next round starts: a verify_us of its round is its own target call and
+    // rest (at most the widest call + 3 ms), never several rounds
+    std::ifstream f(sc.log_path);
+    int n_closed = 0;
+    for (std::string l; std::getline(f, l);) {
+        if (l.find("\"ev\":\"round\"") == std::string::npos || l.find("\"end\":\"closed\"") == std::string::npos) {
+            continue;
+        }
+        const size_t at = l.find("\"verify_us\":");
+        CHECK(at != std::string::npos);
+        const double v = atof(l.c_str() + at + 12);
+        CHECK(v <= curve(5) + 3000.0 + 1.0);
+        CHECK(l.find("\"obs_skip\":\"shared\"") != std::string::npos);
+        n_closed++;
+    }
+    CHECK(n_closed > 0);
+    f.close();
+    std::filesystem::remove(sc.log_path);
+    return 0;
+}
+
+//
 // the hazard model of ngram-varlen with a cost table given
 //
 
@@ -547,9 +1059,17 @@ int main() {
         { "bad_wide_graph_dup", test_bad_wide_graph_dup },
         { "lend",             test_lend },
         { "sparse_blend",     test_sparse_blend },
+        { "smoothing_contract", test_smoothing_contract },
+        { "weighted_pav",     test_weighted_pav },
+        { "smoothing_segments", test_smoothing_segments },
+        { "smoothing_sparse", test_smoothing_sparse },
+        { "smoothing_lookup", test_smoothing_is_a_lookup },
+        { "smoothing_smart_same", test_smoothing_smart_same },
         { "store",            test_store },
         { "rounds_split",     test_rounds_split },
         { "rounds_edges",     test_rounds_edges },
+        { "smart_shared_same", test_smart_shared_same },
+        { "owner_alternation", test_owner_alternation },
         { "hazard_table",     test_hazard_table },
     };
     for (const auto & t : tests) {

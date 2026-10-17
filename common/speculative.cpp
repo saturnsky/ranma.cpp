@@ -4221,7 +4221,8 @@ common_speculative * common_speculative_init(common_params_speculative & params,
                 }
             }
 
-            result->smart = std::make_unique<common_spec_smart>(cfg, (int32_t) n_seq);
+            // the verification cost is the shared one: the controller reads it, the target calls observe it
+            result->smart = std::make_unique<common_spec_smart>(cfg, (int32_t) n_seq, result->vcost.get());
             if (mtp != nullptr) {
                 mtp->smart = result->smart.get();
                 result->smart_type = COMMON_SPECULATIVE_TYPE_DRAFT_MTP;
