@@ -208,6 +208,57 @@ static std::vector<llama_token> server_accept_replay(
     return result;
 }
 
+// diagnostic (LLAMA_SERVER_FORCED_TOKENS_REC=<file>): append the generated token ids of every finished request to the file as
+// one JSON line {"id_task":..,"tokens":[..]}; the record of a run is what a later run sends as forced_tokens
+static const char * server_forced_rec_path() {
+    static const char * path = getenv("LLAMA_SERVER_FORCED_TOKENS_REC");
+    return path != nullptr && path[0] != '\0' ? path : nullptr;
+}
+
+// diagnostic (LLAMA_SERVER_FORCED_TOKENS=1, request field forced_tokens): the token of generation position n_gen + i
+// is forced[n_gen + i] while the list lasts, otherwise the sampled one
+static llama_token server_forced_token(const llama_tokens & forced, size_t pos, llama_token sampled) {
+    return pos < forced.size() ? forced[pos] : sampled;
+}
+
+// teacher-forced draft verification: the sampler runs as usual (same cost, same state updates), its result is replaced by the
+// forced token, and a draft token is accepted when it equals the forced token of its position
+static std::vector<llama_token> server_sample_and_accept_forced(
+        common_sampler * smpl,
+        llama_context * ctx,
+        const std::vector<int32_t> & idxs,
+        const llama_tokens & draft,
+        const llama_tokens & forced,
+        size_t pos0) {
+    GGML_ASSERT(idxs.size() == draft.size() + 1);
+
+    std::vector<llama_token> result;
+    result.reserve(idxs.size());
+
+    const llama_vocab * vocab = llama_model_get_vocab(llama_get_model(ctx));
+
+    size_t i = 0;
+    for (; i < draft.size(); ++i) {
+        const llama_token id = server_forced_token(forced, pos0 + i, common_sampler_sample(smpl, ctx, idxs[i]));
+
+        common_sampler_accept(smpl, id, true);
+        result.push_back(id);
+
+        if (draft[i] != id || (llama_vocab_is_eog(vocab, id) && i + 1 < draft.size())) {
+            break;
+        }
+    }
+
+    if (i == draft.size()) {
+        const llama_token id = server_forced_token(forced, pos0 + i, common_sampler_sample(smpl, ctx, idxs[i]));
+
+        common_sampler_accept(smpl, id, true);
+        result.push_back(id);
+    }
+
+    return result;
+}
+
 // synthetic draft verification for benchmarking - accept draft tokens at random instead of by match with the target
 // on replay the draft was already accepted before a context checkpoint restore, so repeat the same decisions
 static std::vector<llama_token> server_sample_and_accept_synth(
@@ -2267,7 +2318,7 @@ private:
         if (slot.can_speculate()) {
             slot.spec_gen.push_back(result.tok); // --spec-trigram-profile
         }
-        if (slot.task->params.return_tokens) {
+        if (slot.task->params.return_tokens || server_forced_rec_path() != nullptr) {
             slot.generated_tokens.push_back(result.tok);
         }
         slot.has_next_token = true;
@@ -2611,6 +2662,14 @@ private:
         // keep copy of last generated text for debugging purposes
         if (slots_debug) {
             slot.debug_generated_text = slot.generated.text;
+        }
+
+        if (const char * rec = server_forced_rec_path()) {
+            if (FILE * f = fopen(rec, "ab")) {
+                json line = { {"id_task", slot.task->id}, {"tokens", slot.generated_tokens} };
+                fprintf(f, "%s\n", line.dump().c_str());
+                fclose(f);
+            }
         }
 
         // in stream mode, content and tokens are already in last partial chunk
@@ -5177,6 +5236,7 @@ private:
             {
                 scoped_timer timer(t_sampl, n_sampl);
                 id = common_sampler_sample(slot.smpl.get(), slot.ctx_tgt, tok_idx);
+                id = server_forced_token(slot.task->params.forced_tokens, slot.stats.n_gen, id);
             }
 
             slot.i_batch = -1;
@@ -5252,6 +5312,9 @@ private:
                             synth_probs, slot.spec_synth_rng, slot.spec_is_replay);
                 } else if (slot.spec_is_replay && slot.use_spec_rejection()) {
                     accepted = server_accept_replay(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
+                } else if (!slot.task->params.forced_tokens.empty()) {
+                    accepted = server_sample_and_accept_forced(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft,
+                            slot.task->params.forced_tokens, slot.stats.n_gen);
                 } else if (use_rejection) {
                     accepted = common_sampler_sample_and_accept_n_rejection(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft, slot.spec_draft_q);
                 } else {

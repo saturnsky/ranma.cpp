@@ -47,6 +47,28 @@ std::vector<std::unique_ptr<field>> make_llama_cmpl_schema(const common_params &
         ->add_alias("max_tokens")
         ->set_desc("Set the maximum number of tokens to predict. When 0, no tokens will be generated but the prompt is evaluated into the cache"));
 
+    // diagnostic for speed comparisons (tf-bench): the generated text is fixed to the given token ids
+    add((new field_json("forced_tokens"))
+        ->set_desc("Diagnostic, needs LLAMA_SERVER_FORCED_TOKENS=1 in the server environment. Token ids that replace the sampled tokens (teacher forcing) so that runs with different drafters generate the same text. Limits n_predict to the list length")
+        ->set_handler([&](field_eval_context & ctx, const json & data) {
+            if (!data.contains("forced_tokens") || data.at("forced_tokens").is_null()) {
+                return;
+            }
+            const char * env = getenv("LLAMA_SERVER_FORCED_TOKENS");
+            if (env == nullptr || std::string(env) != "1") {
+                throw std::invalid_argument("'forced_tokens' needs LLAMA_SERVER_FORCED_TOKENS=1 in the server environment");
+            }
+            const json & arr = data.at("forced_tokens");
+            if (!arr.is_array()) {
+                throw std::invalid_argument("'forced_tokens' must be an array of token ids");
+            }
+            ctx.params.forced_tokens = arr.get<std::vector<llama_token>>();
+            const int32_t n = (int32_t) ctx.params.forced_tokens.size();
+            if (ctx.params.n_predict < 0 || ctx.params.n_predict > n) {
+                ctx.params.n_predict = n;
+            }
+        }));
+
     add((new field_num("n_indent", params.n_indent))
         ->set_hard_limits(0, INT32_MAX)
         ->set_desc("Specify the minimum line indentation for the generated text in number of whitespace characters. Useful for code completion tasks"));
