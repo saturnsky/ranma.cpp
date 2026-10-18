@@ -1549,8 +1549,13 @@ static ggml_backend_buffer_t ggml_backend_cuda_host_buffer_type_alloc_buffer(ggm
 
 static size_t ggml_backend_cuda_host_buffer_type_get_max_size(ggml_backend_buffer_type_t buft) {
     GGML_UNUSED(buft);
+#if defined(GGML_USE_HIP)
+    // ranma: ROCm on Windows pins far more in one piece (a single 98 GiB hipHostRegister, 171 GiB pinned in total)
+    return SIZE_MAX;
+#else
     // very large pinned allocations can fail (e.g. on Windows) and fall back to pageable memory, smaller ones succeed
     return 4ull*1024*1024*1024;
+#endif // defined(GGML_USE_HIP)
 }
 
 ggml_backend_buffer_type_t ggml_backend_cuda_host_buffer_type() {
