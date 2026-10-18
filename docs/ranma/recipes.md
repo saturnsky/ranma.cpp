@@ -15,7 +15,7 @@ The commands below share these options:
 
 - **Pass the first shard** (`-00001-of-0000N.gguf`) to `-m`; the other shards are found by name.
 - **Host-direct and `--load-mode none` are automatic** with an expert cache budget ([expert-cache.md](expert-cache.md#requirements));
-  no environment switch is needed. The decode pool is on by default ([expert-cache-ub-pool.md](expert-cache-ub-pool.md)).
+  no environment switch is needed. The decode pool is always on with the expert cache ([expert-cache-ub-pool.md](expert-cache-ub-pool.md)).
 - **`-np 1`** for one user. Without it the server runs four slots, the per-slot state grows, and a finite L2 is refused
   (`finite L2 needs positive batch/parallel bounds`).
 - **`--expert-cache-mode exclusive`** keeps one copy of each expert, in VRAM or in RAM
