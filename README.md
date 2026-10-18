@@ -82,8 +82,23 @@ Every other change, one line each with its page: [docs/ranma/README.md](docs/ran
 
 ## Benchmarks
 
-The benchmark of a release is the last commit of its series
-([docs/ranma/releases.md](docs/ranma/releases.md#release-cycle)).
+The release ranma_20261018 (upstream `8f574b0ad`) measured DeepSeek V4.1 Flash in EXL3 3.0 bpw with layer-major
+prefill and n-gram drafting on the Radeon AI PRO R9700: server scenarios (coding, Korean roleplay; warm, one slot, the
+model's recommended sampling) and prompts of 512 to 32768 tokens. The 128 and 192 GB systems are emulated on a 224 GB
+machine (DDR5-5600 in a flex-channel layout, effective bandwidth about that of DDR5-4900) by taking physical memory
+away ([record](docs/ranma/benchmarks/2026-10-18-release.md), with all four decode statistics, the draft acceptance,
+where a long prompt spends its time and memory).
+
+| system | decode, coding | decode, Korean roleplay | prompt 4096 | prompt 32768 |
+|---|---:|---:|---:|---:|
+| R9700, 128 GB | 22.85 t/s | 24.34 t/s | 364.7 t/s | 662.3 t/s (49.5 s) |
+| R9700, 192 GB | 25.32 t/s | 26.62 t/s | 614.5 t/s | 934.5 t/s (35.1 s) |
+
+The latest numbers of the other models (Qwen3.8-Flash-Next, DeepSeek V4 Flash and GLM-5.3 Flash in EXL3 with MTP,
+ranma_20261013), the comparisons against upstream (ranma_20261009 and earlier) and every earlier record, each with the
+release it was measured at, are in [docs/ranma/benchmarks](docs/ranma/benchmarks/README.md); the conditions the
+records share are in [the method](docs/ranma/benchmarks/method.md). The benchmark of a release is the last commit of
+its series ([docs/ranma/releases.md](docs/ranma/releases.md#release-cycle)).
 
 ## Roadmap
 

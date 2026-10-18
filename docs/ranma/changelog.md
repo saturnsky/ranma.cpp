@@ -56,6 +56,8 @@ Upstream base: `8f574b0ad`, tagged 2026-10-18
   before CPU gathers ([engram-tables.md](engram-tables.md), [ple-prefetch.md](ple-prefetch.md)).
 - Diagnostics, off by default: `RANMA_PREFILL_ACCOUNT`, `LLAMA_PREFETCH_TIMING`, `RANMA_EXPERT_L2_TIMELINE`,
   `RANMA_PREFILL_GPU_STAMP`, `RANMA_TENSOR_DUMP` and `RANMA_UB_DUMP`.
+- Release table of this release in `docs/ranma/benchmarks/`: DeepSeek V4.1 Flash in EXL3 with layer-major prefill and
+  n-gram drafting on the R9700 with 128 and 192 GB, server scenarios and prompts of 512 to 32768 tokens.
 
 ### Changed
 

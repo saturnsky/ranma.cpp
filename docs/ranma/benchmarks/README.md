@@ -1,0 +1,144 @@
+# Benchmarks
+
+The throughput of this fork against upstream llama.cpp. The numbers are kept as records: each record was measured at
+one release, against the upstream commit that release is based on, and is not measured again for every later
+release. Every number below therefore names the release tag it was measured at. The feature pages describe what each
+change does and how to switch it; the conditions that the records share are in [method.md](method.md).
+
+## Latest numbers
+
+The newest measurement of each model, warm, on the Radeon AI PRO R9700 (32 GB). Details and the other systems are in
+the records.
+
+| model | file | measured at | decode, coding / Korean roleplay | prompt |
+|---|---|---|---:|---:|
+| DeepSeek V4.1 Flash, n-gram draft | EXL3 3.0 bpw | ranma_20261018, 128 / 192 GB | 22.85 / 24.34, 25.32 / 26.62 t/s | 32768 tokens in 49.5 / 35.1 s |
+| Qwen3.8-Flash-Next, MTP | EXL3 4.05 bpw | ranma_20261013, 128 GB | 62.04 / 62.05 t/s | |
+| DeepSeek V4 Flash, MTP | EXL3 3.04 bpw | ranma_20261013, 128 GB | 28.04 / 35.27 t/s | |
+| GLM-5.3 Flash, MTP | EXL3 3.05 bpw | ranma_20261013, 128 GB | 20.48 / 21.69 t/s | |
+
+Against upstream (general GGUF; upstream cannot load the EXL3 files) the latest comparison is
+[the 2026-10-09 record](2026-10-09-release.md): `llama-bench` TG128 x3.13 (Qwen3.8-Flash-Next UD-Q4_K_XL), x3.48
+(DeepSeek V4 Flash UD-IQ3_XXS) and x2.92 (GLM-5.3 Flash UD-IQ3_XXS) at depth 0 on the R9700 with 128 GB.
+
+## Releases
+
+Which release each kind of number comes from:
+
+- **ranma_20261018** (upstream `8f574b0ad`): the release table. DeepSeek V4.1 Flash in EXL3 with layer-major prefill
+  and n-gram drafting on the R9700 with 128 and 192 GB: server scenarios (coding, Korean roleplay) and prompts of 512,
+  4096 and 32768 tokens. Both systems are emulated on the 224 GB machine by taking physical memory away.
+- **ranma_20261013** (upstream `3d65c90d0`): the release table. Server scenarios (coding, Korean roleplay) of
+  Qwen3.8-Flash-Next, DeepSeek V4 Flash and GLM-5.3 Flash in EXL3 with MTP on the R9700 with 128 GB, and of DeepSeek
+  V4.1 Flash in EXL3 on the R9700 with 128 and 224 GB and the RX 9070 XT emulation with 64 GB, at 224 GB also with the
+  DSpark draft model. The machine has 224 GB; the 128 and 64 GB rows take the physical memory away.
+- **ranma_20261009** (upstream `462524043`): the release table. Qwen3.8-Flash-Next,
+  DeepSeek V4 Flash and GLM-5.3 Flash, each in EXL3 and in a general GGUF, at depth 0 on the R9700 and the RX 9070 XT
+  emulation with 128, 64 and 32 GB. The 64 and 32 GB rows take the physical memory away. The table also has 0 / 8K / 32K
+  rows and server scenarios with MTP for the EXL3 files.
+- **ranma_20261007** (upstream `8e1642198`): no record. It adds GLM-5.3 Flash in EXL3 with its MTP draft; every
+  number below was measured at an earlier release.
+- **ranma_20261005** (upstream `42d958167`): Qwen3.8-Flash-Next in EXL3 3.05 and 4.05 bpw against UD-Q4_K_XL, the
+  `llama-bench` curves and the server scenarios with MTP and `--spec-smart`, on the R9700 with 128 and 64 GB and the
+  RX 9070 XT emulation with 64 GB.
+- **ranma_20261001** (upstream `ed7ac35e1`): the only comparison measured again for that release is the MTP draft
+  length, `--spec-smart` against the single-argument values and no MTP. The rows of 2026-09-29 measured one of its
+  changes, graph reuse per batch shape on by default. Both ran on development builds of its series.
+- **ranma_20260928** (upstream `53ed051ce`): the decode ratios against upstream in the server scenarios, the
+  `llama-bench` curves of that release, Gemma 4 31B and the memory of those rows. The Qwen3.8-Flash-Next MTP n1 rows
+  were measured at `ranma_20260928_qwen_mtp`, ranma_20260928 with the MTP head of upstream pull request #28243.
+- **ranma_20260922** (upstream `aa39d7a3e`): the full set of `llama-bench` curves, with the RX 9070 XT emulation and
+  the 64 and 32 GB systems.
+
+## Records
+
+| record | release | upstream base | measured | what |
+|---|---|---|---|---|
+| [2026-10-18-release.md](2026-10-18-release.md) | ranma_20261018 | `8f574b0ad` | 2026-10-18 | DeepSeek V4.1 Flash EXL3 with layer-major prefill and n-gram drafting: server scenarios and prompts of 512 to 32768 tokens at 128 and 192 GB, where a long prompt spends its time, memory |
+| [2026-10-13-release.md](2026-10-13-release.md) | ranma_20261013 | `3d65c90d0` | 2026-10-13 | server scenarios of four models in EXL3: three with MTP at 128 GB, DeepSeek V4.1 Flash at 128 and 224 GB and on the RX 9070 XT emulation with 64 GB, with and without DSpark, memory |
+| [2026-10-09-release.md](2026-10-09-release.md) | ranma_20261009 | `462524043` | 2026-10-08 and 2026-10-09 | three models in EXL3 and general GGUF, depth 0 on six systems against upstream, 0 / 8K / 32K and MTP server scenarios for EXL3, memory |
+| [2026-10-05-exl3.md](2026-10-05-exl3.md) | ranma_20261005 | `42d958167` | 2026-10-05 | Qwen3.8-Flash-Next EXL3 3.05 and 4.05 bpw against UD-Q4_K_XL: `llama-bench` curves cold and warm, server scenarios with MTP, three systems, memory |
+| [2026-10-01-mtp-smart.md](2026-10-01-mtp-smart.md) | ranma_20261001 (development build) | `ed7ac35e1` | 2026-10-01 | MTP draft length: no MTP, single argument, `--spec-smart` cold and warm; six scenarios, two models |
+| [2026-09-29-graph-reuse-default.md](2026-09-29-graph-reuse-default.md) | ranma_20261001 (development build) | `ed7ac35e1` | 2026-09-29 | graph reuse per batch shape turned on by default |
+| [2026-09-28-qwen-mtp-n1.md](2026-09-28-qwen-mtp-n1.md) | ranma_20260928_qwen_mtp | `53ed051ce` | 2026-09-28 | Qwen3.8-Flash-Next MTP n1 in English roleplay |
+| [2026-09-28-release.md](2026-09-28-release.md) | ranma_20260928 | `53ed051ce` | 2026-09-27 and 2026-09-28 | server scenarios against upstream and the previous release, `llama-bench` curves, Gemma 4 31B, optional features, memory |
+| [2026-09-22-full-set.md](2026-09-22-full-set.md) | ranma_20260922 | `aa39d7a3e` | 2026-09-22 | `llama-bench` curves on the R9700 and the RX 9070 XT emulation, 128, 64 and 32 GB, Gemma 4 31B, memory |
+
+## Qwen3.8-Flash-Next EXL3
+
+| what | numbers | release | record |
+|---|---|---|---|
+| Server decode with MTP and `--spec-smart`, warm, EXL3 4.05 bpw, R9700 128 GB: coding / Korean roleplay | 62.04 / 62.05 t/s | ranma_20261013 | [release table](2026-10-13-release.md#server-decode-warm) |
+| `llama-bench` PP512 / TG128 at depth 0, warm, EXL3 4.05 bpw: R9700 128 / 64 / 32 GB, RX 9070 XT emulation 128 / 64 / 32 GB | 1125 / 50.1, 1189 / 50.4, 1223 / 44.0; 775 / 39.9, 790 / 37.8, 341 / 29.5 | ranma_20261009 | [release table](2026-10-09-release.md#depth-0-pp512--tg128-ts) |
+| Server decode with MTP and `--spec-smart`, warm, EXL3 4.05 bpw, R9700 128 GB: coding / English roleplay | 59.48 / 60.47 t/s | ranma_20261009 | [release table](2026-10-09-release.md#detailed-rows-r9700-128-gb-exl3) |
+| `llama-bench` PP512 / TG128 at depth 0, warm + prefill swap, R9700 with 128 GB: EXL3 3.05 / 4.05 bpw / UD-Q4_K_XL | 1255 / 53.5, 1246 / 49.6, 1138 / 49.3 | ranma_20261005 | [EXL3](2026-10-05-exl3.md#r9700-128-gb) |
+| `llama-bench` TG128 against UD-Q4_K_XL, warm, depth 0 and 65536 | 3.05 bpw +5.9 to +9.5 % on the R9700, +17.7 to +20.5 % on the RX 9070 XT emulation; 4.05 bpw within 1 % on the R9700 | ranma_20261005 | [EXL3](2026-10-05-exl3.md#exl3-against-ud-q4_k_xl-warm-tg128--pp512-ratio-at-depth-0-and-the-deepest-depth) |
+| Server decode with MTP and `--spec-smart`, warm, five scenarios, against UD-Q4_K_XL | 3.05 bpw +17.2 to +23.1 % (R9700, 128 GB), +50.6 to +85.9 % (RX 9070 XT emulation, 64 GB); 4.05 bpw +3.9 to +10.0 % and +15.4 to +28.1 % | ranma_20261005 | [EXL3](2026-10-05-exl3.md#mtp-smart-server-rows-warm-decode-ts) |
+
+## Qwen3.8-Flash-Next UD-Q4_K_XL
+
+| what | numbers | release | record |
+|---|---|---|---|
+| `llama-bench` TG128 at depth 0, warm, against upstream (`-ncmoe 35` / `45`) | R9700 128 GB 48.89 against 15.63 (x3.13), RX 9070 XT emulation 37.48 against 12.23 (x3.06); upstream cannot load at 64 and 32 GB | ranma_20261009 | [release table](2026-10-09-release.md#depth-0-pp512--tg128-ts) |
+| Server decode, release warm against upstream (`-ncmoe 35`), five scenarios | x2.57 (coding) to x2.79; English roleplay 46.54 against 16.75 t/s | ranma_20260928 | [server scenarios](2026-09-28-release.md#qwen38-flash-next-ud-q4_k_xl) |
+| Server decode at 64 GB (host tier of 40 GiB), warm | 5 % below 128 GB | ranma_20260928 | [reading the tables](2026-09-28-release.md#reading-the-tables) |
+| MTP, single argument (`--spec-draft-n-max 2 --spec-draft-p-min 0`) against no MTP, six scenarios | +19.7 to +29.5 % | ranma_20261001 | [MTP draft length](2026-10-01-mtp-smart.md) |
+| `--spec-smart` against the single argument | cold -4.3 to +0.6 %, warm -1.9 to +2.6 % | ranma_20261001 | [MTP draft length](2026-10-01-mtp-smart.md) |
+| English roleplay decode: no MTP / single / smart cold / smart warm | 46.10 / 57.13 / 56.99 / 57.54 t/s | ranma_20261001 | [MTP draft length](2026-10-01-mtp-smart.md) |
+| Graph reuse per batch shape on by default, English roleplay with MTP | +11.1 % (46.52 to 51.67 t/s) | ranma_20261001 | [graph reuse](2026-09-29-graph-reuse-default.md) |
+| MTP n1 with the joint cache, English roleplay, warm | 55.62 t/s: +20.0 % over no MTP, x3.32 upstream without MTP | ranma_20260928_qwen_mtp | [Qwen MTP n1](2026-09-28-qwen-mtp-n1.md) |
+| `llama-bench` PP512 / TG128 at depth 0, release warm + prefill swap against upstream | 1130 / 51.5 against 351 / 16.6 | ranma_20260928 | [`llama-bench` curves](2026-09-28-release.md#llama-bench-curves) |
+| `llama-bench` PP512 / TG128 on the R9700 with 128 GB, depth 0 and 65536, against upstream | 1014 / 49.7 and 692 / 44.8 against 335 / 15.9 and 307 / 13.2 | ranma_20260922 | [full set](2026-09-22-full-set.md#qwen38-flash-next-ud-q4_k_xl) |
+| `llama-bench` PP512 / TG128 on the RX 9070 XT emulation with 64 GB, depth 0 | 625 / 36.7 | ranma_20260922 | [full set](2026-09-22-full-set.md#by-system) |
+
+## DeepSeek V4 Flash EXL3
+
+| what | numbers | release | record |
+|---|---|---|---|
+| Server decode with MTP and `--spec-smart`, warm, R9700 128 GB: coding / Korean roleplay | 28.04 / 35.27 t/s | ranma_20261013 | [release table](2026-10-13-release.md#server-decode-warm) |
+| `llama-bench` PP512 / TG128 at depth 0, warm, EXL3 3.04 bpw: R9700 128 / 64 / 32 GB | 363 / 33.1, 291 / 29.0, 134 / 17.9 | ranma_20261009 | [release table](2026-10-09-release.md#depth-0-pp512--tg128-ts) |
+| Server decode with MTP and `--spec-smart`, warm, R9700 128 GB: coding / English roleplay | 28.40 / 32.45 t/s | ranma_20261009 | [release table](2026-10-09-release.md#detailed-rows-r9700-128-gb-exl3) |
+
+## DeepSeek V4 Flash UD-IQ3_XXS
+
+| what | numbers | release | record |
+|---|---|---|---|
+| `llama-bench` TG128 at depth 0, warm, against upstream (`-ncmoe 33` / `41`) | R9700 128 GB 35.02 against 10.07 (x3.48), RX 9070 XT emulation 25.67 against 8.96 (x2.87) | ranma_20261009 | [release table](2026-10-09-release.md#depth-0-pp512--tg128-ts) |
+| Server decode with MTP n1, release warm against upstream (`-ncmoe 36`) | x2.52 (coding) to x2.95; English roleplay 35.29 against 12.64 t/s | ranma_20260928 | [MTP n1](2026-09-28-release.md#deepseek-v4-flash-ud-iq3_xxs-mtp-n1) |
+| Server decode without MTP, release warm against upstream (`-ncmoe 35`) | x2.70 (coding) to x3.11; English roleplay 31.85 against 10.74 t/s | ranma_20260928 | [no MTP](2026-09-28-release.md#deepseek-v4-flash-ud-iq3_xxs-no-mtp) |
+| Server decode at 64 GB (host tier of 40 GiB), warm | 13 to 17 % below 128 GB with MTP, 10 to 13 % without | ranma_20260928 | [reading the tables](2026-09-28-release.md#reading-the-tables) |
+| MTP, single argument (`--spec-draft-n-max 1 --spec-draft-p-min 0`) against no MTP, six scenarios | +9.8 to +14.6 % | ranma_20261001 | [MTP draft length](2026-10-01-mtp-smart.md) |
+| `--spec-smart` against the single argument | coding +1.0 % cold, +1.5 % warm; every roleplay scenario 1.5 to 3.8 % slower cold, 1.3 to 3.2 % slower warm | ranma_20261001 | [MTP draft length](2026-10-01-mtp-smart.md) |
+| English roleplay decode: no MTP / single / smart cold / smart warm | 31.17 / 35.00 / 34.07 / 34.55 t/s | ranma_20261001 | [MTP draft length](2026-10-01-mtp-smart.md) |
+| Graph reuse per batch shape on by default, English roleplay with MTP | +8.6 % (28.97 to 31.45 t/s) | ranma_20261001 | [graph reuse](2026-09-29-graph-reuse-default.md) |
+| `llama-bench` PP512 / TG128 at depth 0, release warm against upstream | 354 / 34.4 against 268 / 10.2 | ranma_20260928 | [`llama-bench` curves](2026-09-28-release.md#llama-bench-curves) |
+| `llama-bench` PP512 / TG128 on the R9700 with 128 GB, depth 0 and 65536 | 310 / 31.8 and 108 / 28.1; upstream 248 / 9.8 at depth 0 | ranma_20260922 | [full set](2026-09-22-full-set.md#deepseek-v4-flash-ud-iq3_xxs) |
+
+## DeepSeek V4.1 Flash EXL3
+
+| what | numbers | release | record |
+|---|---|---|---|
+| Server decode with n-gram drafting and layer-major prefill, warm, EXL3 3.0 bpw: coding / Korean roleplay on the R9700 with 128 and 192 GB | 22.85 / 24.34, 25.32 / 26.62 t/s, acceptance 0.689 to 0.727 | ranma_20261018 | [release table](2026-10-18-release.md#server-decode-warm) |
+| Prompt processing, 512 / 4096 / 32768 tokens, R9700 128 GB and 192 GB | 82.0 / 364.7 / 662.3 and 159.9 / 614.5 / 934.5 t/s | ranma_20261018 | [release table](2026-10-18-release.md#prompt-processing) |
+| Prompt time of the Korean roleplay evaluation preset (17 requests), R9700 128 GB: ranma_20261013 rows against ranma_20261018 rows (several settings differ) | 142.0 s against 58.4 s | ranma_20261018 | [release table](2026-10-18-release.md#against-the-ranma_20261013-rows) |
+| Server decode, warm, EXL3 3.0 bpw, no draft model: coding / Korean roleplay on the R9700 with 128 GB, the RX 9070 XT emulation with 64 GB and the R9700 with 224 GB | 21.11 / 21.88, 9.30 / 11.07, 23.66 / 23.89 t/s | ranma_20261013 | [release table](2026-10-13-release.md#server-decode-warm) |
+| Server decode with the DSpark draft model, warm, R9700 224 GB: coding / Korean roleplay | 21.02 / 19.36 t/s, acceptance 0.846 / 0.766 | ranma_20261013 | [release table](2026-10-13-release.md#server-decode-warm) |
+
+## GLM-5.3 Flash
+
+| what | numbers | release | record |
+|---|---|---|---|
+| Server decode with MTP (NextN head) and `--spec-smart`, warm, EXL3 3.05 bpw, R9700 128 GB: coding / Korean roleplay | 20.48 / 21.69 t/s | ranma_20261013 | [release table](2026-10-13-release.md#server-decode-warm) |
+| `llama-bench` PP512 / TG128 at depth 0, warm, EXL3 3.05 bpw: R9700 128 / 64 / 32 GB | 309 / 25.0, 168 / 18.5, 101 / 10.3 | ranma_20261009 | [release table](2026-10-09-release.md#depth-0-pp512--tg128-ts) |
+| `llama-bench` TG128 at depth 0, warm, UD-IQ3_XXS against upstream (`-ncmoe 38`), R9700 128 GB | 26.06 against 8.91 (x2.92) | ranma_20261009 | [release table](2026-10-09-release.md#depth-0-pp512--tg128-ts) |
+| Server decode with MTP (NextN head) and `--spec-smart`, warm, EXL3 3.05 bpw, R9700 128 GB, coding | 20.70 t/s, acceptance 0.910 | ranma_20261009 | [release table](2026-10-09-release.md#detailed-rows-r9700-128-gb-exl3) |
+
+## Gemma 4 31B Q4_K_M
+
+Dense, the whole model in VRAM, so only the kernel changes apply.
+
+| what | numbers | release | record |
+|---|---|---|---|
+| `llama-bench` PP512 / TG128 at depth 0 and 32768, against upstream | 1002 / 29.4 and 441 / 24.8 against 895 / 28.7 and 327 / 24.4 (prompt x1.12 to x1.35, decode x1.02 to x1.03) | ranma_20260928 | [Gemma](2026-09-28-release.md#gemma-4-31b-q4_k_m) |
+| Server, English roleplay, MTP with per-position thresholds against upstream MTP with its best scalar setting | 42.52 against 35.82 t/s (+18.7 %); without MTP 28.30 against 27.71 (+2.1 %) | ranma_20260928 | [Gemma](2026-09-28-release.md#gemma-4-31b-q4_k_m) |
+| `llama-bench` PP512 / TG128 at depth 0, against upstream | 1001 / 29.3 against 897 / 28.3 | ranma_20260922 | [full set](2026-09-22-full-set.md#gemma-4-31b-q4_k_m) |

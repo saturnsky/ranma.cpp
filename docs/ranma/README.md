@@ -1,8 +1,9 @@
 # Changes over upstream
 
 Each user-visible change gets a line here and a page under `docs/ranma/` that describes what it is, when it
-applies, how to switch it, and its limits. The main features are summarized in the [README](../../README.md#main-features).
-Starting settings by model and hardware are in [recipes.md](recipes.md).
+applies, how to switch it, and its limits. The main features are summarized in the [README](../../README.md#main-features);
+measured effects are collected in [benchmarks](benchmarks/README.md), and starting settings by model and hardware are in
+[recipes.md](recipes.md).
 
 ### RDNA4 kernels (HIP)
 
