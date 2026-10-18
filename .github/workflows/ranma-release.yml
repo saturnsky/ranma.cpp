@@ -31,12 +31,6 @@ concurrency:
 env:
   ROCM_VERSION: '10.0.0'
   ROCM_WHL_INDEX: 'https://stable.repo.amd.com/rocm/whl-next/'
-  # LLVM OpenMP runtime shipped as libomp.dll; same pinned installer and hashes as upstream
-  # ggml/src/CMakeLists.txt (GGML_OPENMP_FETCH). GGML_OPENMP_FETCH itself cannot be used because it
-  # requires the clang major version to equal the LLVM version (ROCm 10 clang is 23.x).
-  OPENMP_LLVM_VERSION: '20.1.8'
-  OPENMP_INSTALLER_SHA256: '3197846a2b19063687dd56e93e34cd941e3548d907f23a6131571321bdf9fe7b'
-  OPENMP_LICENSE_SHA256: 'fdad1758a9e1f9d5a81e18879b3406772115edc92c24bfa36b70c654f325e8e4'
   # cmake targets that are built and shipped (one .exe each)
   RANMA_TARGETS: 'llama-server llama-bench llama-cli llama-completion llama-gguf-split test-backend-ops'
 
@@ -195,29 +189,6 @@ jobs:
           python -m pip freeze | Out-File -Encoding utf8 (Join-Path $env:RUNNER_TEMP 'rocm-pip-freeze.txt')
           & "$rocmPath\lib\llvm\bin\clang.exe" --version
 
-      - name: Fetch LLVM OpenMP runtime
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $v = $env:OPENMP_LLVM_VERSION
-          $root = Join-Path $env:RUNNER_TEMP "llvm-openmp-$v"
-          $extract = Join-Path $root 'extract'
-          New-Item -ItemType Directory -Force $extract, "$root\lib", "$root\bin", "$root\include" | Out-Null
-          $installer = Join-Path $root "LLVM-$v-win64.exe"
-          Invoke-WebRequest -Uri "https://github.com/llvm/llvm-project/releases/download/llvmorg-$v/LLVM-$v-win64.exe" -OutFile $installer
-          $hash = (Get-FileHash $installer -Algorithm SHA256).Hash.ToLower()
-          if ($hash -ne $env:OPENMP_INSTALLER_SHA256) { throw "LLVM installer hash mismatch: $hash" }
-          7z e -y "-o$extract" $installer -r libomp.lib libomp.dll omp.h | Out-Null
-          if ($LASTEXITCODE -ne 0) { throw "7z extraction failed" }
-          Copy-Item "$extract\libomp.lib" "$root\lib\"
-          Copy-Item "$extract\libomp.dll" "$root\bin\"
-          Copy-Item "$extract\omp.h" "$root\include\"
-          Remove-Item -Recurse -Force $extract, $installer
-          $license = Join-Path $root 'LICENSE.TXT'
-          Invoke-WebRequest -Uri "https://raw.githubusercontent.com/llvm/llvm-project/llvmorg-$v/openmp/LICENSE.TXT" -OutFile $license
-          $hash = (Get-FileHash $license -Algorithm SHA256).Hash.ToLower()
-          if ($hash -ne $env:OPENMP_LICENSE_SHA256) { throw "OpenMP license hash mismatch: $hash" }
-          "OPENMP_ROOT=$($root -replace '\\', '/')" >> $env:GITHUB_ENV
-
       - name: Locate MSVC
         run: |
           $ErrorActionPreference = 'Stop'
@@ -234,10 +205,7 @@ jobs:
           cmd /c "call `"$env:VCVARS64`" >nul && set" | ForEach-Object {
             if ($_ -match '^([^=]+)=(.*)$') { [Environment]::SetEnvironmentVariable($matches[1], $matches[2]) }
           }
-          # the LLVM libomp.lib must win over the MSVC libomp.lib (libomp140.x86_64.dll, not redistributable)
-          $env:LIB = "$($env:OPENMP_ROOT -replace '/', '\')\lib;$env:LIB"
           $llvm = "$env:HIP_PATH\lib\llvm\bin"
-          $ompFlags = "-fopenmp=libomp -I$env:OPENMP_ROOT/include"
           $cmakeArgs = @(
             '-S', '.', '-B', 'build', '-G', 'Ninja',
             '-DCMAKE_BUILD_TYPE=Release',
@@ -252,12 +220,8 @@ jobs:
             '-DGGML_BACKEND_DL=OFF',
             '-DGGML_RPC=OFF',
             '-DGGML_CCACHE=ON',
-            '-DGGML_OPENMP=ON',
-            "-DOpenMP_C_FLAGS=$ompFlags",
-            "-DOpenMP_CXX_FLAGS=$ompFlags",
-            '-DOpenMP_C_LIB_NAMES=libomp',
-            '-DOpenMP_CXX_LIB_NAMES=libomp',
-            "-DOpenMP_libomp_LIBRARY=$env:OPENMP_ROOT/lib/libomp.lib",
+            # ggml's own CPU threadpool: an OpenMP build was slower on this backend (Qwen MTP decode)
+            '-DGGML_OPENMP=OFF',
             '-DLLAMA_OPENSSL=OFF',
             '-DLLAMA_BUILD_TESTS=ON',
             '-DLLAMA_BUILD_EXAMPLES=OFF',
@@ -293,7 +257,6 @@ jobs:
             $exes += "$t.exe"
           }
           Get-ChildItem $buildBin -Filter *.dll | Copy-Item -Destination $binOut
-          Copy-Item "$env:OPENMP_ROOT/bin/libomp.dll" $binOut
 
           # 2. HIP runtime DLLs (the exe directory is searched before System32, where the driver
           #    installs its own amdhip64_7.dll)
@@ -374,12 +337,11 @@ jobs:
             }
           }
           if ($bad.Count -gt 0) { throw "unresolved imports:`n$($bad -join "`n")" }
-          if (-not ($importMap['ggml-cpu.dll'] -contains 'libomp.dll')) { throw "ggml-cpu.dll does not import libomp.dll (OpenMP not enabled?)" }
+          if (@($importMap['ggml-cpu.dll'] | Where-Object { $_ -like 'libomp*' }).Count -gt 0) { throw "ggml-cpu.dll imports an OpenMP runtime (GGML_OPENMP must be OFF)" }
           if (-not ($importMap['ggml-hip.dll'] -contains 'amdhip64_7.dll')) { throw "ggml-hip.dll does not import amdhip64_7.dll" }
 
           # 5. licenses
           Copy-Item LICENSE "$stage\LICENSES\ranma.cpp-LICENSE.txt"
-          Copy-Item "$env:OPENMP_ROOT/LICENSE.TXT" "$stage\LICENSES\llvm-openmp-LICENSE.txt"
           foreach ($di in @(Get-ChildItem $siteRoot -Directory -Filter '*.dist-info' | Where-Object { $_.Name -match '^(_)?rocm' })) {
             $lic = @(Get-ChildItem $di.FullName -Recurse -File | Where-Object { $_.Name -match '^(LICEN[CS]E|COPYING|NOTICE)' })
             if ($lic.Count -gt 0) {
@@ -415,7 +377,6 @@ jobs:
             targets above and are found next to the DLLs; ROCBLAS_TENSILE_LIBPATH and
             HIPBLASLT_TENSILE_LIBPATH are not needed. If you set them anyway, use paths with
             backslashes only: hipBLASLt on Windows mis-reads a path that contains '/'.
-          - libomp.dll is the LLVM OpenMP runtime $env:OPENMP_LLVM_VERSION.
           - manifest.json lists the build settings and the SHA-256 of every file.
 
           GPU selection
@@ -430,7 +391,7 @@ jobs:
           - Verification: the maintainer runs a local smoke test on gfx1201 (test-backend-ops and a
             short generation) before publishing; see docs/ranma/releases.md.
 
-          Licenses: LICENSES\ (RANMA.cpp/llama.cpp: MIT; LLVM OpenMP; ROCm components).
+          Licenses: LICENSES\ (RANMA.cpp/llama.cpp: MIT; ROCm components).
           "@
           $readme = $readme -replace "`r?`n", "`r`n"
           Set-Content -Path "$stage\README.txt" -Value $readme -Encoding utf8
@@ -464,7 +425,7 @@ jobs:
               runtime_sources = $runtimeSources
               libraries = $libReport
             }
-            openmp = [ordered]@{ runtime = 'libomp.dll'; llvm_version = $env:OPENMP_LLVM_VERSION; installer_sha256 = $env:OPENMP_INSTALLER_SHA256 }
+            openmp = 'OFF'
             compiler = $clang
             cmake_args = @(Get-Content (Join-Path $env:RUNNER_TEMP 'cmake-args.txt') | ForEach-Object { [string]$_ })
             runner = [ordered]@{ os = $env:ImageOS; image_version = $env:ImageVersion }
