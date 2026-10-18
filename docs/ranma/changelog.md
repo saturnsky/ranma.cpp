@@ -7,10 +7,95 @@ The series is rebuilt for every release and follow-up fixes are folded into the 
 release does not show a fix as a separate change. This file is where the fixes between releases are recorded.
 The refs and the release cycle are described in [releases.md](releases.md).
 
-## Next release (not tagged yet)
+## ranma_20261018
+
+Upstream base: `8f574b0ad`, tagged 2026-10-18
+
+### Added
+
+- Layer compute mode, `--layer-mode on` ([layer-mode.md](layer-mode.md)): a prompt step is one wide ubatch computed
+  layer by layer, the routed experts of a layer expert by expert (a new `MOE_FFN_HAD` op for EXL3 experts, also with
+  LoRA deltas) and the attention in chunks whose masks are made on the device. The width, the attention chunk and the
+  staging buffers are sized from the model and the free memory before the load. It runs for GLM-5.3, Qwen3.8,
+  DeepSeek V4 Flash and DeepSeek V4.1 Flash with the expert cache; any other setup runs as `off`. Off by default.
+- Layer-major prefill for DeepSeek V4 and V4.1 (part of `--layer-mode`): the ubatches of a prompt run in groups and
+  read each expert of a layer from the host once per group instead of once per ubatch. Its buffers are borrowed from
+  L1 (the prefill lend), the evicted experts return in decode, and a draft model in the joint expert cache takes part.
+- DeepSeek V4.1 Flash: exact tail prefill (on by default: a prompt computes only the rows its output needs in the last
+  layers, and the cache can resume at a position), the indexer on the fused lightning indexer op with candidate blocks
+  skipped in the HIP decode kernel, attention over `[raw | compressed]` K without concatenating every compressed
+  cell, attention sinks in the RDNA4 MLA decode kernel, the fused top-k router for 384 experts, and a DSpark or DFlash
+  draft that reads the target features of its sliding window only, which keeps the layer mode on with it
+  ([deepseek-v41.md](deepseek-v41.md), [layer-mode.md](layer-mode.md)).
+- Slot 0 priority (`--slot0-priority {off,prefill,strict}`, default `prefill`): with several slots, the prompts of the
+  other slots wait while slot 0 works on a request ([slot0-priority.md](slot0-priority.md)).
+- `--spec-type ngram-varlen`: drafts of variable length from the n-gram history of the session, verified in parts of
+  `--spec-ngram-varlen-n-max` tokens with a rollback depth of `--spec-ngram-varlen-rs`, a hazard supplement that
+  drafts a long match where nothing else drafts, and its shadow learning and online cost (all on by default;
+  `--no-spec-ngram-varlen-hazard`, `--no-spec-ngram-varlen-hazard-shadow` and `--no-spec-ngram-varlen-hazard-online`
+  turn them off). The verification cost of the target is shared by all drafters (`--spec-verify-cost-store`,
+  `--spec-verify-cost-log`), so `--spec-smart` and the hazard model price a round with the same measured numbers
+  ([spec-smart.md](spec-smart.md)).
+- `--expert-l1-mib auto` sizes L1 from the free VRAM less `--fit-target`; `--expert-l1-lru-pct N` keeps N % of L1 as
+  per-layer LRU copies of recent misses ([expert-cache.md](expert-cache.md),
+  [expert-cache-ub-pool.md](expert-cache-ub-pool.md)).
+- An L2 of `-1` (the default) is sized at load to hold every expert, the prompt buffers and the experts a lend evicts;
+  a demotion from VRAM can be dropped to the file instead of copied into the L2
+  ([expert-cache-l2.md](expert-cache-l2.md)).
+- The decode pool lends the expert-major op's scratch block between prompt graphs, and the lent slots are a restore
+  space: pinned plan experts and an LRU cache of recent misses (`RANMA_EXPERT_LEND_RESTORE=eager` restores the decode
+  plan's experts when the prompt ends). The SSD tier's rings order experts of equal score by the prompt profile.
+- Expert sidecar (`RANMA_EXPERT_SIDECAR=<file>`, diagnostic): a binary record of the router selections of every decode
+  call with the server's request and draft events, for offline replay of cache policies
+  ([expert-sidecar.md](expert-sidecar.md)).
+- A read engine from NVMe straight into VRAM (D3D12 and IoRing, Windows) with two test programs; the expert cache does not
+  use it yet ([expert-cache-p2p.md](expert-cache-p2p.md)).
+- RDNA4 kernels: the 512-wide WMMA attention reads 4-row index lists, key tiles are shared across tokens in the
+  64 and 32 head lightning indexer prefill, and `HC_PRE`, `RMS_NORM` and the gamma multiply run in one kernel.
+- Engram row hints of single-token decode run on a resident worker, and the lazy table prefetch of prompts is gated
+  before CPU gathers ([engram-tables.md](engram-tables.md), [ple-prefetch.md](ple-prefetch.md)).
+- Diagnostics, off by default: `RANMA_PREFILL_ACCOUNT`, `LLAMA_PREFETCH_TIMING`, `RANMA_EXPERT_L2_TIMELINE`,
+  `RANMA_PREFILL_GPU_STAMP`, `RANMA_TENSOR_DUMP` and `RANMA_UB_DUMP`.
+
+### Changed
+
+- The expert cache accepts a multimodal projector and speculative decoding setups that no run has checked with a
+  startup warning ("use at your own risk") instead of refusing them.
+- The unified host policy of the SSD tier, the decode pool and its ring admission are always on where their gates
+  allow them; their tuning values are fixed (probation part 0.10 of each class list, a ghost window of 32 generations,
+  the rings laid out in score order at a plan install).
+- A drafting context (MTP, DSpark, DFlash, EAGLE3, a plain draft model) computes in views of its target's compute
+  buffers whenever that is possible, and only the largest compute buffer lends to the decode pool.
+- The layer mode has no host memory budget: the host compute buffer is held for the life of the context, as
+  upstream does, and is only logged. With the layer-major prefill the ubatch is at most 8192, and `-b` is the context size.
+- DeepSeek V4.1 Flash scores the indexer with the fused op: the compute buffer at ubatch 2048 shrinks from 18189 to
+  1805 MiB (32768 context), and it reads only the visible raw cells of its joint K layout and of each attention chunk.
+- DeepSeek V4 snapshots the rollback state of its compressors only as deep as the call can be rolled back.
 
 ### Removed
 
+The environment switches below are gone and a variable still set in a script is ignored. Each one's former
+default is the behavior now.
+
+- Optimizations that were on by default: `GGML_HIP_FATTN_GQA12`, `GGML_HIP_PREFILL_WMMA`, `GGML_HIP_PREFILL_BLAS`,
+  `GGML_CUDA_SKINNY_F32`, `GGML_CUDA_MMQ_ID_NCOLS_OPT_SCALE`, `GGML_CUDA_DISABLE_MMVF_SHORT_ROWS`,
+  `GGML_CUDA_MMVQ_ID_DEDUP`, `GGML_CUDA_MMVQ_ID_EXPERTS_FIRST`, `GGML_CUDA_MMVQ_ID_FOLD_SHARED`,
+  `GGML_CUDA_MMVQ_SHARE_Q8`, `GGML_CUDA_HC_MIXES_FUSION`, `GGML_CUDA_HC_MIXES_MAX_ROWS`, `GGML_CUDA_HC_GATED_FUSION`,
+  `GGML_CUDA_DISABLE_SSM_CONV_STATE_FUSION`, `GGML_CUDA_DISABLE_GDN_STATE_ROWS`, `GGML_CUDA_DISABLE_FATTN_MLA_DECODE`,
+  `GGML_CUDA_FATTN_SPARSE`, `GGML_CUDA_FATTN_SPARSE_MIN_KV` (the gather opens from 4096 cells),
+  `GGML_CUDA_FATTN_COMPACT_PARALLEL`, `GGML_DSV4_FUSION3` with its `GGML_CUDA_DSV4_FUSION3_*` parts,
+  `LLAMA_DSV4_HC_COEF_FUSED`, `LLAMA_DSV4_COMPRESSOR_FUSED`, `LLAMA_DSV4_HCA_SKIP_DUMMY`, `LLAMA_LORA_FOLD_SCALE`.
+- Graph runtime and server: `LLAMA_INPUT_UPLOAD_ASYNC`, `GGML_SCHED_STAGE_ALL_INPUTS`, `GGML_SCHED_STAGED_GATHER`,
+  `GGML_CUDA_GRAPH_PER_SHAPE`, `GGML_CUDA_GRAPH_QUICK_CAPTURE`, `GGML_CUDA_GRAPH_DEFER_FREE`,
+  `GGML_CUDA_GRAPH_EVICT_SECONDS` (per-shape graphs are dropped only at the per-context bound),
+  `LLAMA_GRAPH_REUSE_SHAPES` (a context keeps 64 shapes), `LLAMA_GRAPH_META_TRIM`, `LLAMA_SERVER_CKPT_REUSE`.
+- Speculative decoding: `LLAMA_SPEC_TRIGRAM_CONF` (the trigram confidence is always on), `LLAMA_SPEC_TRIGRAM_TOPK`
+  (one candidate), `LLAMA_SPEC_DSPARK_TCONF_POS` (one coefficient set for all positions) and `RANMA_MTP_EXPERT_JOIN`
+  (the NextN layer always joins the profile).
+- Expert cache: `RANMA_EXPERT_UB_POOL` with its `_FILTER`, `_RING`, `_ROWS`, `_RCAP`, `_MIN_MIB` and `_MARGIN_MIB`
+  tuning (the decode pool is always on with the expert cache), and `RANMA_EXPERT_L2_UNIFIED` with its `_RESEED`,
+  `_PROMPT`, `_PROBATION`, `_PROBATION_MIN` and `_GHOST` tuning (the unified host policy is always on where its gate
+  allows it).
 - `LLAMA_DRAFT_SHARE_COMPUTE` (and its alias `LLAMA_MTP_SHARE_COMPUTE`): a drafting context always shares its
   target's compute buffers when it can ([expert-cache-ub-pool.md](expert-cache-ub-pool.md)).
 - The redraw of the VRAM size-class split at plan installs (`RANMA_EXPERT_L1_REDRAW_BENEFIT`,

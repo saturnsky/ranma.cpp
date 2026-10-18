@@ -55,9 +55,14 @@ Starting settings by model and hardware are in [recipes.md](recipes.md).
 - **Slot 0 priority (llama-server)** - with several slots, the prompts of the other slots wait while slot 0 works
   on a request; their generation still shares slot 0's batches (`--slot0-priority strict` holds it too while slot 0
   generates). On by default, `--slot0-priority off` restores the upstream batching. [slot0-priority.md](slot0-priority.md)
+- **n-gram drafts of variable length** - `--spec-type ngram-varlen` drafts from the n-gram history of the session,
+  verifies long drafts in parts and rolls back as deep as needed; a hazard supplement drafts a long match where nothing
+  else drafts, and the verification cost of the target is shared by all drafters. [spec-smart.md](spec-smart.md)
 - **Layer compute mode** - `--layer-mode on` computes a prompt step as one wide ubatch layer by layer (routed experts
   expert by expert, attention in chunks) and sizes the width, the attention chunk and the staging buffers from the
-  model and the free memory. GLM-5.3 EXL3 with the expert cache; off by default. [layer-mode.md](layer-mode.md)
+  model and the free memory. GLM-5.3, Qwen3.8 and DeepSeek V4 / V4.1 Flash with EXL3 experts and the expert cache;
+  off by default. For DeepSeek V4 and V4.1 it also runs the prompt layer-major, reading each expert once per group of
+  ubatches. [layer-mode.md](layer-mode.md)
 - **Reuse of a just-restored context checkpoint (llama-server)** - when the first prompt batch after a checkpoint
   restore starts at that checkpoint, the server keeps the restored entry instead of serializing the unchanged
   state again.
@@ -84,7 +89,8 @@ Starting settings by model and hardware are in [recipes.md](recipes.md).
 - **Expert cache** - `--expert-l1-mib N --expert-profile-dir DIR` gives the routed experts a VRAM budget: the
   server profiles which experts the router selects, plans the most valuable set for the budget and installs it
   at a request boundary. The budget decides the expert placement, so it replaces `--n-cpu-moe`. It turns
-  host-direct on and loads with `--load-mode none` by itself. [expert-cache.md](expert-cache.md)
+  host-direct on and loads with `--load-mode none` by itself. `--expert-l1-mib auto` sizes the budget from the free
+  VRAM, and `--expert-l1-lru-pct N` keeps part of it as per-layer LRU copies. [expert-cache.md](expert-cache.md)
 - **The cache serves prompt processing, and installs are deltas** - MMQ reads the cache arena through the same
   slot tables as MMVQ, and an install moves only what changed between two plans.
   [expert-cache-prefill.md](expert-cache-prefill.md)

@@ -45,6 +45,11 @@ requests in turn it rarely gets the chance. If you serve many users, use upstrea
     state kept per slot grows with them (for Qwen3.8-Flash-Next at a 256K context the recurrent state
     and the compute buffers grow by several GiB), which can overflow VRAM, and a finite host tier is
     refused with `finite L2 needs positive batch/parallel bounds`.
+- **Layer compute mode (`--layer-mode on`)** - for the same models, a prompt step is one wide ubatch computed layer by
+  layer, so every expert that is not in VRAM is read from host memory once per layer instead of once per ubatch
+  (GLM-5.3, Qwen3.8 and DeepSeek V4 / V4.1 Flash in EXL3, with the expert cache). The width and the buffers are sized
+  from the model and the free memory. Off by default.
+  [docs/ranma/layer-mode.md](docs/ranma/layer-mode.md)
 - **Smart MTP draft length (`--spec-smart`)** - with `--spec-type draft-mtp`, llama-server chooses the
   draft length at every step from the measured verification time per width and a calibrated acceptance
   of the draft probabilities, without per-model thresholds. On by default with `draft-mtp`;
@@ -112,6 +117,7 @@ without testing them. Reports and pull requests are welcome
 | Expert cache, VRAM tier | ✔ | ◇ ranma_20261005 |
 | Expert cache, finite host tier with file backing | ✔ | ◇ ranma_20261005 |
 | Smart MTP draft length | ✔ | ? |
+| Layer compute mode | ✔ | ? |
 | Qwen sparse attention, selected cells only | ✔ | ? |
 | DeepSeek V4 selected-cell attention | ✔ | ? |
 | DeepSeek V4 graph ops (hyper-connection coefficients, KV compressor) | ✔ | ? |
